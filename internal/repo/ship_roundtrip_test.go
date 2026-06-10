@@ -59,10 +59,24 @@ func TestShipRoundTrip(t *testing.T) {
 		} else if err := r.CreateAndCheckoutBranch(shipBranch); err != nil {
 			t.Fatalf("create branch: %v", err)
 		}
-		// "generate" an artifact, then add/commit/push (shipRun mechanics).
+		// "generate" artifacts: a NEW test file AND a modification to a TRACKED file. The latter
+		// mirrors --docs inserting into existing sources (and the fixer rewriting tracked files) — it
+		// is what makes a same-branch re-checkout fail with go-git's "unstaged changes".
 		if err := os.WriteFile(filepath.Join(work, genFile), []byte(content), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("seed\n"+content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		// Regression guard: with a dirty TRACKED change, re-checking-out the SAME branch MUST fail —
+		// which is why shipRun skips the checkout when CurrentBranch already equals the ship branch.
+		if err := r.CheckoutBranch(shipBranch); err == nil {
+			t.Fatalf("expected dirty-tree checkout of %q to fail", shipBranch)
+		}
+		if cur, _ := r.CurrentBranch(); cur != shipBranch {
+			t.Fatalf("expected to still be on %q, got %q", shipBranch, cur)
+		}
+		// add/commit/push (shipRun mechanics — no re-checkout).
 		if err := r.Add("."); err != nil {
 			t.Fatalf("add: %v", err)
 		}

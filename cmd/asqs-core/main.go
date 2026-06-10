@@ -209,11 +209,15 @@ func shipRun(ctx context.Context, cfg *config.Config, gitRepo *repo.Repo, origin
 		return fmt.Errorf("no VCS token configured for %s", originURL)
 	}
 
-	// The ship branch is normally already checked out (prepareShipBranch ran before generation);
-	// ensure we are on it, creating it as a fallback if preparation was skipped.
-	if err := gitRepo.CheckoutBranch(branch); err != nil {
-		if err2 := gitRepo.CreateAndCheckoutBranch(branch); err2 != nil {
-			return fmt.Errorf("checkout %s: %w", branch, err)
+	// prepareShipBranch already checked out the ship branch before generation (while the worktree was
+	// clean). Generation then left unstaged changes, so re-checking-out now would fail with
+	// "worktree contains unstaged changes" — switch only when we are NOT already on the branch
+	// (the prep-skipped/failed fallback).
+	if cur, _ := gitRepo.CurrentBranch(); cur != branch {
+		if err := gitRepo.CreateAndCheckoutBranch(branch); err != nil {
+			if err2 := gitRepo.CheckoutBranch(branch); err2 != nil {
+				return fmt.Errorf("checkout %s: %w", branch, err)
+			}
 		}
 	}
 	if err := gitRepo.Add("."); err != nil {
