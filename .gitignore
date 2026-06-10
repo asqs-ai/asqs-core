@@ -1,0 +1,22 @@
+# Binaries
+/asqs-core
+/bin/
+*.exe
+
+# Local config & secrets
+config.local.yaml
+config.yaml
+*.local.yaml
+.env
+
+# Built external indexers (built via `make build-indexers`)
+tools/java-indexer/target/
+tools/js-ts-indexer/dist/
+tools/js-ts-indexer/node_modules/
+tools/csharp-indexer/bin/
+tools/csharp-indexer/obj/
+tools/csharp-indexer/publish/
+
+# Generated patches / scratch
+*.patch
+/tmp/

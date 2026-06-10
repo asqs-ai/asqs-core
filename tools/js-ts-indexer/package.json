@@ -1,0 +1,24 @@
+{
+  "name": "js-ts-indexer",
+  "version": "0.1.0",
+  "description": "JS/TS indexer for ASQS — ts-morph full AST, framework enrichers",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "index": "node dist/index.js",
+    "test": "vitest run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ts-morph": "^24.0.0",
+    "typescript": "^5.3.0",
+    "yaml": "^2.8.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "vitest": "^3.0.5"
+  }
+}

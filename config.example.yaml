@@ -1,0 +1,75 @@
+# asqs-core example configuration. Copy to config.yaml and edit.
+# Only the keys below are needed for a single `asqs-core run`.
+
+database:
+  # PostgreSQL + pgvector (see `docker compose up -d`).
+  metadata_url: "postgres://asqs:asqs@localhost:5432/asqs?sslmode=disable"
+  embeddings_url: "" # empty = reuse metadata_url
+  embeddings_dimension: 1536
+
+llm:
+  # One provider drives every step (generation, fixer, docs, embeddings).
+  provider: openai # openai | anthropic | azure_openai | ollama
+  # Provide the key here directly, OR name an env var in api_key_from_env. The direct api_key is
+  # used unless api_key_from_env points at a variable that is actually set. (Ollama needs no key.)
+  api_key: "" # e.g. "sk-..."
+  api_key_from_env: "" # e.g. OPENAI_API_KEY (leave empty to use api_key above)
+  model: "gpt-4o"
+  embedding_provider: "" # empty = use `provider`
+  embedding_model: "text-embedding-3-small"
+  base_url: "" # e.g. http://127.0.0.1:11434 for a local Ollama (no key needed)
+
+indexer:
+  type: advanced # advanced = Java JAR parser; minimal = Go heuristics
+  execution: local # local | docker (docker = no host JDK/Node/.NET needed)
+  advanced_jar_path: "tools/java-indexer/target/java-indexer-0.1.0.jar"
+  jst_indexer_path: "tools/js-ts-indexer/dist/index.js"
+  csharp_indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
+  max_gaps: 20 # cap unit/doc gaps per run
+  max_gaps_e2e: 5 # cap E2E gaps per run
+
+runner:
+  type: local # local | docker
+  timeout: "15m"
+  start_max_iteration:
+    10 # whole-project fix-loop budget: max LLM fixer iterations for the
+    # SINGLE compile+test evaluation run over ALL generated tests (not
+    # per gap). Raise it for large batches. Tests still failing after
+    # this budget are discarded so the rest of the project stays green.
+  # Docker sandbox images (used when type: docker; empty = built-in defaults):
+  image_java_maven: "" # default: maven:3.9-eclipse-temurin-21
+  image_java_gradle: "" # default: gradle:8.11-jdk21
+  image_node: "" # default: node:20-bookworm
+  image_dotnet: "mcr.microsoft.com/dotnet/sdk:10.0"
+  image_playwright: "" # JS/TS E2E browsers
+  image_playwright_java: "" # Java E2E browsers
+  image_playwright_dotnet: "" # .NET E2E browsers
+  # IMPORTANT (Docker sandbox): compile/test run OFFLINE by default (job_network_test: none) for
+  # reproducibility, so dependencies must already be cached. If a Docker build fails to fetch deps
+  # ("Temporary failure in name resolution"), do ONE of: (a) mount your host package cache below;
+  # (b) set docker_disable_offline_test: true to download live; or (c) use runner.type: local.
+  cache_maven_host: "" # host ~/.m2  → /root/.m2 in the container (empty = no mount)
+  cache_gradle_host: "" # host ~/.gradle
+  cache_npm_host: "" # host ~/.npm
+  cache_nuget_host: "" # host ~/.nuget/packages
+  docker_disable_offline_test: false # true = allow network during compile/test (download deps live)
+  # Optional: detect + install a unit-test framework when the repo has none. OFF by default — it
+  # modifies build files (package.json / pom.xml / .csproj) and runs installs. Enable to opt in.
+  test_framework_bootstrap:
+    enabled: false # true = detect + install Jest / JUnit 5 / xUnit when missing
+    mode: auto # auto | jest | junit | xunit | off
+    pin_versions: false # exact semver in package.json for reproducibility
+    allow_lockfile_change: false # false = frozen lockfile (npm ci / --frozen-lockfile)
+
+# Optional: ship generated tests/docs to a VCS repo after a STABLE run (CLI flag --ship).
+vcs:
+  provider: github # github | gitlab | bitbucket | azure_devops
+  github:
+    token: "" # required for --ship: a PAT with `repo` scope (or via env GITHUB_TOKEN)
+    # owner/repo are auto-derived from the repo's origin URL (HTTPS or SSH). Set these only to
+    # override — e.g. when the origin isn't a recognized github.com URL.
+    default_owner: "" # e.g. my-org
+    default_repo: "" # e.g. my-service
+    ship:
+      branch: "asqs-core" # branch asqs-core pushes (created/updated on each --ship run)
+      base_branch: "main" # PR base branch

@@ -1,0 +1,33 @@
+package com.asqs.e2e;
+
+import org.junit.jupiter.api.Test;
+
+import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserType;
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.Playwright;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/** ASQS e2e_framework_bootstrap smoke test (Playwright Java). */
+public class AsqsPlaywrightSmokeE2E {
+
+	private static final String ASQS_DATA_URL = "data:text/html,<html><title>asqs</title></html>";
+
+	@Test
+	void launchesChromium() {
+		try (Playwright playwright = Playwright.create()) {
+			final BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions();
+			launchOptions.setHeadless(true);
+			try (Browser browser = playwright.chromium().launch(launchOptions)) {
+				final Page page = browser.newPage();
+				page.navigate(ASQS_DATA_URL);
+				final String title = page.title();
+				assertNotNull(title);
+				assertTrue(title.contains("asqs"));
+			}
+		}
+	}
+
+}
