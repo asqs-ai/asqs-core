@@ -46,12 +46,18 @@ func applyPlaywrightDotNetBootstrap(ctx context.Context, p E2EParams, audit Audi
 	})
 	fmt.Fprintln(os.Stderr, "  e2e_framework_bootstrap: installing Microsoft.Playwright (.NET)…")
 
-	csproj, err := primaryCsprojAbs(repo)
+	// Target a DEDICATED e2e/ Playwright project (created from the production projects) instead of
+	// polluting a production .csproj; reuse an existing E2E project when present. Kept under e2e/ so it
+	// never collides with the unit test project under tests/.
+	csproj, createdFiles, err := ensureCSharpE2EProjectForBootstrap(repo, gitRoot, dotnetTFMFallbackFromRunner(p.Runner))
 	if err != nil {
-		return fmt.Errorf("e2e_framework_bootstrap: discover .csproj: %w", err)
+		return fmt.Errorf("e2e_framework_bootstrap: ensure e2e project: %w", err)
 	}
 	if csproj == "" {
 		return fmt.Errorf("e2e_framework_bootstrap: no SDK-style .csproj found under repo")
+	}
+	if len(createdFiles) > 0 {
+		addCSharpTestProjectToSolutions(ctx, ed, repo, csproj, audit)
 	}
 
 	xuFiles, err := applyCSharpXUnit(repo, csproj, gitRoot)
@@ -72,7 +78,7 @@ func applyPlaywrightDotNetBootstrap(ctx context.Context, p E2EParams, audit Audi
 
 	var filesChanged []string
 	seen := map[string]bool{}
-	for _, abs := range append(append([]string(nil), xuFiles...), pwFiles...) {
+	for _, abs := range append(append(append([]string(nil), createdFiles...), xuFiles...), pwFiles...) {
 		rel := relPathForBootstrap(repo, abs)
 		if !seen[rel] {
 			seen[rel] = true

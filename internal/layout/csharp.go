@@ -45,9 +45,22 @@ func SuggestedCSharpUnitTestPath(sourceFileRel, repoAbs string) string {
 		return filepath.Join(dir, testName)
 	}
 
+	// Prefer routing into an existing unit-test project's directory (wherever it lives in the tree),
+	// so generated tests compile in that project instead of being scattered into production projects.
+	if projDir := DetectCSharpUnitTestProjectDir(repoAbs); projDir != "" {
+		mir := MirrorDirForTests(dir)
+		if mir == "" {
+			return filepath.Join(projDir, testName)
+		}
+		return filepath.Join(projDir, filepath.FromSlash(mir), testName)
+	}
+
+	// Never place a C# unit test beside its source: an SDK-style production .csproj would compile it
+	// without referencing xUnit (CS0246). When no dedicated tests root exists yet, default to a tests/
+	// tree (the same root the bootstrap creates the dedicated test project under).
 	root := DetectDedicatedRoot(repoAbs)
 	if root == "" {
-		return filepath.Join(dir, testName)
+		root = "tests"
 	}
 	mir := MirrorDirForTests(dir)
 	if mir == "" {

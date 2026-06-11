@@ -451,8 +451,14 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 		if lang == "javascript" || lang == "typescript" {
 			return suggestedJSTSE2EPathForAPIRouteGap(item, e2eFramework)
 		}
+		if lang == "csharp" || lang == "cs" {
+			return layout.SuggestedCSharpE2ETestPath(item.Gap.Symbol.File, repoPath)
+		}
 		return suggestedJavaE2EPathForRouteGap(item)
 	case "PAGE_ROUTE":
+		if lang := strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Lang)); lang == "csharp" || lang == "cs" {
+			return layout.SuggestedCSharpE2ETestPath(item.Gap.Symbol.File, repoPath)
+		}
 		return suggestedE2EPathForPageRouteGap(item, e2eFramework)
 	}
 	f := item.Gap.Symbol.File

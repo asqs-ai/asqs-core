@@ -151,6 +151,25 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		}
 	}
 
+	// --- E2E framework bootstrap (opt-in; runs when E2E gaps are requested) -------------
+	// When --max-gaps-e2e > 0 and e2e_framework_bootstrap.enabled, set up the E2E stack the repo
+	// lacks (C#: a dedicated e2e/ Playwright project, kept out of production projects; JS/TS:
+	// Playwright/Cypress; Java: Playwright Java). RunE2EBootstrap self-gates on enabled/gaps/mode.
+	// Best-effort: a failure is logged but never aborts the run.
+	if opts.MaxGapsE2E > 0 {
+		if err := testbootstrap.RunE2EBootstrap(ctx, testbootstrap.E2EParams{
+			RepoPath:      repoAbs,
+			Lang:          lang,
+			Config:        &cfg.Runner.E2EFrameworkBootstrap,
+			MaxGapsE2E:    opts.MaxGapsE2E,
+			RunnerTimeout: cfg.Runner.Timeout,
+			Runner:        &cfg.Runner,
+			RunnerType:    cfg.Runner.Type,
+		}, audit); err != nil {
+			fmt.Fprintf(os.Stderr, "asqs-core: e2e bootstrap: %v (continuing)\n", err)
+		}
+	}
+
 	// --- Index --------------------------------------------------------------------------
 	langIdx, indexable, err := buildLangIndexer(ctx, cfg, repoAbs, lang, nJava, nCSharp, nJST)
 	if err != nil {

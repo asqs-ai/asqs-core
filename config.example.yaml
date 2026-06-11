@@ -60,6 +60,13 @@ runner:
     mode: auto # auto | jest | junit | xunit | off
     pin_versions: false # exact semver in package.json for reproducibility
     allow_lockfile_change: false # false = frozen lockfile (npm ci / --frozen-lockfile)
+  # Optional: set up an E2E runner when E2E gaps are requested (--max-gaps-e2e > 0) and the repo has
+  # none. OFF by default. C# creates a DEDICATED e2e/ Playwright test project (kept out of production
+  # projects); JS/TS installs Playwright/Cypress; Java patches Maven/Gradle + Playwright Java.
+  e2e_framework_bootstrap:
+    enabled: false # true = set up the E2E stack when --max-gaps-e2e > 0 and none exists
+    mode: auto # auto | playwright | cypress | off
+    execution: auto # auto | docker | local (auto = ephemeral Docker when runner.type: docker)
 
 # Optional: ship generated tests/docs to a VCS repo after a STABLE run (CLI flag --ship).
 vcs:
