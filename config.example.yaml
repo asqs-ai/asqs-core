@@ -36,6 +36,11 @@ runner:
     # SINGLE compile+test evaluation run over ALL generated tests (not
     # per gap). Raise it for large batches. Tests still failing after
     # this budget are discarded so the rest of the project stays green.
+  # Formatter applied to generated tests (post-generate and after each LLM fix) so they pass the
+  # repo's style gates. Empty = skip, EXCEPT C# which defaults to `dotnet format`. Examples:
+  # "mvn spring-javaformat:apply -q" (Java/Spring), "google-java-format -i" (per-file), "prettier --write .".
+  format_command: "" # empty = C# → "dotnet format"; other langs → no formatting
+  format_only_added: false # true = format only the written files (dotnet format --include / per-file); false = whole repo
   # Docker sandbox images (used when type: docker; empty = built-in defaults):
   image_java_maven: "" # default: maven:3.9-eclipse-temurin-21
   image_java_gradle: "" # default: gradle:8.11-jdk21

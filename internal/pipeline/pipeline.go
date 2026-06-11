@@ -5,6 +5,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -227,6 +228,25 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	fixer := &llmfix.Fixer{LLM: chat}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
+
+	// Formatting (matches asqs-go): format generated tests post-generate and after each LLM fix so
+	// they satisfy the repo's style gates (e.g. `dotnet format --verify-no-changes`, .editorconfig
+	// treated as errors, analyzers). C# defaults to `dotnet format` when runner.format_command is empty.
+	formatCmd := runner.EffectivePostGenerateFormatCommand(lang, cfg.Runner.FormatCommand)
+	formatTimeout := 2 * time.Minute
+	if d, derr := time.ParseDuration(cfg.Runner.Timeout); derr == nil && d > 0 {
+		formatTimeout = d
+	}
+	var formatAfterFixHook func(context.Context, string, []string) error
+	if formatCmd != "" {
+		formatAfterFixHook = func(ctx context.Context, repoPath string, updatedPaths []string) error {
+			err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoPath, lang, formatCmd, cfg.Runner.FormatOnlyAdded, updatedPaths, formatTimeout)
+			if err != nil && errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
+				return fmt.Errorf("%w: %v", evaluator.ErrFormatAfterFixSkipped, err)
+			}
+			return err
+		}
+	}
 	var docGen *generator.LLMDocGenerator
 	var docFmt retrieval.FormatOptions
 	if opts.GenerateDocs {
@@ -298,6 +318,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		return sum, nil
 	}
 
+	// Post-generate format: format the freshly written test files before evaluation so a style gate
+	// (dotnet format --verify-no-changes, .editorconfig-as-errors, analyzers) doesn't fail on layout.
+	// Best-effort: a formatter problem is logged but never aborts the run.
+	if formatCmd != "" {
+		fmt.Fprintf(os.Stderr, "asqs-core: formatting %d generated file(s) (%s)…\n", len(artifactPaths), formatCmd)
+		if err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoAbs, lang, formatCmd, cfg.Runner.FormatOnlyAdded, artifactPaths, formatTimeout); err != nil && !errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
+			fmt.Fprintf(os.Stderr, "asqs-core: post-generate format: %v (continuing)\n", err)
+		}
+	}
+
 	// Phase 2 — evaluate the WHOLE project once: one compile + one test pass (+ optional E2E),
 	// with a single fix loop across all generated files.
 	fmt.Fprintf(os.Stderr, "asqs-core: evaluating %d generated test file(s) (whole-project compile + test)…\n", len(artifactPaths))
@@ -309,6 +339,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		Fixer:              fixer,
 		RunE2ETestPass:     anyE2E,
 		CompileOncePerEval: true,
+		FormatAfterFix:     formatAfterFixHook,
 	}, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)
