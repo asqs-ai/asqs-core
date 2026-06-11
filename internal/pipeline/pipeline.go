@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -261,6 +262,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	seen := map[string]bool{}
 	outcomeIdxByPath := map[string]int{} // normalized path -> index of the gap that first wrote it
 	anyE2E := false
+	docInsertsByFile := map[string][]docInsert{} // collected per-symbol docs, applied per file after the loop
 	for _, item := range plan.Items {
 		out := GapOutcome{Symbol: planItemSymbol(item)}
 		ctxStr := retrieval.BuildLLMContextForGap(item, formatOpts)
@@ -302,16 +304,23 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 				case strings.TrimSpace(doc) == "":
 					fmt.Fprintf(os.Stderr, "asqs-core: docs: empty generation for %s\n", out.Symbol)
 				default:
-					if ierr := insertDocAboveLine(repoAbs, item.Gap.Symbol.File, item.Gap.Symbol.StartLine, doc); ierr != nil {
-						fmt.Fprintf(os.Stderr, "asqs-core: docs: insert for %s (%s:%d): %v\n", out.Symbol, item.Gap.Symbol.File, item.Gap.Symbol.StartLine, ierr)
-					} else {
-						sum.DocsWritten++
-					}
+					// Collect now; applied per file after the loop (dedup + validate + correct offsets).
+					f := item.Gap.Symbol.File
+					docInsertsByFile[f] = append(docInsertsByFile[f], docInsert{
+						line:    item.Gap.Symbol.StartLine,
+						content: doc,
+						symbol:  out.Symbol,
+					})
 				}
 			}
 		}
 		sum.Outcomes = append(sum.Outcomes, out)
 	}
+
+	// Apply collected per-symbol docs in one pass per file: skip symbols that already have a doc, skip
+	// malformed comment blocks, and insert sorted-ascending with a running offset so multiple docs in
+	// one file land at the right lines — preventing duplicate docs and split/broken /** … */ blocks.
+	sum.DocsWritten = applyCollectedDocInserts(repoAbs, docInsertsByFile)
 
 	if len(artifactPaths) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test files were generated — skipping evaluation.")
@@ -377,29 +386,179 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	return sum, nil
 }
 
-// insertDocAboveLine inserts a doc-comment block immediately above the 1-based declaration line in
-// a source file. Minimal/best-effort: it does not walk annotations or de-duplicate existing docs
-// (the enterprise product does); for the open core a single insertion above the symbol is enough.
-func insertDocAboveLine(repoAbs, relFile string, line1Based int, content string) error {
-	if strings.TrimSpace(relFile) == "" || line1Based < 1 {
-		return fmt.Errorf("invalid doc target")
+// docInsert is a pending per-symbol documentation insertion.
+type docInsert struct {
+	line    int    // 1-based declaration line (from the index)
+	content string // the normalized doc comment block
+	symbol  string // for logging
+}
+
+// applyCollectedDocInserts writes the collected per-symbol docs in one read/modify/write pass per
+// file. It mirrors asqs-go's writeGeneratedDocFiles: resolve the insert above annotations, skip
+// symbols that already have a doc (no duplicates), skip malformed comment blocks (no broken /** … */),
+// then insert sorted-ascending with a running line offset so multiple docs in the same file land at
+// the correct lines. Returns the number of docs inserted. Best-effort: every skip/failure is logged.
+func applyCollectedDocInserts(repoAbs string, byFile map[string][]docInsert) int {
+	applied := 0
+	for relFile, inserts := range byFile {
+		if strings.TrimSpace(relFile) == "" {
+			continue
+		}
+		full := filepath.Join(repoAbs, filepath.FromSlash(relFile))
+		b, err := os.ReadFile(full)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "asqs-core: docs: read %s: %v\n", relFile, err)
+			continue
+		}
+		s := string(b)
+		lines := strings.Split(s, "\n")
+		// Resolve/filter against the ORIGINAL file so the existing-doc and annotation checks are
+		// consistent before any insertion shifts lines.
+		var toApply []docInsert
+		for _, in := range inserts {
+			if in.line < 1 {
+				continue
+			}
+			in.line = findInsertLineAboveAnnotations(lines, in.line)
+			if !isWellFormedDocComment(in.content) {
+				fmt.Fprintf(os.Stderr, "asqs-core: docs: skip %s (malformed doc block — not inserted)\n", in.symbol)
+				continue
+			}
+			if hasExistingDocAbove(lines, in.line) {
+				fmt.Fprintf(os.Stderr, "asqs-core: docs: skip %s (symbol already documented)\n", in.symbol)
+				continue
+			}
+			toApply = append(toApply, in)
+		}
+		if len(toApply) == 0 {
+			continue
+		}
+		sort.Slice(toApply, func(i, j int) bool { return toApply[i].line < toApply[j].line })
+		lineOffset := 0
+		for _, in := range toApply {
+			s = insertContentAboveLine(s, in.line+lineOffset, in.content)
+			lineOffset += strings.Count(in.content, "\n") + 1
+		}
+		if err := os.WriteFile(full, []byte(s), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "asqs-core: docs: write %s: %v\n", relFile, err)
+			continue
+		}
+		applied += len(toApply)
 	}
-	full := filepath.Join(repoAbs, filepath.FromSlash(relFile))
-	b, err := os.ReadFile(full)
-	if err != nil {
-		return err
+	return applied
+}
+
+// insertContentAboveLine inserts content as new lines above the 1-based line in body (preserving newlines).
+func insertContentAboveLine(body string, line int, content string) string {
+	if line < 1 || content == "" {
+		return body
 	}
-	lines := strings.Split(string(b), "\n")
-	idx := line1Based - 1
-	if idx > len(lines) {
-		idx = len(lines)
+	lines := strings.Split(body, "\n")
+	if line > len(lines) {
+		return body + "\n" + content
 	}
-	block := strings.TrimRight(content, "\n")
-	out := make([]string, 0, len(lines)+1)
-	out = append(out, lines[:idx]...)
-	out = append(out, block)
-	out = append(out, lines[idx:]...)
-	return os.WriteFile(full, []byte(strings.Join(out, "\n")), 0o644)
+	out := append(append(append([]string{}, lines[:line-1]...), strings.Split(content, "\n")...), lines[line-1:]...)
+	return strings.Join(out, "\n")
+}
+
+// findInsertLineAboveAnnotations moves the insert line up past annotation lines (@Override, …) so the
+// doc sits above all annotations on the declaration.
+func findInsertLineAboveAnnotations(lines []string, declarationLine1Based int) int {
+	insertLine := declarationLine1Based
+	for insertLine > 1 {
+		aboveIdx := insertLine - 2
+		if aboveIdx < 0 || aboveIdx >= len(lines) || !isAnnotationLine(lines[aboveIdx]) {
+			break
+		}
+		insertLine--
+	}
+	return insertLine
+}
+
+func isAnnotationLine(s string) bool {
+	s = strings.TrimSpace(s)
+	return len(s) > 0 && s[0] == '@'
+}
+
+// hasExistingDocAbove reports whether the symbol at insertLine1Based already has a doc comment
+// immediately above it: a Javadoc/JSDoc/TSDoc block (/**, " * …", */), a C# /// XML doc, or //. Skips
+// blank lines and stops at the first non-empty, non-doc line so unrelated far-away comments don't count.
+func hasExistingDocAbove(lines []string, insertLine1Based int) bool {
+	if insertLine1Based <= 1 {
+		return false
+	}
+	startIdx := insertLine1Based - 2
+	if startIdx < 0 {
+		return false
+	}
+	const lookBack = 12
+	endIdx := startIdx - lookBack
+	if endIdx < 0 {
+		endIdx = 0
+	}
+	for idx := startIdx; idx >= endIdx && idx < len(lines); idx-- {
+		s := strings.TrimSpace(lines[idx])
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, "*/") || strings.HasPrefix(s, "/**") || strings.HasPrefix(s, "///") || strings.HasPrefix(s, "//") {
+			return true
+		}
+		if len(s) >= 2 && s[0] == '*' && (s[1] == ' ' || s[1] == '*' || s[1] == '/') {
+			return true
+		}
+		break // first non-empty, non-doc line → no existing doc for this symbol
+	}
+	return false
+}
+
+// isWellFormedDocComment reports whether content is a well-formed in-file doc comment safe to write
+// into source: a C# /// XML-doc run, or a /* … */ block comment scanned to reject the actual failure
+// modes — a missing terminator (ends still open → swallows the following code), a stray/doubled */
+// (closer with no open block), and trailing non-comment code after the block (only whitespace and //
+// line comments may follow). Block comments do not nest. Malformed blocks would cause unfixable
+// compilation errors, so they are skipped rather than inserted.
+func isWellFormedDocComment(content string) bool {
+	s := strings.TrimSpace(content)
+	if s == "" {
+		return false
+	}
+	// C# XML doc: every non-blank line starts with ///
+	if strings.HasPrefix(s, "///") {
+		for _, ln := range strings.Split(s, "\n") {
+			if t := strings.TrimSpace(ln); t != "" && !strings.HasPrefix(t, "///") {
+				return false
+			}
+		}
+		return true
+	}
+	if !strings.HasPrefix(s, "/*") {
+		return false
+	}
+	sawBlock, inside := false, false
+	for i := 0; i < len(s); {
+		if inside {
+			if s[i] == '*' && i+1 < len(s) && s[i+1] == '/' {
+				inside, i = false, i+2
+			} else {
+				i++
+			}
+			continue
+		}
+		switch c := s[i]; {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			i++
+		case c == '/' && i+1 < len(s) && s[i+1] == '*':
+			sawBlock, inside, i = true, true, i+2
+		case c == '/' && i+1 < len(s) && s[i+1] == '/':
+			for i < len(s) && s[i] != '\n' { // skip a // line comment
+				i++
+			}
+		default: // stray */ or any other non-comment text
+			return false
+		}
+	}
+	return sawBlock && !inside
 }
 
 // --- helpers ----------------------------------------------------------------------------
