@@ -1,7 +1,8 @@
 # asqs-core
 
-**asqs-core** is an open-source CLI that automatically generates **unit tests, end-to-end tests, and
-per-symbol documentation** for **Java, C#, and JavaScript/TypeScript** repositories, using a
+**asqs-core** is an open-source CLI that automatically generates **unit tests, end-to-end tests,
+per-symbol documentation, and a whole-repo overview document** for **Java, C#, and
+JavaScript/TypeScript** repositories, using a
 code-graph + retrieval-augmented-generation (RAG) + LLM pipeline. Point it at a local folder or a
 remote git URL and it indexes the code, finds under-tested symbols, generates tests/docs, and
 **validates them by actually compiling and running them** in a sandbox — repairing failures with an
@@ -23,12 +24,16 @@ One command, one pipeline:
 ```
 bootstrap → index → plan → generate (every gap) → evaluate the whole project once
             (compile + test [+ e2e] + LLM fixer loop → discard repeatedly-failing tests)
+            └─ with --docs: a whole-repo overview document is generated IN PARALLEL
 ```
 
 - **bootstrap** — detect (and optionally install) the repo's test framework.
 - **index** — parse the code into a symbol graph (symbols, typed edges, embedded chunks in pgvector).
 - **plan** — rank under-tested symbols into "gaps" and assemble per-gap retrieval context.
-- **generate** — an LLM writes the unit/E2E test or doc, grounded in similar code from your repo.
+- **generate** — an LLM writes the unit/E2E test or doc, grounded in similar code from your repo. With
+  `--docs`, per-symbol docs **and** a whole-repo overview document (`docs/documentation.md` — workflows,
+  dependencies, file-graph visuals from the index) are produced; the overview is generated **in parallel**
+  with the per-symbol test/doc generation.
 - **evaluate** — compile and test the **whole project once** (not per gap) in a sandbox; an LLM
   fixer repairs failures over a bounded loop (`runner.start_max_iteration`). Tests that can't be
   made to pass are discarded so the rest stay green.
@@ -107,6 +112,11 @@ go run ./cmd/asqs-core run --config config.yaml --repo ./path/to/project
 Flags: `--lang` (auto-detected if omitted), `--max-gaps`, `--max-gaps-e2e`, `--docs`,
 `--sandbox local|docker`, `--ship`, `--ship-branch`, `--base-branch`, `--dry-run`.
 
+`--docs` produces both per-symbol documentation **and** a whole-repo overview document
+(`docs/documentation.md`), the latter generated in parallel with test/doc generation. Tune the overview
+via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
+`indexer.overview_max_index_runes_per_slice`, and `indexer.overview_max_completion_tokens`.
+
 ## How it works
 
 - **Indexing** runs language-native parsers (Java AST, C# Roslyn, TypeScript) that emit symbols,
@@ -117,7 +127,12 @@ Flags: `--lang` (auto-detected if omitted), `--max-gaps`, `--max-gaps-e2e`, `--d
 - **Evaluation** generates every gap's test first, then compiles + runs the **whole project once**
   in a local or Docker sandbox (not per gap — one compile per fix iteration, not N). The LLM fixer
   repairs failures over a bounded loop (`runner.start_max_iteration`); tests that repeatedly fail are
-  discarded so the rest stay green. Only artifacts that compile and pass survive.
+  discarded so the rest stay green. Only artifacts that compile and pass survive. A **quality gate**
+  rejects any fixer edit that would degrade the test (e.g. gutting assertions into an empty/tautological
+  shell), so repairs never trade correctness for a green compile.
+- **Documentation** (`--docs`) produces per-symbol doc comments **and**, in parallel, a whole-repo
+  overview document built from the index (batched LLM passes over the source files plus
+  file-dependency/visual sections), written to `docs/documentation.md`.
 
 ## Limitations / non-goals
 

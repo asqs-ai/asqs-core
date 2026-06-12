@@ -334,8 +334,12 @@ func printSummary(s pipeline.Summary) {
 			stable = "yes (after discard)"
 		}
 	}
-	fmt.Printf("\nasqs-core summary (%s): %d files indexed, %d gaps planned, %d generated, %d stable, %d discarded, %d docs | project: %s (%d fix iters)\n",
-		s.Lang, s.FilesIndexed, s.GapsPlanned, s.GapsGenerated, s.GapsStable, s.Discarded, s.DocsWritten, stable, s.Iterations)
+	overview := "no"
+	if s.OverviewWritten {
+		overview = "yes"
+	}
+	fmt.Printf("\nasqs-core summary (%s): %d files indexed, %d gaps planned, %d generated, %d stable, %d discarded, %d docs, overview: %s | project: %s (%d fix iters)\n",
+		s.Lang, s.FilesIndexed, s.GapsPlanned, s.GapsGenerated, s.GapsStable, s.Discarded, s.DocsWritten, overview, stable, s.Iterations)
 	for _, o := range s.Outcomes {
 		status := "skipped"
 		switch {

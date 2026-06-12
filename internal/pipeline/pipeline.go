@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
@@ -21,6 +22,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
+	"github.com/asqs/asqs-core/internal/overview"
 	"github.com/asqs/asqs-core/internal/runner"
 	"github.com/asqs/asqs-core/internal/testbootstrap"
 	csharpindexer "github.com/asqs/asqs-core/tools/csharp-indexer"
@@ -52,16 +54,17 @@ type GapOutcome struct {
 
 // Summary is the run-level result the CLI prints and uses for the exit code / ship gate.
 type Summary struct {
-	Lang          string
-	FilesIndexed  int
-	GapsPlanned   int
-	GapsGenerated int
-	GapsStable    int // generated gaps whose tests are in the (post-discard) green build
-	Discarded     int // generated tests removed because they could not be made to pass
-	DocsWritten   int
-	ProjectStable bool // the whole project compiled + tests passed (possibly after discard)
-	Iterations    int  // fix-loop iterations used by the single whole-project evaluation
-	Outcomes      []GapOutcome
+	Lang            string
+	FilesIndexed    int
+	GapsPlanned     int
+	GapsGenerated   int
+	GapsStable      int // generated gaps whose tests are in the (post-discard) green build
+	Discarded       int // generated tests removed because they could not be made to pass
+	DocsWritten     int
+	OverviewWritten bool // the whole-repo overview document was generated + written (--docs)
+	ProjectStable   bool // the whole project compiled + tests passed (possibly after discard)
+	Iterations      int  // fix-loop iterations used by the single whole-project evaluation
+	Outcomes        []GapOutcome
 }
 
 // Stable reports whether the whole project ended green (possibly after discarding failing tests)
@@ -256,6 +259,27 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		docFmt.DocGeneration = true
 	}
 
+	// Overview documentation (whole-repo) runs in PARALLEL with the per-symbol test/doc generation
+	// below when --docs is set. It only reads the metadata store (which the generation loop does not
+	// touch) and shares the HTTP-based LLM client safely, so the two run concurrently; the generated
+	// document is written after the loop. Matches asqs-go (overview generated alongside generation).
+	var overviewWG sync.WaitGroup
+	var overviewContent, overviewPath string
+	var overviewErr error
+	if opts.GenerateDocs {
+		og := &overview.LLMOverviewDocGenerator{
+			LLM:                     chat,
+			Path:                    strings.TrimSpace(cfg.Indexer.OverviewDocPath),
+			MaxCompletionTokensFull: cfg.Indexer.OverviewMaxCompletionTokens,
+		}
+		overviewWG.Add(1)
+		go func() {
+			defer overviewWG.Done()
+			fmt.Fprintln(os.Stderr, "asqs-core: generating overview documentation (in parallel)…")
+			overviewContent, overviewPath, overviewErr = og.Generate(ctx, meta, lang, repoAbs, cfg.Indexer.OverviewMaxFilesPerSlice, cfg.Indexer.OverviewMaxIndexRunesPerSlice)
+		}()
+	}
+
 	// Phase 1 — generate + write every gap's test (no per-gap evaluation). Collect the unique
 	// artifact paths so the whole project is compiled/tested exactly once below.
 	var artifactPaths []string
@@ -321,6 +345,31 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// malformed comment blocks, and insert sorted-ascending with a running offset so multiple docs in
 	// one file land at the right lines — preventing duplicate docs and split/broken /** … */ blocks.
 	sum.DocsWritten = applyCollectedDocInserts(repoAbs, docInsertsByFile)
+
+	// Overview: join the parallel generation and write the document (best-effort; never aborts the run).
+	if opts.GenerateDocs {
+		overviewWG.Wait()
+		switch {
+		case overviewErr != nil:
+			fmt.Fprintf(os.Stderr, "asqs-core: overview: %v (continuing)\n", overviewErr)
+		case strings.TrimSpace(overviewContent) == "":
+			fmt.Fprintln(os.Stderr, "asqs-core: overview: empty content — not written.")
+		default:
+			rel := strings.TrimSpace(overviewPath)
+			if rel == "" {
+				rel = overview.DefaultOverviewPath
+			}
+			full := filepath.Join(repoAbs, filepath.FromSlash(rel))
+			if mkErr := os.MkdirAll(filepath.Dir(full), 0o755); mkErr != nil {
+				fmt.Fprintf(os.Stderr, "asqs-core: overview: mkdir %s: %v\n", rel, mkErr)
+			} else if wErr := os.WriteFile(full, []byte(overviewContent), 0o644); wErr != nil {
+				fmt.Fprintf(os.Stderr, "asqs-core: overview: write %s: %v\n", rel, wErr)
+			} else {
+				sum.OverviewWritten = true
+				fmt.Fprintf(os.Stderr, "asqs-core: overview written → %s\n", rel)
+			}
+		}
+	}
 
 	if len(artifactPaths) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test files were generated — skipping evaluation.")
