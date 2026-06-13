@@ -134,6 +134,86 @@ via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
   overview document built from the index (batched LLM passes over the source files plus
   file-dependency/visual sections), written to `docs/documentation.md`.
 
+## Troubleshooting
+
+Most failures are environment/configuration, not bugs. A run touches several external pieces (a
+database, an LLM, language toolchains, optionally Docker), so check these first.
+
+### Environment & prerequisites
+
+- **Local sandbox needs the toolchain on PATH.** With `runner.type: local`, asqs-core shells out to
+  the repo's real build tools — so **Java** (JDK + Maven/Gradle), **.NET SDK**, and/or **Node** must be
+  installed and on `PATH` for the language you're running. Missing tools surface as "command not found"
+  or compile/test steps that never start. If you don't want to install them, use `runner.type: docker`
+  (the SDK lives in the image instead).
+- **Build the indexers first.** The advanced indexers are separate artifacts: run `make build-indexers`
+  and point `indexer.advanced_jar_path` (Java JAR), `indexer.jst_indexer_path` (JS/TS `dist/index.js`),
+  and `indexer.csharp_indexer_dll_path` (C# DLL) at them. Symptom: `indexer.jst_indexer_path is not set …`
+  or `… is not set (dotnet publish tools/csharp-indexer)`. Building the indexers needs JDK 21 + Maven,
+  Node 20+, and .NET SDK 10 respectively.
+- **PostgreSQL + pgvector must be running with the vector extension.** `docker compose up -d` starts
+  `pgvector/pgvector:pg16` (the `vector` extension is what stores embeddings). A plain Postgres without
+  pgvector fails on the `vector(…)` column / index. Point `database.metadata_url` at it. Also keep
+  `database.embeddings_dimension` (default `1536`) in sync with your embedding model — a mismatch causes
+  insert/query errors against the `vector(1536)` column.
+- **An LLM key/provider is required.** Set `llm.provider` + `llm.model` and either `llm.api_key` or
+  `llm.api_key_from_env` (Ollama needs no key, just `llm.base_url`). With no key the generation/fixer/doc
+  steps fail or no-op. Embeddings can use a different provider via `llm.embedding_provider`.
+- **Docker must be available for the Docker paths.** When `runner.type: docker` (or `indexer.execution:
+  docker`, or the test/E2E bootstrap runs in Docker), the Docker daemon must be running and `docker` on
+  `PATH`. Symptom: "Cannot connect to the Docker daemon".
+
+### Docker sandbox & offline runs
+
+- **Offline-by-default: cache your dependencies.** The Docker sandbox runs compile/test **offline**
+  (`job_network_test: none`) for reproducibility, so dependencies must already be cached. If a build
+  can't fetch deps (e.g. Maven `Temporary failure in name resolution`, NuGet `NETSDK1064 … was not
+  found`), do **one** of: (a) mount your host package cache — `cache_maven_host`, `cache_gradle_host`,
+  `cache_npm_host`, `cache_nuget_host`; (b) set `runner.docker_disable_offline_test: true` to download
+  live (needs working Docker DNS); or (c) use `runner.type: local`. For a fully offline machine, mount a
+  **pre-populated** host cache (run a build once with network, then point the `cache_*_host` key at it).
+- **Custom / version-pinned images must exist locally.** If you override an image to a specific build
+  (e.g. `image_playwright_dotnet: asqs-playwright-dotnet:net10`), that image must be present in the local
+  Docker (built or pulled) before the run, or the container fails to start with an image-not-found error.
+  Build it first (`docker build -t asqs-playwright-dotnet:net10 …`).
+
+### C# specifics (common)
+
+- **Match the SDK image to the project's target framework.** A `net8.0` project built in a `sdk:10.0`
+  image fails with `NETSDK1127: The targeting pack Microsoft.NETCore.App is not installed`. Leave
+  `runner.image_dotnet: ""` so asqs-core infers `sdk:{major}` from your `.csproj` TFMs, or set it
+  explicitly (e.g. `mcr.microsoft.com/dotnet/sdk:8.0`).
+- **`CS0246: 'Xunit' could not be found` → enable the test-framework bootstrap.** Generated C# tests
+  must live in a project that references xUnit. Set `runner.test_framework_bootstrap.enabled: true`
+  (mode `xunit`/`auto`); asqs-core then creates a dedicated `tests/<Repo>.Tests.csproj` and routes tests
+  there instead of into a production project. (Generated tests now default to a `tests/` tree even
+  without it, so production still compiles — but they only *run* when a test project exists.)
+- **Style gates and `dotnet format`.** With C#, asqs-core runs `dotnet format` on generated tests by
+  default (override via `runner.format_command`). For the **local** sandbox the `dotnet` CLI must be on
+  PATH; for **Docker** the SDK image provides it. If you don't want formatting, set `format_command` to a
+  no-op or use a repo without a `dotnet format --verify-no-changes` gate.
+
+### Generation quality, output & shipping
+
+- **Result quality depends heavily on the LLM.** The strength of the generation/fixer model is the
+  single biggest factor in test quality and how often the fixer succeeds. Prefer a strong, current model
+  for `llm.model`; weak models produce low-value tests (which the quality gate rejects) and fewer
+  successful repairs. Larger `runner.start_max_iteration` gives the fixer more attempts at the cost of
+  more LLM calls.
+- **"could not detect a supported language" / "no source files found".** Language is auto-detected from
+  the file scan; an empty or wrong detection usually means everything was filtered by
+  `indexer.skip_path_prefixes`, or the repo path is wrong. Pass `--lang` to force it.
+- **`--docs` writes into your source tree.** Per-symbol docs are inserted above declarations in source
+  files, and the overview is written to `indexer.overview_doc_path` (default `docs/documentation.md`).
+  Point asqs-core at a clean working tree (or a branch) so you can review the diff.
+- **Shipping (`--ship`) requirements.** Ship only runs on a **stable** result (`run not stable — not
+  shipping` otherwise), and needs a VCS token (`vcs.github.token`) and a recognizable origin (HTTPS or
+  SSH — asqs-core rewrites SSH→HTTPS for the push). If the PR step can't resolve owner/repo from the
+  origin URL, set `vcs.<provider>.default_owner` / `default_repo`.
+- **Exit code 1 on a green-looking run.** The CLI exits non-zero when generated tests didn't end up in a
+  passing whole-project build (`!Stable()`). Check the summary line and the per-symbol `discarded` /
+  `unstable` statuses; the `discard` mechanism drops repeatedly-failing tests so the rest stay green.
+
 ## Limitations / non-goals
 
 No web UI, no REST API, no multi-tenant control plane, no project-intelligence (repo skill-file
