@@ -92,50 +92,37 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 		}
 	}
 
-	// Domain models: same-file types first, then types parsed from target signature (params/return)
-	fileSyms, _ := meta.ListSymbolsByFile(ctx, targetSym.File)
-	for _, s := range fileSyms {
-		if s.Kind != "class" && s.Kind != "interface" && s.Kind != "struct" && strings.ToLower(s.Kind) != "record" {
-			continue
-		}
-		if seen[s.ID] {
-			continue
-		}
-		seen[s.ID] = true
-		c := chunkForSymbol(ctx, chunks, s.ID, req.RepoID)
-		out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
-	}
-	// Domain models from signature: resolve type names (e.g. Java param/return types) to symbols in this repo
+	// Domain models / collaborators: the types the LLM must construct, assert on, or mock. Without
+	// these a unit test invents signatures and fails to compile ("cannot find symbol"). We gather
+	// referenced type names from three sources — the target signature (param/return), the enclosing
+	// class's field declarations (= injected collaborators to mock), and the method body — then
+	// resolve each to a repo symbol. Resolution is cross-package: the prior `<module>.<name>` guess
+	// only found same-package types, so cross-package domain types (the common case) never resolved.
 	f, _ := meta.GetFile(ctx, targetSym.File)
 	fileModule := ""
 	if f != nil {
 		fileModule = strings.TrimSpace(f.Module)
 	}
-	for _, typeName := range typeNamesFromSignature(targetSym) {
-		if typeName == "" {
-			continue
+	addDomainModel := func(s *metadata.Symbol) {
+		if s == nil || seen[s.ID] || !isDomainTypeKind(s.Kind) || len(out.DomainModels) >= maxDomainModels {
+			return
 		}
-		var fqNames []string
-		if strings.Contains(typeName, ".") {
-			fqNames = []string{typeName}
-		} else if fileModule != "" {
-			fqNames = []string{fileModule + "." + typeName, typeName}
-		} else {
-			fqNames = []string{typeName}
+		seen[s.ID] = true
+		c := chunkForSymbol(ctx, chunks, s.ID, req.RepoID)
+		out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
+	}
+	// Same-file types first (cheap, certain).
+	fileSyms, _ := meta.ListSymbolsByFile(ctx, targetSym.File)
+	for _, s := range fileSyms {
+		addDomainModel(s)
+	}
+	// Referenced type names, highest-signal source first so the budget fills with the most relevant.
+	for _, typeName := range referencedTypeNames(ctx, meta, targetSym, out.TargetClass, methodChunk) {
+		if len(out.DomainModels) >= maxDomainModels {
+			break
 		}
-		for _, fqName := range fqNames {
-			syms, _ := meta.ListSymbolsByFQName(ctx, fqName)
-			for _, s := range syms {
-				if s.Kind != "class" && s.Kind != "interface" && s.Kind != "struct" && strings.ToLower(s.Kind) != "record" {
-					continue
-				}
-				if seen[s.ID] {
-					continue
-				}
-				seen[s.ID] = true
-				c := chunkForSymbol(ctx, chunks, s.ID, req.RepoID)
-				out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
-			}
+		for _, s := range resolveTypeNameToSymbols(ctx, meta, typeName, fileModule) {
+			addDomainModel(s)
 		}
 	}
 
@@ -795,6 +782,212 @@ func typeNamesFromSignature(sym *metadata.Symbol) []string {
 			seen[tok] = true
 			out = append(out, tok)
 		}
+	}
+	return out
+}
+
+// maxDomainModels caps how many resolved domain-model / collaborator types are attached to one gap's
+// context, so a method that touches many types cannot blow the context budget.
+const maxDomainModels = 8
+
+// domainTypeKinds are the symbol kinds that represent a type the LLM may construct, assert on, or
+// mock — across Java/C#/TS. Comparison is lower-cased.
+var domainTypeKinds = map[string]bool{
+	"class": true, "interface": true, "struct": true, "record": true,
+	"enum": true, "type": true, "type_alias": true, "object": true,
+}
+
+func isDomainTypeKind(kind string) bool {
+	return domainTypeKinds[strings.ToLower(strings.TrimSpace(kind))]
+}
+
+// commonNonDomainTypeNames are language/stdlib/framework type tokens that are never repo domain
+// symbols; skipping them avoids wasted lookups and accidental same-name collisions. Anything not
+// listed that fails to resolve to a repo symbol is simply dropped, so this set only needs to cover
+// the high-frequency noise.
+var commonNonDomainTypeNames = map[string]bool{
+	"String": true, "Object": true, "Integer": true, "Long": true, "Boolean": true, "Double": true,
+	"Float": true, "Number": true, "Byte": true, "Short": true, "Character": true, "Void": true,
+	"List": true, "Map": true, "Set": true, "Collection": true, "Optional": true, "Stream": true,
+	"Iterable": true, "Iterator": true, "Array": true, "ArrayList": true, "HashMap": true, "HashSet": true,
+	"Date": true, "LocalDate": true, "LocalDateTime": true, "Instant": true, "Duration": true, "BigDecimal": true,
+	"Exception": true, "RuntimeException": true, "Throwable": true, "Error": true,
+	"Override": true, "Test": true, "Promise": true, "Record": true, "Task": true, "IEnumerable": true,
+	"IList": true, "IDictionary": true, "Dictionary": true, "Guid": true, "DateTime": true, "Func": true, "Action": true,
+}
+
+// typeSimpleNameResolver is an OPTIONAL capability: when the metadata store implements it (the
+// production *metadata.Store does), referenced type names that don't resolve in the target's own
+// package are looked up repo-wide by their simple name. Kept optional so existing MetaReader fakes
+// in tests need no changes.
+type typeSimpleNameResolver interface {
+	ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*metadata.Symbol, error)
+}
+
+// resolveTypeNameToSymbols resolves a (possibly simple) type name to repo type symbols. Order:
+// exact FQ name → same-package guess (<fileModule>.<name>) → bare name → repo-wide simple-name
+// fallback (cross-package, optional capability). Returns the first non-empty match.
+func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fileModule string) []*metadata.Symbol {
+	typeName = strings.TrimSpace(typeName)
+	if typeName == "" {
+		return nil
+	}
+	if strings.Contains(typeName, ".") {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+			return syms
+		}
+	} else {
+		if fileModule != "" {
+			if syms, _ := meta.ListSymbolsByFQName(ctx, fileModule+"."+typeName); len(syms) > 0 {
+				return syms
+			}
+		}
+		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+			return syms
+		}
+	}
+	simple := typeName
+	if i := strings.LastIndex(simple, "."); i >= 0 {
+		simple = simple[i+1:]
+	}
+	if r, ok := meta.(typeSimpleNameResolver); ok && simple != "" {
+		if syms, _ := r.ListSymbolsByTypeSimpleName(ctx, simple, maxDomainModels); len(syms) > 0 {
+			return syms
+		}
+	}
+	return nil
+}
+
+// fieldTypeNamesForContainer returns the declared field/property types of the enclosing class —
+// these are exactly the injected collaborators a unit test must mock. Scoped to the container's
+// line range so other types in the same file don't leak in.
+func fieldTypeNamesForContainer(ctx context.Context, meta MetaReader, classSym *metadata.Symbol) []string {
+	if classSym == nil {
+		return nil
+	}
+	syms, _ := meta.ListSymbolsByFile(ctx, classSym.File)
+	var out []string
+	for _, s := range syms {
+		if s == nil {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(s.Kind))
+		if k != "field" && k != "property" {
+			continue
+		}
+		if s.StartLine < classSym.StartLine || (classSym.EndLine > 0 && s.EndLine > classSym.EndLine) {
+			continue
+		}
+		out = append(out, fieldDeclaredTypeNames(s)...)
+	}
+	return out
+}
+
+// fieldDeclaredTypeNames extracts the declared type token(s) of a field/property symbol. Field
+// symbols store the type under the "type" key (Java advanced.go emits {"type":"OrderService"}),
+// NOT "signature" — so typeNamesFromSignature (which reads "signature") silently missed them, which
+// is why constructor-injected collaborators never surfaced. Falls back to "signature" for shapes
+// that use it. Reads existing indexed data, so no reindex is required.
+func fieldDeclaredTypeNames(sym *metadata.Symbol) []string {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return nil
+	}
+	var parsed struct {
+		Type      string `json:"type"`
+		Signature string `json:"signature"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
+		return nil
+	}
+	raw := strings.TrimSpace(parsed.Type)
+	if raw == "" {
+		raw = strings.TrimSpace(parsed.Signature)
+	}
+	if raw == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range typeNameInSignatureRe.FindAllStringSubmatch(raw, -1) {
+		tok := m[1]
+		if javaPrimitives[strings.ToLower(tok)] {
+			continue
+		}
+		if !seen[tok] {
+			seen[tok] = true
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// typeNamesFromCodeBody extracts capitalized type-like tokens referenced in a code chunk (the target
+// method body), e.g. `new Order(...)`, `OrderResponse.from(...)`. Noisy by nature — only tokens that
+// later resolve to a repo symbol survive — so we just cap the count and skip obvious stdlib noise.
+func typeNamesFromCodeBody(content string) []string {
+	if strings.TrimSpace(content) == "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var out []string
+	for _, m := range typeNameInSignatureRe.FindAllStringSubmatch(content, -1) {
+		if len(m) < 2 {
+			continue
+		}
+		tok := m[1]
+		// Body references are usually `Type.member` (e.g. `Status.OK`, `OrderResponse.from`) — keep
+		// the leading type segment so we resolve the type, not the member.
+		if i := strings.Index(tok, "."); i >= 0 {
+			tok = tok[:i]
+		}
+		if tok == "" || javaPrimitives[strings.ToLower(tok)] || commonNonDomainTypeNames[tok] {
+			continue
+		}
+		if seen[tok] {
+			continue
+		}
+		seen[tok] = true
+		out = append(out, tok)
+		if len(out) >= 40 {
+			break
+		}
+	}
+	return out
+}
+
+// referencedTypeNames gathers candidate domain/collaborator type names for the target, in priority
+// order: signature (param/return) → enclosing-class fields → enclosing-class body (field
+// declarations + constructor-injected dependencies) → method body. Deduped, preserving first-seen
+// order so the per-gap budget fills with the highest-signal types first.
+//
+// The enclosing-class chunk is parsed for type tokens because field symbols' signature_json does not
+// reliably carry the declared TYPE (observed for Java: only the constructor signature names the
+// injected collaborator). Reading the class chunk recovers constructor-injected / field-declared
+// collaborators (e.g. `private final OrderService orderService`) regardless of field-symbol metadata.
+func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metadata.Symbol, targetClass *SymbolChunk, methodChunk *embeddings.Chunk) []string {
+	seen := make(map[string]bool)
+	var out []string
+	add := func(names []string) {
+		for _, n := range names {
+			n = strings.TrimSpace(n)
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	add(typeNamesFromSignature(targetSym))
+	if targetClass != nil {
+		if targetClass.Symbol != nil {
+			add(fieldTypeNamesForContainer(ctx, meta, targetClass.Symbol))
+		}
+		if targetClass.Chunk != nil {
+			add(typeNamesFromCodeBody(targetClass.Chunk.Content))
+		}
+	}
+	if methodChunk != nil {
+		add(typeNamesFromCodeBody(methodChunk.Content))
 	}
 	return out
 }

@@ -243,22 +243,49 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 		}
 	}
 
-	// --- Domain models (types used in signatures / same file) ---
+	// --- Domain models + collaborators (types the target uses) ---
+	// Split into collaborators (interfaces / injected services to MOCK) and value/domain types (to
+	// CONSTRUCT and ASSERT on). Without these the LLM invents type shapes → "cannot find symbol"
+	// compile errors. Rows carry the signature so the model sees the exact API to stub/build.
 	if opts.IncludeDomainModels && len(rc.DomainModels) > 0 {
-		b.WriteString(opts.SectionPrefix)
-		b.WriteString("Domain models (types relevant to the target)\n\n")
+		var collaborators, valueTypes []*SymbolChunk
 		for _, dm := range rc.DomainModels {
-			if dm.Symbol == nil {
+			if dm == nil || dm.Symbol == nil {
 				continue
 			}
-			b.WriteString("- ")
-			b.WriteString(symbolTableRow(dm.Symbol))
-			if dm.Chunk != nil {
-				b.WriteString("\n")
-				b.WriteString(chunkBlock(dm.Chunk, opts.MaxChunkChars))
+			if isLikelyCollaborator(dm.Symbol) {
+				collaborators = append(collaborators, dm)
+			} else {
+				valueTypes = append(valueTypes, dm)
 			}
-			b.WriteString("\n\n")
 		}
+		writeDomainGroup := func(title, hint string, group []*SymbolChunk) {
+			if len(group) == 0 {
+				return
+			}
+			b.WriteString(opts.SectionPrefix)
+			b.WriteString(title)
+			b.WriteString("\n\n")
+			if hint != "" && !opts.DocGeneration {
+				b.WriteString(hint)
+				b.WriteString("\n\n")
+			}
+			for _, dm := range group {
+				b.WriteString("- ")
+				b.WriteString(symbolTableRowWithSignature(dm.Symbol))
+				if dm.Chunk != nil {
+					b.WriteString("\n")
+					b.WriteString(chunkBlock(dm.Chunk, opts.MaxChunkChars))
+				}
+				b.WriteString("\n\n")
+			}
+		}
+		writeDomainGroup("Collaborators (mock these)",
+			"These are the target's dependencies — stub/mock them (Mockito, Moq, jest.mock/vi.mock) and verify interactions; do not hit real implementations.",
+			collaborators)
+		writeDomainGroup("Domain types (construct real instances, assert on these)",
+			"Build real instances of these value/DTO/model types for inputs and assertions; use their actual fields/constructors shown below.",
+			valueTypes)
 	}
 
 	// --- Symbol table summary (compact view of all symbols above) ---
@@ -349,6 +376,36 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 	}
 
 	return strings.TrimSpace(b.String())
+}
+
+// collaboratorNameSuffixes are simple-name endings that strongly imply a behavioral dependency the
+// LLM should MOCK rather than construct. Used only for presentation grouping (a misgrouped type is
+// still present in context), so a heuristic suffix list is acceptable across Java/C#/TS.
+var collaboratorNameSuffixes = []string{
+	"Service", "Repository", "Client", "Dao", "Gateway", "Provider", "Mapper", "Manager",
+	"Factory", "Handler", "Producer", "Consumer", "Publisher", "Listener", "Store", "Engine",
+	"Validator", "Resolver", "Adapter", "Facade", "Strategy", "Broker", "Dispatcher", "Scheduler",
+}
+
+// isLikelyCollaborator reports whether a resolved type reads as a dependency to mock (interface kind
+// or a service/repository-style name) vs a value/DTO type to construct and assert on.
+func isLikelyCollaborator(s *metadata.Symbol) bool {
+	if s == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(s.Kind), "interface") {
+		return true
+	}
+	name := s.FQName
+	if i := strings.LastIndexAny(name, ".#"); i >= 0 {
+		name = name[i+1:]
+	}
+	for _, suf := range collaboratorNameSuffixes {
+		if strings.HasSuffix(name, suf) {
+			return true
+		}
+	}
+	return false
 }
 
 func symbolLoc(s *metadata.Symbol) string {

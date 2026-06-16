@@ -467,6 +467,37 @@ func formatAvailableNpmPackagesLineForPrompt(names []string) string {
 	return s
 }
 
+// rankDependencyPaths orders not-yet-emitted dependency files so the ones the error output actually
+// references (matched file:line in lineByPath) come FIRST, then alphabetically for determinism.
+// Previously the legacy builder ranged the Files map in random order, so when the per-request rune
+// budget filled, an unrelated dependency could be kept while the file holding the unresolved symbol
+// (the one the LLM needs to read) was dropped. Ranking spends the budget on the relevant files.
+func rankDependencyPaths(files map[string]string, emitted map[string]bool, lineByPath map[string][]int) []string {
+	type dep struct {
+		path       string
+		referenced bool
+	}
+	deps := make([]dep, 0, len(files))
+	for p := range files {
+		canonical := evaluator.NormalizeRepoRelPath(p)
+		if emitted[canonical] {
+			continue
+		}
+		deps = append(deps, dep{path: canonical, referenced: len(lineByPath[canonical]) > 0})
+	}
+	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].referenced != deps[j].referenced {
+			return deps[i].referenced
+		}
+		return deps[i].path < deps[j].path
+	})
+	out := make([]string, len(deps))
+	for i, d := range deps {
+		out[i] = d.path
+	}
+	return out
+}
+
 // buildFixUserMessage builds the user message: metadata, then dependency manifests (so LLM only uses listed packages), then error log, then files.
 func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
 	var b strings.Builder
@@ -612,11 +643,8 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
 			break
 		}
 	}
-	for path, content := range req.Files {
-		if emitted[evaluator.NormalizeRepoRelPath(path)] {
-			continue
-		}
-		emitFile(evaluator.NormalizeRepoRelPath(path), content, false)
+	for _, canonical := range rankDependencyPaths(req.Files, emitted, lineByPath) {
+		emitFile(canonical, req.Files[canonicalKey(canonical, req.Files)], false)
 	}
 	b.WriteString("Respond with a single JSON object: { \"path/to/file\": \"full content\" }. Only the test file(s) you changed. No markdown or explanation.")
 	return b.String()

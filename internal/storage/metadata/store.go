@@ -192,6 +192,38 @@ func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symb
 	return scanSymbols(rows)
 }
 
+// ListSymbolsByTypeSimpleName returns TYPE symbols (class/interface/struct/record/enum/type) whose
+// fully-qualified name's final segment equals simpleName — e.g. "Order" resolves
+// "com.example.javatest.model.Order" regardless of which package the caller lives in. The match is
+// anchored at the package separator ('.') so "Order" does NOT match "OrderController" or
+// "PurchaseOrder". Used by retrieval to resolve cross-package param/return/field types into domain
+// models + collaborators (the prior `<module>.<name>` guess only found same-package types). Capped.
+func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*Symbol, error) {
+	simpleName = strings.TrimSpace(simpleName)
+	if simpleName == "" {
+		return nil, nil
+	}
+	if limit < 1 {
+		limit = 20
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	query := `
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		FROM symbols
+		WHERE lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
+		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
+		ORDER BY length(fq_name), fq_name
+		LIMIT $2`
+	rows, err := s.db.QueryContext(ctx, query, simpleName, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSymbols(rows)
+}
+
 // ListSymbolsByLang returns symbols for the given language, optionally filtered by kind.
 func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string) ([]*Symbol, error) {
 	if kind != "" {

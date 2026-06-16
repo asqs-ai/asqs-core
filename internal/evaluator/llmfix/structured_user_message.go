@@ -198,17 +198,9 @@ func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits
 			break
 		}
 	}
-	// Deterministic order for dependency files so snapshot tests don't flake.
-	depPaths := make([]string, 0, len(req.Files))
-	for p := range req.Files {
-		canonical := evaluator.NormalizeRepoRelPath(p)
-		if emitted[canonical] {
-			continue
-		}
-		depPaths = append(depPaths, canonical)
-	}
-	sort.Strings(depPaths)
-	for _, canonical := range depPaths {
+	// Error-referenced dependencies first, then alphabetical (deterministic) — so the per-request
+	// budget is spent on the files the diagnostic points at, not dropped for unrelated deps.
+	for _, canonical := range rankDependencyPaths(req.Files, emitted, lineByPath) {
 		emitFile(canonical, req.Files[canonicalKey(canonical, req.Files)], false)
 	}
 
