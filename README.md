@@ -17,7 +17,7 @@ LLM providers) is intentionally **not** part of this core.
 > **Status.** The full engine (indexing, retrieval, generation, evaluation/repair), the three
 > language indexers, and the `asqs-core run` CLI build as a standalone Go module — `go build ./...`
 > is green and `asqs-core run` is wired end to end. Executing a real run requires a Postgres +
-> pgvector database, an LLM API key or a local Ollama endpoint running an open-source model (like Llama, Codestral, or Qwen), 
+> pgvector database, an LLM API key or a local Ollama endpoint running an open-source model (like Llama, Codestral, or Qwen),
 > and (for the Docker sandbox) Docker; follow the steps below.
 
 ## What it does
@@ -168,7 +168,7 @@ database, an LLM, language toolchains, optionally Docker), so check these first.
   `llm.api_key_from_env` (Ollama needs no key, just `llm.base_url`). With no key the generation/fixer/doc
   steps fail or no-op. Embeddings can use a different provider via `llm.embedding_provider`.
 - **Docker must be available for the Docker paths.** When `runner.type: docker` (or `indexer.execution:
-  docker`, or the test/E2E bootstrap runs in Docker), the Docker daemon must be running and `docker` on
+docker`, or the test/E2E bootstrap runs in Docker), the Docker daemon must be running and `docker` on
   `PATH`. Symptom: "Cannot connect to the Docker daemon".
 
 ### Docker sandbox & offline runs
@@ -176,7 +176,7 @@ database, an LLM, language toolchains, optionally Docker), so check these first.
 - **Offline-by-default: cache your dependencies.** The Docker sandbox runs compile/test **offline**
   (`job_network_test: none`) for reproducibility, so dependencies must already be cached. If a build
   can't fetch deps (e.g. Maven `Temporary failure in name resolution`, NuGet `NETSDK1064 … was not
-  found`), do **one** of: (a) mount your host package cache — `cache_maven_host`, `cache_gradle_host`,
+found`), do **one** of: (a) mount your host package cache — `cache_maven_host`, `cache_gradle_host`,
   `cache_npm_host`, `cache_nuget_host`; (b) set `runner.docker_disable_offline_test: true` to download
   live (needs working Docker DNS); or (c) use `runner.type: local`. For a fully offline machine, mount a
   **pre-populated** host cache (run a build once with network, then point the `cache_*_host` key at it).
@@ -195,7 +195,7 @@ database, an LLM, language toolchains, optionally Docker), so check these first.
   must live in a project that references xUnit. Set `runner.test_framework_bootstrap.enabled: true`
   (mode `xunit`/`auto`); asqs-core then creates a dedicated `tests/<Repo>.Tests.csproj` and routes tests
   there instead of into a production project. (Generated tests now default to a `tests/` tree even
-  without it, so production still compiles — but they only *run* when a test project exists.)
+  without it, so production still compiles — but they only _run_ when a test project exists.)
 - **Style gates and `dotnet format`.** With C#, asqs-core runs `dotnet format` on generated tests by
   default (override via `runner.format_command`). For the **local** sandbox the `dotnet` CLI must be on
   PATH; for **Docker** the SDK image provides it. If you don't want formatting, set `format_command` to a
@@ -215,14 +215,14 @@ database, an LLM, language toolchains, optionally Docker), so check these first.
   files, and the overview is written to `indexer.overview_doc_path` (default `docs/documentation.md`).
   Point asqs-core at a clean working tree (or a branch) so you can review the diff.
 - **Shipping (`--ship`) requirements.** Ship only runs on a **stable** result (`run not stable — not
-  shipping` otherwise), and needs a VCS token (`vcs.github.token`) and a recognizable origin (HTTPS or
+shipping` otherwise), and needs a VCS token (`vcs.github.token`) and a recognizable origin (HTTPS or
   SSH — asqs-core rewrites SSH→HTTPS for the push). If the PR step can't resolve owner/repo from the
   origin URL, set `vcs.<provider>.default_owner` / `default_repo`.
 - **Exit code 1 on a green-looking run.** The CLI exits non-zero when generated tests didn't end up in a
   passing whole-project build (`!Stable()`). Check the summary line and the per-symbol `discarded` /
   `unstable` statuses; the `discard` mechanism drops repeatedly-failing tests so the rest stay green.
 
-## Limitations / non-goals
+## Limitations
 
 No web UI, no REST API, no multi-tenant control plane, no project-intelligence (repo skill-file
 reading), no pre-generation seams, no audit reports, no governance/policy engine, no
