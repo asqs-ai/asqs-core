@@ -2,8 +2,10 @@
 
 **asqs-core** is an open-source CLI that automatically generates **unit tests, end-to-end tests,
 per-symbol documentation, and a whole-repo overview document** for **Java, C#, and
-JavaScript/TypeScript** repositories, using a
-code-graph + retrieval-augmented-generation (RAG) + LLM pipeline. Point it at a local folder or a
+JavaScript/TypeScript** repositories in **small incremental updates**. Using a
+code-graph + retrieval-augmented-generation (RAG) + LLM pipeline, it supports **first-class integration
+with self-hosted, open-source models (Llama, Codestral, Qwen)** to provide absolute privacy/security
+and massive cost reduction. Point it at a local folder or a
 remote git URL and it indexes the code, finds under-tested symbols, generates tests/docs, and
 **validates them by actually compiling and running them** in a sandbox — repairing failures with an
 LLM fixer loop.
@@ -15,7 +17,8 @@ LLM providers) is intentionally **not** part of this core.
 > **Status.** The full engine (indexing, retrieval, generation, evaluation/repair), the three
 > language indexers, and the `asqs-core run` CLI build as a standalone Go module — `go build ./...`
 > is green and `asqs-core run` is wired end to end. Executing a real run requires a Postgres +
-> pgvector database, an LLM key, and (for the Docker sandbox) Docker; follow the steps below.
+> pgvector database, an LLM API key or a local Ollama endpoint running an open-source model (like Llama, Codestral, or Qwen), 
+> and (for the Docker sandbox) Docker; follow the steps below.
 
 ## What it does
 
@@ -45,7 +48,7 @@ on GitHub, GitLab, Bitbucket, or Azure DevOps.
 
 - **Go 1.24+**
 - **Docker** (for PostgreSQL + pgvector, and the optional Docker sandbox)
-- An **LLM API key** (OpenAI / Anthropic / Azure OpenAI), or a local **Ollama** endpoint
+- A local **Ollama** endpoint running open-source models (e.g., Llama, Codestral, Qwen) for maximum privacy and cost reduction, or an external **LLM API key** (OpenAI / Anthropic / Azure OpenAI)
 - To **build the indexers**: JDK 21 + Maven, Node 20+, and .NET SDK 10
 - For the **local** (non-Docker) sandbox: the matching toolchain on PATH (Maven/Gradle, Node, .NET)
 
@@ -120,10 +123,14 @@ via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
 ## How it works
 
 - **Indexing** runs language-native parsers (Java AST, C# Roslyn, TypeScript) that emit symbols,
-  typed edges, and source chunks; chunks are embedded into pgvector.
+  typed edges, and source chunks; chunks are embedded into pgvector. On subsequent runs, it performs
+  **small incremental updates**, only re-indexing changed or added files to keep execution times fast.
 - **Planning** uses the symbol graph + RAG to pick under-tested symbols and build a focused
-  retrieval context per gap (target + dependencies + similar tests, MMR-diversified).
+  retrieval context per gap (target + dependencies + similar tests, MMR-diversified). It generates
+  tests in **small, reviewable incremental batches** to avoid massive, unreviewable pull requests.
 - **Generation** uses a provider-agnostic LLM with embedded per-language skill-packs and contracts.
+  This includes first-level support for self-hosted open-source models (such as Llama, Codestral, and Qwen),
+  ensuring no source code leaves your local environment for ultimate data security and cost reduction.
 - **Evaluation** generates every gap's test first, then compiles + runs the **whole project once**
   in a local or Docker sandbox (not per gap — one compile per fix iteration, not N). The LLM fixer
   repairs failures over a bounded loop (`runner.start_max_iteration`); tests that repeatedly fail are
@@ -132,7 +139,8 @@ via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
   shell), so repairs never trade correctness for a green compile.
 - **Documentation** (`--docs`) produces per-symbol doc comments **and**, in parallel, a whole-repo
   overview document built from the index (batched LLM passes over the source files plus
-  file-dependency/visual sections), written to `docs/documentation.md`.
+  file-dependency/visual sections), written to `docs/documentation.md`. Both per-symbol and overview
+  docs support **incremental delta updates** so existing files are updated rather than rewritten from scratch.
 
 ## Troubleshooting
 
