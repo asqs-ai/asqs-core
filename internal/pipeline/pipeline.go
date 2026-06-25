@@ -107,6 +107,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		return sum, fmt.Errorf("open embeddings store: %w", err)
 	}
 	defer emb.Close()
+	// Create the pgvector chunks table, and re-dimension it when the embedding model's dimension
+	// changed — e.g. switching to the nomic-embed-text fallback (768) against an older vector(1536)
+	// column: alignChunksEmbeddingColumn truncates the now-incompatible vectors and ALTERs the type.
+	// Without this, inserts fail with "expected 1536 dimensions, not 768" (SQLSTATE 22000).
+	if err := emb.InitSchema(ctx); err != nil {
+		return sum, fmt.Errorf("init embeddings schema: %w", err)
+	}
 
 	// --- LLM clients --------------------------------------------------------------------
 	chat, err := llm.NewChatCompleter(cfg)
@@ -116,6 +123,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	embedder, err := llm.NewEmbedder(cfg)
 	if err != nil {
 		return sum, fmt.Errorf("llm embedder: %w", err)
+	}
+	if w := llm.DimensionMismatchWarning(cfg, cfg.Database.EmbeddingsDimension); w != "" {
+		fmt.Fprintf(os.Stderr, "pipeline: %s\n", w)
 	}
 
 	// --- Scan files + detect language ---------------------------------------------------

@@ -4,6 +4,7 @@ package llm
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strings"
 
@@ -173,9 +174,25 @@ func NewEmbedder(cfg *config.Config) (model.Embedder, error) {
 		}
 		return client, nil
 	case "openai", "cohere", "voyage", "vertex", "vertexai", "ollama", "bedrock":
+		// Ollama is supported for embeddings, but a code/chat model (e.g. codestral) has no
+		// embeddings and embedding_model may be unset. When the fallback is enabled, use it
+		// rather than failing in newNativeOllamaEmbedder ("llm.embedding_model required").
+		if p == "ollama" && strings.TrimSpace(cfg.LLM.EmbeddingModel) == "" {
+			if fb := embeddingFallbackModel(cfg); fb != "" {
+				log.Printf("[asqs] llm: ollama embedding_model unset; using embedding fallback model %q (ensure `ollama pull %s` and database.embeddings_dimension matches)", fb, fb)
+				return llembed.NewOllamaEmbedderForModel(cfg, key, fb)
+			}
+		}
 		return llembed.NewProviderEmbedder(cfg, p, key)
 	default:
-		return nil, fmt.Errorf("llm: unsupported embedding provider %q (supported: openai, azure_openai, cohere, voyage, vertex, ollama, bedrock; set embedding_provider when chat uses a provider without embeddings)", p)
+		// The configured provider (e.g. anthropic) has no embeddings API. When enabled, fall
+		// back to a local Ollama embedding model rather than failing the index. No cloud key
+		// is needed (the fallback targets a local Ollama server).
+		if fb := embeddingFallbackModel(cfg); fb != "" {
+			log.Printf("[asqs] llm: provider %q has no embeddings; falling back to local Ollama model %q (ensure `ollama pull %s` and database.embeddings_dimension matches)", p, fb, fb)
+			return llembed.NewOllamaEmbedderForModel(cfg, "", fb)
+		}
+		return nil, fmt.Errorf("llm: unsupported embedding provider %q (supported: openai, azure_openai, cohere, voyage, vertex, ollama, bedrock; set embedding_provider, or enable llm.embedding_fallback to use a local Ollama model like %q)", p, DefaultEmbeddingFallbackModel)
 	}
 }
 

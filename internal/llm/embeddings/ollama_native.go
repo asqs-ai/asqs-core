@@ -47,6 +47,19 @@ func newNativeOllamaEmbedder(cfg *config.Config, apiKey string) (model.Embedder,
 	if modelID == "" {
 		return nil, fmt.Errorf("ollama embeddings: llm.embedding_model required")
 	}
+	return NewOllamaEmbedderForModel(cfg, apiKey, modelID)
+}
+
+// NewOllamaEmbedderForModel builds the native Ollama /api/embed embedder for an
+// EXPLICIT model name, ignoring cfg.LLM.EmbeddingModel. Used by the embedding
+// fallback (llm.NewEmbedder) when the configured provider has no embeddings — e.g.
+// provider=ollama with a code model (codestral), or a non-embedding chat provider
+// like anthropic. The /api/embed URL is still derived from cfg.LLM.BaseURL.
+func NewOllamaEmbedderForModel(cfg *config.Config, apiKey, modelID string) (model.Embedder, error) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return nil, fmt.Errorf("ollama embeddings: model required")
+	}
 	root := ollamaEmbedAPIRoot(cfg)
 	apiURL := strings.TrimSuffix(root, "/") + "/embed"
 	maybeLogResolvedOllamaEmbed(apiURL, modelID)

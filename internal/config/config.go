@@ -634,6 +634,16 @@ type LLMConfig struct {
 	// EmbeddingModel is the model for embeddings (e.g. text-embedding-3-small). If empty, Model may be used.
 	EmbeddingModel string `yaml:"embedding_model" env:"LLM_EMBEDDING_MODEL"`
 
+	// EmbeddingFallback enables a fallback embedding model served via Ollama (native
+	// /api/embed) when the configured embedding provider cannot produce embeddings —
+	// e.g. provider=anthropic, or provider=ollama with a code model (codestral) and no
+	// embedding_model. "" = DISABLED (the provider error surfaces as before). "auto"/
+	// "default" = nomic-embed-text (768-dim). Any other value = an explicit Ollama
+	// embedding model name. When enabled, set database.embeddings_dimension to match the
+	// fallback model (nomic-embed-text=768) or chunk inserts fail; a startup warning is
+	// printed on mismatch. Env: LLM_EMBEDDING_FALLBACK.
+	EmbeddingFallback string `yaml:"embedding_fallback" env:"LLM_EMBEDDING_FALLBACK"`
+
 	// BaseURL is the API base URL; set for Azure or other proxies.
 	BaseURL string `yaml:"base_url" env:"LLM_BASE_URL"`
 
