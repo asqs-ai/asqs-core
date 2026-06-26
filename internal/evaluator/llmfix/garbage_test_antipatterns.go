@@ -19,6 +19,13 @@ Final tests must exercise behavior: call the unit under test (or render UI), use
 - **Ctor-only:** @Test that only does new Foo(); assertNotNull(foo); with no interaction with collaborators or public API beyond construction.
 - **Empty @Disabled / @Ignored body:** a no-op disabled method added only to silence failures.
 
+**Java — Mockito misuse (these compile or fail at runtime; never generate them, and never "fix" by introducing them):**
+- **Mocking unmockable types:** do NOT mock/spy wrapper or value types, String, or final/sealed framework classes — e.g. mock(Integer.class), mock(String.class), mock(RuntimeHints.class), records, or enums. Mockito rejects these ("Cannot mock/spy wrapper types, String.class or Class.class"). Use the **real** value: an int/Integer literal, a real String, a real RuntimeHints(), etc.
+- **Mocking the type under test or simple entities:** instantiate real domain/JPA entities with their constructor and setters (new Owner(); owner.setId(1); owner.addPet(pet)) instead of mock(Owner.class). Only mock collaborators with behavior (repositories, services).
+- **when() on a non-mock (MissingMethodInvocation):** the argument to when(...)/verify(...) must be a method call **on a Mockito mock or spy**. Never wrap a call on a real object, a plain field, a constructor result, or a previously-returned value. If you need stubbing, the receiver must come from mock()/@Mock/spy().
+- **Unnecessary stubbings (strict stubs):** under JUnit 5 @ExtendWith(MockitoExtension.class) / MockitoJUnitRunner the default strictness is STRICT_STUBS — every when(...).thenReturn(...) you declare must actually be exercised by the code path the test invokes. Remove stubs the test does not use; do not stub getters/fields that are never read. Only when a shared @BeforeEach stub is legitimately used by some but not all tests, scope it down or use lenient()/@MockitoSettings(strictness = Strictness.LENIENT) deliberately — not as a blanket silencer.
+- **Construct objects with real APIs:** call the constructor/factory signature that actually exists in the provided source (do not invent a Pet(long, String, LocalDate, PetType) ctor when only a no-arg + setters exist) and reference real members (PetType is an entity with a name set via setName(...), not an enum with PetType.DOG / PetType.valueOf(...)). Verify against the dependency source provided in context.
+
 **JavaScript / TypeScript (Jest / Vitest / Mocha / Jasmine)**
 - **Self-smoke:** it/test that only expects the test module or test class wrapper to be defined without importing and invoking production exports.
 - **Ctor-only:** a single new ProductionType() plus only expect(x).toBeDefined() / not.toBeNull() with no further assertions or mock setup.
