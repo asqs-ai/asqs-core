@@ -20,6 +20,7 @@ import (
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
 	"github.com/asqs/asqs-core/internal/overview"
@@ -230,6 +231,46 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	sum.GapsPlanned = len(plan.Items)
 
+	// --- Project intel ------------------------------------------------------------------
+	// Discover + rank repo docs/skills and build a markdown context block injected into
+	// each gap's generation prompt. Enabled by default; errors are non-fatal.
+	var piResult *projectintel.Result
+	piCfg := cfg.EffectiveProjectIntel()
+	if piCfg.EffectiveEnabled() {
+		piIn := projectintel.Input{
+			RepoAbs:           repoAbs,
+			Lang:              lang,
+			CurrentFiles:      files,
+			ConfigFingerprint: piCfg.ConfigFingerprintHash(),
+			LLM:               chat,
+			Opts: projectintel.Options{
+				Enabled:             true,
+				MaxTotalRunes:       piCfg.EffectiveMaxTotalRunes(),
+				MaxDocFiles:         piCfg.EffectiveMaxDocFiles(),
+				MaxSkillFiles:       piCfg.EffectiveMaxSkillFiles(),
+				MinRelevanceScore:   piCfg.EffectiveMinRelevanceScore(),
+				SummarizeAboveRunes: piCfg.EffectiveSummarizeAboveRunes(),
+				UseEmbeddingsRank:   piCfg.UseEmbeddingsRank,
+				ExtraDocGlobs:       piCfg.ExtraDocGlobs,
+				ExtraSkillGlobs:     piCfg.ExtraSkillGlobs,
+				CacheEnabled:        piCfg.EffectiveCacheEnabled(),
+				CachePath:           piCfg.EffectiveCachePath(),
+				ForceRefresh:        piCfg.ForceRefresh,
+				FingerprintMode:     piCfg.EffectiveFingerprintMode(),
+			},
+		}
+		if piCfg.UseEmbeddingsRank {
+			piIn.Embedder = embedder
+		}
+		if r, piErr := projectintel.Run(ctx, piIn); piErr == nil {
+			piResult = r
+			fmt.Fprintf(os.Stderr, "asqs-core: project-intel mode=%s docs=%d skills=%d approx_runes=%d cache_hit=%v\n",
+				r.Mode, r.DocsSelected, r.SkillsSelected, r.ApproxRunes, r.CacheHit)
+		} else {
+			fmt.Fprintf(os.Stderr, "asqs-core: project-intel: %v (continuing without)\n", piErr)
+		}
+	}
+
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
 	rules := contract.ByLang(lang)
@@ -300,6 +341,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	for _, item := range plan.Items {
 		out := GapOutcome{Symbol: planItemSymbol(item)}
 		ctxStr := retrieval.BuildLLMContextForGap(item, formatOpts)
+		if piResult != nil {
+			if piMarkdown := strings.TrimSpace(piResult.Snapshot.Markdown); piMarkdown != "" {
+				ctxStr = piMarkdown + "\n\n" + ctxStr
+			}
+		}
 		content, relPath, gerr := gen.Generate(ctx, item, ctxStr)
 		switch {
 		case gerr != nil:

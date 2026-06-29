@@ -224,11 +224,9 @@ type RetrievalConfig struct {
 	ContextCompact ContextCompactConfig `yaml:"context_compact"`
 }
 
-// EffectiveProjectIntel returns runner.policy.project_intel. When runner.policy is omitted, returns the zero value (built-in defaults via ProjectIntelConfig Effective* methods).
+// EffectiveProjectIntel returns runner.project_intel with built-in defaults applied.
 func (c *Config) EffectiveProjectIntel() ProjectIntelConfig {
-	// Project-intelligence is an enterprise feature excluded from asqs-core; always return the
-	// zero value (built-in defaults).
-	return ProjectIntelConfig{}
+	return c.Runner.ProjectIntel
 }
 
 // AuditConfig configures where audit entries are persisted (DB + optional file).
@@ -799,6 +797,9 @@ type RunnerConfig struct {
 	// types (bool, int, string, []float64, duration string, regex slice); the strong-typed
 	// validation lives in session.ValidatePolicyOverrides which the loader calls during parse.
 	Policy *PolicyConfig `yaml:"policy"`
+	// ProjectIntel configures repo doc / agent-skill scanning injected into generation context.
+	// Available by default (enabled when the key is absent). Env vars share the RETRIEVAL_PROJECT_INTEL_* prefix.
+	ProjectIntel ProjectIntelConfig `yaml:"project_intel"`
 	// TwoPhaseTestGeneration when true, unit-test gaps use two LLM completions: (1) compilable skeleton (imports, containers, mock stubs, placeholder bodies), (2) full tests conditioned on that skeleton. Skipped for E2E items, extend-existing mode, empty suggested path, or nil item. Each phase uses structured path→content JSON when DisableStructuredGenerateOutput is false and the provider supports it; otherwise both phases use free-form output. Default true when the key is omitted from YAML (see config.Load); set false in YAML or env to disable. Env: RUNNER_TWO_PHASE_TEST_GENERATION.
 	TwoPhaseTestGeneration bool `yaml:"two_phase_test_generation" env:"RUNNER_TWO_PHASE_TEST_GENERATION"`
 	// GapConcurrency is the worker count for the per-gap loop (Retrieve → Generate → Sandbox →
