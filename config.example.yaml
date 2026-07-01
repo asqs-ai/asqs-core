@@ -36,6 +36,15 @@ runner:
     # SINGLE compile+test evaluation run over ALL generated tests (not
     # per gap). Raise it for large batches. Tests still failing after
     # this budget are discarded so the rest of the project stays green.
+  human_in_the_loop_email: "" # Possible values: empty; or RFC5322 email address
+  # Actual sending requires human_in_the_loop_email AND smtp_host AND smtp_from to be set;
+  # otherwise the notification is a no-op. smtp_port 0 = default 587.
+  # When smtp_user is set, PLAIN auth (with STARTTLS when offered) is used.
+  smtp_host: "" # Possible values: empty; or SMTP server hostname (e.g. smtp.example.com)
+  smtp_port: 0 # Possible values: 0 (default 587); or positive int
+  smtp_user: "" # Possible values: empty (no auth); or SMTP username
+  smtp_password: "" # Possible values: empty; or SMTP password (prefer env RUNNER_SMTP_PASSWORD)
+  smtp_from: "" # Possible values: empty; or RFC5322 from address (e.g. asqs-bot@example.com)
   # Formatter applied to generated tests (post-generate and after each LLM fix) so they pass the
   # repo's style gates. Empty = skip, EXCEPT C# which defaults to `dotnet format`. Examples:
   # "mvn spring-javaformat:apply -q" (Java/Spring), "google-java-format -i" (per-file), "prettier --write .".

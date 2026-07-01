@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/notification"
 	"github.com/asqs/asqs-core/internal/pipeline"
 	"github.com/asqs/asqs-core/internal/repo"
 )
@@ -174,6 +175,9 @@ func run() error {
 		return err
 	}
 	printSummary(sum)
+	if !sum.Stable() && sum.GapsGenerated > 0 {
+		sendHumanInTheLoopEmail(ctx, cfg, sum)
+	}
 
 	// --- Ship (opt-in, gated on a stable run) ------------------------------------------
 	if shipEnabled {
@@ -381,6 +385,69 @@ func repoIDFromURL(u string) string {
 }
 
 func repoIDFromPath(p string) string { return filepath.Base(filepath.Clean(p)) }
+
+func sendHumanInTheLoopEmail(ctx context.Context, cfg *config.Config, sum pipeline.Summary) {
+	to := strings.TrimSpace(cfg.Runner.HumanInTheLoopEmail)
+	if to == "" {
+		return
+	}
+	sender, ok := notification.NewSMTPSender(notification.SMTPConfig{
+		Host:     cfg.Runner.SMTPHost,
+		Port:     cfg.Runner.SMTPPort,
+		From:     cfg.Runner.SMTPFrom,
+		User:     cfg.Runner.SMTPUser,
+		Password: cfg.Runner.SMTPPassword,
+	})
+	if !ok {
+		return
+	}
+	subject := fmt.Sprintf("[ASQS] Run still unstable — %s", sum.Lang)
+	if err := sender.Send(ctx, to, subject, buildHITLEmailBody(sum)); err != nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: human-in-the-loop email: %v\n", err)
+	}
+}
+
+func buildHITLEmailBody(s pipeline.Summary) string {
+	var b strings.Builder
+	stable := "no"
+	if s.ProjectStable {
+		stable = "yes"
+		if s.Discarded > 0 {
+			stable = "yes (after discard)"
+		}
+	}
+	fmt.Fprintf(&b, "language:      %s\n", s.Lang)
+	fmt.Fprintf(&b, "stable:        %s\n", stable)
+	fmt.Fprintf(&b, "iterations:    %d\n", s.Iterations)
+	fmt.Fprintf(&b, "files indexed: %d\n", s.FilesIndexed)
+	fmt.Fprintf(&b, "gaps planned:  %d\n", s.GapsPlanned)
+	fmt.Fprintf(&b, "generated:     %d\n", s.GapsGenerated)
+	fmt.Fprintf(&b, "stable gaps:   %d\n", s.GapsStable)
+	fmt.Fprintf(&b, "discarded:     %d\n", s.Discarded)
+	if len(s.Outcomes) > 0 {
+		b.WriteString("\nper-gap outcomes:\n")
+		for _, o := range s.Outcomes {
+			status := "skipped"
+			switch {
+			case o.Discarded:
+				status = "discarded"
+			case o.Stable:
+				status = "stable"
+			case o.Generated:
+				status = "unstable"
+			}
+			line := fmt.Sprintf("  [%s] %s", status, o.Symbol)
+			if o.Path != "" {
+				line += " → " + o.Path
+			}
+			if o.Err != "" {
+				line += "  (" + o.Err + ")"
+			}
+			b.WriteString(line + "\n")
+		}
+	}
+	return b.String()
+}
 
 func firstNonEmpty(vals ...string) string {
 	for _, v := range vals {

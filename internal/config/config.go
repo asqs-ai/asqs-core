@@ -835,6 +835,14 @@ type RunnerConfig struct {
 	SchedulerInterval string `yaml:"scheduler_interval" env:"RUNNER_SCHEDULER_INTERVAL"`
 	// HumanInTheLoopEmail is the address to notify when max_iteration is reached and evaluation is still unstable. Empty = do not send.
 	HumanInTheLoopEmail string `yaml:"human_in_the_loop_email" env:"RUNNER_HUMAN_IN_THE_LOOP_EMAIL"`
+	// SMTP* configure the human-in-the-loop email sender. SMTPHost and SMTPFrom are required to
+	// actually send (together with HumanInTheLoopEmail); otherwise the notification is a no-op.
+	// SMTPPort defaults to 587. When SMTPUser is set, PLAIN auth (with STARTTLS when offered) is used.
+	SMTPHost     string `yaml:"smtp_host" env:"RUNNER_SMTP_HOST"`
+	SMTPPort     int    `yaml:"smtp_port" env:"RUNNER_SMTP_PORT"`
+	SMTPUser     string `yaml:"smtp_user" env:"RUNNER_SMTP_USER"`
+	SMTPPassword string `yaml:"smtp_password" env:"RUNNER_SMTP_PASSWORD"`
+	SMTPFrom     string `yaml:"smtp_from" env:"RUNNER_SMTP_FROM"`
 
 	// PostGenerateStaticCheck runs fast static checks on written test files after format (when set) and before sandbox evaluation. See docs/DOCUMENTATION.md.
 	PostGenerateStaticCheck PostGenerateStaticCheckConfig `yaml:"post_generate_static_check"`
