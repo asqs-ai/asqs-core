@@ -25,8 +25,10 @@ indexer:
   advanced_jar_path: "tools/java-indexer/target/java-indexer-0.1.0.jar"
   jst_indexer_path: "tools/js-ts-indexer/dist/index.js"
   csharp_indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
+  # Gap caps. The --max-gaps / --max-gaps-e2e CLI flags override these when passed; otherwise these
+  # values apply, and only if both are absent do the built-ins (10 unit / 0 E2E) kick in.
   max_gaps: 20 # cap unit/doc gaps per run
-  max_gaps_e2e: 5 # cap E2E gaps per run
+  max_gaps_e2e: 5 # cap E2E gaps per run (0 = skip E2E entirely)
 
 runner:
   type: local # local | docker

@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -30,62 +29,47 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "usage: asqs-core run [flags] [<repo-path-or-git-url>]\n")
 		return fmt.Errorf("the only supported command is `run`")
 	}
-	fs := flag.NewFlagSet("asqs-core run", flag.ContinueOnError)
-	configPath := fs.String("config", "", "path to config YAML (database, llm, indexer, runner, vcs)")
-	repoFlag := fs.String("repo", "", "repo path or git URL (may also be passed as a trailing argument)")
-	lang := fs.String("lang", "", "language override: java|csharp|typescript|javascript (default: autodetect)")
-	maxGaps := fs.Int("max-gaps", 10, "max unit gaps to generate")
-	maxGapsE2E := fs.Int("max-gaps-e2e", 0, "max E2E gaps to generate (0 = skip E2E)")
-	docs := fs.Bool("docs", false, "also generate per-symbol documentation (inserted above declarations)")
-	sandbox := fs.String("sandbox", "", "sandbox type override: local|docker")
-	ship := fs.Bool("ship", false, "after a stable run, commit+push a branch and open/update a PR/MR")
-	shipBranch := fs.String("ship-branch", "", "branch to push when shipping (default: config or 'asqs-core')")
-	baseBranch := fs.String("base-branch", "", "PR base branch (default: config or 'main')")
-	dryRun := fs.Bool("dry-run", false, "generate + evaluate but never ship")
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: asqs-core run [flags] [<repo-path-or-git-url>]\n\n")
-		fs.PrintDefaults()
+	flags, err := parseRunFlags(os.Args[2:], os.Stderr)
+	if err != nil {
+		return err
 	}
-	// Go's flag package stops parsing at the first non-flag token, so flags placed AFTER a trailing
-	// repo argument (e.g. `run ./project --docs`) would otherwise be silently dropped. Re-parse,
-	// pulling positionals out one at a time, so flags and the repo arg may appear in any order.
-	var positionals []string
-	rest := os.Args[2:]
-	for {
-		if err := fs.Parse(rest); err != nil {
-			return err
-		}
-		if fs.NArg() == 0 {
-			break
-		}
-		positionals = append(positionals, fs.Arg(0))
-		rest = fs.Args()[1:]
-	}
-	repoArg := strings.TrimSpace(*repoFlag)
-	if repoArg == "" && len(positionals) > 0 {
-		repoArg = positionals[0]
-	}
+	repoArg := flags.repo
 	if repoArg == "" {
-		fs.Usage()
+		flags.usage()
 		return fmt.Errorf("missing repo: pass --repo <path-or-url> or as a trailing argument")
 	}
 
-	cfg, err := config.Load(config.LoadOptions{ConfigPath: *configPath, ValidateMode: "audit"})
+	cfg, err := config.Load(config.LoadOptions{ConfigPath: flags.configPath, ValidateMode: "audit"})
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if s := strings.TrimSpace(*sandbox); s != "" {
+	if s := strings.TrimSpace(flags.sandbox); s != "" {
 		cfg.Runner.Type = s
 	}
+
+	// --- Gap caps ------------------------------------------------------------------------
+	// An explicit flag wins; otherwise indexer.max_gaps / indexer.max_gaps_e2e from the config
+	// file (or their ASQS_INDEXER_* env vars) apply; otherwise the built-in defaults. The
+	// effective values and where they came from are printed so a run is self-explaining.
+	maxGaps, maxGapsSrc, err := resolveMaxGaps(flags.setFlags["max-gaps"], flags.maxGaps, cfg.Indexer.MaxGaps)
+	if err != nil {
+		return err
+	}
+	maxGapsE2E, maxGapsE2ESrc, err := resolveMaxGapsE2E(flags.setFlags["max-gaps-e2e"], flags.maxGapsE2E, cfg.Indexer.MaxGapsE2E)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "asqs-core: max-gaps=%d (%s) max-gaps-e2e=%d (%s)\n",
+		maxGaps, maxGapsSrc, maxGapsE2E, maxGapsE2ESrc)
 
 	// --- Ship settings (resolved up front) ----------------------------------------------
 	// Ship targets the REPO WE RUN AGAINST: the ship branch is prepared on that repo *before*
 	// generation (asqs-go behaviour), so generated tests/docs are written and committed from it — and
 	// an existing remote ship branch is reused so re-runs update its open PR instead of diverging.
 	shipCfg := cfg.ActiveShip()
-	shipEnabled := *ship && !*dryRun
-	shipBranchName := firstNonEmpty(*shipBranch, shipCfg.Branch, "asqs-core")
-	shipBaseName := firstNonEmpty(*baseBranch, shipCfg.BaseBranch, "main")
+	shipEnabled := flags.ship && !flags.dryRun
+	shipBranchName := firstNonEmpty(flags.shipBranch, shipCfg.Branch, "asqs-core")
+	shipBaseName := firstNonEmpty(flags.baseBranch, shipCfg.BaseBranch, "main")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -165,10 +149,10 @@ func run() error {
 	sum, err := pipeline.Run(ctx, cfg, pipeline.Options{
 		RepoPath:     repoDir,
 		RepoID:       repoID,
-		Lang:         *lang,
-		MaxGaps:      *maxGaps,
-		MaxGapsE2E:   *maxGapsE2E,
-		GenerateDocs: *docs,
+		Lang:         flags.lang,
+		MaxGaps:      maxGaps,
+		MaxGapsE2E:   maxGapsE2E,
+		GenerateDocs: flags.docs,
 		Sandbox:      cfg.Runner.Type,
 	})
 	if err != nil {

@@ -10,9 +10,9 @@ remote git URL and it indexes the code, finds under-tested symbols, generates te
 **validates them by actually compiling and running them** in a sandbox — repairing failures with an
 LLM fixer loop.
 
-It is the open foundation of a larger quality system. The enterprise layer (project-intelligence,
-governance/policy, multi-tenant control plane, audit reports, web UI, CI webhook triggers, per-step
-LLM providers) is intentionally **not** part of this core.
+It is the open foundation of a larger quality system. The enterprise layer (governance/policy engine,
+multi-tenant control plane, REST API + web UI, persisted audit reports, CI webhook triggers, per-step
+LLM providers, parallel session orchestration) is intentionally **not** part of this core.
 
 > **Status.** The full engine (indexing, retrieval, generation, evaluation/repair), the three
 > language indexers, and the `asqs-core run` CLI build as a standalone Go module — `go build ./...`
@@ -25,7 +25,7 @@ LLM providers) is intentionally **not** part of this core.
 One command, one pipeline:
 
 ```
-bootstrap → index → plan → generate (every gap) → evaluate the whole project once
+bootstrap → index → plan → project intel → generate (every gap) → evaluate the whole project once
             (compile + test [+ e2e] + LLM fixer loop → discard repeatedly-failing tests)
             └─ with --docs: a whole-repo overview document is generated IN PARALLEL
 ```
@@ -33,6 +33,9 @@ bootstrap → index → plan → generate (every gap) → evaluate the whole pro
 - **bootstrap** — detect (and optionally install) the repo's test framework.
 - **index** — parse the code into a symbol graph (symbols, typed edges, embedded chunks in pgvector).
 - **plan** — rank under-tested symbols into "gaps" and assemble per-gap retrieval context.
+- **project intel** — discover and rank your repo's own markdown docs, `SKILL.md` files, OpenAPI specs,
+  and SQL schemas, then inject them as a context block into every generation prompt so your written
+  conventions take precedence over generic guidance. On by default; cached under `.asqs/`.
 - **generate** — an LLM writes the unit/E2E test or doc, grounded in similar code from your repo. With
   `--docs`, per-symbol docs **and** a whole-repo overview document (`docs/documentation.md` — workflows,
   dependencies, file-graph visuals from the index) are produced; the overview is generated **in parallel**
@@ -46,7 +49,7 @@ on GitHub, GitLab, Bitbucket, or Azure DevOps.
 
 ## Prerequisites
 
-- **Go 1.24+**
+- **Go 1.25+** (see the `go` directive in `go.mod`)
 - **Docker** (for PostgreSQL + pgvector, and the optional Docker sandbox)
 - A local **Ollama** endpoint running open-source models (e.g., Llama, Codestral, Qwen) for maximum privacy and cost reduction, or an external **LLM API key** (OpenAI / Anthropic / Azure OpenAI)
 - To **build the indexers**: JDK 21 + Maven, Node 20+, and .NET SDK 10
@@ -96,6 +99,14 @@ cp config.example.yaml config.yaml
 # edit: database URL, llm provider + key/model, indexer artifact paths, runner type
 ```
 
+Project intel is on by default and needs no configuration. To tune or disable it, use the
+`runner.project_intel` block — `enabled`, `max_total_runes` (default 12000), `max_doc_files` (12),
+`max_skill_files` (8), `min_relevance_score` (0.08), `summarize_above_runes` (6000),
+`extra_doc_globs` / `extra_skill_globs`, `cache_enabled`, `cache_path`, `force_refresh`, and
+`fingerprint_mode` (`stat` | `content`). The same keys are settable via `RETRIEVAL_PROJECT_INTEL_*`
+environment variables. `use_embeddings_rank` embeds the selected docs but does not change what is
+injected — asqs-core builds one shared context block per run rather than re-ranking it per gap.
+
 ## 5. Run
 
 ```bash
@@ -115,6 +126,31 @@ go run ./cmd/asqs-core run --config config.yaml --repo ./path/to/project
 Flags: `--lang` (auto-detected if omitted), `--max-gaps`, `--max-gaps-e2e`, `--docs`,
 `--sandbox local|docker`, `--ship`, `--ship-branch`, `--base-branch`, `--dry-run`.
 
+### How many gaps a run generates
+
+`--max-gaps` and `--max-gaps-e2e` resolve in this order — **flag → config → built-in default**:
+
+| Source                                              | `max-gaps` | `max-gaps-e2e` |
+| --------------------------------------------------- | ---------- | -------------- |
+| `--max-gaps` / `--max-gaps-e2e` on the command line | wins       | wins           |
+| `indexer.max_gaps` / `indexer.max_gaps_e2e`         | then this  | then this      |
+| built-in default                                    | `10`       | `0` (skip E2E) |
+
+The config keys also accept the `ASQS_INDEXER_MAX_GAPS` and `ASQS_INDEXER_MAX_GAPS_E2E` environment
+variables. Every run prints which source won, so a surprising gap count is one line away:
+
+```
+asqs-core: max-gaps=20 (config) max-gaps-e2e=5 (config)
+```
+
+Two details worth knowing:
+
+- `--max-gaps-e2e 0` is **explicit** and turns E2E off for that run even when the config enables it.
+  For `--max-gaps`, `0` is treated as "unset" and falls through to the config (a run capped at zero
+  unit gaps would do nothing, and the planner clamps it anyway).
+- A negative value — from a flag or the config file — is rejected with an error rather than being
+  silently clamped.
+
 `--docs` produces both per-symbol documentation **and** a whole-repo overview document
 (`docs/documentation.md`), the latter generated in parallel with test/doc generation. Tune the overview
 via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
@@ -128,6 +164,12 @@ via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
 - **Planning** uses the symbol graph + RAG to pick under-tested symbols and build a focused
   retrieval context per gap (target + dependencies + similar tests, MMR-diversified). It generates
   tests in **small, reviewable incremental batches** to avoid massive, unreviewable pull requests.
+- **Project intel** scans the repo for markdown docs, Cursor-style `SKILL.md` files, OpenAPI specs, and
+  SQL schemas, ranks them lexically for relevance, summarizes oversized files with the LLM, and prepends
+  the resulting markdown block to every gap's prompt — so generated tests follow _your_ documented
+  conventions. The block is built once per run and shared by all gaps (there is no per-gap re-ranking).
+  Results are cached in `.asqs/project-intel-cache.json`, keyed by a file/config fingerprint, so repeat
+  runs skip the work.
 - **Generation** uses a provider-agnostic LLM with embedded per-language skill-packs and contracts.
   This includes first-level support for self-hosted open-source models (such as Llama, Codestral, and Qwen),
   ensuring no source code leaves your local environment for ultimate data security and cost reduction.
@@ -224,9 +266,39 @@ shipping` otherwise), and needs a VCS token (`vcs.github.token`) and a recogniza
 
 ## Limitations
 
-No web UI, no REST API, no multi-tenant control plane, no project-intelligence (repo skill-file
-reading), no pre-generation seams, no audit reports, no governance/policy engine, no
-coverage/mutation gates, and no per-step LLM provider selection. Those live in the commercial layer.
+asqs-core is a **one-shot CLI**. It runs the pipeline once and exits; there is no long-running
+service, no scheduler, and no CI webhook listener — drive it from your own cron or CI job instead.
+
+Not included (these live in the commercial layer):
+
+- **Control plane** — no REST API, no web UI, no multi-tenant tenants/projects.
+- **Serve mode** — no cron scheduler, no automatic reruns, no PR-webhook triggers or PR gating.
+- **Persisted audit** — steps are logged to stderr only; nothing is written to an audit log table and
+  there is no audit reporting/export CLI.
+- **Governance/policy engine** — a `runner.policy:` block parses but is ignored. No coverage gate, no
+  mutation-testing gate.
+- **Parallelism** — gaps are generated sequentially. `runner.gap_concurrency` and `llm.max_concurrent`
+  are not honoured. (The whole-repo overview is the one exception: it runs in parallel with generation.)
+- **Pre-generation seams** — no controlled source-seam edits or C# project-reference fixes before
+  generation. (The evaluator's in-loop C# project-reference autofix _is_ included.)
+- **Per-step LLM providers** — one `llm.provider` + `llm.model` drives generation, docs, fixing, and
+  embeddings. Per-step overrides are not wired.
+- **Mono-repo scoping** — `indexer.mono_repo_workspace` and related keys are ignored; asqs-core indexes
+  from the repo root and picks a single primary language by file count.
+- **Retrieval tuning** — the `retrieval:` config block is not read. Profiles, per-profile budgets,
+  MMR lambda, context compaction, and retrieval **abstention** all run at their built-in defaults
+  (abstention is off, so low-confidence gaps are still generated).
+- **Post-generate static micro-gate** — `runner.post_generate_static_check` is ignored; generated files
+  go straight to the sandbox after formatting.
+- **Private registries** — no Maven `settings.xml` / npm `.npmrc` / NuGet credential injection into the
+  Docker sandbox.
+- **GitHub Copilot SDK** — the `copilot:` config block parses but no code consumes it.
+
+### Config keys that are CLI-driven here
+
+Shipping is enabled by `--ship`, not by `vcs.<provider>.ship.enabled`. The rest of that block _is_
+read: `branch` and `base_branch` supply the defaults for `--ship-branch` / `--base-branch`, and
+`draft_pr` opens the PR as a draft (GitHub; ignored for Azure DevOps).
 
 ## License
 
