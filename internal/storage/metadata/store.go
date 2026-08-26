@@ -194,7 +194,7 @@ func (s *Store) DeleteFile(ctx context.Context, repoID, file string) (deleted bo
 // everything.
 func (s *Store) GetSymbolByID(ctx context.Context, repoID, id string) (*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols WHERE id = $1 AND repo_id = $2`
 	var sym Symbol
 	var sig sql.Null[[]byte]
@@ -202,6 +202,7 @@ func (s *Store) GetSymbolByID(ctx context.Context, repoID, id string) (*Symbol, 
 	err := s.db.QueryRow(ctx, query, id, repoID).Scan(
 		&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 		&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
+		&sym.InDegree, &sym.OutDegree, &sym.InDegreeNonTest,
 	)
 	if err == pgx.ErrNoRows {
 		return nil, nil
@@ -219,7 +220,7 @@ func (s *Store) GetSymbolByID(ctx context.Context, repoID, id string) (*Symbol, 
 // ListSymbolsByFile returns all symbols in the given file, ordered by start_line.
 func (s *Store) ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols WHERE repo_id = $1 AND file = $2 ORDER BY start_line`
 	rows, err := s.db.Query(ctx, query, repoID, file)
 	if err != nil {
@@ -242,7 +243,7 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, repoID, needle str
 		return nil, nil
 	}
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
 		WHERE repo_id = $3 AND strpos(lower(fq_name), lower($1)) > 0
 		ORDER BY fq_name
@@ -258,7 +259,7 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, repoID, needle str
 // ListSymbolsByFQName returns all symbols with the given fully qualified name (may be multiple overloads/locations).
 func (s *Store) ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols WHERE repo_id = $1 AND fq_name = $2 ORDER BY file, start_line`
 	rows, err := s.db.Query(ctx, query, repoID, fqName)
 	if err != nil {
@@ -286,7 +287,7 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 		limit = 100
 	}
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
 		WHERE repo_id = $3
 		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
@@ -305,7 +306,7 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 func (s *Store) ListSymbolsByLang(ctx context.Context, repoID, lang string, kind string) ([]*Symbol, error) {
 	if kind != "" {
 		query := `
-			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 			FROM symbols WHERE repo_id = $3 AND lang = $1 AND kind = $2 ORDER BY file, start_line`
 		rows, err := s.db.Query(ctx, query, lang, kind, repoID)
 		if err != nil {
@@ -315,7 +316,7 @@ func (s *Store) ListSymbolsByLang(ctx context.Context, repoID, lang string, kind
 		return scanSymbols(rows)
 	}
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols WHERE repo_id = $2 AND lang = $1 ORDER BY file, start_line`
 	rows, err := s.db.Query(ctx, query, lang, repoID)
 	if err != nil {
@@ -345,6 +346,7 @@ func scanSymbols(rows pgx.Rows) ([]*Symbol, error) {
 		if err := rows.Scan(
 			&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 			&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
+			&sym.InDegree, &sym.OutDegree, &sym.InDegreeNonTest,
 		); err != nil {
 			return nil, err
 		}
@@ -364,7 +366,7 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kin
 	// the same relative path, so `src/index.ts` being a test file in one repository hid the other
 	// repository's symbols from gap analysis entirely.
 	query := `
-		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
+		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json, s.in_degree, s.out_degree, s.in_degree_non_test
 		FROM symbols s
 		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
 		WHERE s.repo_id = $3 AND f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
@@ -381,7 +383,7 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kin
 // ListSymbolsInTestFiles returns symbols of the given kind from files where is_test = true (e.g. E2E specs).
 func (s *Store) ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind string) ([]*Symbol, error) {
 	query := `
-		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
+		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json, s.in_degree, s.out_degree, s.in_degree_non_test
 		FROM symbols s
 		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
 		WHERE s.repo_id = $3 AND f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
@@ -900,4 +902,43 @@ func (s *Store) ListSymbolFilesByRepo(ctx context.Context, repoID string) ([]str
 		out = append(out, f)
 	}
 	return out, rows.Err()
+}
+
+// RecomputeSymbolDegrees refreshes symbols.in_degree / out_degree / in_degree_non_test from edges.
+//
+// It replaces a per-symbol GetEdgesTo during gap listing — on a 30k-symbol repository that was 30k
+// queries per run, all of them answerable by a column read. Run it once at the end of an index run,
+// after edges are written.
+//
+// in_degree_non_test excludes TESTS_SOURCE because the centrality signal it feeds does. A test that
+// covers a symbol creates an inbound edge, so counting it would inflate "central dependency,
+// under-tested" for exactly the symbols that already have tests — inverting the signal's meaning.
+//
+// The three counts are computed in one pass and applied in one UPDATE. Symbols with no edges are
+// reset to zero rather than skipped, or a symbol that lost its last caller would keep a stale
+// degree forever.
+// It is scoped to one repository: an index run rewrites only its own edges, and recomputing every
+// repository's degrees on each run would make a large neighbour's index run a source of write
+// amplification for everyone else in the database.
+func (s *Store) RecomputeSymbolDegrees(ctx context.Context, repoID string) error {
+	const q = `
+UPDATE symbols s
+   SET in_degree          = COALESCE(d.in_all, 0),
+       out_degree         = COALESCE(d.out_all, 0),
+       in_degree_non_test = COALESCE(d.in_non_test, 0)
+  FROM (
+        SELECT sy.id,
+               (SELECT count(*) FROM edges e WHERE e.callee_symbol_id = sy.id AND e.repo_id = $2)     AS in_all,
+               (SELECT count(*) FROM edges e WHERE e.caller_symbol_id = sy.id AND e.repo_id = $2)     AS out_all,
+               (SELECT count(*) FROM edges e WHERE e.callee_symbol_id = sy.id AND e.repo_id = $2
+                                              AND e.edge_type <> $1)                                  AS in_non_test
+          FROM symbols sy WHERE sy.repo_id = $2
+       ) d
+ WHERE s.id = d.id AND s.repo_id = $2
+   AND (s.in_degree, s.out_degree, s.in_degree_non_test)
+       IS DISTINCT FROM (COALESCE(d.in_all, 0)::int, COALESCE(d.out_all, 0)::int, COALESCE(d.in_non_test, 0)::int)`
+	if _, err := s.db.Exec(ctx, q, EdgeTypeTestsSource, repoID); err != nil {
+		return fmt.Errorf("recompute symbol degrees: %w", err)
+	}
+	return nil
 }

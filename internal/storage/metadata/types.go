@@ -17,6 +17,13 @@ type Symbol struct {
 	StartColumn   *int
 	EndColumn     *int
 	SignatureJSON []byte // JSON; nil for empty
+	// InDegree / OutDegree / InDegreeNonTest are materialized by RecomputeSymbolDegrees at the end
+	// of an index run. InDegreeNonTest excludes TESTS_SOURCE edges — see the centrality signal in
+	// gap listing, which would otherwise count a symbol's own tests as evidence that it is central
+	// and under-tested.
+	InDegree        int
+	OutDegree       int
+	InDegreeNonTest int
 	// RepoID scopes the symbol to one repository. Empty means "unscoped", which is what rows
 	// written before repo-scoping carry; deletes match it exactly rather than treating it as a
 	// wildcard, so a legacy row is never removed by a scoped run.

@@ -220,7 +220,7 @@ func TestTwoRepos_gapListingIsScoped(t *testing.T) {
 	}
 }
 
-func TestTwoRepos_edgesAreScoped(t *testing.T) {
+func TestTwoRepos_edgesAndExpansionAreScoped(t *testing.T) {
 	f := newTwoRepoFixture(t)
 	methA := f.ids[f.repoA+"|com.acme.Order#place"]
 	clsA := f.ids[f.repoA+"|com.acme.Order"]
@@ -248,8 +248,45 @@ func TestTwoRepos_edgesAreScoped(t *testing.T) {
 		}
 	}
 
-	// The ExpandGraph assertions from upstream's version of this test arrive with the unified
-	// graph-traversal port (CP12), which brings ExpandGraph itself.
+	// Expansion is scoped at the seed, at every hop, and at the join back to symbols.
+	rows, err := f.s.ExpandGraph(f.ctx, f.repoA, clsA, ExpandGraphOptions{
+		Callees: true, Callers: true, MaxDepth: 3, MaxNodes: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) == 0 {
+		t.Fatal("ExpandGraph returned nothing from a symbol with edges")
+	}
+	idsInA := map[string]bool{}
+	for k, v := range f.ids {
+		if len(k) > len(f.repoA) && k[:len(f.repoA)] == f.repoA {
+			idsInA[v] = true
+		}
+	}
+	for _, r := range rows {
+		if r.Symbol == nil {
+			t.Fatal("ExpandGraph returned a row with no symbol")
+		}
+		if !idsInA[r.Symbol.ID] {
+			t.Errorf("ExpandGraph walked to symbol %s (%s), which is not in repo A",
+				r.Symbol.ID, r.Symbol.FQName)
+		}
+		if r.Symbol.RepoID != f.repoA {
+			t.Errorf("ExpandGraph returned a symbol owned by %q", r.Symbol.RepoID)
+		}
+	}
+
+	// Seeding from another repository's id must not expand at all.
+	rows, err = f.s.ExpandGraph(f.ctx, f.repoA, f.ids[f.repoB+"|com.acme.Order"], ExpandGraphOptions{
+		Callees: true, Callers: true, MaxDepth: 3, MaxNodes: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("ExpandGraph expanded from repo B's symbol while scoped to repo A: %d rows", len(rows))
+	}
 }
 
 func TestTwoRepos_countersAndFilesAreScoped(t *testing.T) {

@@ -251,14 +251,29 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 				gap.Reason = "business-critical module"
 				gap.Priority += 30 // highest band: critical beats "no tests" and "has tests"
 			}
-			edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
-			edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
-			if len(edgesToCentrality) >= 3 {
+			// Inbound-edge count for the centrality signal, read from the materialized column
+			// rather than one GetEdgesTo per candidate — on a 30k-symbol repository that was 30k
+			// queries per run.
+			//
+			// InDegreeNonTest excludes TESTS_SOURCE, matching what the old edgesExcludingTypes call
+			// computed. That exclusion is the signal, not a detail: counting a symbol's own test
+			// coverage would mark well-tested symbols as "central dependency, under-tested".
+			//
+			// Degrees are recomputed at the end of an index run, so a symbol indexed before this
+			// column existed reads 0 until the next run. Falling back to the query when the column
+			// is 0 keeps behaviour identical on a stale corpus at the cost of one query for
+			// genuinely-unreferenced symbols, which are the cheap case.
+			centrality := sym.InDegreeNonTest
+			if centrality == 0 {
+				edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
+				centrality = len(edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource))
+			}
+			if centrality >= 3 {
 				if gap.Priority < 30 {
 					gap.Kind = GapLowCoverageCentral
 					gap.Reason = "central dependency, under-tested"
 				}
-				gap.Priority += len(edgesToCentrality)
+				gap.Priority += centrality
 			}
 			// Priority order: 1) critical, 2) modules without tests, 3) modules with tests. Deprioritize "has existing test" only so they sort last.
 			if hasExistingTest {

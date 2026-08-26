@@ -646,6 +646,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 	// Match HTTP client symbols to backend routes by method + path (same run + fqNameToID).
+	// Degrees are derived from edges, so they are refreshed once here rather than maintained
+	// incrementally: an edge write anywhere changes two symbols' counts, and gap listing reads them
+	// on the next run, not during this one. A failure is logged and tolerated — stale degrees
+	// degrade gap *ordering*, which is worth far less than failing an otherwise complete index run.
+	if err := meta.RecomputeSymbolDegrees(ctx, opts.RepoID); err != nil && opts.Audit != nil {
+		opts.Audit.Log(ctx, "index.degrees_stale", map[string]interface{}{
+			"message": fmt.Sprintf("Could not recompute symbol degrees: %v. Gap centrality ordering may be stale.", err),
+			"run_id":  runID,
+		})
+	}
+
 	// A files-row write failure is fatal to the run's usefulness even though every other write
 	// succeeded: `files` is what change detection, gap listing, the doc plan and the overview all
 	// read, so a run that stored symbols but no files produces an empty plan and reports success.

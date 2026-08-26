@@ -306,7 +306,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `in review` |
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `in review` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
-| CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `ready` |
+| CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
@@ -364,7 +364,7 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `blocked (CP25–CP27)` |
 | CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `blocked (CP06, CP41)` |
-| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `blocked (CP06, CP12, CP41)` |
+| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `blocked (CP41)` |
 | CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP03, CP28, CP42, CP43)` |
 | CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `blocked (CP44, CP16)` |
 | CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP44, CP50)` |
@@ -1052,7 +1052,7 @@ rather than everything" (GetSymbolByID's comment). Pinned by the ported
 
 ### CP12 — Unified graph traversal and degree columns
 
-- **Status:** `ready` · **Effort:** 3 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 3 d · **Risk:** medium
 
 **Goal.** Replace the per-hop Go BFS with one bounded recursive CTE, and materialise the centrality
 signal that gap ranking recomputes.
@@ -1073,6 +1073,34 @@ set on a fixture graph, with the node cap applied identically. Degree columns ma
 cross-check after a full run.
 
 **Unblocks.** CP43's `expand_symbol` tool — see the correction in §2.5(1).
+
+**Implementation record (2026-08-26).** All three tasks done.
+
+- `expand.go` ported verbatim: one bounded recursive CTE with the path-array cycle guard
+  (correctness, not termination — without it a three-node cycle returns the start symbol in its
+  own expansion), `DISTINCT ON` shallowest-path collapse, ranking by depth →
+  `in_degree_non_test` desc → `fq_name` before truncation so a capped expansion keeps the
+  important neighbourhood, and repository scoping at all three points (seed, hop, join back).
+  `pqTextArray` renders the edge-type filter. **Scope note:** upstream keeps retrieval's Go BFS
+  (`collectGraphEdges`) — `ExpandGraph`'s consumers are the tool suite (CP43) and the operator
+  API; nothing in core calls it yet, exactly as upstream's non-enterprise tree.
+- Degree columns in `schema.sql` (idempotent ALTERs after the repo_id block, before where CP13's
+  identity block will sit) and migration `0005_symbols_degree_columns` (verbatim; slice order in
+  `MetadataMigrations` is 0004 → 0005 → 0006, matching upstream's ledger order).
+  `RecomputeSymbolDegrees` ported verbatim (one UPDATE, zero-reset for edge-less symbols,
+  repo-scoped to avoid cross-tenant write amplification); `Symbol` gained the three fields and
+  every symbol SELECT in store.go/batch.go now returns them.
+- Indexer calls `RecomputeSymbolDegrees` after edge writes, tolerating failure with the
+  `index.degrees_stale` audit event (stale ordering is worth less than a failed run);
+  `MetadataWriter` gained the method. Gap listing reads `sym.InDegreeNonTest` with the
+  documented fallback to `GetEdgesTo` when the column is 0 (pre-column corpora behave
+  identically at the cost of one query for genuinely-unreferenced symbols).
+- Acceptance: ported `expand_live_test.go` green live — including
+  `TestExpandGraph_matchesBreadthFirstSearch` (the CTE-vs-BFS equivalence with identical node
+  cap), cycle termination, shallowest-path, high-degree-first truncation — plus
+  `TestRecomputeSymbolDegrees` (COUNT cross-check) and the two-repo suite's ExpandGraph
+  assertions restored from their CP11 deferral. Migration 0005 applied and re-ran clean on
+  `asqs_scratch`.
 
 ### CP13 — Stable symbol identity and churn signal
 

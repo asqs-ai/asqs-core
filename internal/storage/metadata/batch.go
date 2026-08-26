@@ -192,7 +192,7 @@ func (s *Store) ListSymbolsByFQNames(ctx context.Context, repoID string, fqNames
 	}
 
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols WHERE repo_id = $1 AND fq_name = ANY($2) ORDER BY fq_name, file, start_line`
 	rows, err := s.db.Query(ctx, query, repoID, uniq)
 	if err != nil {

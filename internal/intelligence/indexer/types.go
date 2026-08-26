@@ -134,6 +134,9 @@ type MetadataWriter interface {
 	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
 	// ListSymbolsByFQNames resolves many names in one query; see prefetchFQNames.
 	ListSymbolsByFQNames(ctx context.Context, repoID string, fqNames []string) (map[string][]*metadata.Symbol, error)
+	// RecomputeSymbolDegrees refreshes the materialized degree columns from edges after a run's
+	// writes finish. Mocks may return nil.
+	RecomputeSymbolDegrees(ctx context.Context, repoID string) error
 	// MaterializeTestsSourceEdges rebuilds TESTS_SOURCE edges after indexing (test→SUT heuristics). Mocks may return (0, nil).
 	MaterializeTestsSourceEdges(ctx context.Context, repoID string) (inserted int, err error)
 	InsertIndexRun(ctx context.Context, runID, repoID, commitSHA string, startedAt int64, currentIteration int, extras *metadata.IndexRunStartExtras) error

@@ -21,6 +21,14 @@ CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols (lang);
 -- idempotent ALTER here.
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
 
+-- Degree columns are recomputed at the end of an index run. in_degree_non_test excludes
+-- TESTS_SOURCE because the centrality signal in gap listing does: counting a test-coverage edge
+-- would inflate "central dependency, under-tested" for symbols that already have tests.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS out_degree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree_non_test INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_symbols_in_degree_non_test ON symbols (in_degree_non_test);
+
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols (file);
 CREATE INDEX IF NOT EXISTS idx_symbols_repo_file ON symbols (repo_id, file);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name ON symbols (fq_name);

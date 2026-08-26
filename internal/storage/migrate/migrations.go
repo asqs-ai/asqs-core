@@ -57,9 +57,9 @@ UPDATE chunks
 
 // MetadataMigrations are one-shot migrations for the metadata database.
 //
-// IDs 0001–0003 and 0005 are reserved: upstream's bodies for those (case normalization,
-// simple_name/trigram aids, degree columns) arrive with the bundles that add their readers, and
-// reusing or renumbering an ID would desynchronize the ledger from upstream's.
+// IDs 0001–0003 are reserved: upstream's bodies for those (case normalization, simple_name and
+// trigram aids) arrive with the bundles that add their readers, and reusing or renumbering an ID
+// would desynchronize the ledger from upstream's.
 func MetadataMigrations() []Migration {
 	return []Migration{
 		{
@@ -92,6 +92,34 @@ func MetadataMigrations() []Migration {
 				for _, s := range stmts {
 					if _, err := pool.Exec(ctx, s); err != nil {
 						return fmt.Errorf("repo-scope symbols/files: %w", err)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			ID:          "0005_symbols_degree_columns",
+			Description: "materialize in/out degree on symbols so gap listing stops issuing one edge query per candidate",
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// Gap listing calls GetEdgesTo once per candidate symbol to compute a centrality
+				// signal. On a 30k-symbol repository that is 30k queries per run, all of them
+				// answerable by a column read.
+				//
+				// Three columns, not two. The centrality check counts inbound edges EXCLUDING
+				// TESTS_SOURCE: a test that covers a symbol creates an inbound edge, and counting it
+				// would inflate the "central dependency, under-tested" signal for precisely the
+				// symbols that already have tests. A plain in_degree is therefore not a drop-in
+				// replacement for what the code computes, and swapping one in would quietly reorder
+				// gap priorities — the ordering this wave makes deterministic and measurable.
+				stmts := []string{
+					`ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree INTEGER NOT NULL DEFAULT 0`,
+					`ALTER TABLE symbols ADD COLUMN IF NOT EXISTS out_degree INTEGER NOT NULL DEFAULT 0`,
+					`ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree_non_test INTEGER NOT NULL DEFAULT 0`,
+					`CREATE INDEX IF NOT EXISTS idx_symbols_in_degree_non_test ON symbols (in_degree_non_test)`,
+				}
+				for _, q := range stmts {
+					if _, err := pool.Exec(ctx, q); err != nil {
+						return fmt.Errorf("degree columns: %w", err)
 					}
 				}
 				return nil
