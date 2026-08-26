@@ -331,8 +331,8 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP25 | Output truncation and transport hardening | B01 (+ latent `content` fix, §2.6) | — | 2–3 d | `in review` |
-| CP26 | Provider capability contract and Ollama parity | B08, R08 | CP25 | 2 d | `blocked (CP25)` |
-| CP27 | Anthropic block messages *(no prompt caching)* | B12 | CP25 | 1–2 d | `blocked (CP25)` |
+| CP26 | Provider capability contract and Ollama parity | B08, R08 | CP25 | 2 d | `in review` |
+| CP27 | Anthropic block messages *(no prompt caching)* | B12 | CP25 | 1–2 d | `in review` |
 | CP28 | Token budget and prompt accounting | B07 | CP06, CP17 | 3–4 d | `blocked (CP06, CP17)` |
 | CP29 | `prompt_tokens` end to end | R07 | CP26 | 0.5 d | `blocked (CP26)` |
 | CP60 | LLM concurrency limiter — wires two inert core keys | (unbundled upstream) | CP26 | 1–2 d | `blocked (CP26)` |
@@ -1841,7 +1841,7 @@ function, since the upstream client files interleave CP26/CP27/CP41 material.
 
 ### CP26 — Provider capability contract and Ollama parity
 
-- **Status:** `blocked (CP25)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2 d · **Risk:** low
 
 **Design constraint, do not "simplify" it.** Capabilities go on a **separate optional**
 `model.CapabilityReporter` interface plus a `DeclaredCapabilitiesOf` helper — **not** as a method on
@@ -1860,9 +1860,37 @@ requested one — usually larger, occasionally different in behaviour.
 **Acceptance.** Each client declares capabilities; an undeclared completer is treated as unknown, not
 incapable, with a test that fails if that inverts.
 
+**Implementation record (2026-08-26).** Done, with two corrections to this section's task list.
+
+- `model/capabilities.go` ported whole (the struct includes the three tool fields — their
+  consumers arrive with CP41–44), with `CapabilityReporter` + the two-value
+  `DeclaredCapabilitiesOf` exactly per the design constraint. **Correction 1: there is no
+  `model.ErrCapabilityUnknown` upstream** — the two-value form IS the unknown-vs-incapable
+  mechanism; the task named a design that was never built. **Correction 2: there is no Ollama
+  `/api/show` probe in the client** — that probe is the tool-support probe (`ProbeToolSupport`)
+  and belongs to the tool-calling wave; nothing in CP26's upstream delta touches /api/show.
+- Ollama parity: `MaxTokens` → `options.num_predict` (release note above stands), `Temperature` →
+  options, `Structured` → the native `format` grammar (`structuredFormat` — the schema object,
+  not OpenAI's envelope; this endpoint enforces it, unlike the OpenAI-compat path), per-request
+  options merged over the client defaults so `num_ctx` survives, truncation errors now truthfully
+  name the requested cap, and Usage is mapped from the server's token counts — the local path's
+  `llm_total_tokens` was always 0, blinding the cost side of CP16's measurement loop.
+  (`promptOverflowWarning` was already in core from CP25's wave; it now reads the merged options.)
+- All three clients declare `Capabilities()`. **Honest-state adaptations, each with its flip
+  note:** the three tool fields are `false` everywhere (core's model package has no tool types
+  until CP41 — declaring support for fields that cannot be sent would be a lie), and Anthropic
+  declares `PromptCaching: false` (upstream says true; core carries none of the cache machinery —
+  the seam). The usage-tracking wrapper forwards a declaration when the inner completer has one
+  and never fabricates one — the acceptance's invert-detection test is
+  `TestWrappers_doNotFabricateADeclaration` (rewritten for core's wrapper; the
+  concurrency-limiter wrapper tests are deferred in-file to the bundle that brings the limiter).
+- Deferred tests restored as CP25 predicted: the Ollama truncation assertion flipped 0 → the
+  requested 8192, and the OpenAI `TestCapabilities_temperatureReflectsTheModel` returned. The
+  ported Ollama capability/structured-format/usage tests pass unmodified.
+
 ### CP27 — Anthropic block messages
 
-- **Status:** `blocked (CP25)` · **Effort:** 1–2 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 1–2 d · **Risk:** low
 
 Port the content-block message shape: `contentBlock.MarshalJSON`, `isToolResultOnly`,
 `buildSystemBlocks`, and send `temperature` when a caller sets it (it was previously discarded).
@@ -1874,6 +1902,26 @@ creep back.
 
 **Acceptance.** Anthropic requests carry block-shaped content; `temperature` reaches the wire; no
 `cache_control` key appears in any request, pinned by a test.
+
+**Implementation record (2026-08-26).** Done.
+
+- The block-message shape ported: `contentBlock` is the three-way union (text / tool_use /
+  tool_result) with the type-switched `MarshalJSON` — text blocks stay byte-identical to what the
+  client sent before, which is the non-tool request guarantee; `isToolResultOnly` comes along as
+  the parallel-result merge predicate. The tool halves are dormant until CP41 populates
+  `Message.ToolCalls` (core's model package has no tool types yet); the request-side tool fields
+  (`anthropicTool`, `tool_choice`) stay with CP41.
+- `System` is `[]systemBlock`; `buildSystemBlocks(system)` has **no cache parameter** — removed,
+  not wired to false, exactly per the seam instruction, and `systemBlock` has no `CacheControl`
+  field at all, so no request from this client can construct a `cache_control` key.
+- `temperature` reaches the wire clamped to [0,1] — it was discarded with a literal
+  `_ = opts.Temperature`. Upstream's `TestComplete_sendsTemperature` restored (the CP25-deferred
+  test), including the clamp assertion.
+- The acceptance pin is the core-authored `TestComplete_neverSendsCacheControl`: system arrives
+  as a one-element text-block array AND the raw request contains no `cache_control` byte
+  sequence. The cache-marking and cache-token-usage tests upstream keeps stay excluded, noted
+  in-file. Not ported (cache half, per the seam): `cachePrompts`, `llm.disable_prompt_caching`,
+  and the `cache_creation/cache_read` usage counters.
 
 ### CP28 — Token budget and prompt accounting
 

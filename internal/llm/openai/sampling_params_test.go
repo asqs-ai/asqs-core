@@ -152,8 +152,17 @@ func TestComplete_noTemperatureRequestedSendsNone(t *testing.T) {
 	}
 }
 
-// (Upstream also asserts Capabilities().Temperature reflects the model here; that test returns
-// with CP26, which brings the capability contract.)
+// Capabilities must tell the truth per model, so a caller can see the knob is inert rather than
+// discovering it from a 400.
+func TestCapabilities_temperatureReflectsTheModel(t *testing.T) {
+	noop := func(w http.ResponseWriter, r *http.Request) {}
+	if c := newTestClientForModel(t, "gpt-5.5", noop); c.Capabilities().Temperature {
+		t.Error("gpt-5.5 must report Temperature: false")
+	}
+	if c := newTestClientForModel(t, "gpt-4o", noop); !c.Capabilities().Temperature {
+		t.Error("gpt-4o must report Temperature: true")
+	}
+}
 
 // MaxCompletionTokens is the sibling fix already in place; pin it so a future edit to the sampling
 // logic cannot regress the field that reasoning models DO require.

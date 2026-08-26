@@ -7,8 +7,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"encoding/json"
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
+	"io"
+	"strings"
 )
 
 func newTestClient(t *testing.T, handler http.HandlerFunc) *Client {
@@ -163,6 +166,70 @@ func TestComplete_rebuildsBodyOnRetry(t *testing.T) {
 	}
 }
 
-// (Upstream additionally tests the cache_control system-block marking, cache-token usage counting,
-// and temperature pass-through here. Prompt caching is excluded from the open core by the seam;
-// the block-message shape and temperature send arrive with CP27.)
+// Temperature was discarded with a literal `_ = opts.Temperature`.
+func TestComplete_sendsTemperature(t *testing.T) {
+	t.Parallel()
+	var body map[string]any
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
+	})
+	temp := float32(0.35)
+	if _, err := c.Complete(context.Background(), []model.Message{{Role: "user", Content: "x"}},
+		model.CompleteOptions{Temperature: &temp}); err != nil {
+		t.Fatal(err)
+	}
+	if body["temperature"] == nil {
+		t.Fatal("temperature was not sent")
+	}
+	// Anthropic accepts [0,1]; out-of-range values are clamped rather than rejected by the API.
+	hi := float32(4)
+	if _, err := c.Complete(context.Background(), []model.Message{{Role: "user", Content: "x"}},
+		model.CompleteOptions{Temperature: &hi}); err != nil {
+		t.Fatal(err)
+	}
+	if got := body["temperature"].(float64); got != 1 {
+		t.Errorf("temperature = %v, want it clamped to 1", got)
+	}
+}
+
+// TestComplete_neverSendsCacheControl is the seam pin: prompt caching is excluded from the open
+// core, so no request from this client may ever carry a cache_control key. buildSystemBlocks
+// deliberately has no cache parameter (upstream's does); this test is what catches the mechanism
+// creeping back.
+func TestComplete_neverSendsCacheControl(t *testing.T) {
+	t.Parallel()
+	var raw []byte
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn"}`))
+	})
+	if _, err := c.Complete(context.Background(), []model.Message{
+		{Role: "system", Content: "you are a test generator"},
+		{Role: "user", Content: "x"},
+	}, model.CompleteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "cache_control") {
+		t.Fatalf("request carries cache_control — the excluded prompt-caching mechanism crept back:\n%s", raw)
+	}
+	// And the system prompt must still arrive, as blocks.
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	sys, ok := body["system"].([]any)
+	if !ok || len(sys) != 1 {
+		t.Fatalf("system is not a one-element block array: %v", body["system"])
+	}
+	blk := sys[0].(map[string]any)
+	if blk["type"] != "text" || blk["text"] != "you are a test generator" {
+		t.Fatalf("system block wrong: %v", blk)
+	}
+}
+
+// (Upstream additionally tests the cache_control system-block marking and cache-token usage
+// counting here; both belong to the prompt-caching mechanism the seam excludes and stay out.)

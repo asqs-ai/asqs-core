@@ -29,10 +29,16 @@ type Client struct {
 }
 
 type chatRequest struct {
-	Model    string         `json:"model"`
-	Messages []chatMessage  `json:"messages"`
-	Stream   bool           `json:"stream"`
-	Options  map[string]any `json:"options,omitempty"`
+	Model    string        `json:"model"`
+	Messages []chatMessage `json:"messages"`
+	Stream   bool          `json:"stream"`
+	// Format is Ollama's native structured-output control on POST /api/chat: either the string
+	// "json" or a JSON Schema object, which the server enforces during decoding. This is NOT the
+	// OpenAI-compatible `response_format` (that lives on /v1/chat/completions and is a different
+	// endpoint), which is why "Ollama ignores json_schema" is true of the compat path and false
+	// here.
+	Format  json.RawMessage `json:"format,omitempty"`
+	Options map[string]any  `json:"options,omitempty"`
 }
 
 type chatMessage struct {
@@ -98,7 +104,9 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, chatModel string)
 	}, nil
 }
 
-// Complete implements model.ChatCompleter (non-streaming). Structured output from opts is ignored for Ollama.
+// Complete implements model.ChatCompleter (non-streaming). MaxTokens maps to options.num_predict
+// and Temperature to options.temperature; Structured is sent as the native `format` grammar (see
+// Capabilities).
 func (c *Client) Complete(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
 	msgs := make([]chatMessage, 0, len(messages))
 	for _, m := range messages {
@@ -108,11 +116,29 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		}
 		msgs = append(msgs, chatMessage{Role: role, Content: m.Content})
 	}
+	// Per-request options are merged over the client defaults (which carry num_ctx) so a caller's
+	// MaxTokens/Temperature are not lost and the client's own settings are not mutated.
+	opt := make(map[string]any, len(c.chatOptions)+2)
+	for k, v := range c.chatOptions {
+		opt[k] = v
+	}
+	if opts.MaxTokens > 0 {
+		// num_predict is Ollama's output cap. It was never sent, so the fixer asking for 8192 got
+		// the server default instead — truncation at an unknown, unrequested limit.
+		opt["num_predict"] = opts.MaxTokens
+	}
+	if opts.Temperature != nil {
+		opt["temperature"] = *opts.Temperature
+	}
+	if len(opt) == 0 {
+		opt = nil
+	}
 	payload := chatRequest{
 		Model:    c.model,
 		Messages: msgs,
 		Stream:   false,
-		Options:  c.chatOptions,
+		Format:   structuredFormat(opts.Structured),
+		Options:  opt,
 	}
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(&payload); err != nil {
@@ -163,14 +189,14 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		}
 		stopReason := strings.ToLower(strings.TrimSpace(out.DoneReason))
 		if model.IsLengthStopReason(stopReason) {
-			// MaxTokens is 0, not opts.MaxTokens: this client does not yet send opts.MaxTokens as
-			// num_predict (that lands with the capability contract), so the cap that was hit is the
-			// server's own default — reporting a number that was never sent would be a lie in the
-			// audit trail.
+			// opts.MaxTokens is now sent as num_predict, so when the caller set one it IS the cap
+			// that was hit and reporting it is truthful. When the caller set none, the server's own
+			// num_predict default applied — leave MaxTokens zero rather than naming a limit ASQS
+			// never requested.
 			return nil, &model.TruncatedCompletionError{
 				Provider:  "ollama",
 				Reason:    stopReason,
-				MaxTokens: 0,
+				MaxTokens: opts.MaxTokens,
 				GotTokens: out.EvalCount,
 				Content:   out.Message.Content,
 			}
@@ -179,9 +205,19 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		// wants it, and a plain-text contract cannot survive it. See model.StripReasoningBlock.
 		content, thought := model.StripReasoningBlock(out.Message.Content)
 		res := &model.CompleteResult{Content: content, StopReason: stopReason, ReasoningRunes: thought}
-		if w := promptOverflowWarning(out.PromptEvalCount, c.chatOptions); w != "" {
+		if w := promptOverflowWarning(out.PromptEvalCount, opt); w != "" {
 			res.Warnings = append(res.Warnings, w)
 			log.Printf("[asqs] llm ollama: %s", w)
+		}
+		// Mapping the server's token counts restores first_wave_metrics.llm_total_tokens and
+		// tokens_to_stable on the local path, which were always 0 — the entire cost side of the
+		// measurement loop was blind on a supported configuration.
+		if out.PromptEvalCount > 0 || out.EvalCount > 0 {
+			res.Usage = &model.Usage{
+				PromptTokens:     out.PromptEvalCount,
+				CompletionTokens: out.EvalCount,
+				TotalTokens:      out.PromptEvalCount + out.EvalCount,
+			}
 		}
 		return res, nil
 	}
@@ -253,5 +289,49 @@ func intOption(v any) (int, bool) {
 		return int(n), true
 	default:
 		return 0, false
+	}
+}
+
+// structuredFormat renders CompleteOptions.Structured as Ollama's native `format` value.
+func structuredFormat(s *model.StructuredJSONSchema) json.RawMessage {
+	if s == nil || s.Schema == nil {
+		return nil
+	}
+	raw, err := s.Schema.MarshalJSON()
+	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
+		return nil
+	}
+	// Ollama takes the schema object itself, not OpenAI's {name, strict, schema} envelope.
+	return json.RawMessage(raw)
+}
+
+// Capabilities implements model.CapabilityReporter.
+//
+// StructuredOutput is true: Complete sends CompleteOptions.Structured as the `format` field on
+// POST /api/chat, which Ollama enforces during decoding.
+//
+// This was false for as long as the client did not send the field, and the cost of that gap was
+// concrete: a fixer that returned one file under a renamed key, which a schema enumerating the
+// in-scope path makes unrepresentable. The config that run used had turned structured output off
+// with the note "Ollama ignores API-level json_schema anyway", which is true of the
+// OpenAI-compatible endpoint and not of this one.
+func (c *Client) Capabilities() model.Capabilities {
+	return model.Capabilities{
+		StructuredOutput: true,
+		Temperature:      true,
+		MaxTokens:        true,
+		UsageReporting:   true,
+		PromptCaching:    false,
+		// ToolCalling flips to the /api/show probe's answer when the tool-calling wave (CP41)
+		// lands; until then no tools are ever sent, so false is simply true.
+		ToolCalling: false,
+		// `format` is a grammar constraint over the whole generation: with it set, the model
+		// cannot emit tool-call syntax at all. Measured upstream (qwen3-coder:30b, 2026-08-18):
+		// the same lookup-requiring prompt called get_symbol on every trial without format and on
+		// none with it. Tool loops must defer Structured to the final tool-free turn.
+		StructuredWithTools: false,
+		// /api/chat has no tool_choice field, so a final turn cannot keep tools while forbidding
+		// calls — it must drop the tools field and say "no more lookups" in the message text.
+		ToolChoiceNoneWithTools: false,
 	}
 }

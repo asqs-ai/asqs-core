@@ -51,7 +51,14 @@ func NewUsageTrackingChatCompleter(inner ChatCompleter, acc *UsageAccumulator) C
 	if inner == nil || acc == nil {
 		return inner
 	}
-	return &usageTrackingChatCompleter{inner: inner, acc: acc}
+	base := &usageTrackingChatCompleter{inner: inner, acc: acc}
+	// A wrapper must forward a capability declaration when there is one and must not manufacture
+	// one when there is not: an undeclared inner completer stays undeclared through the wrapper,
+	// so callers keep the "unknown, not incapable" semantics.
+	if _, ok := inner.(CapabilityReporter); ok {
+		return &usageTrackingReporter{usageTrackingChatCompleter: *base}
+	}
+	return base
 }
 
 func (t *usageTrackingChatCompleter) Complete(ctx context.Context, messages []Message, opts CompleteOptions) (*CompleteResult, error) {
@@ -63,4 +70,13 @@ func (t *usageTrackingChatCompleter) Complete(ctx context.Context, messages []Me
 		t.acc.Add(res.Usage)
 	}
 	return res, nil
+}
+
+// usageTrackingReporter is the usage wrapper for a provider that declares capabilities.
+type usageTrackingReporter struct {
+	usageTrackingChatCompleter
+}
+
+func (u *usageTrackingReporter) Capabilities() Capabilities {
+	return u.inner.(CapabilityReporter).Capabilities()
 }

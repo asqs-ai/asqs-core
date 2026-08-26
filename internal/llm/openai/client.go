@@ -404,3 +404,23 @@ func modelFixesSamplingParams(name string) bool {
 	}
 	return false
 }
+
+// Capabilities implements model.CapabilityReporter. OpenAI/Azure acts on every CompleteOptions
+// field this client sends; reasoning models fix their sampling parameters, so Temperature is
+// declared only where it actually reaches the wire.
+func (c *Client) Capabilities() model.Capabilities {
+	return model.Capabilities{
+		StructuredOutput: true,
+		Temperature:      !modelFixesSamplingParams(c.model),
+		MaxTokens:        true,
+		UsageReporting:   true,
+		PromptCaching:    true,
+		// The three tool fields flip with the tool-calling wave (CP41), which brings the request
+		// plumbing; until then no tools are ever sent and false is simply true. Their eventual
+		// values here are true/true/true — response_format and tools are separate request fields
+		// the API composes, and tool_choice "none" is legal alongside tools.
+		ToolCalling:             false,
+		StructuredWithTools:     false,
+		ToolChoiceNoneWithTools: false,
+	}
+}

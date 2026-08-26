@@ -45,11 +45,9 @@ func TestComplete_doneReasonLengthIsTruncationError(t *testing.T) {
 	if trunc.Reason != "length" {
 		t.Errorf("Reason = %q", trunc.Reason)
 	}
-	// MaxTokens is 0: this client does not yet send opts.MaxTokens as num_predict, so the cap that
-	// was hit is the server's own default and naming the requested value would be a lie. CP26 (the
-	// capability contract) starts sending num_predict and flips this assertion to the requested 8192.
-	if trunc.MaxTokens != 0 {
-		t.Errorf("MaxTokens = %d, want 0 (num_predict is not sent until the capability contract lands)", trunc.MaxTokens)
+	// MaxTokens is now forwarded as num_predict, so it IS the cap that was hit.
+	if trunc.MaxTokens != 8192 {
+		t.Errorf("MaxTokens = %d, want the requested 8192 (now sent as num_predict)", trunc.MaxTokens)
 	}
 	if trunc.Content != "public class Ord" {
 		t.Errorf("partial content not retained: %q", trunc.Content)
