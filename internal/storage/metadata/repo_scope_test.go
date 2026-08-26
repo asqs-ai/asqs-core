@@ -11,8 +11,7 @@ import (
 // repository sharing that path. Two React or Angular repositories in one database would strip each
 // other's symbol graph mid-run.
 func TestDeleteSymbolsByFileIsRepoScoped(t *testing.T) {
-	// batch.go rejoins this list when the batched insert path arrives (CP10).
-	src := readMetadataSourceWithoutComments(t, "store.go")
+	src := readMetadataSourceWithoutComments(t, "store.go", "batch.go")
 
 	if strings.Contains(src, `"DELETE FROM symbols WHERE file = $1"`) {
 		t.Error("DeleteSymbolsByFile is unscoped again; indexing one repository will delete another's symbols")

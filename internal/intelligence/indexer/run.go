@@ -246,6 +246,8 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	chunksStored := 0
 	symbolsStored := 0
 	edgesStored := 0
+	var fileUpsertErrors int
+	var firstFileUpsertErr error
 	unresolvedCallerByType := make(map[string]int64)
 	unresolvedCalleeByType := make(map[string]int64)
 	filesToIndex := append(changeSet.Added, changeSet.Changed...)
@@ -345,6 +347,9 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 
 		// Insert symbols and collect IDs
 		symbolIDByFQName := make(map[string]string)
+		// One round trip for the whole file's symbols instead of one per symbol; ids come back in
+		// input order, which the maps below depend on.
+		metaSyms := make([]*metadata.Symbol, 0, len(parsed.Symbols))
 		for _, sym := range parsed.Symbols {
 			metaSym := &metadata.Symbol{
 				Lang:          parsed.Lang,
@@ -354,6 +359,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				StartLine:     sym.StartLine,
 				EndLine:       sym.EndLine,
 				SignatureJSON: sym.SignatureJSON,
+				RepoID:        opts.RepoID,
 			}
 			if sym.StartColumn != nil {
 				v := *sym.StartColumn
@@ -363,16 +369,27 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				v := *sym.EndColumn
 				metaSym.EndColumn = &v
 			}
-			id, err := meta.InsertSymbol(ctx, metaSym)
-			if err != nil {
-				return nil, fmt.Errorf("indexer: insert symbol %s: %w", sym.FQName, err)
-			}
-			symbolIDByFQName[sym.FQName] = id
-			fqNameToID[sym.FQName] = id // global for cross-file edge resolution
+			metaSyms = append(metaSyms, metaSym)
+		}
+		ids, err := meta.InsertSymbols(ctx, metaSyms)
+		if err != nil {
+			return nil, fmt.Errorf("indexer: insert symbols for %s: %w", parsed.Path, err)
+		}
+		for i, sym := range parsed.Symbols {
+			symbolIDByFQName[sym.FQName] = ids[i]
+			fqNameToID[sym.FQName] = ids[i] // global for cross-file edge resolution
 			symbolsStored++
 		}
 		// Synthetic CONTAINS for chunk parent_fq / parent_symbol_id (same relations we persist below).
 		var chunkExtraEdges []ParsedEdge
+		// Edges are accumulated for the whole file and written in one batch below. Nothing between
+		// here and the flush reads edges back, so deferring the write costs no correctness.
+		var pendingEdges []*metadata.Edge
+		// One query for every fq_name this file's edges might have to resolve, instead of one per
+		// name. Derived names (normalized Java imports, trimmed C# namespaces) are not predictable
+		// from the edge list, so they still fall through to a single lookup each — the cache records
+		// those too, which matters because the same import repeats across a file.
+		fqCache := prefetchFQNames(ctx, meta, opts.RepoID, edgeResolutionCandidates(parsed))
 		importHintPaths := collectImportTargetPathsFromParsed(parsed)
 		edgeHintFiles := append([]string{parsed.Path}, importHintPaths...)
 		ambiguousEdgeKeys := make(map[string]struct{})
@@ -403,7 +420,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if callerID == "" {
 				var amb bool
-				callerID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, e.CallerFQName, edgeHintFiles, parsed.Lang)
+				callerID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, e.CallerFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("caller", e.CallerFQName)
 				}
@@ -418,7 +435,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if calleeID == "" {
 				var amb bool
-				calleeID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, e.CalleeFQName, edgeHintFiles, parsed.Lang)
+				calleeID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, e.CalleeFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("callee", e.CalleeFQName)
 				}
@@ -434,7 +451,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 						calleeID = id
 					} else {
 						var amb bool
-						calleeID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, normalized, edgeHintFiles, parsed.Lang)
+						calleeID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, normalized, edgeHintFiles, parsed.Lang)
 						if amb {
 							logAmbiguous("callee", normalized)
 						}
@@ -443,19 +460,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			// IMPORTS: JavaParser emits full declaration text ("import pkg.T;"); normalize and strip segments for static members.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") {
-				calleeID = resolveJavaImportCalleeID(ctx, meta, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveJavaImportCalleeID(ctx, meta, fqCache, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			// C#: using directives reference namespaces; map to an indexed symbol by trimming suffixes.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") && parsed.Lang == "csharp" {
-				calleeID = resolveCSharpImportCalleeID(ctx, meta, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveCSharpImportCalleeID(ctx, meta, fqCache, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			if calleeID == "" {
 				unresolvedCalleeByType[metricKey]++
 				continue
 			}
-			if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType, RepoID: opts.RepoID}) == nil {
-				edgesStored++
-			}
+			pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType, RepoID: opts.RepoID})
 		}
 		// Java / C#: add type -> method "contains" for graph structure (method FQName uses Type#Member; see csharp-indexer).
 		if parsed.Lang == "java" || parsed.Lang == "csharp" {
@@ -474,7 +489,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				}
 				if classID == "" {
 					var amb bool
-					classID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, classFQName, edgeHintFiles, parsed.Lang)
+					classID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, classFQName, edgeHintFiles, parsed.Lang)
 					if amb {
 						logAmbiguous("class", classFQName)
 					}
@@ -482,9 +497,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				methodID := symbolIDByFQName[sym.FQName]
 				if classID != "" && methodID != "" {
 					chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: classFQName, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-					if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS", RepoID: opts.RepoID}) == nil {
-						edgesStored++
-					}
+					pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS", RepoID: opts.RepoID})
 				}
 			}
 		}
@@ -506,15 +519,30 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 					childID := symbolIDByFQName[sym.FQName]
 					if childID != "" {
 						chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: moduleFQ, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-						if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS", RepoID: opts.RepoID}) == nil {
-							edgesStored++
-						}
+						pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS", RepoID: opts.RepoID})
 					}
 				}
 			}
 		}
 		// Upsert file
-		_ = meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest, RepoID: opts.RepoID})
+		edgesStored += flushEdges(ctx, meta, pendingEdges)
+
+		// Upsert file. RepoID is not optional: `files` is keyed (repo_id, file), so a row written
+		// without it is a row this repository's own change detection can never see again — every
+		// file would look new on every run, and the reindex-required warning would never clear.
+		//
+		// The error is CHECKED, and that is the whole point. It used to be `_ = meta.UpsertFile(…)`.
+		// When UpsertFile started targeting ON CONFLICT (repo_id, file), a database whose primary key
+		// had not been migrated failed every single call with SQLSTATE 42P10 — and the discard turned
+		// 43 consecutive failures into a run that reported success, stored 367 symbols, wrote zero
+		// `files` rows, and then planned zero gaps because every consumer of `files` came back empty.
+		// A swallowed write error is indistinguishable from an empty repository.
+		if ferr := meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest, RepoID: opts.RepoID}); ferr != nil {
+			fileUpsertErrors++
+			if firstFileUpsertErr == nil {
+				firstFileUpsertErr = ferr
+			}
+		}
 
 		// Chunk and optionally embed + store (include synthetic CONTAINS so parent_fq matches persisted graph).
 		forChunk := *parsed
@@ -618,6 +646,25 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 	// Match HTTP client symbols to backend routes by method + path (same run + fqNameToID).
+	// A files-row write failure is fatal to the run's usefulness even though every other write
+	// succeeded: `files` is what change detection, gap listing, the doc plan and the overview all
+	// read, so a run that stored symbols but no files produces an empty plan and reports success.
+	// That exact combination is what made this failure invisible the first time.
+	if fileUpsertErrors > 0 {
+		if opts.Audit != nil {
+			opts.Audit.LogError(ctx, "index.file_upsert_failed", map[string]interface{}{
+				"message": fmt.Sprintf("%d of %d file row(s) could not be written: %v. Every consumer of `files` "+
+					"— change detection, gap listing, the documentation plan and the overview — will see an empty "+
+					"repository, so this run is failed rather than reported as successful.",
+					fileUpsertErrors, len(filesToIndex), firstFileUpsertErr),
+				"failed": fileUpsertErrors, "total": len(filesToIndex),
+				"error": firstFileUpsertErr.Error(), "run_id": runID,
+			})
+		}
+		return nil, fmt.Errorf("indexer: %d of %d file rows could not be written: %w",
+			fileUpsertErrors, len(filesToIndex), firstFileUpsertErr)
+	}
+
 	if n := LinkAPIClientRequestsToRoutes(ctx, meta, opts.RepoID, fqNameToID); n > 0 {
 		edgesStored += n
 		if opts.Audit != nil {
@@ -864,6 +911,7 @@ func qualifiedSignatureToFQName(sig string) string {
 func resolveJavaImportCalleeID(
 	ctx context.Context,
 	meta MetadataWriter,
+	cache fqNameCache,
 	repoID string,
 	symbolIDByFQName, fqNameToID map[string]string,
 	raw string,
@@ -879,7 +927,7 @@ func resolveJavaImportCalleeID(
 		if id := fqNameToID[s]; id != "" {
 			return id
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, s); len(syms) > 0 {
+		if syms := lookupFQName(ctx, meta, cache, repoID, s); len(syms) > 0 {
 			return syms[0].ID
 		}
 		i := strings.LastIndex(s, ".")
@@ -889,4 +937,29 @@ func resolveJavaImportCalleeID(
 		s = s[:i]
 	}
 	return ""
+}
+
+// flushEdges writes a file's edges in one batched round trip and returns how many were stored.
+//
+// On a batch error it retries the edges one at a time. That looks redundant next to the batch's own
+// transaction, and it is deliberate: the per-edge path this replaces tolerated individual failures
+// silently (`if InsertEdge(...) == nil { edgesStored++ }`), so a single unwritable edge cost that
+// edge and nothing else. A bare batch would turn the same situation into "this file has no edges at
+// all" — a behaviour change smuggled in by a performance bundle, and an invisible one, since edge
+// counts are not asserted anywhere a human looks. The fallback keeps the old tolerance exactly while
+// the healthy path pays one round trip.
+func flushEdges(ctx context.Context, meta MetadataWriter, edges []*metadata.Edge) int {
+	if len(edges) == 0 {
+		return 0
+	}
+	if err := meta.InsertEdges(ctx, edges); err == nil {
+		return len(edges)
+	}
+	stored := 0
+	for _, e := range edges {
+		if meta.InsertEdge(ctx, e) == nil {
+			stored++
+		}
+	}
+	return stored
 }

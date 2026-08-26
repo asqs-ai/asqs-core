@@ -141,26 +141,10 @@ func truncate(s string, n int) string {
 
 // --- Symbols ---
 
-// InsertSymbol inserts a symbol and returns its generated ID.
+// InsertSymbol inserts a symbol and returns its generated ID. Batch callers (the indexer) go
+// through InsertSymbols; both run the shared symbolInsertQuery so the paths cannot drift.
 func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err error) {
-	query := `
-		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, repo_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		RETURNING id`
-	var sig *[]byte
-	if len(sym.SignatureJSON) > 0 {
-		sig = &sym.SignatureJSON
-	}
-	var startCol, endCol interface{}
-	if sym.StartColumn != nil {
-		startCol = *sym.StartColumn
-	}
-	if sym.EndColumn != nil {
-		endCol = *sym.EndColumn
-	}
-	err = s.db.QueryRow(ctx, query,
-		sym.Lang, sym.Kind, sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig, sym.RepoID,
-	).Scan(&id)
+	err = s.db.QueryRow(ctx, symbolInsertQuery, symbolInsertArgs(sym)...).Scan(&id)
 	return id, err
 }
 

@@ -304,7 +304,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP07 | Migration mechanism + `asqs-core migrate` | B04 (infra) | CP05 | 2 d | `in review` |
 | CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `in review` |
 | CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `in review` |
-| CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `ready` |
+| CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `in review` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `ready` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
@@ -912,7 +912,7 @@ files) plus config wiring on both stores.
 
 ### CP10 — Batched inserts, `COPY`, batched FQName resolution
 
-- **Status:** `ready` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2 d · **Risk:** medium
 
 **Goal.** Index-write throughput. Upstream measured **4.8×** on a realistic shape and **7.5×** at
 1 ms round-trip latency — the second number is the one that matters for a hosted database.
@@ -924,6 +924,42 @@ one batched round trip instead of per-symbol. New `internal/storage/metadata/{ba
 before and after. Partial-failure behaviour is tested explicitly — a batch with one bad row must not
 silently drop the other 999. Live-DB test with a timing assertion expressed as a ratio, not a
 wall-clock threshold.
+
+**Implementation record (2026-08-26).** Done, sequenced deliberately AFTER CP11 so upstream's
+repo-scoped `batch.go` end state could be copied without a strip-and-re-add cycle.
+
+- `internal/storage/metadata/batch.go`: `InsertSymbols` (single-symbol fast path — upstream
+  measured the transactional path ~16% slower on one-symbol files; transaction-wrapped `pgx.Batch`
+  with RETURNING ids in input order; drain-before-return on error), `InsertEdges` (same shape over
+  `edgeInsertQuery`), `ListSymbolsByFQNames` (deduped `= ANY`, absent names absent from the map,
+  per-name order identical to `ListSymbolsByFQName`). **Adaptation:** `symbolInsertQuery` is the
+  shared constant but stays a plain insert — the natural-key upsert, `dup_ordinal` and
+  `assignDupOrdinals` arrive with CP13, and write-time lowercasing with CP18. `InsertSymbol` now
+  runs the shared constant so the two paths cannot drift.
+- **Correction to this bundle's file list:** `fqname.go` (`BareFQName`) is B25 material — all its
+  consumers are CP55/CP21/tools bundles — and is NOT ported here; the "batched FQName resolution"
+  the goal means is `ListSymbolsByFQNames` + the indexer's `fqNameCache`. (Conversely CP11 already
+  ported `reindex_warning.go`, which §17's file map had under CP55 — its tests ride the two-repo
+  suite.)
+- `embeddings.InsertChunks` is now one `CopyFrom` (ids generated client-side — COPY cannot RETURN;
+  generated columns stay out of `chunkCopyColumns`, which matters when CP21's `content_tsv`
+  lands). Adds `github.com/google/uuid`. Live probe confirmed COPY rows are shape-identical to
+  `InsertChunk`'s.
+- Indexer: per-file symbols go through one `InsertSymbols` call; edges accumulate in
+  `pendingEdges` and flush once per file through `flushEdges`, whose per-edge fallback on batch
+  error deliberately preserves the old "one bad edge costs that edge" tolerance;
+  `prefetchFQNames`/`lookupFQName`/`resolveSymbolIDForFQNameCached` +
+  `edgeResolutionCandidates` cut edge resolution to one query per file with derived names cached
+  on first miss (Java/C# import resolvers take the cache too). `MetadataWriter` gained the three
+  batch methods. **Carried CP11 remainder:** `UpsertFile`'s error is now CHECKED and counted —
+  `fileUpsertErrors > 0` fails the run with the audit event, closing the "367 symbols, zero
+  files rows, empty plan, reported success" hole; upstream keeps this beside the batch rewrite
+  of the same loop.
+- Acceptance: ported `batch_live_test.go` green on `asqs_scratch` — atomic partial failure
+  (malformed JSONB mid-batch leaves zero rows), ids in input order, `InsertEdges` idempotence
+  + repo_id repair, batched-vs-per-name equivalence including row order. **Note:** upstream's end
+  state has no timing-ratio test — the 4.8×/7.5× figures were its one-off measurements; the
+  correctness suite is what shipped, and core copies that.
 
 ### CP11 — Repo-scoped `symbols` / `edges` / `files`
 

@@ -121,13 +121,19 @@ func (c *ChunkToEmbed) ToChunk(embedding []float32) *embeddings.Chunk {
 // MetadataWriter is the subset of metadata.Store needed for indexing (write symbols, edges, files; delete for incremental; index runs).
 type MetadataWriter interface {
 	InsertSymbol(ctx context.Context, sym *metadata.Symbol) (string, error)
+	// InsertSymbols writes a file's symbols in one round trip and returns their ids in input
+	// order; InsertEdges is its edge twin. See the store's batch path for the atomicity contract.
+	InsertSymbols(ctx context.Context, syms []*metadata.Symbol) ([]string, error)
 	InsertEdge(ctx context.Context, e *metadata.Edge) error
+	InsertEdges(ctx context.Context, edges []*metadata.Edge) error
 	UpsertFile(ctx context.Context, f *metadata.File) error
 	DeleteSymbolsByFile(ctx context.Context, repoID, file string) (int64, error)
 	DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error)
 	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
 	ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error)
 	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
+	// ListSymbolsByFQNames resolves many names in one query; see prefetchFQNames.
+	ListSymbolsByFQNames(ctx context.Context, repoID string, fqNames []string) (map[string][]*metadata.Symbol, error)
 	// MaterializeTestsSourceEdges rebuilds TESTS_SOURCE edges after indexing (test→SUT heuristics). Mocks may return (0, nil).
 	MaterializeTestsSourceEdges(ctx context.Context, repoID string) (inserted int, err error)
 	InsertIndexRun(ctx context.Context, runID, repoID, commitSHA string, startedAt int64, currentIteration int, extras *metadata.IndexRunStartExtras) error

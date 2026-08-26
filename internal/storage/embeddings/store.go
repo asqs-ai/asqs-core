@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
@@ -219,46 +220,70 @@ func (s *Store) InsertChunk(ctx context.Context, c *Chunk) (id string, err error
 	return id, err
 }
 
-// InsertChunks inserts multiple chunks in one transaction. Returns the list of assigned IDs in order.
+// InsertChunks inserts multiple chunks in one COPY. Returns the list of assigned IDs in order.
 func (s *Store) InsertChunks(ctx context.Context, chunks []*Chunk) (ids []string, err error) {
 	if len(chunks) == 0 {
 		return nil, nil
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+
+	// COPY, not one INSERT per chunk. Indexing is round-trip bound: a large repository produced one
+	// query per chunk, sequentially, which is minutes of pure latency against a networked Postgres.
+	//
+	// Ids are generated here rather than by the column's gen_random_uuid() default, because COPY
+	// cannot return them and the method's contract is to hand them back. Both are random v4 UUIDs,
+	// so nothing about the stored value changes.
+	//
+	// Two things COPY could have silently broken, both checked:
+	//   - Generated columns are computed for COPY exactly as for INSERT, and must be left out of
+	//     the column list (the lexical channel's content_tsv relies on this when it arrives).
+	//   - CopyFrom is one statement, so it is all-or-nothing on its own. The explicit transaction
+	//     the per-row loop needed is therefore gone, not merely moved.
 	ids = make([]string, 0, len(chunks))
+	rows := make([][]any, 0, len(chunks))
 	for _, c := range chunks {
 		if len(c.Embedding) != s.dim {
 			return nil, fmt.Errorf("embeddings: embedding length %d != store dimension %d", len(c.Embedding), s.dim)
 		}
-		vec := pgvector.NewVector(c.Embedding)
-		symbolID := nullUUID(c.SymbolID)
 		chunkType := c.ChunkType
 		if chunkType == "" {
 			chunkType = "definition"
 		}
-		var id string
-		metaArg := any(nil)
+		var metaArg any
 		if len(c.MetadataJSON) > 0 {
 			metaArg = c.MetadataJSON
 		}
-		parentID := nullUUID(c.ParentSymbolID)
-		err = tx.QueryRow(ctx, `
-			INSERT INTO chunks (content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			RETURNING id`,
-			sanitizeTextForPostgres(c.Content), vec, symbolID, sanitizeTextForPostgres(c.File), sanitizeTextForPostgres(c.Lang),
-			sanitizeTextForPostgres(chunkType), c.StartLine, c.EndLine, sanitizeTextForPostgres(c.RepoID), metaArg, parentID,
-		).Scan(&id)
-		if err != nil {
-			return nil, err
-		}
+		id := uuid.NewString()
 		ids = append(ids, id)
+		rows = append(rows, []any{
+			id,
+			sanitizeTextForPostgres(c.Content),
+			pgvector.NewVector(c.Embedding),
+			nullUUID(c.SymbolID),
+			sanitizeTextForPostgres(c.File),
+			sanitizeTextForPostgres(c.Lang),
+			sanitizeTextForPostgres(chunkType),
+			c.StartLine,
+			c.EndLine,
+			sanitizeTextForPostgres(c.RepoID),
+			metaArg,
+			nullUUID(c.ParentSymbolID),
+		})
 	}
-	return ids, tx.Commit(ctx)
+
+	n, err := s.pool.CopyFrom(ctx, pgx.Identifier{"chunks"}, chunkCopyColumns, pgx.CopyFromRows(rows))
+	if err != nil {
+		return nil, fmt.Errorf("embeddings: copy chunks: %w", err)
+	}
+	if int(n) != len(rows) {
+		return nil, fmt.Errorf("embeddings: copy chunks: wrote %d of %d rows", n, len(rows))
+	}
+	return ids, nil
+}
+
+// chunkCopyColumns is the column list InsertChunks copies into, in row order.
+var chunkCopyColumns = []string{
+	"id", "content", "embedding", "symbol_id", "file", "lang", "chunk_type",
+	"start_line", "end_line", "repo_id", "chunk_metadata", "parent_symbol_id",
 }
 
 // GetByID returns the chunk with the given ID, or nil if not found.
