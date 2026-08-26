@@ -322,7 +322,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `in review` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `in review` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `in review` |
-| CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
+| CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `in review` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
 
@@ -1609,7 +1609,7 @@ it — CP16's run-outcome metrics are the only available evidence.
 
 ### CP23 — Route-aware E2E gaps and branch gaps
 
-- **Status:** `blocked (CP18)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2 d · **Risk:** low
 
 **Goal.** E2E gap planning currently misses uncovered API routes and page routes. Port
 `ListGapsWithChunks`, `uncoveredAPIRouteLangs`, `uncoveredAPIRouteE2EGapsForLang` and
@@ -1622,6 +1622,31 @@ from there, and core's `--docs` path shares the plan.
 
 **Acceptance.** A fixture repo with an uncovered controller route yields an E2E gap naming it.
 Existing gap counts on repos with no routes are unchanged.
+
+**Implementation record (2026-08-26).** Done — and this bundle's premise was stale for core's
+tree, which is recorded because it changes what the work was.
+
+- **Core already had all the route-awareness**: the uncovered-API-route model (Java, C#, and the
+  JS/TS Nest block), the PAGE_ROUTE anchors, `listUncoveredAPIRouteE2EGaps`,
+  `e2eProfileWantsJSTSSupplement`, `pageRouteE2EGapsEnabledJS` — everything, inline. The actual
+  delta was upstream's DECOMPOSITION of `ListGapsE2E` (221 → 138 lines): the two near-identical
+  Java/C# blocks become `uncoveredAPIRouteLangs` + `uncoveredAPIRouteE2EGapsForLang` (whose
+  `decided` bool is the load-bearing part — when routes exist this phase decides the outcome),
+  and the inline PAGE_ROUTE block becomes `appendPageRouteE2EGaps`. This also delivers CP24's
+  item 6 second half ("ListGapsE2E is ~220 lines of nested dispatch — decompose") ahead of that
+  bundle. `ListGapsWithChunks` and `gap_shortlist.go` had already arrived with CP18.
+- `branch_gaps.go` delta: `buildExistingTestCoverageHintForGap` + `targetBranchIntents` reuse the
+  shortlist-stage branch intents (same chunk, same regexes) instead of recomputing per gap; the
+  plan-build call site passes the gap.
+- **CP11 correction found by the `apiclient_route_link.go` diff**: core's
+  `LinkAPIClientRequestsToRoutes` wrote TARGETS_API_ROUTE edges with an EMPTY repo_id — the CP11
+  threading regex missed this multi-line struct literal. Fixed; scoped reads would never have
+  seen those edges.
+- Acceptance held by the CP18-ported suite, which passes unchanged against the decomposed
+  version: `TestListGapsE2E_java_uncoveredApiRoutes` (a fixture uncovered controller route yields
+  exactly one E2E gap naming it), the all-routes-covered no-fallback cases for both backends, the
+  Playwright fall-through cases, and the max/skip-prefix behaviour — i.e. the refactor is proven
+  behaviour-preserving by tests written against the pre-refactor shape.
 
 ### CP24 — Review-findings cleanup
 

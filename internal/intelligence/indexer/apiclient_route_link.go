@@ -57,6 +57,7 @@ func LinkAPIClientRequestsToRoutes(ctx context.Context, meta MetadataWriter, rep
 				CallerSymbolID: callerID,
 				CalleeSymbolID: calleeID,
 				EdgeType:       "TARGETS_API_ROUTE",
+				RepoID:         repoID,
 			}) == nil {
 				stored++
 			}

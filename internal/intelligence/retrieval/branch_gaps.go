@@ -22,13 +22,19 @@ var (
 )
 
 func buildExistingTestCoverageHint(rc *RetrievalContext, hasExistingTests bool) *ExistingTestCoverageHint {
+	return buildExistingTestCoverageHintForGap(rc, hasExistingTests, nil)
+}
+
+// buildExistingTestCoverageHintForGap is buildExistingTestCoverageHint with the gap in hand so
+// shortlist-stage branch intents are reused instead of recomputed from the same chunk.
+func buildExistingTestCoverageHintForGap(rc *RetrievalContext, hasExistingTests bool, gap *TestGap) *ExistingTestCoverageHint {
 	if rc == nil {
 		return nil
 	}
 	if !hasExistingTests && len(rc.SimilarTests) == 0 {
 		return nil
 	}
-	targetIntents := inferTargetBranchIntents(rc)
+	targetIntents := targetBranchIntents(rc, gap)
 	coveredIntents := inferCoveredBranchIntents(rc.SimilarTests)
 	missing := diffIntents(targetIntents, coveredIntents)
 	if len(targetIntents) == 0 && len(coveredIntents) == 0 {
@@ -125,4 +131,13 @@ func sortedIntentKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// targetBranchIntents prefers intents already computed during gap shortlisting (same chunk, same
+// regexes) and falls back to recomputing from the retrieval context.
+func targetBranchIntents(rc *RetrievalContext, gap *TestGap) []string {
+	if gap != nil && len(gap.BranchIntents) > 0 {
+		return gap.BranchIntents
+	}
+	return inferTargetBranchIntents(rc)
 }

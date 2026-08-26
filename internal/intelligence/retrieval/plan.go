@@ -609,6 +609,138 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 // Java fallback without API_ROUTE: PAGE_OBJECT, USER_FLOW, E2E_SPEC in test files.
 //
 // Requires MaxGapsE2E > 0; uses skip/critical heuristics and diversity caps.
+// uncoveredAPIRouteLangs maps the workflow language to the backend language whose API routes anchor
+// E2E gaps, or nothing when the language does not use that model.
+func uncoveredAPIRouteLangs(workflowLang string) []string {
+	switch workflowLang {
+	case "java":
+		return []string{"java"}
+	case "csharp", "cs":
+		return []string{"csharp"}
+	}
+	return nil
+}
+
+// uncoveredAPIRouteE2EGapsForLang returns the E2E gaps derived from API routes that no test targets.
+//
+// The bool is the control flow the caller needs and the reason this cannot be a plain helper: when
+// routes exist, this phase DECIDES the outcome. Either some route is uncovered — those are the gaps,
+// and nothing else is considered — or every route is covered, in which case a pure Java/C# E2E
+// profile yields no gaps at all, while a full-stack or Playwright profile falls through so indexed
+// JS/TS can still contribute PAGE_ROUTE and E2E_SPEC anchors.
+//
+// decided=false means "this phase has no opinion": either the language has no indexed API routes, or
+// every route is covered and the profile wants the JS/TS supplement.
+
+// uncoveredAPIRouteE2EGapsForLang returns the E2E gaps derived from API routes that no test targets.
+//
+// The bool is the control flow the caller needs and the reason this cannot be a plain helper: when
+// routes exist, this phase DECIDES the outcome. Either some route is uncovered — those are the gaps,
+// and nothing else is considered — or every route is covered, in which case a pure Java/C# E2E
+// profile yields no gaps at all, while a full-stack or Playwright profile falls through so indexed
+// JS/TS can still contribute PAGE_ROUTE and E2E_SPEC anchors.
+//
+// decided=false means "this phase has no opinion": either the language has no indexed API routes, or
+// every route is covered and the profile wants the JS/TS supplement.
+func uncoveredAPIRouteE2EGapsForLang(
+	ctx context.Context,
+	meta GapMetaReader,
+	opts PlanOptions,
+	lang string,
+	maxPerFile int,
+) (gaps []*TestGap, decided bool, err error) {
+	routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, lang, "API_ROUTE")
+	if err != nil {
+		return nil, false, err
+	}
+	routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
+	if len(routes) == 0 {
+		return nil, false, nil
+	}
+	list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(list) > 0 {
+		list = sortByPriority(list)
+		return selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile), true, nil
+	}
+	if !e2eProfileWantsJSTSSupplement(opts) {
+		// Every API route is targeted from a test and the profile is backend-only: no gaps, and no
+		// "extend an existing spec" anchors either.
+		return nil, true, nil
+	}
+	return nil, false, nil
+}
+
+// appendPageRouteE2EGaps adds UI-route anchors (React Router, Angular, …) for JS/TS, unless
+// profile_e2e is explicitly java_unit-shaped.
+//
+// Separate from the pass above because these come from NON-test files: they are production routes
+// that no spec targets, whereas the main pass walks symbols already living in test files.
+
+// appendPageRouteE2EGaps adds UI-route anchors (React Router, Angular, …) for JS/TS, unless
+// profile_e2e is explicitly java_unit-shaped.
+//
+// Separate from the pass above because these come from NON-test files: they are production routes
+// that no spec targets, whereas the main pass walks symbols already living in test files.
+func appendPageRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions, list []*TestGap) ([]*TestGap, error) {
+	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
+	if pageRouteE2EGapsEnabledJS(opts) {
+		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
+			seenID := make(map[string]bool)
+			for _, g := range list {
+				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
+					seenID[g.Symbol.ID] = true
+				}
+			}
+			for _, l := range langs {
+				pages, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
+				if err != nil {
+					return nil, err
+				}
+				for _, sym := range pages {
+					if sym == nil || sym.ID == "" || seenID[sym.ID] {
+						continue
+					}
+					if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {
+						continue
+					}
+					if indexer.IsTypeScriptDeclarationPath(sym.File) {
+						continue
+					}
+					if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
+						continue
+					}
+					f, err := meta.GetFile(ctx, opts.RepoID, sym.File)
+					if err != nil || f == nil {
+						continue
+					}
+					gap := &TestGap{
+						Symbol: sym, Module: f.Module, Kind: GapNoTests,
+						Reason: e2eGapBaseReasonForSymbolKind("PAGE_ROUTE"), Priority: 3,
+					}
+					if isCritical(sym.File, f.Module, opts.CriticalModulePrefixes) {
+						gap.Kind = GapBusinessCritical
+						gap.Reason = "business-critical UI route — add or extend E2E coverage"
+						gap.Priority += 30
+					}
+					edgesToRaw, _ := meta.GetEdgesTo(ctx, opts.RepoID, sym.ID)
+					edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
+					if len(edgesToCentrality) >= 2 && gap.Kind == GapNoTests {
+						gap.Kind = GapLowCoverageCentral
+						gap.Reason = "UI route linked to many graph symbols — prioritize E2E"
+						gap.Priority += len(edgesToCentrality)
+					}
+					seenID[sym.ID] = true
+					list = append(list, gap)
+				}
+			}
+		}
+	}
+	return list, nil
+}
+
 func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*TestGap, error) {
 	if opts.MaxGapsE2E <= 0 {
 		return nil, nil
@@ -624,50 +756,16 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		maxPerFile = 2
 	}
 	wl := strings.ToLower(strings.TrimSpace(opts.Lang))
-	if wl == "java" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "java", "API_ROUTE")
+	// Java and C# use the same model: if any API route is not targeted from a test, those routes ARE
+	// the E2E gaps and nothing else is considered. They were two near-identical 20-line blocks
+	// differing only in the language literal and a comment.
+	for _, lang := range uncoveredAPIRouteLangs(wl) {
+		gaps, decided, err := uncoveredAPIRouteE2EGapsForLang(ctx, meta, opts, lang, maxPerFile)
 		if err != nil {
 			return nil, err
 		}
-		routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
-		if len(routes) > 0 {
-			list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
-			if err != nil {
-				return nil, err
-			}
-			if len(list) > 0 {
-				list = sortByPriority(list)
-				return selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile), nil
-			}
-			if !e2eProfileWantsJSTSSupplement(opts) {
-				// Pure Java E2E: no "extend spec" gaps when every API route is targeted from tests.
-				return nil, nil
-			}
-			// Monorepo: fall through so indexed JS/TS (React/Node) can still yield PAGE_ROUTE / E2E_SPEC when profile_e2e is full_stack / react / e2e_playwright.
-		}
-	}
-
-	// C# ASP.NET Core: same uncovered API_ROUTE model as Java; same e2e_playwright / full_stack fallthrough when all covered.
-	if wl == "csharp" || wl == "cs" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "csharp", "API_ROUTE")
-		if err != nil {
-			return nil, err
-		}
-		routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
-		if len(routes) > 0 {
-			apiList, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
-			if err != nil {
-				return nil, err
-			}
-			if len(apiList) > 0 {
-				apiList = sortByPriority(apiList)
-				return selectGapsWithDiversity(apiList, opts.MaxGapsE2E, maxPerFile), nil
-			}
-			if !e2eProfileWantsJSTSSupplement(opts) {
-				// http_api-style E2E: no further anchors when every API route is targeted from tests.
-				return nil, nil
-			}
-			// e2e_playwright / full_stack / react_feature: fall through to csharp E2E_SPEC + JS/TS supplement.
+		if decided {
+			return gaps, nil
 		}
 	}
 
@@ -769,58 +867,9 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		}
 	}
 
-	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
-	if pageRouteE2EGapsEnabledJS(opts) {
-		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
-			seenID := make(map[string]bool)
-			for _, g := range list {
-				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
-					seenID[g.Symbol.ID] = true
-				}
-			}
-			for _, l := range langs {
-				pages, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
-				if err != nil {
-					return nil, err
-				}
-				for _, sym := range pages {
-					if sym == nil || sym.ID == "" || seenID[sym.ID] {
-						continue
-					}
-					if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {
-						continue
-					}
-					if indexer.IsTypeScriptDeclarationPath(sym.File) {
-						continue
-					}
-					if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
-						continue
-					}
-					f, err := meta.GetFile(ctx, opts.RepoID, sym.File)
-					if err != nil || f == nil {
-						continue
-					}
-					gap := &TestGap{
-						Symbol: sym, Module: f.Module, Kind: GapNoTests,
-						Reason: e2eGapBaseReasonForSymbolKind("PAGE_ROUTE"), Priority: 3,
-					}
-					if isCritical(sym.File, f.Module, opts.CriticalModulePrefixes) {
-						gap.Kind = GapBusinessCritical
-						gap.Reason = "business-critical UI route — add or extend E2E coverage"
-						gap.Priority += 30
-					}
-					edgesToRaw, _ := meta.GetEdgesTo(ctx, opts.RepoID, sym.ID)
-					edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
-					if len(edgesToCentrality) >= 2 && gap.Kind == GapNoTests {
-						gap.Kind = GapLowCoverageCentral
-						gap.Reason = "UI route linked to many graph symbols — prioritize E2E"
-						gap.Priority += len(edgesToCentrality)
-					}
-					seenID[sym.ID] = true
-					list = append(list, gap)
-				}
-			}
-		}
+	list, perr := appendPageRouteE2EGaps(ctx, meta, opts, list)
+	if perr != nil {
+		return nil, perr
 	}
 
 	if len(list) == 0 {
@@ -830,7 +879,6 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	list = selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile)
 	return list, nil
 }
-
 func isCritical(filePath, module string, prefixes []string) bool {
 	lower := strings.ToLower(filePath + " " + module)
 	for _, p := range prefixes {
@@ -1093,7 +1141,7 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 		}
 		symFileNorm := filepath.ToSlash(strings.TrimSpace(r.item.Gap.Symbol.File))
 		_, hasExistingTests := opts.SourceFilesWithExistingTest[symFileNorm]
-		r.item.Context.ExistingTestCoverage = buildExistingTestCoverageHint(r.item.Context, hasExistingTests)
+		r.item.Context.ExistingTestCoverage = buildExistingTestCoverageHintForGap(r.item.Context, hasExistingTests, r.item.Gap)
 		if paths := opts.ExistingTestPathsBySource[symFileNorm]; len(paths) > 0 {
 			// Copy + normalise so downstream sees slash-separated, sorted, dedup'd repo-relative paths.
 			seen := make(map[string]struct{}, len(paths))
