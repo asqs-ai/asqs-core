@@ -5,6 +5,7 @@ import (
 	"context"
 	"math"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/asqs/asqs-core/internal/intelligence/model"
@@ -86,20 +87,59 @@ func (e *NormalizingEmbedder) Embed(ctx context.Context, texts []string) ([][]fl
 // MaxEmbeddingInputRunes caps each input to reduce token-limit failures (aligned with prior OpenAI embedder).
 const MaxEmbeddingInputRunes = 30000
 
-// NormalizeTexts trims inputs, replaces empty strings with a minimal token, and truncates by rune count.
+// NormalizeTexts trims inputs, replaces empty strings with a minimal token, and truncates at the
+// legacy flat cap. Prefer NormalizeTextsForModel, which uses the configured model's real limit.
 func NormalizeTexts(texts []string) []string {
+	out, _ := NormalizeTextsWithLimit(texts, MaxEmbeddingInputRunes)
+	return out
+}
+
+// NormalizeTextsForModel is NormalizeTexts with the cap derived from the provider and model.
+// Returns the number of inputs that had to be truncated.
+func NormalizeTextsForModel(texts []string, provider, model string) ([]string, int) {
+	return NormalizeTextsWithLimit(texts, MaxInputRunes(provider, model))
+}
+
+// NormalizeTextsWithLimit trims, substitutes empties, and truncates each input to maxRunes.
+// The second return value is the number of inputs that were truncated — a signal that previously
+// did not exist at all.
+func NormalizeTextsWithLimit(texts []string, maxRunes int) ([]string, int) {
+	if maxRunes <= 0 {
+		maxRunes = MaxEmbeddingInputRunes
+	}
 	inputs := make([]string, len(texts))
+	truncated := 0
 	for i, t := range texts {
 		s := strings.TrimSpace(t)
 		if s == "" {
 			inputs[i] = " "
 			continue
 		}
-		if utf8.RuneCountInString(s) > MaxEmbeddingInputRunes {
+		if utf8.RuneCountInString(s) > maxRunes {
 			runes := []rune(s)
-			s = string(runes[:MaxEmbeddingInputRunes])
+			s = string(runes[:maxRunes])
+			truncated++
 		}
 		inputs[i] = s
 	}
-	return inputs
+	return inputs, truncated
 }
+
+// TruncationCount is the process-wide number of embedding inputs that had to be truncated.
+//
+// This counter is the real deliverable of the input-limit work. The chunker targets MaxTokens 800
+// (~3 200 runes), so primary chunks should be far under any model's limit — which means a non-zero
+// count says the chunker is emitting oversized chunks (Angular templates, or a symbol whose span
+// extraction went wrong). That is a separate bug worth knowing about, and it was previously
+// invisible.
+var truncationCount atomic.Int64
+
+// NoteTruncated records n truncated embedding inputs.
+func NoteTruncated(n int) {
+	if n > 0 {
+		truncationCount.Add(int64(n))
+	}
+}
+
+// TruncationCount returns the number of embedding inputs truncated since process start.
+func TruncationCount() int64 { return truncationCount.Load() }

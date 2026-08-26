@@ -618,6 +618,13 @@ type GatingConfig struct {
 
 // LLMConfig configures the LLM/embedding API used for generation and RAG.
 type LLMConfig struct {
+	// DisableEmbeddingCache turns off the content-addressed embedding memo. Default false (cache
+	// on): a cache miss is exactly the previous behaviour, so enabling costs nothing and re-runs
+	// over unchanged content stop paying the provider. Env: LLM_DISABLE_EMBEDDING_CACHE.
+	DisableEmbeddingCache bool `yaml:"disable_embedding_cache" env:"LLM_DISABLE_EMBEDDING_CACHE"`
+	// EmbeddingCacheRetentionDays prunes cache rows unused for this long. 0 = 30 days.
+	// Env: LLM_EMBEDDING_CACHE_RETENTION_DAYS.
+	EmbeddingCacheRetentionDays int `yaml:"embedding_cache_retention_days" env:"LLM_EMBEDDING_CACHE_RETENTION_DAYS"`
 	// Provider is the provider name: "openai", "anthropic", "azure_openai", etc.
 	Provider string `yaml:"provider" env:"LLM_PROVIDER"`
 

@@ -26,6 +26,7 @@ import (
 	"github.com/asqs/asqs-core/internal/llm"
 	"github.com/asqs/asqs-core/internal/overview"
 	"github.com/asqs/asqs-core/internal/runner"
+	"github.com/asqs/asqs-core/internal/storage/embeddings"
 	"github.com/asqs/asqs-core/internal/testbootstrap"
 	csharpindexer "github.com/asqs/asqs-core/tools/csharp-indexer"
 	javaindexer "github.com/asqs/asqs-core/tools/java-indexer"
@@ -119,10 +120,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	if err != nil {
 		return sum, fmt.Errorf("llm chat client: %w", err)
 	}
-	embedder, err := llm.NewEmbedder(cfg)
+	// The embedder is wrapped in the content-addressed memo: a second run over unchanged content
+	// issues zero embed calls. Every cache failure degrades to "embed it again".
+	embedder, err := llm.NewCachedEmbedder(cfg, emb, emb.Dimension())
 	if err != nil {
 		return sum, fmt.Errorf("llm embedder: %w", err)
 	}
+	// Prune the embedding memo on startup. ~6 KB per cached vector means 1M chunks is ~6 GB, so
+	// an unpruned cache is a slow-motion disk problem. Best-effort: a prune failure must never
+	// prevent a run.
+	pruneEmbeddingCache(emb, cfg.LLM.EmbeddingCacheRetentionDays)
 	if w := llm.DimensionMismatchWarning(cfg, cfg.Database.EmbeddingsDimension); w != "" {
 		fmt.Fprintf(os.Stderr, "pipeline: %s\n", w)
 	}
@@ -842,4 +849,26 @@ func projectIntelForGap(pi *projectintel.Result, piCfg config.ProjectIntelConfig
 	return projectintel.SelectForGapWithLinks(pi.Candidates, targetEmbedding,
 		piCfg.EffectiveMaxDocFiles(), piCfg.EffectiveMaxSkillFiles(), piCfg.EffectiveMaxTotalRunes(),
 		fallback, boost)
+}
+
+// defaultEmbeddingCacheRetentionDays is used when llm.embedding_cache_retention_days is unset.
+const defaultEmbeddingCacheRetentionDays = 30
+
+// pruneEmbeddingCache removes cache rows unused for longer than the configured retention.
+// Best-effort by design: the cache is an optimization, and a failure to prune must not fail a run.
+func pruneEmbeddingCache(store *embeddings.Store, retentionDays int) {
+	if store == nil {
+		return
+	}
+	if retentionDays <= 0 {
+		retentionDays = defaultEmbeddingCacheRetentionDays
+	}
+	n, err := store.PruneEmbeddingCache(context.Background(), time.Duration(retentionDays)*24*time.Hour)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: embedding cache prune: %v (continuing)\n", err)
+		return
+	}
+	if n > 0 {
+		fmt.Fprintf(os.Stderr, "asqs-core: embedding cache: pruned %d row(s) unused for %d day(s)\n", n, retentionDays)
+	}
 }

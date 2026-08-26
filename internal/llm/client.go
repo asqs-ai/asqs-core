@@ -14,6 +14,7 @@ import (
 	llembed "github.com/asqs/asqs-core/internal/llm/embeddings"
 	"github.com/asqs/asqs-core/internal/llm/ollama"
 	"github.com/asqs/asqs-core/internal/llm/openai"
+	"github.com/asqs/asqs-core/internal/storage/embeddings"
 )
 
 // StepDoc is the config step name for doc generation.
@@ -149,6 +150,27 @@ func NewEmbedder(cfg *config.Config) (model.Embedder, error) {
 		return inner, err
 	}
 	return llembed.NewNormalizingEmbedder(inner), nil
+}
+
+// NewCachedEmbedder is NewEmbedder plus the content-addressed memo, when a cache store is available
+// and llm.disable_embedding_cache is not set.
+//
+// The cache wraps the NORMALIZED embedder so a hit is indistinguishable from a fresh embed: cached
+// vectors are already unit length. Caching outside normalization would re-normalize on every hit;
+// caching inside it would store raw vectors that later reads use directly.
+func NewCachedEmbedder(cfg *config.Config, cache llembed.EmbeddingCache, dim int) (model.Embedder, error) {
+	emb, err := NewEmbedder(cfg)
+	if err != nil || emb == nil {
+		return emb, err
+	}
+	if cfg.LLM.DisableEmbeddingCache || cache == nil || dim <= 0 {
+		return emb, nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(cfg.LLM.EmbeddingProvider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))
+	}
+	return llembed.NewCachingEmbedder(emb, cache, provider, cfg.LLM.EmbeddingModel, dim, embeddings.CacheKey), nil
 }
 
 // newRawEmbedder builds the provider embedder without the normalization wrapper.

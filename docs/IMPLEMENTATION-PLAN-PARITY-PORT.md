@@ -308,7 +308,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
-| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
+| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `in review` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `in review` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
 
@@ -1141,7 +1141,7 @@ commits; `symbol_versions` gains one row per changed symbol and none per unchang
 
 ### CP14 — Embedding input limits and embedding cache
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2–3 d · **Risk:** low
 
 **Goal.** Stop re-embedding identical content, and stop silently truncating oversized inputs.
 
@@ -1160,6 +1160,34 @@ commits; `symbol_versions` gains one row per changed symbol and none per unchang
 **Acceptance.** A second index run over an unchanged file issues zero embed calls. Changing the model
 id produces a full miss, not a stale hit. Pruning honours the retention setting and the cache table
 never blocks a run on failure.
+
+**Implementation record (2026-08-26).** All four tasks done.
+
+1. `limits.go` ported whole (per-model token windows with a deliberately SMALL 512-token default
+   for unknown models — over-estimating silently embeds a fraction of the chunk into what is
+   effectively a random vector), plus normalize.go's CP14 half: `NormalizeTextsWithLimit`,
+   `NormalizeTextsForModel`, and the truncation counter. **Faithful to upstream's end state, the
+   counter is unwired**: the providers still call plain `NormalizeTexts`, and
+   `NormalizeTextsForModel` has no production caller upstream either (fusion.go's own comment
+   already names `TruncationCount` as "which nothing reads"). Ported as the machinery it is.
+2. Both cache halves ported whole: `llembed.CachingEmbedder` (wraps the NORMALIZED embedder so a
+   hit is indistinguishable from a fresh embed; every failure path degrades to "embed it again";
+   process-wide hit/miss counters) and the store side (`CacheKey` = sha256 over provider ‖ model
+   ‖ dimension ‖ content — all four in the key; `GetCachedEmbeddings` returns misses on ANY
+   error, `PutCachedEmbeddings` never caches a wrong-dimension vector and never fails the run,
+   `touchCache` refreshes LRU on hits). `embedding_cache` table + LRU index added to schema.sql.
+3. `PruneEmbeddingCache` with the retention setting `llm.embedding_cache_retention_days`
+   (0 = 30 days), pruned at pipeline startup — core's stand-in for upstream's runner-factory
+   site, best-effort with the same wording.
+4. `NewCachedEmbedder` in client.go; the pipeline's embedder is now
+   `NewCachedEmbedder(cfg, emb, emb.Dimension())`. `llm.disable_embedding_cache` (default off =
+   cache on) — a miss is exactly the previous behaviour, which is what makes on-by-default safe.
+- Acceptance: ported unit tests pin second-call-hits-cache, only-misses-reach-the-provider,
+  model-change-is-a-clean-miss, and failure-degrades-to-embedding; a live probe on `asqs_scratch`
+  verified the real table end to end — same-key hit, different-model miss, wrong-dimension
+  vectors never cached, prune honouring retention (aged row pruned at 1h retention; maxAge 0 a
+  no-op). `limits_test.go` covers the window table, tag/version handling, rune-safe truncation
+  and the counter.
 
 ### CP15 — Fail closed on embedding-dimension mismatch
 
