@@ -42,13 +42,6 @@ type Config struct {
 
 	// Audit holds audit log settings (run-scoped step logging for debugging and improvement).
 	Audit AuditConfig `yaml:"audit"`
-
-	// Copilot holds optional GitHub Copilot SDK gap-agent settings. Disabled by default.
-	// When Enabled=true and ProbeAtStartup succeeds, the orchestrator replaces the legacy
-	// LLM-backed Generator/DocGenerator/OverviewDocGenerator/ProjectIntel/Fixer with Copilot
-	// agentic sessions. When disabled or probe fails, the legacy llm.* path is used. See
-	// docs/DOCUMENTATION.md ("Copilot SDK intelligence layer").
-	Copilot CopilotConfig `yaml:"copilot"`
 }
 
 // RetrievalProfileBudget caps context sections for one RetrievalProfile (unit and E2E plans resolve separately using each plan’s active profile).
@@ -211,6 +204,9 @@ type RetrievalConfig struct {
 	PersistLastEvalFailure bool `yaml:"persist_last_eval_failure" env:"RETRIEVAL_PERSIST_LAST_EVAL_FAILURE"`
 	// DisableHybridModuleFilter when true, similar-chunk vector search does not constrain chunk_metadata.module (disables hybrid structured filter). Default false. Env: RETRIEVAL_DISABLE_HYBRID_MODULE_FILTER.
 	DisableHybridModuleFilter bool `yaml:"disable_hybrid_module_filter" env:"RETRIEVAL_DISABLE_HYBRID_MODULE_FILTER"`
+	// DependencyMaxDepth is how many edge hops the dependency-graph walk expands per gap
+	// (0 = built-in 2). Env: RETRIEVAL_DEPENDENCY_MAX_DEPTH.
+	DependencyMaxDepth int `yaml:"dependency_max_depth" env:"RETRIEVAL_DEPENDENCY_MAX_DEPTH"`
 	// Fusion selects how retrieval candidate lists are combined: "dense" (default, previous
 	// behaviour) or "rrf" — dense per-chunk_type lists plus a lexical (tsvector) list, fused by
 	// reciprocal rank. RRF also removes the invalid comparison of raw cosines across chunk_type
@@ -251,169 +247,6 @@ type AuditConfig struct {
 	// the sink stores {sha256, len} for such fields instead. Enable for post-mortems.
 	// Env: ASQS_AUDIT_DUMP_PROMPTS.
 	DumpPrompts bool `yaml:"dump_prompts" env:"AUDIT_DUMP_PROMPTS"`
-}
-
-// CopilotConfig configures the optional GitHub Copilot SDK gap-agent intelligence layer.
-//
-// When Enabled=true and `Validate` succeeds and the runtime probe (ProbeAtStartup) confirms
-// authentication, the orchestrator swaps in Copilot-backed delegates for generation, docs,
-// overview, project intel summarisation, and the LLM fixer. When Enabled=false, missing token,
-// failed validation, or failed probe, the existing `llm.*` path is used unchanged.
-//
-// Embeddings are never sourced from Copilot; `llm.embedding_provider` (or `llm.provider`) must
-// stay configured so the indexer and retrieval keep working. See docs/DOCUMENTATION.md.
-type CopilotConfig struct {
-	// Enabled gates the whole integration. Default false: legacy llm.* path is used.
-	Enabled bool `yaml:"enabled" env:"COPILOT_ENABLED"`
-
-	// Host is the GitHub host the Copilot CLI authenticates against. Empty = github.com. For
-	// GHE.com data residency, set a subdomain like "<tenant>.ghe.com"; for GHES, the appliance
-	// base URL. Wired into the SDK via the Copilot CLI `--host` flag.
-	Host string `yaml:"host" env:"COPILOT_HOST"`
-
-	// TokenFromEnv names an environment variable to read the GitHub token from. Empty falls
-	// back to COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN (in that order). Prefer this to
-	// embedding the token in YAML.
-	TokenFromEnv string `yaml:"token_from_env" env:"COPILOT_TOKEN_FROM_ENV"`
-
-	// Token is the literal token (discouraged outside secret-managed deployments). When set,
-	// overrides TokenFromEnv. Audit redaction lists should treat it as sensitive.
-	Token string `yaml:"token" env:"COPILOT_TOKEN"`
-
-	// CLIPath is an explicit path to the Copilot CLI binary. Empty falls back to the
-	// COPILOT_CLI_PATH env var or the embedded CLI bundled by the SDK.
-	CLIPath string `yaml:"cli_path" env:"COPILOT_CLI_PATH"`
-
-	// CopilotHome overrides the SDK's COPILOT_HOME (config + state directory). Empty =
-	// $HOME/.copilot. Useful in containers where only specific directories are writable.
-	CopilotHome string `yaml:"copilot_home" env:"COPILOT_HOME_DIR"`
-
-	// Model is the default Copilot model id (e.g. "gpt-5", "gpt-5.2-codex", "claude-sonnet-4.5").
-	// Empty = SDK default. Per-step overrides live under Steps.<step>.Model.
-	Model string `yaml:"model" env:"COPILOT_MODEL"`
-
-	// ReasoningEffort hints reasoning depth (low|medium|high|xhigh) for models that support it.
-	// Empty = SDK default.
-	ReasoningEffort string `yaml:"reasoning_effort" env:"COPILOT_REASONING_EFFORT"`
-
-	// RequestTimeout is the per-session deadline (Go duration). Empty = 10m.
-	RequestTimeout string `yaml:"request_timeout" env:"COPILOT_REQUEST_TIMEOUT"`
-
-	// MaxToolRounds caps the number of tool-call rounds the agent may perform inside one
-	// session. 0 = built-in default 40. Lower values keep premium request usage bounded.
-	MaxToolRounds int `yaml:"max_tool_rounds" env:"COPILOT_MAX_TOOL_ROUNDS"`
-
-	// Steps allow opting individual intelligence steps in / out independently of the top-level
-	// Enabled flag (e.g. enable generation + fixer, leave doc + overview on legacy).
-	Steps CopilotSteps `yaml:"steps"`
-
-	// Permissions sets allow / deny lists handed to the Copilot SDK permission handler.
-	Permissions CopilotPermissions `yaml:"permissions"`
-
-	// Telemetry forwards OpenTelemetry settings to the SDK. Optional.
-	Telemetry CopilotTelemetry `yaml:"telemetry"`
-}
-
-// CopilotSteps lets each intelligence step opt in or out independently. Empty step blocks
-// inherit the top-level Copilot.Enabled flag and model. Setting Enabled=false on one step
-// keeps that step on the legacy LLM path even while the others use Copilot.
-type CopilotSteps struct {
-	Generation   CopilotStep `yaml:"generation"`
-	Doc          CopilotStep `yaml:"doc"`
-	Overview     CopilotStep `yaml:"overview"`
-	ProjectIntel CopilotStep `yaml:"project_intel"`
-	Fixer        CopilotStep `yaml:"fixer"`
-}
-
-// CopilotStep is a per-step override block.
-type CopilotStep struct {
-	// Enabled when nil inherits Copilot.Enabled. Explicit true or false overrides for this step.
-	Enabled *bool `yaml:"enabled"`
-	// Model overrides Copilot.Model for this step only. Empty = inherit.
-	Model string `yaml:"model"`
-	// ReasoningEffort overrides Copilot.ReasoningEffort for this step only. Empty = inherit.
-	ReasoningEffort string `yaml:"reasoning_effort"`
-}
-
-// IsEnabledOr returns the step's Enabled field, falling back to topEnabled when the step did
-// not specify one. Used at the selector to decide whether to swap a particular intelligence
-// component.
-func (s CopilotStep) IsEnabledOr(topEnabled bool) bool {
-	if s.Enabled == nil {
-		return topEnabled
-	}
-	return *s.Enabled
-}
-
-// CopilotPermissions translates to allow / deny lists on the SDK PermissionHandler. Defaults
-// are applied at runtime so an empty config still works safely.
-type CopilotPermissions struct {
-	// AllowShellPrefixes are command stems the agent may execute via shell (fixer only). Default:
-	// mvn, ./mvnw, gradle, ./gradlew, dotnet, npm, pnpm, yarn, npx. Generation / doc / overview
-	// / project_intel sessions never allow shell regardless of this list.
-	AllowShellPrefixes []string `yaml:"allow_shell_prefixes"`
-	// DenyShellPrefixes are command stems blocked even when AllowShellPrefixes matches. Default:
-	// "git push", "rm -rf", "sudo".
-	DenyShellPrefixes []string `yaml:"deny_shell_prefixes"`
-	// AllowWriteGlobs adds repo-relative glob patterns the agent may write to in addition to
-	// the per-step defaults (suggested test path for generation, source file for doc, overview
-	// path for overview, artifact + dependency paths for fixer).
-	AllowWriteGlobs []string `yaml:"allow_write_globs"`
-	// AllowUrls lists URL hosts the agent may fetch. Empty = deny all (no network).
-	AllowUrls []string `yaml:"allow_urls"`
-}
-
-// CopilotTelemetry forwards OpenTelemetry configuration to the SDK process.
-type CopilotTelemetry struct {
-	Enabled  bool   `yaml:"enabled"`
-	Endpoint string `yaml:"endpoint"`
-}
-
-// ResolveToken returns the Copilot GitHub token from (in order): cfg.Token literal,
-// os.Getenv(cfg.TokenFromEnv), then standard precedence COPILOT_GITHUB_TOKEN, GH_TOKEN,
-// GITHUB_TOKEN. Returns ("", false) when no source is set.
-func (c CopilotConfig) ResolveToken(lookupEnv func(string) string) (string, bool) {
-	if lookupEnv == nil {
-		lookupEnv = func(string) string { return "" }
-	}
-	if s := strings.TrimSpace(c.Token); s != "" {
-		return s, true
-	}
-	if name := strings.TrimSpace(c.TokenFromEnv); name != "" {
-		if s := strings.TrimSpace(lookupEnv(name)); s != "" {
-			return s, true
-		}
-	}
-	for _, name := range []string{"COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"} {
-		if s := strings.TrimSpace(lookupEnv(name)); s != "" {
-			return s, true
-		}
-	}
-	return "", false
-}
-
-// ValidateForRuntime checks copilot.enabled prerequisites. Returns (ok, reason). When Enabled
-// is false, ok=true regardless. When Enabled is true, a token must resolve and the embeddings
-// path must stay configured on llm.* so the indexer/retrieval keep working. The reason string
-// is suitable for an audit / stderr line (no secrets).
-func (c CopilotConfig) ValidateForRuntime(cfg *Config, lookupEnv func(string) string) (bool, string) {
-	if !c.Enabled {
-		return true, ""
-	}
-	if _, ok := c.ResolveToken(lookupEnv); !ok {
-		return false, "copilot.enabled=true but no token found (set copilot.token_from_env or COPILOT_GITHUB_TOKEN/GH_TOKEN/GITHUB_TOKEN)"
-	}
-	emb := ""
-	if cfg != nil {
-		emb = strings.TrimSpace(cfg.LLM.EmbeddingProvider)
-		if emb == "" {
-			emb = strings.TrimSpace(cfg.LLM.Provider)
-		}
-	}
-	if emb == "" {
-		return false, "copilot.enabled=true requires llm.embedding_provider (or llm.provider) so embeddings keep working; Copilot SDK does not provide embeddings"
-	}
-	return true, ""
 }
 
 // IndexerConfig configures when the indexer runs (schedule and first start) and which language indexer to use.
@@ -561,9 +394,6 @@ type GitHubConfig struct {
 	// BaseURL is the API base URL; set for GitHub Enterprise (e.g. https://github.company.com/api/v3).
 	BaseURL string `yaml:"base_url" env:"GITHUB_BASE_URL"`
 
-	// UploadURL is for uploads (optional, for Enterprise).
-	UploadURL string `yaml:"upload_url" env:"GITHUB_UPLOAD_URL"`
-
 	// DefaultOwner and DefaultRepo are optional defaults for CreatePullRequest when not specified per run.
 	DefaultOwner string `yaml:"default_owner" env:"GITHUB_DEFAULT_OWNER"`
 	DefaultRepo  string `yaml:"default_repo" env:"GITHUB_DEFAULT_REPO"`
@@ -690,9 +520,6 @@ type LLMConfig struct {
 type RunnerConfig struct {
 	// Type is the runner type: "docker" (default), "local", "kubernetes" (future).
 	Type string `yaml:"type" env:"RUNNER_TYPE"`
-
-	// DockerEndpoint is the Docker API endpoint (e.g. unix:///var/run/docker.sock).
-	DockerEndpoint string `yaml:"docker_endpoint" env:"RUNNER_DOCKER_ENDPOINT"`
 
 	// Timeout is the max duration for a single test run (e.g. 5m).
 	Timeout string `yaml:"timeout" env:"RUNNER_TIMEOUT"`

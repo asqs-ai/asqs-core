@@ -316,7 +316,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
+| CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `in review` |
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `in review` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `in review` |
@@ -1292,7 +1292,7 @@ never had came with it.
 
 ### CP17 — Wire compaction, eliminate inert config
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2–3 d · **Risk:** low
 
 **Goal.** Context compaction exists and is not reached; and a class of settings parse, validate,
 document and do nothing.
@@ -1316,6 +1316,40 @@ document and do nothing.
 
 **Acceptance.** Compaction demonstrably runs (counter via CP03). Every new config field added by any
 later bundle in this plan fails the build unless wired in the same change.
+
+**Implementation record (2026-08-26).** All four tasks done; task 3 corrected to upstream's end
+state.
+
+1. Compaction wired: `applyRetrievalContextCompactToFormat` (default ON; explicit `enabled: false`
+   is the one switch the config keeps — the rune caps and merge/dedupe behaviours stay frozen) +
+   `compactPlanContexts` in the pipeline, once per plan after the unit and E2E plans merge, with
+   the `retrieve.context_compacted_total` audit counter. The wiring test pins both directions and
+   that an oversized dependency chunk actually shrinks — the mechanism had ZERO production callers.
+2. `config/retrieval_profile.go` ported (alias table + `NormalizeRetrievalProfileName`, canonical
+   constants) and `validateRetrievalProfiles` hooked into `Validate` in EVERY mode — a typo'd
+   profile silently degraded to java_unit, the most restrictive profile.
+   `retrieval.ParseRetrievalProfile` delegates; `NormalizeRetrievalProfile` stays infallible for
+   internal call sites (the CP22-skipped profiles.go delta, owned here). The v2-schema alias
+   tests in the ported test file are deferred in-file to CP38.
+3. **Correction:** upstream's end state has NO flat `max_context_chunks`/`max_config_chunks`
+   config keys — its config restructure DELETED them as dead ("only the dead flat twins are
+   gone"; the live home is v2's run_hooks). Only `retrieval.dependency_max_depth` is added.
+   Beyond it, `buildPlanOptions` ports upstream's `BuildPlanOptions` mapping wholesale: per-file
+   gap caps, critical/skip prefixes, profiles (with the language-default E2E profile resolution),
+   profile budgets, failure-hint file, hybrid toggle, mono-repo workspace, and the abstention
+   defaults — the section budgets and MMR lambda stay deliberately unmapped (retrieval
+   substitutes its defaults for zero; wiring them would promote unmeasured values).
+4. The inert-field lint (`config_field_usage_test.go`) ported and ADAPTED: core keeps its
+   accessors inside config.go, so the struct-definition file is scanned at FUNCTION-BODY level
+   instead of skipped (upstream's whole-file skip false-flagged accessor-read fields). First run
+   found 38 offenders. Dispositions: **deleted** — the whole enterprise-excluded `copilot` block
+   (Config.Copilot + five types, 163 lines, zero references anywhere) plus
+   `vcs.github.upload_url` and `runner.docker_endpoint` (the exact fields upstream's C1 deleted
+   as dead); **wired** — `indexer.disable_overview_doc_generation` and
+   `indexer.overview_full_rewrite` (trivial gates matching upstream's call sites); **baselined**
+   with TRIAGE owners — 15 entries, each naming the bundle that brings its reader (fixer wave,
+   CP49 generator merge, CP50 static gate, CP60/D15, the compile-only credential seam, CP38
+   deletions). The lint is enforced from this commit on.
 
 ### CP18 — Plan determinism and hot-path lookups
 

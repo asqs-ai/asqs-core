@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
@@ -29,25 +30,33 @@ const (
 	ProfileFullStack RetrievalProfile = "full_stack"
 )
 
-// NormalizeRetrievalProfile maps aliases and defaults empty to java_unit.
+// ParseRetrievalProfile maps aliases to canonical profiles, returning an error for anything
+// unrecognized. Empty is the documented default (java_unit) and is NOT an error.
+//
+// The alias table itself lives in internal/config (this package imports config, so it cannot be the
+// other way round) and is shared with config.Validate, which rejects a bad value at startup rather
+// than letting it silently degrade every run.
+func ParseRetrievalProfile(p RetrievalProfile) (RetrievalProfile, error) {
+	name, err := config.NormalizeRetrievalProfileName(string(p))
+	if err != nil {
+		return "", err
+	}
+	return RetrievalProfile(name), nil
+}
+
+// NormalizeRetrievalProfile maps aliases to canonical profiles.
+//
+// Infallible by design: internal call sites hold a value that config validation already accepted
+// via ParseRetrievalProfile, so re-checking at every use would only add noise. Configuration input
+// must go through ParseRetrievalProfile (or config.Validate) instead — this function still falls
+// back to java_unit for an unrecognized value, which is safe only because validation rejects those
+// before they reach here.
 func NormalizeRetrievalProfile(p RetrievalProfile) RetrievalProfile {
-	s := strings.ToLower(strings.TrimSpace(string(p)))
-	switch s {
-	case "", "java", "java_unit", "java-unit", "unit":
-		return ProfileJavaUnit
-	case "http_api", "http-api", "api", "backend", "nest_api", "spring":
-		return ProfileHTTPAPI
-	case "e2e_playwright", "e2e-playwright", "e2e", "playwright", "ui_test":
-		return ProfileE2EPlaywright
-	case "react_feature", "react-feature", "react", "frontend":
-		return ProfileReactFeature
-	case "nest_module", "nest-module", "nest", "wiring":
-		return ProfileNestModule
-	case "full_stack", "full-stack", "fullstack", "react_http_api", "react-http-api", "ui_and_api":
-		return ProfileFullStack
-	default:
+	out, err := ParseRetrievalProfile(p)
+	if err != nil {
 		return ProfileJavaUnit
 	}
+	return out
 }
 
 func profileUsesInboundExpansion(p RetrievalProfile) bool {

@@ -28,6 +28,7 @@ import (
 	"github.com/asqs/asqs-core/internal/runner"
 	"github.com/asqs/asqs-core/internal/storage/embeddings"
 	"github.com/asqs/asqs-core/internal/testbootstrap"
+	"github.com/asqs/asqs-core/internal/workspace"
 	csharpindexer "github.com/asqs/asqs-core/tools/csharp-indexer"
 	javaindexer "github.com/asqs/asqs-core/tools/java-indexer"
 	jstindexer "github.com/asqs/asqs-core/tools/js-ts-indexer"
@@ -221,15 +222,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 
 	// --- Plan ---------------------------------------------------------------------------
-	planOpts := retrieval.PlanOptions{
-		Lang:       lang,
-		RepoID:     opts.RepoID,
-		MaxGaps:    orDefault(opts.MaxGaps, 10),
-		MaxGapsE2E: opts.MaxGapsE2E,
-		Audit:      audit,
-		// Candidate-list fusion; empty/dense is the measured default (see retrieval.fusion).
-		Fusion: cfg.Retrieval.Fusion,
-	}
+	planOpts := buildPlanOptions(cfg, lang, opts.RepoID)
+	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
+	planOpts.MaxGapsE2E = opts.MaxGapsE2E
+	planOpts.Audit = audit
 	plan, err := retrieval.CreateTestPlan(ctx, meta, meta, emb, planOpts)
 	if err != nil {
 		return sum, fmt.Errorf("plan: %w", err)
@@ -293,6 +289,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
+	applyRetrievalContextCompactToFormat(&cfg.Retrieval, &formatOpts)
+	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
+	// same shrunken context and the cost is paid once per item.
+	compactPlanContexts(ctx, formatOpts, audit, plan)
 	rules := contract.ByLang(lang)
 	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
 	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).
@@ -349,11 +349,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var overviewWG sync.WaitGroup
 	var overviewContent, overviewPath string
 	var overviewErr error
-	if opts.GenerateDocs {
+	if opts.GenerateDocs && !cfg.Indexer.DisableOverviewDocGeneration {
 		og := &overview.LLMOverviewDocGenerator{
 			LLM:                     chat,
 			Path:                    strings.TrimSpace(cfg.Indexer.OverviewDocPath),
 			MaxCompletionTokensFull: cfg.Indexer.OverviewMaxCompletionTokens,
+			FullRewrite:             cfg.Indexer.OverviewFullRewrite,
 		}
 		overviewWG.Add(1)
 		go func() {
@@ -870,5 +871,169 @@ func pruneEmbeddingCache(store *embeddings.Store, retentionDays int) {
 	}
 	if n > 0 {
 		fmt.Fprintf(os.Stderr, "asqs-core: embedding cache: pruned %d row(s) unused for %d day(s)\n", n, retentionDays)
+	}
+}
+
+// buildPlanOptions maps config onto retrieval.PlanOptions — the config-reading half CP17 exists
+// for: these keys parsed, validated and documented while the planner ran on built-in defaults.
+//
+// The section budgets (max_similar_tests, max_dependency_chunks, max_fixtures) and the MMR lambda
+// are deliberately LEFT AT ZERO here: retrieval substitutes its Default* constants for a zero,
+// which is exactly what every shipped config resolved to, and upstream's config restructure froze
+// those keys pending an A/B. Wiring them now would promote unmeasured defaults (rule 10).
+func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval.PlanOptions {
+	lang := strings.TrimSpace(workflowLang)
+	if lang == "" {
+		lang = "java"
+	}
+	if cfg == nil {
+		return retrieval.PlanOptions{Lang: lang, RepoID: repoID}
+	}
+	p := retrieval.PlanOptions{
+		Lang:                      lang,
+		RepoID:                    repoID,
+		MaxGaps:                   cfg.Indexer.MaxGaps,
+		MaxGapsPerFile:            cfg.Indexer.MaxGapsPerFile,
+		MaxGapsE2E:                cfg.Indexer.MaxGapsE2E,
+		MaxGapsPerFileE2E:         cfg.Indexer.MaxGapsPerFileE2E,
+		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang),
+		CriticalModulePrefixes:    cfg.Indexer.CriticalModulePrefixes,
+		SkipPathPrefixes:          cfg.Indexer.SkipPathPrefixes,
+		DependencyMaxDepth:        cfg.Retrieval.DependencyMaxDepth,
+		Fusion:                    cfg.Retrieval.Fusion,
+		ProfileBudgets:            retrieval.NormalizeProfileBudgetsMap(cfg.Retrieval.ProfileBudgets),
+		RetrievalProfile:          cfg.Retrieval.Profile,
+		FailureHintFile:           strings.TrimSpace(cfg.Retrieval.FailureHintFile),
+		DisableHybridModuleFilter: cfg.Retrieval.DisableHybridModuleFilter,
+	}
+	if m, err := workspace.NormalizeMonoRepoWorkspace(cfg.Indexer.MonoRepoWorkspace); err == nil && m != "" {
+		p.MonoRepoGapPrefix = m
+	}
+	applyRetrievalAbstentionDefaults(&cfg.Retrieval, &p)
+	return p
+}
+
+// defaultRetrievalProfileE2E resolves the E2E retrieval profile: explicit profile_e2e, else the
+// unit profile, else a language default (http_api for backends, e2e_playwright otherwise).
+func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string {
+	if cfg == nil {
+		return string(retrieval.ProfileE2EPlaywright)
+	}
+	if s := strings.TrimSpace(cfg.Retrieval.ProfileE2E); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(cfg.Retrieval.Profile); s != "" {
+		return s
+	}
+	switch strings.ToLower(strings.TrimSpace(workflowLang)) {
+	case "java", "csharp", "cs":
+		return string(retrieval.ProfileHTTPAPI)
+	default:
+		return string(retrieval.ProfileE2EPlaywright)
+	}
+}
+
+// applyRetrievalAbstentionDefaults sets PlanOptions sufficiency fields from config.
+// When abstention_disabled is false (default), zero YAML/env values become meaningful defaults
+// (at least one similar-reference chunk; cosine ≥ 0.5 when target has an embedding).
+func applyRetrievalAbstentionDefaults(rc *config.RetrievalConfig, p *retrieval.PlanOptions) {
+	if rc == nil || p == nil {
+		return
+	}
+	if rc.AbstentionDisabled {
+		p.MinSimilarTestsForGeneration = 0
+		p.MinSimilarityCosine = 0
+		return
+	}
+	switch {
+	case rc.MinSimilarTestsForGeneration == -1:
+		p.MinSimilarTestsForGeneration = 0
+	case rc.MinSimilarTestsForGeneration <= 0:
+		p.MinSimilarTestsForGeneration = retrieval.DefaultAbstentionMinSimilarTests
+	default:
+		p.MinSimilarTestsForGeneration = rc.MinSimilarTestsForGeneration
+	}
+	if rc.MinSimilarityCosine < 0 {
+		p.MinSimilarityCosine = 0
+	} else if rc.MinSimilarityCosine == 0 {
+		p.MinSimilarityCosine = retrieval.DefaultAbstentionMinSimilarityCosine
+	} else {
+		p.MinSimilarityCosine = rc.MinSimilarityCosine
+	}
+}
+
+// applyRetrievalContextCompactToFormat copies retrieval.context_compact into
+// FormatOptions.ContextCompact. Everything except the on/off switch is frozen: the rune caps fall
+// through to retrieval's DefaultCompact* constants at zero, and the merge/dedupe behaviours stay
+// off until an A/B earns them a different default.
+func applyRetrievalContextCompactToFormat(rc *config.RetrievalConfig, fo *retrieval.FormatOptions) {
+	if rc == nil || fo == nil {
+		return
+	}
+	enabled := true
+	if rc.ContextCompact.Enabled != nil {
+		enabled = *rc.ContextCompact.Enabled
+	}
+	fo.ContextCompact = retrieval.ContextCompactOptions{Enabled: enabled}
+}
+
+// compactPlanContexts applies retrieval.CompactRetrievalContext to every plan item's context.
+//
+// This is the production call site for context compaction. Before it existed, the whole mechanism
+// — the deterministic merging/deduping/truncation, its tests, and the full YAML plumbing through
+// config.ContextCompactConfig — had ZERO production callers: FormatOptions.ContextCompact was
+// written and never read, so tuning retrieval.context_compact did nothing at all.
+//
+// It runs once per plan, after the unit and E2E plans are merged and before the generation
+// fan-out, so the cost is paid once per item, test generation and the doc pass see the same
+// compacted context, and the audit counters describe the whole run. The compaction never touches
+// the target method, the target class, or the failure hint — see context_compact.go.
+func compactPlanContexts(ctx context.Context, formatOpts retrieval.FormatOptions, audit interface {
+	Log(ctx context.Context, step string, payload interface{})
+}, plan *retrieval.TestPlan) {
+	if plan == nil || len(plan.Items) == 0 {
+		return
+	}
+	compactOpts := formatOpts.ContextCompact
+	if !compactOpts.Enabled {
+		return
+	}
+	var (
+		items          int
+		runesBefore    int64
+		runesAfter     int64
+		depsMerged     int
+		headersDeduped int
+		chunksTrimmed  int
+	)
+	for _, item := range plan.Items {
+		if item == nil || item.Context == nil {
+			continue
+		}
+		stats := retrieval.CompactRetrievalContext(item.Context, compactOpts)
+		items++
+		runesBefore += stats.InputContentRunes
+		runesAfter += stats.OutputContentRunes
+		depsMerged += stats.MergedDependencyFileGroups
+		headersDeduped += stats.DedupedBoilerplateChunks
+		chunksTrimmed += stats.TruncatedChunks
+	}
+	if audit != nil && items > 0 {
+		saved := runesBefore - runesAfter
+		var pct int64
+		if runesBefore > 0 {
+			pct = saved * 100 / runesBefore
+		}
+		audit.Log(ctx, "retrieve.context_compacted_total", map[string]interface{}{
+			"message":          "Compacted retrieval context before generation.",
+			"items":            items,
+			"runes_before":     runesBefore,
+			"runes_after":      runesAfter,
+			"runes_saved":      saved,
+			"percent_saved":    pct,
+			"chunks_merged":    depsMerged,
+			"headers_deduped":  headersDeduped,
+			"chunks_truncated": chunksTrimmed,
+		})
 	}
 }

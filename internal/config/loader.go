@@ -235,6 +235,10 @@ func Validate(c *Config, mode string) error {
 	if err := c.Runner.Policy.ValidatePolicy(); err != nil {
 		errs = append(errs, err.Error())
 	}
+	// Retrieval profile names fail closed in every mode — see validateRetrievalProfiles: a typo'd
+	// profile silently degrades to java_unit, the most restrictive profile, and that regression
+	// arrives without a warning.
+	errs = append(errs, validateRetrievalProfiles(c)...)
 	if c.Database.MetadataURL == "" {
 		errs = append(errs, "database.metadata_url (or ASQS_DATABASE_METADATA_URL)")
 	}
