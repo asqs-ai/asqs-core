@@ -55,10 +55,13 @@ func BuiltinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 
 func mavenToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 	return ToolchainProfile{
-		ID:               id,
-		Image:            img,
-		Restore:          []string{"mvn", "-q", "-B", "dependency:go-offline"},
-		Compile:          []string{"mvn", "-q", "-B", "-DskipTests", "compile"},
+		ID:      id,
+		Image:   img,
+		Restore: []string{"mvn", "-q", "-B", "dependency:go-offline"},
+		// test-compile (not compile) so the compile step also builds the generated TEST sources:
+		// otherwise a syntax error in a generated test only surfaces in the test phase as a
+		// confusing "Compile ok" followed by a COMPILATION ERROR. -DskipTests keeps it compile-only.
+		Compile:          []string{"mvn", "-q", "-B", "-DskipTests", "test-compile"},
 		Test:             []string{"mvn", "-q", "-B", "test"},
 		Coverage:         []string{"mvn", "-q", "-B", "test", "jacoco:report"},
 		CacheTargetPaths: []string{"/root/.m2"},
@@ -68,10 +71,12 @@ func mavenToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 
 func gradleToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 	return ToolchainProfile{
-		ID:               id,
-		Image:            img,
-		Restore:          []string{"./gradlew", "--no-daemon", "-q", "dependencies"},
-		Compile:          []string{"./gradlew", "--no-daemon", "-q", "compileJava"},
+		ID:      id,
+		Image:   img,
+		Restore: []string{"./gradlew", "--no-daemon", "-q", "dependencies"},
+		// compileTestJava (depends on compileJava) so the compile step also builds the generated
+		// TEST sources — see the Maven note above. The `./gradlew` wrapper is CP32's to remove.
+		Compile:          []string{"./gradlew", "--no-daemon", "-q", "compileTestJava"},
 		Test:             []string{"./gradlew", "--no-daemon", "-q", "test"},
 		Coverage:         []string{"./gradlew", "--no-daemon", "-q", "test", "jacocoTestReport"},
 		CacheTargetPaths: []string{"/root/.gradle"},

@@ -126,7 +126,7 @@ func (s *Sandbox) runDockerDotNetFormatIncludeBatch(ctx context.Context, absGit 
 		return fmt.Errorf("format (docker): %w", derr)
 	}
 	// TFM props on exec-form argv before docker shell wrapping so we can derive a matching `dotnet restore`.
-	argv, derr = applyDotnetDockerTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
+	argv, derr = applyDotnetEvalTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
 	if derr != nil {
 		return fmt.Errorf("format (docker): %w", derr)
 	}
@@ -136,8 +136,8 @@ func (s *Sandbox) runDockerDotNetFormatIncludeBatch(ctx context.Context, absGit 
 	}
 	didRestore := false
 	if rargv0 := dotnetRestoreArgvFromFormatArgv(argv); rargv0 != nil {
-		rargv := ApplyDotnetDockerDisableNuGetAudit(append([]string(nil), rargv0...))
-		rargv, derr = ensureDotnetDockerInvocation(p, rargv, absCwd)
+		rargv := ApplyDotnetDisableNuGetAudit(append([]string(nil), rargv0...))
+		rargv, derr = ensureDotnetInvocation(p, rargv, absCwd)
 		if derr != nil {
 			return fmt.Errorf("format (docker): %w", derr)
 		}
@@ -155,11 +155,11 @@ func (s *Sandbox) runDockerDotNetFormatIncludeBatch(ctx context.Context, absGit 
 	if didRestore {
 		argv = dotnetFormatArgvInsertNoRestore(argv)
 	}
-	argv, derr = ensureDotnetDockerInvocation(p, argv, absCwd)
+	argv, derr = ensureDotnetInvocation(p, argv, absCwd)
 	if derr != nil {
 		return fmt.Errorf("format (docker): %w", derr)
 	}
-	argv = ApplyDotnetDockerDisableNuGetAudit(argv)
+	argv = ApplyDotnetDisableNuGetAudit(argv)
 
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=FormatAfterFix phase=main argv=[%s] network=%s (include)\n", strings.Join(argv, " "), net)
 	res, runErr := s.runDockerJobWithTimeout(ctx, absGit, p, argv, net, dockerImageNeedsPlaywrightIPC(p.Image), timeout)
@@ -208,15 +208,15 @@ func (s *Sandbox) runDockerFormatAfterFix(ctx context.Context, gitRootAbs, lang,
 	}
 	if p.ID == profile.CSharpDotnet {
 		var derr error
-		argv, derr = ensureDotnetDockerInvocation(p, argv, absCwd)
+		argv, derr = ensureDotnetInvocation(p, argv, absCwd)
 		if derr != nil {
 			return fmt.Errorf("format (docker): %w", derr)
 		}
-		argv, derr = applyDotnetDockerTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
+		argv, derr = applyDotnetEvalTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
 		if derr != nil {
 			return fmt.Errorf("format (docker): %w", derr)
 		}
-		argv = ApplyDotnetDockerDisableNuGetAudit(argv)
+		argv = ApplyDotnetDisableNuGetAudit(argv)
 	}
 
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=FormatAfterFix phase=main argv=[%s] network=%s\n", strings.Join(argv, " "), net)

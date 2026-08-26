@@ -23,77 +23,26 @@ import (
 // upstream unification plan's four rows: 1 toolchain provenance, 2 filesystem isolation, 4
 // credential location, 5 machine-global blast radius) or the CP bundle that removes the entry.
 var permittedDifferences = map[string]string{
-	// CP31 — restore stage on local; unified JS/Java/.NET command construction (U2a/U2b/U4);
-	// coverage argv and report paths from one source.
-	"dotnet-multitarget/Argv[compile]":                        "CP31",
-	"dotnet-multitarget/Argv[coverage]":                       "CP31",
-	"dotnet-multitarget/Argv[test]":                           "CP31",
-	"dotnet-multitarget/Restore":                              "CP31",
-	"dotnet-overrides/Argv[compile]":                          "CP31",
-	"dotnet-overrides/Argv[coverage]":                         "CP31",
-	"dotnet-overrides/Argv[test]":                             "CP31",
-	"dotnet-overrides/Restore":                                "CP31",
-	"dotnet/Argv[compile]":                                    "CP31",
-	"dotnet/Argv[coverage]":                                   "CP31",
-	"dotnet/Argv[test]":                                       "CP31",
-	"dotnet/Restore":                                          "CP31",
-	"gradle/CoverageReportPaths":                              "CP31",
-	"gradle/Restore":                                          "CP31",
-	"java-both-build-files-forced-gradle/CoverageReportPaths": "CP31",
-	"java-both-build-files-forced-gradle/Restore":             "CP31",
-	"java-no-jacoco/Argv[compile]":                            "CP31",
-	"java-no-jacoco/Argv[test]":                               "CP31",
-	"java-no-jacoco/CoverageReportPaths":                      "CP31",
-	"java-no-jacoco/Restore":                                  "CP31",
-	"js-build-runs-start/Argv[compile]":                       "CP31",
-	"js-build-runs-start/Argv[coverage]":                      "CP31",
-	"js-build-runs-start/Argv[test]":                          "CP31",
-	"js-build-runs-start/Restore":                             "CP31",
-	"js-nest-no-build/Argv[compile]":                          "CP31",
-	"js-nest-no-build/Argv[coverage]":                         "CP31",
-	"js-nest-no-build/Argv[test]":                             "CP31",
-	"js-nest-no-build/Restore":                                "CP31",
-	"js-no-package-json/Toolchain":                            "CP31",
-	"js-no-test-script/Argv[compile]":                         "CP31",
-	"js-no-test-script/Argv[coverage]":                        "CP31",
-	"js-no-test-script/Argv[test]":                            "CP31",
-	"js-no-test-script/Restore":                               "CP31",
-	"js-test-coverage-only/Argv[compile]":                     "CP31",
-	"js-test-coverage-only/Argv[coverage]":                    "CP31",
-	"js-test-coverage-only/Argv[test]":                        "CP31",
-	"js-test-coverage-only/Restore":                           "CP31",
-	"maven-overrides/CoverageReportPaths":                     "CP31",
-	"maven-overrides/Restore":                                 "CP31",
-	"maven/Argv[compile]":                                     "CP31",
-	"maven/Argv[coverage]":                                    "CP31",
-	"maven/Argv[test]":                                        "CP31",
-	"maven/CoverageReportPaths":                               "CP31",
-	"maven/Restore":                                           "CP31",
-	"mono-repo-subpath/Argv[compile]":                         "CP31",
-	"mono-repo-subpath/Argv[coverage]":                        "CP31",
-	"mono-repo-subpath/Argv[test]":                            "CP31",
-	"mono-repo-subpath/CoverageReportPaths":                   "CP31",
-	"mono-repo-subpath/Restore":                               "CP31",
-	"npm/Argv[compile]":                                       "CP31",
-	"npm/Argv[coverage]":                                      "CP31",
-	"npm/Argv[test]":                                          "CP31",
-	"npm/Restore":                                             "CP31",
-	"pnpm/Argv[compile]":                                      "CP31",
-	"pnpm/Argv[coverage]":                                     "CP31",
-	"pnpm/Argv[test]":                                         "CP31",
-	"pnpm/Restore":                                            "CP31",
-	"yarn/Argv[compile]":                                      "CP31",
-	"yarn/Argv[coverage]":                                     "CP31",
-	"yarn/Argv[test]":                                         "CP31",
-	"yarn/Restore":                                            "CP31",
+	// PERMITTED (§1 row 5, machine-global blast radius): the Docker target appends
+	// `dotnet build-server shutdown` after `dotnet test`. That kills EVERY MSBuild/Roslyn node on
+	// the machine — in a container that is the container, on a host it would reach a concurrent
+	// run or the operator's IDE. Everything else in these argv is byte-identical since CP31.
+	// Permanent: no bundle removes these entries.
+	"dotnet-multitarget/Argv[coverage]": "§1-5",
+	"dotnet-multitarget/Argv[test]":     "§1-5",
+	"dotnet/Argv[coverage]":             "§1-5",
+	"dotnet/Argv[test]":                 "§1-5",
 
-	// CP32 — build-tool resolution honoured on both targets; wrapper-free argv (U3/U3b).
+	// CP32 — build-tool resolution honoured on both targets; wrapper-free argv (U3/U3b). The
+	// forced-gradle restore row is the build_tool half: Docker restores from the Maven profile
+	// while local obeys build_tool and restores with Gradle.
 	"gradle/Argv[compile]":                               "CP32",
 	"gradle/Argv[coverage]":                              "CP32",
 	"gradle/Argv[test]":                                  "CP32",
 	"java-both-build-files-forced-gradle/Argv[compile]":  "CP32",
 	"java-both-build-files-forced-gradle/Argv[coverage]": "CP32",
 	"java-both-build-files-forced-gradle/Argv[test]":     "CP32",
+	"java-both-build-files-forced-gradle/Restore":        "CP32",
 	"java-both-build-files-forced-gradle/Toolchain":      "CP32",
 
 	// CP33 — step environment parity: Docker sets CI=true (+ .NET hygiene vars) on every step,
@@ -118,9 +67,8 @@ var permittedDifferences = map[string]string{
 	"java-no-jacoco/Env[test]":                          "CP33",
 	"js-build-runs-start/Env[compile]":                  "CP33",
 	"js-nest-no-build/Env[compile]":                     "CP33",
+	"js-no-package-json/Env[compile]":                   "CP33",
 	"js-no-test-script/Env[compile]":                    "CP33",
-	"js-no-test-script/Env[coverage]":                   "CP33",
-	"js-no-test-script/Env[test]":                       "CP33",
 	"js-test-coverage-only/Env[compile]":                "CP33",
 	"maven-overrides/Env[compile]":                      "CP33",
 	"maven-overrides/Env[coverage]":                     "CP33",
@@ -134,14 +82,6 @@ var permittedDifferences = map[string]string{
 	"npm/Env[compile]":                                  "CP33",
 	"pnpm/Env[compile]":                                 "CP33",
 	"yarn/Env[compile]":                                 "CP33",
-
-	// CP34 — skip/fail policy, JaCoCo coverage skip, and result parity (U7/U8).
-	"java-no-jacoco/Argv[coverage]":         "CP34",
-	"js-no-package-json/Decision[compile]":  "CP34",
-	"js-no-package-json/Decision[coverage]": "CP34",
-	"js-no-package-json/Decision[test]":     "CP34",
-	"js-no-test-script/Decision[coverage]":  "CP34",
-	"js-no-test-script/Decision[test]":      "CP34",
 }
 
 // planParityFixture is one repository shape, planned for both targets from one Sandbox config.

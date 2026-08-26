@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -16,15 +17,14 @@ import (
 // place for them to disagree. The parity harness exploits the method form directly: it builds one
 // Sandbox, flips Type, and plans twice.
 //
-// Delegation is the point. The Docker branch calls profile.ResolveToolchain, ApplyCommandOverrides,
-// dockerArgvForStep and the same .NET patch chain that runDockerEvalWithImageOverride calls; the
-// local branch calls localBuildCommand, jsLocalCommand and dotnetShellLineWithProject, which are
-// the only places runLocalCompile/Test/Coverage obtain argv. Nothing here re-derives a command, so
-// a plan cannot describe something the sandbox would not actually run.
+// Delegation is the point. The Docker branch calls profile.ResolveToolchain, ApplyCommandOverrides
+// and the same .NET patch chain the executor applies; the local branch calls localBuildCommand and
+// the shared JS planner. Since CP31 both executors RUN what the plan records — the plan is the
+// single source of argv, restore and skip/fail decisions — so a plan cannot describe something
+// the sandbox would not actually run.
 //
-// This is the CP30 state of the planner: it describes core's two targets AS THEY ARE, and the
-// parity whitelist enumerates their disagreements. CP31–CP35 move both the executors and this
-// planner together, shrinking the whitelist to the structural rows.
+// CP32–CP35 continue to converge the two targets (wrappers, env, policy, dead code), shrinking the
+// parity whitelist to the structural rows.
 func (s *Sandbox) buildStepPlan(gitRootAbs, lang, imageOverride string) (StepPlan, error) {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	abs, err := filepath.Abs(strings.TrimSpace(gitRootAbs))
@@ -39,7 +39,7 @@ func (s *Sandbox) buildStepPlan(gitRootAbs, lang, imageOverride string) (StepPla
 	switch strings.ToLower(strings.TrimSpace(s.Type)) {
 	case string(TargetLocal):
 		plan.Target = TargetLocal
-		s.planLocal(&plan, s.evalHostCwd(abs))
+		s.planLocal(&plan, abs, s.evalHostCwd(abs))
 	case string(TargetDocker):
 		plan.Target = TargetDocker
 		s.planDocker(&plan, abs, s.evalHostCwd(abs), imageOverride)
@@ -52,15 +52,30 @@ func (s *Sandbox) buildStepPlan(gitRootAbs, lang, imageOverride string) (StepPla
 }
 
 // ---------------------------------------------------------------------------
-// Docker — mirrors runDockerEvalWithImageOverride
+// Docker
 // ---------------------------------------------------------------------------
 
 func (s *Sandbox) planDocker(plan *StepPlan, absGitRoot, absCwd, imageOverride string) {
+	// One JS planner for both targets (CP31), reached BEFORE the toolchain-resolution guard below.
+	// A JS repo with no package.json makes ResolveToolchain fail, and bailing there produced a
+	// plan with no toolchain, no restore and a differently-worded skip than local's — a divergence
+	// in the very case where both targets do exactly nothing.
+	if isJSLang(plan.Lang) {
+		if p, err := profile.ResolveToolchain(absCwd, plan.Lang, s.EvalProfile,
+			s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet); err == nil {
+			if v := strings.TrimSpace(imageOverride); v != "" {
+				p.Image = v
+			}
+			plan.Image = p.Image
+			plan.Profile = p
+		}
+		s.planJS(plan, absCwd)
+		return
+	}
 	p, err := profile.ResolveToolchain(absCwd, plan.Lang, s.EvalProfile,
 		s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet)
 	if err != nil {
-		// Production reports this exact skip per step invocation; CP34 unifies the wording with
-		// the local target's.
+		// CP34 unifies this wording with the local target's unsupported-lang skip.
 		for _, step := range planSteps {
 			plan.Decisions[step] = skipStep(fmt.Sprintf("skip (docker: %v)", err))
 		}
@@ -73,17 +88,18 @@ func (s *Sandbox) planDocker(plan *StepPlan, absGitRoot, absCwd, imageOverride s
 	plan.Toolchain = p.ID
 	plan.Image = p.Image
 	plan.Profile = p
+	plan.CoverageReportPaths = coverageReportPathsFor(p.ID)
 
 	env := dockerJobEnv(p, s.DockerEvalExtraEnv)
 	for _, step := range planSteps {
 		plan.Env[step] = append([]string(nil), env...)
 	}
 
-	// Core's Docker executor runs the restore phase before EVERY step invocation (no memo until
-	// CP31); the plan records the argv once, with the same patch chain production applies.
 	plan.RestoreDecision = runStep()
+	plan.RestoreKey = restoreKeyFor(absCwd, p.ID, absCwd)
 	if len(p.Restore) > 0 {
-		restore, rerr := s.patchDotnetDockerEvalArgv(p, append([]string(nil), p.Restore...), absGitRoot, absCwd)
+		restore, rerr := s.patchDotnetEvalArgv(p, append([]string(nil), p.Restore...), absGitRoot, absCwd, TargetDocker)
+		restore = s.applyDotnetContainerProvisioning(p, restore, absGitRoot, absCwd)
 		if rerr != nil {
 			// Production fails the STEP when the restore argv cannot be resolved; it is not the
 			// same as a restore that runs and exits non-zero, which stays best-effort.
@@ -94,77 +110,83 @@ func (s *Sandbox) planDocker(plan *StepPlan, absGitRoot, absCwd, imageOverride s
 	}
 
 	for _, step := range planSteps {
-		plan.Decisions[step] = s.planDockerStep(plan, p, step, absGitRoot, absCwd)
+		plan.Decisions[step] = s.planProfileStep(plan, p, step, absGitRoot, absCwd, TargetDocker)
 	}
 }
 
-func (s *Sandbox) planDockerStep(plan *StepPlan, p profile.ToolchainProfile, step evaluator.SandboxStep, absGitRoot, absCwd string) StepDecision {
-	if step == evaluator.StepCompile && isJSLang(plan.Lang) && !pathExists(filepath.Join(absCwd, "package.json")) {
-		return skipStep("skip (no package.json)")
+// planProfileStep plans one step from a toolchain profile, for either target. Docker uses it for
+// Java and C#; local uses it for C#, where the argv chain is identical apart from the
+// container-provisioning prepends and the post-test build-server shutdown.
+func (s *Sandbox) planProfileStep(plan *StepPlan, p profile.ToolchainProfile, step evaluator.SandboxStep, absGitRoot, absCwd string, target Target) StepDecision {
+	if step == evaluator.StepCoverage && isJavaToolchain(p.ID) && !javaBuildFileDeclaresJaCoCo(absCwd) {
+		// Without the plugin there is no report to produce, so the coverage step could only re-run
+		// the suite the test step already ran — and Maven fails outright with "No plugin found for
+		// prefix 'jacoco'". Local has always skipped; Docker appended jacoco:report regardless.
+		return skipStep("skip (no JaCoCo plugin declared in the build file)")
 	}
 	argv := dockerArgvForStep(s, p, step)
 	if len(argv) == 0 {
 		return skipStep("skip (no command)")
 	}
-	argv, err := s.patchDotnetDockerEvalArgv(p, argv, absGitRoot, absCwd)
+	argv, err := s.patchDotnetEvalArgv(p, argv, absGitRoot, absCwd, target)
 	if err != nil {
 		return failStep(err.Error())
 	}
 	if p.ID == profile.CSharpDotnet && (step == evaluator.StepTest || step == evaluator.StepCoverage) {
-		argv = ApplyDotnetTestDockerHangMitigationProps(argv)
-		argv = ApplyDotnetTestDockerVSTestCLIArgs(argv, s.jobTimeout())
-		// `dotnet build-server shutdown` kills EVERY MSBuild/Roslyn node on the machine, not just
-		// this step's. In a container that is the container; on a host it would reach a concurrent
-		// run or the operator's IDE. §1 row 5 — machine-global blast radius is a permitted
-		// difference, and one the local target must not acquire silently.
-		argv = WrapDotnetDockerTestWithBuildServerShutdown(argv)
+		argv = ApplyDotnetTestHangMitigationProps(argv)
+		argv = ApplyDotnetTestVSTestCLIArgs(argv, s.jobTimeout())
+		if target == TargetDocker {
+			// `dotnet build-server shutdown` kills EVERY MSBuild/Roslyn node on the machine, not
+			// just this step's. In a container that is the container; on a host it would reach a
+			// concurrent run or the operator's IDE. §1 row 5 — machine-global blast radius is a
+			// permitted difference, and one the local target must not acquire silently.
+			argv = WrapDotnetTestWithBuildServerShutdown(argv)
+		}
+	}
+	if target == TargetDocker {
+		argv = s.applyDotnetContainerProvisioning(p, argv, absGitRoot, absCwd)
 	}
 	plan.setArgv(step, argv)
 	return runStep()
 }
 
 // ---------------------------------------------------------------------------
-// Local — mirrors runLocalCompile/Test/Coverage
+// Local
 // ---------------------------------------------------------------------------
 
-func (s *Sandbox) planLocal(plan *StepPlan, absCwd string) {
+func (s *Sandbox) planLocal(plan *StepPlan, absGitRoot, absCwd string) {
 	switch {
 	case isCSharpLang(plan.Lang):
 		plan.Toolchain = profile.CSharpDotnet
-		s.planLocalDotnet(plan, absCwd)
+		s.planLocalDotnet(plan, absGitRoot, absCwd)
+		return
 	case isJSLang(plan.Lang):
-		plan.Toolchain = detectLocalJSToolchain(absCwd)
-		s.planLocalJS(plan, absCwd)
+		s.planJS(plan, absCwd)
+		return
 	case plan.Lang == "java":
 		plan.Toolchain = detectLocalJavaToolchain(absCwd, s.BuildTool)
 		s.planLocalJava(plan, absCwd)
-		plan.CoverageReportPaths = localJavaCoverageReportPaths()
+		plan.CoverageReportPaths = coverageReportPathsFor(plan.Toolchain)
 	default:
 		for _, step := range planSteps {
 			plan.Decisions[step] = skipStep("skip (unsupported lang)")
 		}
+		return
 	}
+	// CP31: local restores too, from the SAME toolchain profile the Docker target reads, so the
+	// two argv cannot drift.
+	plan.RestoreDecision = runStep()
+	plan.Restore = restoreArgvFor(plan.Toolchain)
+	plan.RestoreKey = restoreKeyFor(absCwd, plan.Toolchain, absCwd)
 }
 
-// planLocalJava mirrors runLocalCompile/Test/Coverage's Java branch, including its asymmetries: a
-// compile or test that cannot resolve a command FAILS while a coverage that cannot is a SKIP, and
-// the coverage step runs the plain "test" goal (there is no separate local coverage goal yet —
-// CP31).
+// planLocalJava mirrors the local Java executor's semantics, including its asymmetry: a compile or
+// test that cannot resolve a command FAILS, while a coverage that cannot is a SKIP.
 func (s *Sandbox) planLocalJava(plan *StepPlan, absCwd string) {
 	for _, step := range planSteps {
-		// runLocalCoverage passes the plain "test" goal to localBuildCommand — a "coverage" goal
-		// would fall through to the compile arguments there. Only the JS path has a coverage goal.
-		goal := "test"
-		if step == evaluator.StepCompile {
-			goal = "compile"
-		}
-		cmd, err := localBuildCommand(absCwd, goal, s.BuildTool, s.CompileCommand, s.TestCommand)
+		cmd, err := localBuildCommand(absCwd, localGoalFor(step), s.BuildTool, s.CompileCommand, s.TestCommand)
 		if err != nil {
-			if step == evaluator.StepCoverage {
-				plan.Decisions[step] = skipStep("no build tool")
-			} else {
-				plan.Decisions[step] = failStep(err.Error())
-			}
+			plan.Decisions[step] = localJavaFailure(step, err)
 			continue
 		}
 		plan.setArgv(step, cmd.Args)
@@ -172,69 +194,55 @@ func (s *Sandbox) planLocalJava(plan *StepPlan, absCwd string) {
 	}
 }
 
-// planLocalJS mirrors runJSCompile/runJSTest/runJSCoverage, whose three error branches disagree
-// with one another: compile turns a missing build script into a SKIP, coverage turns any
-// resolution error into a SKIP, and test turns it into a FAIL. CP34 settles this.
-func (s *Sandbox) planLocalJS(plan *StepPlan, absCwd string) {
+func localJavaFailure(step evaluator.SandboxStep, err error) StepDecision {
+	if step != evaluator.StepCoverage {
+		return failStep(err.Error())
+	}
+	if errors.Is(err, errLocalCoverageUnavailable) {
+		return skipStep("skip (no JaCoCo plugin declared in the build file)")
+	}
+	return skipStep("no build tool")
+}
+
+// planLocalDotnet plans local C# from the SAME toolchain profile the Docker target uses, and runs
+// the same argv chain (CP31/U2b). Previously it built a bare `sh -c "dotnet build -c Release
+// <proj>"` and skipped the whole chain — multitarget pin, MSBuild props, VSTest session timeout —
+// and skipped even the fallback TFM whenever compile_command/test_command was set.
+//
+// This could not land before the restore stage existed: the Docker compile argv carries
+// `--no-restore`, and until local had a restore stage that implicit restore was the only thing
+// writing project.assets.json.
+func (s *Sandbox) planLocalDotnet(plan *StepPlan, absGitRoot, absCwd string) {
+	p, err := profile.ResolveToolchain(absCwd, plan.Lang, s.EvalProfile,
+		s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet)
+	if err != nil {
+		for _, step := range planSteps {
+			plan.Decisions[step] = skipStep(fmt.Sprintf("skip (%v)", err))
+		}
+		return
+	}
+	p = profile.ApplyCommandOverrides(p, s.CompileCommand, s.TestCommand)
+	// Image stays empty: on a host the toolchain comes from PATH (§1 row 1).
+	plan.Profile = p
+	plan.CoverageReportPaths = coverageReportPathsFor(p.ID)
+
+	plan.RestoreDecision = runStep()
+	plan.RestoreKey = restoreKeyFor(absCwd, p.ID, absCwd)
+	if len(p.Restore) > 0 {
+		restore, rerr := s.patchDotnetEvalArgv(p, append([]string(nil), p.Restore...), absGitRoot, absCwd, TargetLocal)
+		if rerr != nil {
+			plan.RestoreDecision = failStep(rerr.Error())
+		} else {
+			plan.Restore = restore
+		}
+	}
 	for _, step := range planSteps {
-		goal := localGoalForCore(step)
-		override := s.CompileCommand
-		if step != evaluator.StepCompile {
-			override = s.TestCommand
-		}
-		cmd, err := jsLocalCommand(absCwd, goal, override)
-		if err != nil {
-			switch {
-			case step == evaluator.StepCompile && strings.Contains(err.Error(), "no build script"):
-				plan.Decisions[step] = skipStep("skip (no build script)")
-			case step == evaluator.StepCoverage:
-				plan.Decisions[step] = skipStep("no test script")
-			default:
-				plan.Decisions[step] = failStep(err.Error())
-			}
-			continue
-		}
-		// runJSTest/runJSCoverage add CI=true (watch-mode kill switch); compile does not. The plan
-		// records what the sandbox ADDS to the process environment.
+		// Local adds CI=true (and the .NET extras) only on test/coverage today; CP33 unifies the
+		// step env across targets.
 		if step != evaluator.StepCompile {
 			plan.Env[step] = []string{"CI=true"}
 		}
-		plan.setArgv(step, cmd.Args)
-		plan.Decisions[step] = runStep()
-	}
-}
-
-// planLocalDotnet mirrors runDotnetCompile/Test/Coverage: an explicit compile_command/test_command
-// wins, else dotnetShellLineWithProject resolves the entry .sln/.csproj into a shell line; every
-// step runs through `sh -c`. A resolution failure FAILS all three steps in production. CP31/CP32
-// move local C# onto the shared toolchain profile.
-func (s *Sandbox) planLocalDotnet(plan *StepPlan, absCwd string) {
-	type stepSpec struct {
-		step     evaluator.SandboxStep
-		override string
-		prefix   string
-	}
-	specs := []stepSpec{
-		{evaluator.StepCompile, s.CompileCommand, "dotnet build -c Release"},
-		{evaluator.StepTest, s.TestCommand, "dotnet test -c Release --no-build"},
-		{evaluator.StepCoverage, s.TestCommand, `dotnet test -c Release --no-build --collect 'XPlat Code Coverage'`},
-	}
-	for _, sp := range specs {
-		line := strings.TrimSpace(sp.override)
-		if line == "" {
-			var err error
-			line, err = dotnetShellLineWithProject(absCwd, sp.prefix, s.DotNetFallbackTargetFramework)
-			if err != nil {
-				plan.Decisions[sp.step] = failStep(err.Error())
-				continue
-			}
-		}
-		// runDotnetTest/Coverage add CI=true; compile does not.
-		if sp.step != evaluator.StepCompile {
-			plan.Env[sp.step] = []string{"CI=true"}
-		}
-		plan.setArgv(sp.step, []string{"sh", "-c", line})
-		plan.Decisions[sp.step] = runStep()
+		plan.Decisions[step] = s.planProfileStep(plan, p, step, absGitRoot, absCwd, TargetLocal)
 	}
 }
 
@@ -254,10 +262,8 @@ func (p *StepPlan) setArgv(step evaluator.SandboxStep, argv []string) {
 	}
 }
 
-// localGoalForCore maps a sandbox step onto the goal string localBuildCommand and jsLocalCommand
-// take. Note the Java coverage step maps to "test" for localBuildCommand (runLocalCoverage passes
-// "test") while jsLocalCommand receives "coverage" — mirrored per call site above.
-func localGoalForCore(step evaluator.SandboxStep) string {
+// localGoalFor maps a sandbox step onto the goal string localBuildCommand takes.
+func localGoalFor(step evaluator.SandboxStep) string {
 	switch step {
 	case evaluator.StepCompile:
 		return "compile"
@@ -284,19 +290,6 @@ func isCSharpLang(lang string) bool {
 	return false
 }
 
-// detectLocalJSToolchain reports the package manager the local path would use. readJSPackageMeta
-// is the same lockfile probe jsLocalCommand runs, so the two cannot disagree.
-func detectLocalJSToolchain(absCwd string) profile.ToolchainID {
-	switch readJSPackageMeta(absCwd).PackageManager {
-	case "yarn":
-		return profile.TypeScriptYarn
-	case "pnpm":
-		return profile.TypeScriptPNPM
-	default:
-		return profile.TypeScriptNPM
-	}
-}
-
 // detectLocalJavaToolchain reports Maven vs Gradle the way localBuildCommand resolves it, at the
 // family level (the wrapper-vs-binary axis is CP32's to remove and is not modelled here).
 func detectLocalJavaToolchain(absCwd, buildTool string) profile.ToolchainID {
@@ -315,8 +308,11 @@ func detectLocalJavaToolchain(absCwd, buildTool string) profile.ToolchainID {
 	return profile.UnsupportedDocker
 }
 
-// localJavaCoverageReportPaths is the list coverageSummary scans; the two share this function so
-// the plan and the executor cannot disagree about where a report may appear.
-func localJavaCoverageReportPaths() []string {
-	return []string{"target/site/jacoco/index.html", "build/reports/jacoco/test/html/index.html"}
+func isJavaToolchain(id profile.ToolchainID) bool {
+	switch id {
+	case profile.JavaMaven, profile.JavaMaven11, profile.JavaMaven21,
+		profile.JavaGradle, profile.JavaGradle11, profile.JavaGradle21:
+		return true
+	}
+	return false
 }

@@ -22,8 +22,11 @@ var Profiles = map[string]LanguageProfile{
 		Lang:                "java",
 		DefaultImage:        "eclipse-temurin:21-jdk",
 		CacheContainerPaths: []string{"/root/.m2"},
-		ReportPaths:         []string{"target/site/jacoco/*/index.html", "build/reports/jacoco/test/html/index.html"},
-		TestFrameworkHints:  []string{"junit", "testng", "surefire"},
+		// The fixed path, not the old `target/site/jacoco/*/index.html` glob: the fixed path is the
+		// standard single-module JaCoCo output and the one that actually matches; the `*` segment
+		// corresponds to no layout Maven produces. Globs are still supported by the lookup.
+		ReportPaths:        []string{"target/site/jacoco/index.html", "build/reports/jacoco/test/html/index.html"},
+		TestFrameworkHints: []string{"junit", "testng", "surefire"},
 	},
 	"javascript": {
 		Lang:                "javascript",

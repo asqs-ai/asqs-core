@@ -13,8 +13,9 @@
 // something production does not do. TestStepPlanParity then builds a plan for both targets from
 // identical inputs and asserts they match, minus an explicit and shrinking whitelist.
 //
-// CP30 does not make the two targets agree — that is CP31 onwards. It makes their disagreement
-// visible, enumerated, and impossible to add to silently.
+// CP30 did not make the two targets agree — it made their disagreement visible, enumerated, and
+// impossible to add to silently. CP31 moved both executors onto the plan and converged restore,
+// JS/Java/.NET command construction and coverage-report discovery; CP32–CP35 close the rest.
 package runner
 
 import (
@@ -72,13 +73,13 @@ type StepPlan struct {
 	// carry the final argv, which is what actually runs.
 	Profile profile.ToolchainProfile
 
-	// Restore is the dependency-restore argv, or nil when the ecosystem/target has none. Local is
-	// nil today for every ecosystem; CP31 changes that.
+	// Restore is the dependency-restore argv, or nil when the ecosystem/target has none. Both
+	// targets read it from the same toolchain profile (CP31).
 	Restore []string
 
-	// RestoreKey fingerprints the ecosystem and its dependency manifests, so the executor can
-	// restore at most once per key per round. Empty until CP31 introduces the restore memo — core
-	// runs Docker restore before every step invocation today.
+	// RestoreKey fingerprints the ecosystem and its dependency manifests. The executor restores at
+	// most once per key per run (see restore.go): once-per-round rather than once-per-step, and
+	// automatically invalidated when the fix loop edits a manifest.
 	RestoreKey string
 
 	// RestoreDecision is the verdict for the restore phase. Only ActionRun and ActionFail occur:
@@ -101,7 +102,7 @@ type StepPlan struct {
 	Decisions map[evaluator.SandboxStep]StepDecision
 
 	// CoverageReportPaths are repo-relative locations where a coverage report is expected, used to
-	// build the coverage summary. Docker reports none today; CP31 wires both to one source.
+	// build the coverage summary. One source for both targets (coverage_paths.go, CP31).
 	CoverageReportPaths []string
 }
 

@@ -26,9 +26,9 @@ func dotnetFirstArgIsCLI(argv []string) bool {
 	return strings.EqualFold(filepath.Base(strings.TrimSpace(argv[0])), "dotnet")
 }
 
-// ensureDotnetDockerInvocation appends a project/sln for C# Docker when argv is exec-form dotnet *or* sh -c "dotnet …".
+// ensureDotnetInvocation appends a project/sln for C# Docker when argv is exec-form dotnet *or* sh -c "dotnet …".
 // compile_command / test_command overrides use the latter; bare dotnet argv was not patched before (bug).
-func ensureDotnetDockerInvocation(p profile.ToolchainProfile, argv []string, absCwd string) ([]string, error) {
+func ensureDotnetInvocation(p profile.ToolchainProfile, argv []string, absCwd string) ([]string, error) {
 	if p.ID != profile.CSharpDotnet {
 		return argv, nil
 	}
@@ -42,8 +42,8 @@ func ensureDotnetDockerInvocation(p profile.ToolchainProfile, argv []string, abs
 	return ensureDotnetProjectArg(p, argv, absCwd)
 }
 
-// applyDotnetDockerTargetFrameworkFallback appends /p:TargetFramework for exec-form or sh -c dotnet commands.
-func applyDotnetDockerTargetFrameworkFallback(argv []string, cwdAbs, fallback string) ([]string, error) {
+// applyDotnetEvalTargetFrameworkFallback appends /p:TargetFramework for exec-form or sh -c dotnet commands.
+func applyDotnetEvalTargetFrameworkFallback(argv []string, cwdAbs, fallback string) ([]string, error) {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		patched, err := applyDotnetShellScriptTargetFrameworkFallback(argv[2], cwdAbs, fallback)
 		if err != nil {
@@ -206,9 +206,9 @@ func vstestSessionTimeoutMS(jobTimeout time.Duration) int {
 	return ms
 }
 
-// ApplyDotnetTestDockerVSTestCLIArgs appends console logger + RunConfiguration.TestSessionTimeout for `dotnet test`
+// ApplyDotnetTestVSTestCLIArgs appends console logger + RunConfiguration.TestSessionTimeout for `dotnet test`
 // in Docker (exec argv or sh -c). Improves stuck-after-"Starting test execution" diagnostics and caps hung sessions.
-func ApplyDotnetTestDockerVSTestCLIArgs(argv []string, jobTimeout time.Duration) []string {
+func ApplyDotnetTestVSTestCLIArgs(argv []string, jobTimeout time.Duration) []string {
 	ms := vstestSessionTimeoutMS(jobTimeout)
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		return []string{"sh", "-c", applyDotnetTestDockerVSTestShellScript(argv[2], ms)}
@@ -276,10 +276,10 @@ func applyDotnetTestDockerVSTestShellScript(script string, timeoutMs int) string
 	return s + fmt.Sprintf(` --logger "console;verbosity=normal" -- RunConfiguration.TestSessionTimeout=%d`, timeoutMs)
 }
 
-// WrapDotnetDockerTestWithBuildServerShutdown runs `dotnet build-server shutdown` after `dotnet test` (preserving the
+// WrapDotnetTestWithBuildServerShutdown runs `dotnet build-server shutdown` after `dotnet test` (preserving the
 // test exit code). MSBuild worker nodes can otherwise keep the main process alive after VSTest has printed results,
 // which makes `docker run` appear to hang until the job timeout despite tests having finished.
-func WrapDotnetDockerTestWithBuildServerShutdown(argv []string) []string {
+func WrapDotnetTestWithBuildServerShutdown(argv []string) []string {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		s := strings.TrimSpace(argv[2])
 		low := strings.ToLower(s)
@@ -387,10 +387,10 @@ func applyDotnetShellScriptDisableNuGetAudit(script string) string {
 	return applyDotnetShellScriptInsertMSBuildProps(script, []string{"/p:NuGetAudit=false"})
 }
 
-// ApplyDotnetDockerDisableNuGetAudit disables NuGet vulnerability audit for dotnet (exec argv or sh -c).
+// ApplyDotnetDisableNuGetAudit disables NuGet vulnerability audit for dotnet (exec argv or sh -c).
 // Used for Docker eval/format and for local post-generate `dotnet restore` / `dotnet format --include` so NU1900
 // does not fail restores when audit metadata cannot be fetched from private feeds.
-func ApplyDotnetDockerDisableNuGetAudit(argv []string) []string {
+func ApplyDotnetDisableNuGetAudit(argv []string) []string {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		return []string{"sh", "-c", applyDotnetShellScriptDisableNuGetAudit(argv[2])}
 	}
@@ -406,9 +406,9 @@ func ApplyDotnetTestFrameworkBootstrapMSBuildProps(argv []string) []string {
 	return applyDotnetExecInsertMSBuildPropsAfterVerb(argv, dotnetTestFrameworkBootstrapMSBuildProps)
 }
 
-// ApplyDotnetTestDockerHangMitigationProps applies UseSharedCompilation/UseRazorBuildServer disables for
+// ApplyDotnetTestHangMitigationProps applies UseSharedCompilation/UseRazorBuildServer disables for
 // Docker eval `dotnet test` (and coverage, which re-invokes test). No-op for non-test argv shapes.
-func ApplyDotnetTestDockerHangMitigationProps(argv []string) []string {
+func ApplyDotnetTestHangMitigationProps(argv []string) []string {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		s := strings.TrimSpace(argv[2])
 		if !strings.Contains(strings.ToLower(s), "dotnet test") {

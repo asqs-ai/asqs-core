@@ -342,7 +342,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP30 | Shared run state, plan/planner, **parity harness** | U0, U1 | — | 3–4 d | `in review` |
-| CP31 | Restore stage; JS plan and coverage paths | U4, U2a, U2b | CP30 | 3 d | `blocked (CP30)` |
+| CP31 | Restore stage; JS plan and coverage paths | U4, U2a, U2b | CP30 | 3 d | `in review` |
 | CP32 | Build-tool resolution; wrapper-free argv | U3b, U3 | CP30, CP06 | 3 d | `blocked (CP30, CP06)` |
 | CP33 | Step environment, credential seam, log redaction | U5, U6, U6b | CP30 | 2 d | `blocked (CP30)` |
 | CP34 | Browser preflight; local steps onto the plan | U7, U8 | CP31, CP32, CP33 | 5–6 d | `blocked (CP31, CP32, CP33)` |
@@ -1429,7 +1429,7 @@ that was the substantive work.
 
 ### CP31 — Restore stage; JS plan and coverage paths
 
-- **Status:** `blocked (CP30)` · **Effort:** 3 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 3 d · **Risk:** medium
 
 `restore.go` (new, self-contained) must precede the .NET half: core's local .NET compile has no
 `--no-restore` and no restore stage either, so adding the flag without the stage breaks the build.
@@ -1448,6 +1448,44 @@ stale restore. The memo also relies on shared run state (CP30) because `Sandbox`
 
 **Acceptance.** Restore runs once per fingerprint, not 5–6× per round. A failing JS coverage script
 fails the step. Parity harness still green.
+
+**Implementation record (2026-08-26).** Done, and it went further than the file list implies: since
+this bundle, **both executors run what the plan records** — the plan is the single source of argv,
+restore and skip/fail decisions for every ecosystem, on both targets.
+
+- Ported: `restore.go` (fingerprint memo on the shared run state), `js_plan.go` (planJS for both
+  targets; per-target env kept until CP33), `coverage_paths.go` (+ the `language.go` Maven-glob
+  fix), `local_build_cmd.go` (toolchain preflight wrapper-tolerant until CP32). The maven/gradle
+  profiles adopted `test-compile` / `compileTestJava` so generated TEST sources compile in the
+  compile step on both targets; `./gradlew` in the gradle profile stays for CP32.
+- The .NET patch chain is target-neutral (`patchDotnetEvalArgv` + the split-out, docker-only
+  `applyDotnetContainerProvisioning`, applied last), the `Docker` helper names are dropped per
+  U2b, and local C# plans from the shared profile — restore stage before the `--no-restore`
+  compile, exactly the U4-before-U2b ordering the spec demands. Local java argv is byte-identical
+  to the docker profile (flags before goals), with the JaCoCo coverage gate on both targets.
+- Executors: `runLocalPlannedStep` replaces the nine `runLocal*/runJS*/runDotnet*` constructors
+  (plus `jsLocalCommand`, `jsNoOpCompile`, `coverageSummary`, `dotnetShellLineWithProject` — all
+  dead); the docker executor consumes the plan and memoises restore per fingerprint instead of
+  restoring before every step invocation. Step summaries keep core's wording (CP34 unifies);
+  coverage summaries now name the report via the shared `coverageSummaryFromPlan`.
+- **Whitelist: 110 → 47 rows.** All 61 CP31 rows and all 6 CP34-forecast rows converged (planJS's
+  skip policy unified the JS decisions early); the four `dotnet*/Argv[test|coverage]` rows are
+  re-attributed **§1-5** (verified: argv byte-identical except the docker-only build-server
+  shutdown wrap) and the forced-gradle Restore row moved to CP32 (docker restores from the Maven
+  profile while local obeys `build_tool`). Remaining: 4 × §1-5 permanent, 8 × CP32, 35 × CP33.
+- Tests ported: `restore_test.go` (14, incl. once-per-round across steps AND clones on both
+  targets — the acceptance), `js_plan_test.go` (10, incl. no `--if-present`/`||` anywhere — the
+  npm silent-pass killer — and the JaCoCo gate), `run_state_test.go` (CP30's own tests, ported
+  late; one caught a real gap — the nil-config `NewSandboxFromConfig` path skipped the run-state
+  allocation), `local_build_cmd_test.go` (CI-env test deferred to CP33 in-file; the
+  config-key needle adapted `general.sandbox.type` → `runner.type` until CP38), and a planner_test
+  subset (agreement tests stay for CP34, unknown-type executor backstop for CP35).
+- **Behaviour changes to release-note:** a JS repo with no test script now SKIPS on the local
+  target instead of failing (the unified skip policy); the js-build-runs-start shape now skips
+  with a named reason instead of pretending via a no-op compile; local java/gradle compile now
+  builds test sources (`test-compile`/`compileTestJava`); local runs now restore dependencies
+  before the first step; docker restore no longer re-runs per step; and the npm docker coverage
+  step can finally fail (previously structurally incapable of reporting a problem).
 
 ### CP32 — Build-tool resolution; wrapper-free argv
 

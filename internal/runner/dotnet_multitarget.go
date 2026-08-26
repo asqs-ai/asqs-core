@@ -244,9 +244,9 @@ func PlaywrightDotnetDockerInstallShell(repoRoot, csprojAbs, fallbackTFM string)
 	return b.String()
 }
 
-// ResolveCsprojAbsForDotnetDockerEval picks a primary .csproj for multitarget / Playwright runtime heuristics
+// ResolveCsprojAbsForDotnetEval picks a primary .csproj for multitarget / Playwright runtime heuristics
 // given the eval working directory and patched argv (exec-form dotnet or sh -c).
-func ResolveCsprojAbsForDotnetDockerEval(cwdAbs string, argv []string) (string, error) {
+func ResolveCsprojAbsForDotnetEval(cwdAbs string, argv []string) (string, error) {
 	cwdAbs = filepath.Clean(cwdAbs)
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		abs, ok, err := shellScriptResolvePrimaryCsprojAbs(argv[2], cwdAbs)
@@ -306,8 +306,8 @@ func applyDotnetShellScriptMultiTargetPin(script, cwdAbs, csprojAbs, preferTFM s
 	return applyDotnetShellScriptInsertMSBuildProps(script, []string{"/p:TargetFramework=" + pick})
 }
 
-// ApplyDotnetDockerMultiTargetFramework pins a runnable TFM for multitarget csproj (exec argv or sh -c dotnet).
-func ApplyDotnetDockerMultiTargetFramework(argv []string, cwdAbs, csprojAbs, preferTFM string) []string {
+// ApplyDotnetMultiTargetFramework pins a runnable TFM for multitarget csproj (exec argv or sh -c dotnet).
+func ApplyDotnetMultiTargetFramework(argv []string, cwdAbs, csprojAbs, preferTFM string) []string {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		return []string{"sh", "-c", applyDotnetShellScriptMultiTargetPin(argv[2], cwdAbs, csprojAbs, preferTFM)}
 	}

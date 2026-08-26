@@ -18,122 +18,6 @@ import (
 
 const defaultLocalTimeout = 5 * time.Minute
 
-// runLocalCompile runs compile in repoPath using the configured command or BuildTool. Returns real StepResult.
-func runLocalCompile(ctx context.Context, repoPath, lang string, timeout time.Duration, buildTool, compileCommand, testCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	lang = strings.ToLower(strings.TrimSpace(lang))
-	if lang == "csharp" || lang == "cs" {
-		return runDotnetCompile(ctx, repoPath, timeout, compileCommand, dotnetFallbackTFM)
-	}
-	if lang != "java" && lang != "javascript" && lang != "typescript" {
-		return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "skip (unsupported lang)"}
-	}
-	if lang == "javascript" || lang == "typescript" {
-		return runJSCompile(ctx, repoPath, timeout, compileCommand)
-	}
-	fmt.Fprintln(os.Stderr, "  Compiling code...")
-	cmd, err := localBuildCommand(repoPath, "compile", buildTool, compileCommand, testCommand)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Compile: %v\n", err)
-		return evaluator.StepResult{
-			Step: evaluator.StepCompile, OK: false,
-			Summary: err.Error(), Output: "",
-		}
-	}
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		summary := "compile failed"
-		if out != "" {
-			summary = firstLines(out, 3)
-		}
-		fmt.Fprintf(os.Stderr, "  Compile: failed. %s\n", summary)
-		return evaluator.StepResult{
-			Step: evaluator.StepCompile, OK: false,
-			Summary: summary, Output: out,
-		}
-	}
-	fmt.Fprintln(os.Stderr, "  Compile: ok.")
-	return evaluator.StepResult{
-		Step: evaluator.StepCompile, OK: true,
-		Summary: "compile ok", Output: out,
-	}
-}
-
-// runLocalTest runs tests using the configured command or BuildTool. Returns real StepResult.
-func runLocalTest(ctx context.Context, repoPath, lang string, timeout time.Duration, buildTool, compileCommand, testCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	lang = strings.ToLower(strings.TrimSpace(lang))
-	if lang == "csharp" || lang == "cs" {
-		return runDotnetTest(ctx, repoPath, timeout, testCommand, dotnetFallbackTFM)
-	}
-	if lang != "java" && lang != "javascript" && lang != "typescript" {
-		return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "skip (unsupported lang)"}
-	}
-	if lang == "javascript" || lang == "typescript" {
-		return runJSTest(ctx, repoPath, timeout, testCommand)
-	}
-	fmt.Fprintln(os.Stderr, "  Running tests...")
-	cmd, err := localBuildCommand(repoPath, "test", buildTool, compileCommand, testCommand)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Tests: %v\n", err)
-		return evaluator.StepResult{
-			Step: evaluator.StepTest, OK: false,
-			Summary: err.Error(), Output: "",
-		}
-	}
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		summary := "tests failed"
-		if out != "" {
-			summary = firstLines(out, 5)
-		}
-		fmt.Fprintf(os.Stderr, "  Tests: failed. %s\n", summary)
-		return evaluator.StepResult{
-			Step: evaluator.StepTest, OK: false,
-			Summary: summary, Output: out,
-		}
-	}
-	fmt.Fprintln(os.Stderr, "  Tests: ok.")
-	return evaluator.StepResult{
-		Step: evaluator.StepTest, OK: true,
-		Summary: "tests ok", Output: out,
-	}
-}
-
-// runLocalCoverage runs tests with coverage when possible. Returns StepResult with Summary containing coverage info or "N/A" if not configured.
-func runLocalCoverage(ctx context.Context, repoPath, lang string, timeout time.Duration, buildTool, compileCommand, testCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	lang = strings.ToLower(strings.TrimSpace(lang))
-	if lang == "csharp" || lang == "cs" {
-		return runDotnetCoverage(ctx, repoPath, timeout, testCommand, dotnetFallbackTFM)
-	}
-	if lang != "java" && lang != "javascript" && lang != "typescript" {
-		return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: "skip (unsupported lang)"}
-	}
-	if lang == "javascript" || lang == "typescript" {
-		return runJSCoverage(ctx, repoPath, timeout, testCommand)
-	}
-	fmt.Fprintln(os.Stderr, "  Running tests (coverage)...")
-	cmd, err := localBuildCommand(repoPath, "test", buildTool, compileCommand, testCommand)
-	if err != nil {
-		return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: "no build tool"}
-	}
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		fmt.Fprintf(os.Stderr, "  Coverage: failed. %s\n", firstLines(out, 3))
-		return evaluator.StepResult{
-			Step: evaluator.StepCoverage, OK: false,
-			Summary: firstLines(out, 5), Output: out,
-		}
-	}
-	summary := coverageSummary(repoPath)
-	if summary == "" {
-		summary = "tests ok (coverage report not found)"
-	}
-	fmt.Fprintf(os.Stderr, "  Coverage: %s\n", summary)
-	return evaluator.StepResult{
-		Step: evaluator.StepCoverage, OK: true,
-		Summary: summary, Output: out,
-	}
-}
-
 // jsPackageMeta holds package.json scripts, package manager, and framework detection for JS/TS projects.
 type jsPackageMeta struct {
 	Scripts                 map[string]string
@@ -208,371 +92,11 @@ func readJSPackageMeta(repoPath string) (m jsPackageMeta) {
 	return m
 }
 
-// jsNoOpCompile returns a command that exits 0 (no-op). Used when "build" script runs start/install so compile step passes without running prestart in sandbox.
-func jsNoOpCompile(repoPath string) *exec.Cmd {
-	c := exec.Command("node", "-e", "process.exit(0)")
-	c.Dir = filepath.Clean(repoPath)
-	return c
-}
-
-// jsLocalCommand builds the command for compile or test for JS/TS. overrideCommand is from config/indexer meta; if set, it's used. Otherwise we use package manager + script from package.json.
-func jsLocalCommand(repoPath, goal string, overrideCommand string) (*exec.Cmd, error) {
-	dir := filepath.Clean(repoPath)
-	if strings.TrimSpace(overrideCommand) != "" {
-		// If compile command is "npm run build" (or equivalent) but package.json "build" script runs start/install, use no-op so eval doesn't fail (e.g. angular-seed prestart).
-		if goal == "compile" {
-			meta := readJSPackageMeta(repoPath)
-			if meta.BuildRunsStartOrInstall {
-				norm := strings.ToLower(strings.TrimSpace(overrideCommand))
-				if norm == "npm run build" || norm == "yarn run build" || norm == "pnpm run build" {
-					return jsNoOpCompile(repoPath), nil
-				}
-			}
-		}
-		line := strings.TrimSpace(overrideCommand)
-		if line == "" {
-			return nil, fmt.Errorf("command is empty after trim")
-		}
-		c := exec.Command("sh", "-c", line)
-		c.Dir = dir
-		return c, nil
-	}
-	meta := readJSPackageMeta(repoPath)
-	var name string
-	var args []string
-
-	// When "build" runs start/install (e.g. angular-seed), skip real compile so step passes without running prestart in sandbox.
-	if goal == "compile" && meta.HasBuild && meta.BuildRunsStartOrInstall {
-		return jsNoOpCompile(repoPath), nil
-	}
-
-	// NestJS fallbacks when scripts are missing (e.g. custom or older Nest project).
-	if goal == "compile" && !meta.HasBuild && meta.IsNest {
-		c := exec.Command("npx", "nest", "build")
-		c.Dir = dir
-		return c, nil
-	}
-	if (goal == "test" || goal == "coverage") && !meta.HasTest && meta.IsNest {
-		c := exec.Command("npx", "nest", "test")
-		c.Dir = dir
-		return c, nil
-	}
-
-	switch meta.PackageManager {
-	case "yarn":
-		name = "yarn"
-		if goal == "compile" {
-			if !meta.HasBuild {
-				return nil, fmt.Errorf("no build script in package.json")
-			}
-			args = []string{"run", "build"}
-		} else if goal == "coverage" && meta.HasCoverage {
-			args = []string{"run", "coverage"}
-		} else if goal == "coverage" || goal == "test" {
-			if !meta.HasTest {
-				return nil, fmt.Errorf("no test script in package.json")
-			}
-			args = []string{"test"}
-		} else {
-			return nil, fmt.Errorf("unknown goal %q", goal)
-		}
-	case "pnpm":
-		name = "pnpm"
-		if goal == "compile" {
-			if !meta.HasBuild {
-				return nil, fmt.Errorf("no build script in package.json")
-			}
-			args = []string{"run", "build"}
-		} else if goal == "coverage" && meta.HasCoverage {
-			args = []string{"run", "coverage"}
-		} else if goal == "coverage" || goal == "test" {
-			if !meta.HasTest {
-				return nil, fmt.Errorf("no test script in package.json")
-			}
-			args = []string{"test"}
-		} else {
-			return nil, fmt.Errorf("unknown goal %q", goal)
-		}
-	default:
-		name = "npm"
-		if goal == "compile" {
-			if !meta.HasBuild {
-				return nil, fmt.Errorf("no build script in package.json")
-			}
-			args = []string{"run", "build"}
-		} else if goal == "coverage" && meta.HasCoverage {
-			args = []string{"run", "coverage"}
-		} else if goal == "coverage" || goal == "test" {
-			if !meta.HasTest {
-				return nil, fmt.Errorf("no test script in package.json")
-			}
-			args = []string{"test"}
-		} else {
-			return nil, fmt.Errorf("unknown goal %q", goal)
-		}
-	}
-	c := exec.Command(name, args...)
-	c.Dir = dir
-	return c, nil
-}
-
-func runJSCompile(ctx context.Context, repoPath string, timeout time.Duration, compileCommand string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Compiling (JS/TS)...")
-	cmd, err := jsLocalCommand(repoPath, "compile", compileCommand)
-	if err != nil {
-		if strings.Contains(err.Error(), "no build script") {
-			fmt.Fprintln(os.Stderr, "  Compile: skip (no build script).")
-			return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "skip (no build script)"}
-		}
-		fmt.Fprintf(os.Stderr, "  Compile: %v\n", err)
-		return evaluator.StepResult{Step: evaluator.StepCompile, OK: false, Summary: err.Error(), Output: ""}
-	}
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		summary := "compile failed"
-		if out != "" {
-			summary = firstLines(out, 3)
-		}
-		fmt.Fprintf(os.Stderr, "  Compile: failed. %s\n", summary)
-		return evaluator.StepResult{Step: evaluator.StepCompile, OK: false, Summary: summary, Output: out}
-	}
-	fmt.Fprintln(os.Stderr, "  Compile: ok.")
-	return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "compile ok", Output: out}
-}
-
-func runJSTest(ctx context.Context, repoPath string, timeout time.Duration, testCommand string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Running tests (JS/TS)...")
-	cmd, err := jsLocalCommand(repoPath, "test", testCommand)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "  Tests: %v\n", err)
-		return evaluator.StepResult{Step: evaluator.StepTest, OK: false, Summary: err.Error(), Output: ""}
-	}
-	// Disable watch mode so Jest/Vitest etc. run once and exit (otherwise they can hang waiting for file changes).
-	cmd.Env = append(os.Environ(), "CI=true")
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		if jsTestOutputSummaryShowsZeroFailures(out) {
-			fmt.Fprintf(os.Stderr, "  Tests: non-zero exit but Jest/Vitest summary shows zero failures (treating as ok; often Jest open handles / did not exit). %s\n", firstLines(out, 2))
-			return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "tests ok (summary all passed; exit code ignored)", Output: out}
-		}
-		summary := "tests failed"
-		if out != "" {
-			summary = firstLines(out, 5)
-		}
-		fmt.Fprintf(os.Stderr, "  Tests: failed. %s\n", summary)
-		return evaluator.StepResult{Step: evaluator.StepTest, OK: false, Summary: summary, Output: out}
-	}
-	fmt.Fprintln(os.Stderr, "  Tests: ok.")
-	return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "tests ok", Output: out}
-}
-
-func runJSCoverage(ctx context.Context, repoPath string, timeout time.Duration, testCommand string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Running tests (coverage, JS/TS)...")
-	cmd, err := jsLocalCommand(repoPath, "coverage", testCommand)
-	if err != nil {
-		return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: "no test script"}
-	}
-	cmd.Env = append(os.Environ(), "CI=true")
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		fmt.Fprintf(os.Stderr, "  Coverage: failed. %s\n", firstLines(out, 3))
-		return evaluator.StepResult{Step: evaluator.StepCoverage, OK: false, Summary: firstLines(out, 5), Output: out}
-	}
-	summary := "tests ok (coverage report path depends on test framework)"
-	fmt.Fprintf(os.Stderr, "  Coverage: %s\n", summary)
-	return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: summary, Output: out}
-}
-
-// localBuildCommand returns a command for the given goal (compile or test). Uses compileCommand/testCommand when set; otherwise uses buildTool (auto|mvn|mvnw|gradle|gradlew) to choose the executable and default args.
-func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand string) (*exec.Cmd, error) {
-	dir := filepath.Clean(repoPath)
-	if goal == "compile" && strings.TrimSpace(compileCommand) != "" {
-		line := strings.TrimSpace(compileCommand)
-		if line == "" {
-			return nil, fmt.Errorf("compile_command is empty after trim")
-		}
-		c := exec.Command("sh", "-c", line)
-		c.Dir = dir
-		return c, nil
-	}
-	if (goal == "test" || goal == "default") && strings.TrimSpace(testCommand) != "" {
-		line := strings.TrimSpace(testCommand)
-		if line == "" {
-			return nil, fmt.Errorf("test_command is empty after trim")
-		}
-		c := exec.Command("sh", "-c", line)
-		c.Dir = dir
-		return c, nil
-	}
-	// Resolve build tool: auto-detect or use configured buildTool
-	tool := strings.TrimSpace(strings.ToLower(buildTool))
-	if tool == "" {
-		tool = "auto"
-	}
-	hasPom := pathExists(filepath.Join(dir, "pom.xml"))
-	hasMvnw := pathExists(filepath.Join(dir, "mvnw")) || pathExists(filepath.Join(dir, "mvnw.cmd"))
-	hasGradle := pathExists(filepath.Join(dir, "build.gradle")) || pathExists(filepath.Join(dir, "build.gradle.kts"))
-	hasGradlew := pathExists(filepath.Join(dir, "gradlew")) || pathExists(filepath.Join(dir, "gradlew.bat"))
-	if tool == "auto" {
-		if hasPom {
-			if hasMvnw {
-				tool = "mvnw"
-			} else {
-				tool = "mvn"
-			}
-		} else if hasGradle {
-			if hasGradlew {
-				tool = "gradlew"
-			} else {
-				tool = "gradle"
-			}
-		} else {
-			return nil, fmt.Errorf("no pom.xml or build.gradle in %s", dir)
-		}
-	}
-	if tool == "mvn" || tool == "mvnw" {
-		if !hasPom {
-			return nil, fmt.Errorf("build_tool is %s but no pom.xml in %s", tool, dir)
-		}
-		var name string
-		var args []string
-		if tool == "mvnw" {
-			if !hasMvnw {
-				return nil, fmt.Errorf("build_tool is mvnw but mvnw not found in %s", dir)
-			}
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "mvnw.cmd")) {
-				name = "mvnw.cmd"
-			} else {
-				name = "./mvnw"
-			}
-			args = []string{"compile", "-q", "-B"}
-			if goal == "test" || goal == "default" {
-				args = []string{"test", "-q", "-B"}
-			}
-		} else {
-			name = "mvn"
-			args = []string{"compile", "-q", "-B"}
-			if goal == "test" || goal == "default" {
-				args = []string{"test", "-q", "-B"}
-			}
-		}
-		c := exec.Command(name, args...)
-		c.Dir = dir
-		return c, nil
-	}
-	if tool == "gradle" || tool == "gradlew" {
-		if !hasGradle {
-			return nil, fmt.Errorf("build_tool is %s but no build.gradle in %s", tool, dir)
-		}
-		args := []string{"--no-daemon", "-q"}
-		if tool == "gradlew" && !hasGradlew {
-			return nil, fmt.Errorf("build_tool is gradlew but gradlew not found in %s", dir)
-		}
-		var name string
-		if tool == "gradlew" {
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "gradlew.bat")) {
-				name = "gradlew.bat"
-			} else {
-				name = "./gradlew"
-			}
-		} else {
-			name = "gradle"
-		}
-		switch goal {
-		case "compile":
-			c := exec.Command(name, append(args, "compileJava")...)
-			c.Dir = dir
-			return c, nil
-		default:
-			c := exec.Command(name, append(args, "test")...)
-			c.Dir = dir
-			return c, nil
-		}
-	}
-	return nil, fmt.Errorf("build_tool must be auto, mvn, mvnw, gradle, or gradlew; got %q", buildTool)
-}
-
 func shutdownDotnetBuildServers(dir string) {
 	cmd := exec.Command("dotnet", "build-server", "shutdown")
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
 	_ = cmd.Run()
-}
-
-func runDotnetCompile(ctx context.Context, repoPath string, timeout time.Duration, compileCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Compiling (.NET)...")
-	// Drop lingering MSBuild/VBCSCompiler nodes so a prior timed-out test/build cannot keep bin/obj locked.
-	shutdownDotnetBuildServers(filepath.Clean(repoPath))
-	line := strings.TrimSpace(compileCommand)
-	if line == "" {
-		var err error
-		line, err = dotnetShellLineWithProject(repoPath, "dotnet build -c Release", dotnetFallbackTFM)
-		if err != nil {
-			return evaluator.StepResult{Step: evaluator.StepCompile, OK: false, Summary: err.Error(), Output: ""}
-		}
-	}
-	cmd := exec.Command("sh", "-c", line)
-	cmd.Dir = filepath.Clean(repoPath)
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		summary := "compile failed"
-		if out != "" {
-			summary = firstLines(out, 3)
-		}
-		fmt.Fprintf(os.Stderr, "  Compile: failed. %s\n", summary)
-		return evaluator.StepResult{Step: evaluator.StepCompile, OK: false, Summary: summary, Output: out}
-	}
-	fmt.Fprintln(os.Stderr, "  Compile: ok.")
-	return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "compile ok", Output: out}
-}
-
-func runDotnetTest(ctx context.Context, repoPath string, timeout time.Duration, testCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Running tests (.NET)...")
-	line := strings.TrimSpace(testCommand)
-	if line == "" {
-		var err error
-		line, err = dotnetShellLineWithProject(repoPath, "dotnet test -c Release --no-build", dotnetFallbackTFM)
-		if err != nil {
-			return evaluator.StepResult{Step: evaluator.StepTest, OK: false, Summary: err.Error(), Output: ""}
-		}
-	}
-	cmd := exec.Command("sh", "-c", line)
-	cmd.Dir = filepath.Clean(repoPath)
-	cmd.Env = append(os.Environ(), "CI=true")
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		summary := "tests failed"
-		if out != "" {
-			summary = firstLines(out, 5)
-		}
-		fmt.Fprintf(os.Stderr, "  Tests: failed. %s\n", summary)
-		return evaluator.StepResult{Step: evaluator.StepTest, OK: false, Summary: summary, Output: out}
-	}
-	fmt.Fprintln(os.Stderr, "  Tests: ok.")
-	return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "tests ok", Output: out}
-}
-
-func runDotnetCoverage(ctx context.Context, repoPath string, timeout time.Duration, testCommand, dotnetFallbackTFM string) evaluator.StepResult {
-	fmt.Fprintln(os.Stderr, "  Running tests (.NET coverage)...")
-	line := strings.TrimSpace(testCommand)
-	if line == "" {
-		var err error
-		line, err = dotnetShellLineWithProject(repoPath, `dotnet test -c Release --no-build --collect 'XPlat Code Coverage'`, dotnetFallbackTFM)
-		if err != nil {
-			return evaluator.StepResult{Step: evaluator.StepCoverage, OK: false, Summary: err.Error(), Output: ""}
-		}
-	}
-	cmd := exec.Command("sh", "-c", line)
-	cmd.Dir = filepath.Clean(repoPath)
-	cmd.Env = append(os.Environ(), "CI=true")
-	out, runErr := runCommand(ctx, cmd, timeout)
-	if runErr != nil {
-		fmt.Fprintf(os.Stderr, "  Coverage: failed. %s\n", firstLines(out, 3))
-		return evaluator.StepResult{Step: evaluator.StepCoverage, OK: false, Summary: firstLines(out, 5), Output: out}
-	}
-	summary := "coverage ok (see test output for report path)"
-	fmt.Fprintf(os.Stderr, "  Coverage: %s\n", summary)
-	return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: summary, Output: out}
 }
 
 func pathExists(path string) bool {
@@ -774,16 +298,178 @@ func RunFormatCommandFiles(ctx context.Context, repoPath, formatCommand string, 
 	return nil
 }
 
-// coverageSummary looks for jacoco report and returns a one-line summary (e.g. "line coverage 42%").
-func coverageSummary(repoPath string) string {
-	// Maven: target/site/jacoco/index.html; Gradle: build/reports/jacoco/test/html/index.html.
-	// The list lives in localJavaCoverageReportPaths so the step plan reports the same locations
-	// this scan reads.
-	for _, rel := range localJavaCoverageReportPaths() {
-		p := filepath.Join(repoPath, rel)
-		if _, err := os.Stat(p); err == nil {
-			return "coverage report: " + rel
+// localBuildCommand returns the command for a local Java build step goal (compile, test,
+// coverage). compileCommand/testCommand override when set; otherwise buildTool
+// (auto|mvn|mvnw|gradle|gradlew) selects the executable and the argv comes goal-for-goal from the
+// same shapes the Docker toolchain profiles carry — same flags, same goals, flags before goals —
+// so the two targets produce the same string (CP31). The wrapper axis (mvnw/gradlew) is CP32's to
+// remove.
+func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand string) (*exec.Cmd, error) {
+	dir := filepath.Clean(repoPath)
+	if goal == "compile" && strings.TrimSpace(compileCommand) != "" {
+		return localBuildCmd(dir, []string{"sh", "-c", strings.TrimSpace(compileCommand)})
+	}
+	if (goal == "test" || goal == "default" || goal == "coverage") && strings.TrimSpace(testCommand) != "" {
+		return localBuildCmd(dir, []string{"sh", "-c", strings.TrimSpace(testCommand)})
+	}
+	tool := strings.TrimSpace(strings.ToLower(buildTool))
+	if tool == "" {
+		tool = "auto"
+	}
+	hasPom := pathExists(filepath.Join(dir, "pom.xml"))
+	hasMvnw := pathExists(filepath.Join(dir, "mvnw")) || pathExists(filepath.Join(dir, "mvnw.cmd"))
+	hasGradle := pathExists(filepath.Join(dir, "build.gradle")) || pathExists(filepath.Join(dir, "build.gradle.kts"))
+	hasGradlew := pathExists(filepath.Join(dir, "gradlew")) || pathExists(filepath.Join(dir, "gradlew.bat"))
+	if tool == "auto" {
+		switch {
+		case hasPom && hasMvnw:
+			tool = "mvnw"
+		case hasPom:
+			tool = "mvn"
+		case hasGradle && hasGradlew:
+			tool = "gradlew"
+		case hasGradle:
+			tool = "gradle"
+		default:
+			return nil, fmt.Errorf("no pom.xml or build.gradle in %s", dir)
 		}
 	}
-	return ""
+	switch tool {
+	case "mvn", "mvnw":
+		if !hasPom {
+			return nil, fmt.Errorf("build_tool is %s but no pom.xml in %s", tool, dir)
+		}
+		name := "mvn"
+		if tool == "mvnw" {
+			if !hasMvnw {
+				return nil, fmt.Errorf("build_tool is mvnw but mvnw not found in %s", dir)
+			}
+			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "mvnw.cmd")) {
+				name = "mvnw.cmd"
+			} else {
+				name = "./mvnw"
+			}
+		}
+		// -DskipTests on test-compile is inert (that phase runs no tests) and is carried only so
+		// the two targets produce the same string; test-compile (not compile) so generated TEST
+		// sources compile here too instead of first failing in the test phase.
+		args := []string{"-q", "-B", "-DskipTests", "test-compile"}
+		switch goal {
+		case "test", "default":
+			args = []string{"-q", "-B", "test"}
+		case "coverage":
+			// Without jacoco:report the step is a byte-identical re-run of the test step that
+			// produces no report; with it on a pom that never declares the plugin, Maven fails the
+			// whole step with "No plugin found for prefix 'jacoco'". Hence the gate.
+			if !javaBuildFileDeclaresJaCoCo(dir) {
+				return nil, errLocalCoverageUnavailable
+			}
+			args = []string{"-q", "-B", "test", "jacoco:report"}
+		}
+		return localBuildCmd(dir, append([]string{name}, args...))
+	case "gradle", "gradlew":
+		if !hasGradle {
+			return nil, fmt.Errorf("build_tool is %s but no build.gradle in %s", tool, dir)
+		}
+		name := "gradle"
+		if tool == "gradlew" {
+			if !hasGradlew {
+				return nil, fmt.Errorf("build_tool is gradlew but gradlew not found in %s", dir)
+			}
+			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "gradlew.bat")) {
+				name = "gradlew.bat"
+			} else {
+				name = "./gradlew"
+			}
+		}
+		args := []string{"--no-daemon", "-q"}
+		switch goal {
+		case "compile":
+			// compileTestJava (depends on compileJava) so generated TEST sources compile here too.
+			args = append(args, "compileTestJava")
+		case "coverage":
+			// Same gate and rationale as the Maven branch: an undeclared jacoco plugin means
+			// Gradle has no jacocoTestReport task to run.
+			if !javaBuildFileDeclaresJaCoCo(dir) {
+				return nil, errLocalCoverageUnavailable
+			}
+			args = append(args, "test", "jacocoTestReport")
+		default:
+			args = append(args, "test")
+		}
+		return localBuildCmd(dir, append([]string{name}, args...))
+	}
+	return nil, fmt.Errorf("unsupported build_tool %q (want auto|mvn|mvnw|gradle|gradlew)", tool)
+}
+
+// runLocalPlannedStep executes one evaluation step on the host from the StepPlan. Since CP31 every
+// local ecosystem runs what the plan records — the plan is the single source of argv, restore and
+// skip/fail decisions, which is what makes the parity harness's claims about the local target true
+// rather than aspirational. Step summaries keep core's existing wording; CP34 unifies them with
+// the Docker target's.
+func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang string, step evaluator.SandboxStep, label string) evaluator.StepResult {
+	plan, err := s.buildStepPlan(gitRootAbs, lang, "")
+	if err != nil {
+		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
+	}
+	// Restore before the step, at most once per manifest fingerprint (see restore.go). Best-effort
+	// by contract, matching the Docker path.
+	s.runLocalRestoreOnce(ctx, plan, cwd)
+
+	switch dec := plan.DecisionFor(step); dec.Action {
+	case ActionSkip:
+		fmt.Fprintf(os.Stderr, "  %s: %s\n", label, dec.Reason)
+		return evaluator.StepResult{Step: step, OK: true, Summary: dec.Reason}
+	case ActionFail:
+		fmt.Fprintf(os.Stderr, "  %s: %s\n", label, dec.Reason)
+		return evaluator.StepResult{Step: step, OK: false, Summary: dec.Reason}
+	}
+	argv := plan.ArgvFor(step)
+	if len(argv) == 0 {
+		return evaluator.StepResult{Step: step, OK: true, Summary: "skip (no command)"}
+	}
+	if err := requireLocalToolchain(argv[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "  %s: %v\n", label, err)
+		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
+	}
+	if step == evaluator.StepCompile && isCSharpLang(lang) {
+		// Drop lingering MSBuild/VBCSCompiler nodes so a prior timed-out test/build cannot keep
+		// bin/obj locked. Compile-only: Docker also shuts them down AFTER test, but that reaches
+		// every node on the machine and must not be inherited by a host (§1 row 5).
+		shutdownDotnetBuildServers(cwd)
+	}
+	fmt.Fprintf(os.Stderr, "  %s...\n", label)
+	cmd := newLocalBuildCmd(cwd, argv)
+	if env := plan.EnvFor(step); len(env) > 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	out, runErr := runCommand(ctx, cmd, s.timeoutDuration())
+	if runErr != nil {
+		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
+			fmt.Fprintf(os.Stderr, "  %s: non-zero exit but the runner's own summary shows zero failures (treating as ok; often Jest open handles). %s\n", label, firstLines(out, 2))
+			return evaluator.StepResult{Step: step, OK: true, Summary: "tests ok (summary all passed; exit code ignored)", Output: out}
+		}
+		lines := 5
+		fallback := "tests failed"
+		if step == evaluator.StepCompile {
+			lines, fallback = 3, "compile failed"
+		}
+		summary := fallback
+		if out != "" {
+			summary = firstLines(out, lines)
+		}
+		fmt.Fprintf(os.Stderr, "  %s: failed. %s\n", label, firstLines(summary, 2))
+		return evaluator.StepResult{Step: step, OK: false, Summary: summary, Output: out}
+	}
+	var summary string
+	switch step {
+	case evaluator.StepCompile:
+		summary = "compile ok"
+	case evaluator.StepCoverage:
+		summary = coverageSummaryFromPlan(cwd, plan)
+	default:
+		summary = "tests ok"
+	}
+	fmt.Fprintf(os.Stderr, "  %s: %s\n", label, summary)
+	return evaluator.StepResult{Step: step, OK: true, Summary: summary, Output: out}
 }

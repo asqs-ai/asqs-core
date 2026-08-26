@@ -75,7 +75,7 @@ type Sandbox struct {
 // NewSandboxFromConfig builds a Sandbox from application config.
 func NewSandboxFromConfig(cfg *config.Config) *Sandbox {
 	if cfg == nil {
-		return &Sandbox{Type: "local"}
+		return &Sandbox{Type: "local", run: &sandboxRunState{}}
 	}
 	r := cfg.Runner
 	t := strings.ToLower(strings.TrimSpace(r.Type))
@@ -179,7 +179,7 @@ func (s *Sandbox) Compile(ctx context.Context, repoPath, lang string) evaluator.
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
 		s.logLocalEvalEnvOnce(repoPath)
-		return runLocalCompile(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepCompile, "Compile")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCompile), "Compile")
@@ -191,7 +191,7 @@ func (s *Sandbox) Compile(ctx context.Context, repoPath, lang string) evaluator.
 func (s *Sandbox) Test(ctx context.Context, repoPath, lang string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		return runLocalTest(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepTest, "Tests")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepTest), "Tests")
@@ -264,7 +264,7 @@ func (s *Sandbox) Lint(ctx context.Context, repoPath, lang string) evaluator.Ste
 func (s *Sandbox) Coverage(ctx context.Context, repoPath, lang string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		return runLocalCoverage(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepCoverage, "Coverage")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCoverage), "Coverage")

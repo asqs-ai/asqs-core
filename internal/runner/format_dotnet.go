@@ -116,7 +116,7 @@ func dotnetRestoreArgvForPreFormat(formatArgv []string) []string {
 	if r == nil {
 		return nil
 	}
-	return ApplyDotnetDockerDisableNuGetAudit(append([]string(nil), r...))
+	return ApplyDotnetDisableNuGetAudit(append([]string(nil), r...))
 }
 
 // dotnetFormatArgvInsertNoRestore inserts --no-restore immediately after the workspace argument so `dotnet format`
@@ -182,7 +182,7 @@ func runDotNetFormatIncludeOnce(ctx context.Context, repoPath string, relFiles [
 	if didRestore {
 		argv = dotnetFormatArgvInsertNoRestore(argv)
 	}
-	argv = ApplyDotnetDockerDisableNuGetAudit(append([]string(nil), argv...))
+	argv = ApplyDotnetDisableNuGetAudit(append([]string(nil), argv...))
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = formatEnv(dir)
