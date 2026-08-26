@@ -286,9 +286,9 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP01 | Untrack .NET build output; path-specific ignore rules | U §10.5 | — | 0.5 d | `in review` |
-| CP02 | Toolchain and CI alignment | — | — | 0.5 d | `ready` |
+| CP02 | Toolchain and CI alignment | — | — | 0.5 d | `in review` |
 | CP03 | **Structured audit sink** — payloads stop being discarded | B13 (adapted) | — | 1–2 d | `in review` |
-| CP04 | Live-DB test guard and scratch-database convention | R09 | — | 1 d | `ready` |
+| CP04 | Live-DB test guard and scratch-database convention | R09 | — | 1 d | `in review` |
 
 ### P1 — Leaf packages *(no internal dependencies; verified)*
 
@@ -500,7 +500,7 @@ regenerated on next build, but it reads as a large deletion in the diff.
 
 ### CP02 — Toolchain and CI alignment
 
-- **Status:** `ready` · **Effort:** 0.5 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 0.5 d · **Risk:** low
 
 **Verified defect.** `go.mod` declares `go 1.25.0`; `.github/workflows/ci.yml` pins
 `go-version: "1.24"`. It survives today only because the Go toolchain auto-downloads a newer one —
@@ -518,6 +518,19 @@ an implicit network dependency in CI that nobody chose.
 4. Do not touch the `indexers` job until CP54 changes the C# build.
 
 **Acceptance.** CI green with no toolchain auto-download; `vet` failure fails the build.
+
+**Implementation record (2026-08-26).** Done.
+
+- `go-version` pinned to `1.25`, matching `go.mod`, with a comment recording why (the 1.24 pin
+  survived only via toolchain auto-download — an implicit network dependency).
+- Task 2 was **already satisfied**: build, vet and test each run as their own failing step in the
+  existing `go` job, so there was nothing to add — recorded rather than duplicated. (The
+  "four copylocks findings" this task cited were the same stale claim CP30's record corrects.)
+- The `live-db` job runs `make test-live` against a `pgvector/pgvector:pg16` service container
+  whose database is named `asqs_scratch` — the name the CP04 guard requires. Skipped by default:
+  it runs only on `workflow_dispatch` (added to the `on:` block), so ordinary pushes and PRs are
+  untouched.
+- The `indexers` job is untouched, per task 4. YAML validated locally.
 
 ### CP03 — Structured audit sink
 
@@ -599,7 +612,7 @@ known step's payload lands.
 
 ### CP04 — Live-DB test guard and scratch-database convention
 
-- **Status:** `ready` · **Effort:** 1 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 1 d · **Risk:** low
 
 **Goal.** Several bundles below (CP10, CP11, CP12, CP13, CP19) can only be proven against a real
 Postgres. Give them a safe place to run **before** they are written, not after.
@@ -617,6 +630,25 @@ Postgres. Give them a safe place to run **before** they are written, not after.
 
 **Acceptance.** `ASQS_TEST_METADATA_URL` pointed at a database named `asqs` skips with a reason;
 pointed at `asqs_scratch` it runs. `make test-live` with the variable unset exits 0 having skipped.
+
+**Implementation record (2026-08-26).** Done, all three acceptance cases verified against the live
+dev Postgres.
+
+- `livetest_guard.go` ported verbatim, plus a core-own unit test pinning the acceptance matrix
+  (unset → skip with instructions; `asqs` → refused BY NAME with the reason; `asqs_scratch`,
+  `ci_test`, case-insensitive → allowed). Upstream has no such unit test — same "one step further"
+  reasoning as the `make test-live` target itself.
+- The harness has real tenants from day one: upstream's `initschema_live_test.go` ported (the
+  first function; the pre-`repo_id` upgrade test arrives with CP11, noted in-file), plus a
+  core-own embeddings twin that exercises the dimension rewrite and is routed through the guard
+  because `alignChunksEmbeddingColumn` can TRUNCATE on a dimension change — exactly the
+  destructive write the guard exists to prevent. Together they make permanent what CP05 verified
+  with a throwaway script.
+- `make test-live` runs the storage + intelligence trees with `-count=1`; with the variable unset
+  it exits 0 with every live test skipped (verified). The convention is documented in `README.md`
+  beside the docker-compose section, including the one-time `createdb asqs_scratch`.
+- Verified live: both InitSchema tests ran and passed against `asqs_scratch`; pointed at `asqs`,
+  the guard-routed test skipped with `refusing to write to database "asqs"…` verbatim.
 
 ---
 
