@@ -19,6 +19,10 @@ import (
 // The guard tests in this package enforce the last two on the source.
 
 // EmbeddingsMigrations are one-shot migrations for the embeddings (pgvector) database.
+//
+// ID 0002 is reserved: upstream's body (chunk_metadata/module/path indexes) arrives with the
+// bundle that tunes those filters, and reusing or renumbering an ID would desynchronize the
+// ledger from upstream's.
 func EmbeddingsMigrations() []Migration {
 	return []Migration{
 		{
@@ -49,6 +53,32 @@ UPDATE chunks
 					return fmt.Errorf("normalize embeddings: %w", err)
 				}
 				_ = tag
+				return nil
+			},
+		},
+		{
+			ID:          "0003_chunks_content_tsv_gin",
+			Description: "GIN index on chunks.content_tsv for the lexical retrieval channel",
+			Concurrent:  true,
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// The column is declared in schema.sql too, but `asqs-core migrate` connects with a
+				// raw pool and never runs schema.sql — so on a corpus indexed before the lexical
+				// channel existed, and never restarted through the pipeline since, the column is
+				// absent and the index build fails with "column content_tsv does not exist". A
+				// migration has to be self-contained; this ADD COLUMN is the same idempotent DDL
+				// schema.sql carries, so running both is harmless.
+				//
+				// Adding a STORED generated column rewrites the table — this migration is where an
+				// operator schedules that cost. The GIN index must be CONCURRENTLY for the same
+				// reason as the others.
+				if _, err := pool.Exec(ctx, `ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+					   GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED`); err != nil {
+					return fmt.Errorf("add content_tsv column: %w", err)
+				}
+				if _, err := pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_content_tsv
+					   ON chunks USING GIN (content_tsv)`); err != nil {
+					return fmt.Errorf("create content_tsv index: %w", err)
+				}
 				return nil
 			},
 		},

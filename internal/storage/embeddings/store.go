@@ -27,6 +27,13 @@ var vectorColumnDimRE = regexp.MustCompile(`(?i)\bvector\s*\(\s*(\d+)\s*\)`)
 
 const defaultDimension = 1536
 
+// ChunkTypeDependencyDoc marks chunks ingested from dependency documentation (Spec B55) rather
+// than the repository's own source. They are retrievable on request (explicit chunk_type or the
+// doc-fallback path) but must not displace repository chunks in similarity search, so the
+// search-side callers exclude them by default via ExcludeChunkType. The ingestion that produces
+// them arrives with the dependency-docs bundle; until then no chunk carries this type.
+const ChunkTypeDependencyDoc = "dependency_doc"
+
 // Store provides chunk + embedding storage and vector search for symbol-aware RAG.
 type Store struct {
 	pool *pgxpool.Pool
@@ -328,6 +335,12 @@ type SearchOptions struct {
 	ParentSymbolID string // filter by parent_symbol_id (container symbol)
 	RepoID         string // filter by repo_id
 	ChunkType      string // filter by chunk_type
+	// ExcludeChunkType drops one chunk_type from results. Ignored when ChunkType is set (an exact
+	// filter already excludes everything else). Exists so dependency_doc chunks (B55) stay OUT of
+	// every search that did not ask for them: retrieval quality was tuned on repository chunks,
+	// and tens of thousands of library-doc chunks outranking repository code for a "find a similar
+	// test" query is the failure mode the B55 review focus names.
+	ExcludeChunkType string
 	// Module filters chunk_metadata->>'module' (exact). Empty = no filter. Populated by indexer chunk metadata.
 	Module string
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (PostgreSQL @>). Empty = no filter.
@@ -387,6 +400,11 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 		argNum++
 		where = append(where, fmt.Sprintf("repo_id = $%d", argNum))
 		args = append(args, opts.RepoID)
+	}
+	if opts.ChunkType == "" && opts.ExcludeChunkType != "" {
+		argNum++
+		where = append(where, fmt.Sprintf("chunk_type <> $%d", argNum))
+		args = append(args, opts.ExcludeChunkType)
 	}
 	if opts.ChunkType != "" {
 		argNum++
@@ -511,9 +529,11 @@ type ListOptions struct {
 	ParentSymbolID string // return only chunks whose parent_symbol_id matches (container symbol)
 	RepoID         string // return only chunks for this repo
 	ChunkType      string // e.g. "test", "fixture", "definition"
-	Lang           string // e.g. "java", "csharp"
-	Limit          int    // max results; 0 = no limit (use with care)
-	Module         string // chunk_metadata->>'module' exact match; empty = no filter
+	// ExcludeChunkType drops one chunk_type; ignored when ChunkType is set. See SearchOptions.
+	ExcludeChunkType string
+	Lang             string // e.g. "java", "csharp"
+	Limit            int    // max results; 0 = no limit (use with care)
+	Module           string // chunk_metadata->>'module' exact match; empty = no filter
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (@>).
 	MetadataContains []byte
 	// OmitEmbedding skips selecting and decoding the embedding column (~6 KB/row at 1536 dims).
@@ -550,6 +570,11 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 		argNum++
 		where = append(where, fmt.Sprintf("repo_id = $%d", argNum))
 		args = append(args, opts.RepoID)
+	}
+	if opts.ChunkType == "" && opts.ExcludeChunkType != "" {
+		argNum++
+		where = append(where, fmt.Sprintf("chunk_type <> $%d", argNum))
+		args = append(args, opts.ExcludeChunkType)
 	}
 	if opts.ChunkType != "" {
 		argNum++

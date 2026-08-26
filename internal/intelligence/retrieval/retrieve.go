@@ -362,6 +362,9 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 		assemblyPoolLimit = limit
 	}
 	seen := make(map[string]bool)
+	// channelLists holds one ranked list per retrieval channel (one per chunk_type, plus the
+	// lexical list when fusion is enabled). RRF fuses by rank across these.
+	var channelLists [][]embeddings.SearchResult
 	var out []*embeddings.Chunk
 	addChunk := func(ch *embeddings.Chunk) {
 		if ch == nil {
@@ -415,9 +418,15 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 				loose.Module = ""
 				wide, werr := chunks.Search(ctx, targetChunk.Embedding, loose)
 				if werr == nil && len(wide) > 0 {
-					similar = append(append([]embeddings.SearchResult(nil), similar...), wide...)
+					// Merge by distance rather than concatenating. The concatenation left the tail
+					// unordered and duplicated the overlap, which is harmless for the max-cosine
+					// merge below but feeds RRF fabricated ranks.
+					similar = mergeByBestDistance(similar, wide)
 				}
 			}
+			// Keep each channel's ranked list so RRF can fuse by rank. The dense-only path below
+			// still consumes bestByKey, so both modes read from the same searches.
+			channelLists = append(channelLists, similar)
 			for i := range similar {
 				sc := similar[i].Chunk
 				key := chunkStableKey(&sc)
@@ -433,6 +442,45 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 				}
 				cp := sc
 				bestByKey[key] = mmrScoredChunk{chunk: cp, relevance: rel}
+			}
+		}
+
+		// Lexical channel + reciprocal-rank fusion, behind retrieval.fusion: rrf.
+		//
+		// Default is dense (unchanged behaviour) because this changes ranking and must be A/B'd
+		// against a measured baseline before it becomes the default.
+		if NormalizeFusionMode(req.Fusion) == FusionRRF && len(bestByKey) > 0 {
+			if lex := lexicalChannel(ctx, chunks, req, targetChunk, poolSize, hybridMod); len(lex) > 0 {
+				channelLists = append(channelLists, lex)
+				// A lexical hit may be absent from every dense list; it still belongs in the pool.
+				for i := range lex {
+					sc := lex[i].Chunk
+					key := chunkStableKey(&sc)
+					if key == "" {
+						continue
+					}
+					if _, ok := bestByKey[key]; !ok {
+						cp := sc
+						bestByKey[key] = mmrScoredChunk{chunk: cp}
+					}
+				}
+			}
+			// Rescale before the scores become MMR's relevance input: raw RRF values are ~60x
+			// weaker than MMR's diversity term at the default lambda, which stops MMR ranking.
+			fused := normalizeFusedScores(FuseRRF(channelLists))
+			for key, sc := range bestByKey {
+				f, ok := fused[key]
+				if !ok {
+					// Every pool member came from a list in channelLists, so this cannot happen —
+					// but if it ever does, the chunk would keep a raw cosine relevance (0..1)
+					// among peers holding rescaled RRF scores and would dominate the pool. Fail
+					// to the bottom instead of silently to the top.
+					sc.relevance = 0
+					bestByKey[key] = sc
+					continue
+				}
+				sc.relevance = f
+				bestByKey[key] = sc
 			}
 		}
 		if len(bestByKey) > 0 {

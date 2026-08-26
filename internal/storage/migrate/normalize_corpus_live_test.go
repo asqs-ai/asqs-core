@@ -41,7 +41,11 @@ func TestNormalizeChunkEmbeddings_liveCorpus(t *testing.T) {
 	defer pool.Close()
 	defer func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM chunks WHERE file LIKE 'livetest_norm_%'`)
-		_, _ = pool.Exec(ctx, `DELETE FROM schema_migrations WHERE id = '0001_normalize_chunk_embeddings'`)
+		// Remove every embeddings-ledger row this run recorded, so the test stays repeatable as
+		// the migration list grows.
+		for _, m := range EmbeddingsMigrations() {
+			_, _ = pool.Exec(ctx, `DELETE FROM schema_migrations WHERE id = $1`, m.ID)
+		}
 	}()
 
 	const ins = `INSERT INTO chunks (content, embedding, file, lang, chunk_type, start_line, end_line, repo_id)
@@ -57,8 +61,12 @@ func TestNormalizeChunkEmbeddings_liveCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res.Applied) != 1 || res.Applied[0] != "0001_normalize_chunk_embeddings" {
-		t.Fatalf("applied = %v", res.Applied)
+	applied := map[string]bool{}
+	for _, id := range res.Applied {
+		applied[id] = true
+	}
+	if !applied["0001_normalize_chunk_embeddings"] {
+		t.Fatalf("normalize migration not applied: %v", res.Applied)
 	}
 
 	var norm float64
@@ -89,7 +97,7 @@ func TestNormalizeChunkEmbeddings_liveCorpus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(again.Applied) != 0 || len(again.Skipped) != 1 {
+	if len(again.Applied) != 0 || len(again.Skipped) != len(EmbeddingsMigrations()) {
 		t.Errorf("re-run: applied=%v skipped=%v, want all skipped", again.Applied, again.Skipped)
 	}
 }

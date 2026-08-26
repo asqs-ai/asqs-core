@@ -32,6 +32,12 @@ type ContextRequest struct {
 	FailureHint string
 	// DisableHybridModuleFilter when true, skips SQL module matching (chunk_metadata.module) on similar-chunk vector search and list fallbacks. Default false = hybrid filter + adaptive widening.
 	DisableHybridModuleFilter bool
+	// Fusion selects how candidate lists are combined: "dense" (default, previous behaviour) or
+	// "rrf" (dense lists plus a lexical list, fused by reciprocal rank). See fusion.go.
+	Fusion string
+	// LexicalQuery is the synthesized term query for the lexical channel. Empty disables it even
+	// when Fusion is rrf. Built by LexicalQueryForTarget from the target symbol.
+	LexicalQuery string
 }
 
 // SymbolChunk is a symbol plus its chunk content (for inclusion in context).

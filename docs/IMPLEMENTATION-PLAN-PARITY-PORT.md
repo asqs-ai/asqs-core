@@ -320,7 +320,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `in review` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `in review` |
-| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `ready` |
+| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `in review` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
@@ -1447,7 +1447,7 @@ this section's own text, both argued here.
 
 ### CP21 — Lexical channel and RRF fusion
 
-- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle; **ships `fusion: dense`**, exactly as specified) · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
 
 **Read the upstream result before implementing.** Upstream measured RRF fusion against a labelled
 suite and it was a **regression**: nDCG@10 0.4792 → 0.2736, R@10 0.5500 → 0.2542. The default stayed
@@ -1475,6 +1475,43 @@ because the `content_tsv` column is cheap; it is not worth enabling.
 the test that would have caught the original defect. With `fusion: dense` (the default), retrieval
 results are byte-identical to before this bundle. Any move of the default requires a CP16 comparison
 recorded in this file.
+
+**Implementation record (2026-08-26).** Built correctly, left off — the channel works and the
+default stays `dense`, per the upstream measurement quoted above.
+
+1. `content_tsv` as a STORED generated column in `schema.sql` (`'simple'`, with the identifier
+   rationale) and migration `0003_chunks_content_tsv_gin` (Concurrent — the ledger's first; adds
+   the column itself too, since migrate never runs schema.sql). ID 0002 is now the reserved one.
+2. `lexical.go` ported whole: `SearchLexical` with the disjunctive `orTSQuery` (the conjunctive
+   `plainto_tsquery` form matched 0 of 387 chunks for a realistic 13-term query — the defect that
+   made the flag inert), a TOTAL order-by (`score, file, start_line, id` — ts_rank_cd gave 74
+   chunks only 16 distinct scores), real errors surfaced (only missing-column maps to
+   `ErrLexicalIndexUnavailable` and falls back to dense), and embeddings selected unless opted out
+   (nil embeddings made MMR read lexical hits as maximally novel). **`SearchByPathPattern` rides
+   along** — it shares the file and compiles standalone; its consumer (`fixtures.go`) is CP22's.
+3. `fusion.go` ported whole: `FuseRRF` (k=60, one contribution per document per list),
+   `normalizeFusedScores` (raw RRF is ~60× weaker than MMR's diversity term — a unit error, not a
+   tuning choice), `mergeByBestDistance` with a total final key (the widening path's `append`
+   fed RRF fabricated ranks; harmless under dense, so dense results stay byte-identical),
+   `LexicalQueryForTarget` (camelCase splitting; there is no user query in this system),
+   `lexicalChannel` behind the optional `lexicalSearcher` seam, and the `LexicalFailures` counter
+   whose reader (`retrieval-eval`) arrives with the eval bundle. Both fusion test files green.
+4. Config `retrieval.fusion` (default dense; the doc comment quotes upstream's regression numbers
+   and points at ab-report) wired `cfg → PlanOptions.Fusion → ContextRequest` — the ONE retrieval
+   key the pipeline wires; the rest of `cfg.Retrieval` was already unwired in core before this
+   bundle (CP17's cleanup territory). `LexicalQuery` is synthesized per gap at the
+   `createTestPlanFromGaps` request site; the memo key needs no new fields (SymbolID subsumes the
+   query, fusion is run-constant — upstream's key agrees).
+- **Pulled forward as fusion's dependencies, recorded:** `ChunkTypeDependencyDoc` and
+  `SearchOptions/ListOptions.ExcludeChunkType` with their filter branches (B55 plumbing —
+  `lexicalChannel` excludes dependency docs by type; until B55's ingestion exists no chunk
+  carries the type and the branches are inert).
+- Acceptance verified live on `asqs_scratch`: a 15-term synthesized query
+  (`OwnerController#processCreationForm` + signature types) returned non-zero rows from a chunk
+  mentioning only some terms — the exact shape the conjunctive form zeroed; migration 0003
+  applied + re-ran clean with the GIN index present; the ported live tests cover embeddings-
+  unless-omitted, surfaced errors, missing-column classification and the total order. The
+  CP08-era migration live test was made growth-robust (it had hardcoded a one-entry ledger).
 
 ### CP22 — Relevance-driven fixtures/config and doc-link boost
 

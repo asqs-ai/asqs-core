@@ -122,6 +122,8 @@ type PlanOptions struct {
 	FailureHintFile string
 	// DisableHybridModuleFilter when true, disables structured module filter on similar-chunk retrieval (see ContextRequest).
 	DisableHybridModuleFilter bool
+	// Fusion selects candidate-list combination: "dense" (default) or "rrf". From retrieval.fusion.
+	Fusion string
 	// MinSimilarTestsForGeneration when > 0: skip adding a gap to the plan (abstain) if len(SimilarTests) is below this after Retrieve. 0 = disabled. See AssessSimilarReferenceSufficiency.
 	MinSimilarTestsForGeneration int
 	// MinSimilarityCosine when > 0: abstain when the target chunk has an embedding, at least one similar-reference chunk exists, and max cosine to any similar chunk is below this (clamped to [0,1]). 0 = disabled. When there are no similar chunks (greenfield) or the target has no embedding, this criterion is not applied.
@@ -1036,6 +1038,10 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 				SimilarMMRLambda:          opts.SimilarMMRLambda,
 				FailureHint:               opts.FailureHint,
 				DisableHybridModuleFilter: opts.DisableHybridModuleFilter,
+				Fusion:                    opts.Fusion,
+				// The lexical channel has no user query to work with; it is synthesized from
+				// what the target IS. Empty (no symbol) disables the channel for that gap.
+				LexicalQuery: LexicalQueryForTarget(gap.Symbol, typeNamesFromSignature(gap.Symbol)),
 			}
 			normReq := normalizeContextRequestForRetrieveKey(req)
 			cacheKey := retrievalCacheKey(normReq)

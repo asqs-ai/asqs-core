@@ -46,3 +46,16 @@ CREATE TABLE IF NOT EXISTS embedding_provider (
 INSERT INTO embedding_provider (id, provider, embedding_model, dimension)
 VALUES (1, '', '', 1536)
 ON CONFLICT (id) DO NOTHING;
+
+-- content_tsv: lexical index over chunk content.
+--
+-- "Hybrid" retrieval was dense ANN plus SQL equality filters — there was no lexical index to fuse
+-- with, and metadata filtering is a FILTER (it narrows candidates) not a RANKING (it does not score
+-- term overlap). Nothing in the system ranked a chunk higher because it literally contained the
+-- token `OrderRepository`, which is first-order for a task whose central question is "find the
+-- existing test for OrderService.place and the collaborators it mocks".
+--
+-- 'simple' rather than 'english' is deliberate: no stemming and no stop-word removal, because
+-- `get`, `set` and `is` are meaningful identifiers in code, not noise.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;

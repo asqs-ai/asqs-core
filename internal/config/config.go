@@ -211,6 +211,13 @@ type RetrievalConfig struct {
 	PersistLastEvalFailure bool `yaml:"persist_last_eval_failure" env:"RETRIEVAL_PERSIST_LAST_EVAL_FAILURE"`
 	// DisableHybridModuleFilter when true, similar-chunk vector search does not constrain chunk_metadata.module (disables hybrid structured filter). Default false. Env: RETRIEVAL_DISABLE_HYBRID_MODULE_FILTER.
 	DisableHybridModuleFilter bool `yaml:"disable_hybrid_module_filter" env:"RETRIEVAL_DISABLE_HYBRID_MODULE_FILTER"`
+	// Fusion selects how retrieval candidate lists are combined: "dense" (default, previous
+	// behaviour) or "rrf" — dense per-chunk_type lists plus a lexical (tsvector) list, fused by
+	// reciprocal rank. RRF also removes the invalid comparison of raw cosines across chunk_type
+	// sub-corpora. Requires `asqs-core migrate` for the content_tsv index. Upstream measured rrf
+	// as a REGRESSION on its golden suite (nDCG@10 0.4792 → 0.2736); leave it on dense unless an
+	// ab-report comparison on your corpus says otherwise. Env: RETRIEVAL_FUSION.
+	Fusion string `yaml:"fusion" env:"RETRIEVAL_FUSION"`
 	// MaxSimilarTests global default before profile_budgets (0 = use built-in default 5 in retrieval.ResolveRetrievalBudgets). Env: RETRIEVAL_MAX_SIMILAR_TESTS.
 	MaxSimilarTests int `yaml:"max_similar_tests" env:"RETRIEVAL_MAX_SIMILAR_TESTS"`
 	// MaxDependencyChunks global default before profile_budgets (0 = built-in 15). Env: RETRIEVAL_MAX_DEPENDENCY_CHUNKS.

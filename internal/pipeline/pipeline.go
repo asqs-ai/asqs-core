@@ -220,6 +220,8 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		MaxGaps:    orDefault(opts.MaxGaps, 10),
 		MaxGapsE2E: opts.MaxGapsE2E,
 		Audit:      audit,
+		// Candidate-list fusion; empty/dense is the measured default (see retrieval.fusion).
+		Fusion: cfg.Retrieval.Fusion,
 	}
 	plan, err := retrieval.CreateTestPlan(ctx, meta, meta, emb, planOpts)
 	if err != nil {
