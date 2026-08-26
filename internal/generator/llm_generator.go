@@ -250,7 +250,20 @@ func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages [
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = DefaultGenerateMaxTokens
 	}
-	const maxRetries = 3
+	// ONE application-level retry, not three (M-18). This loop sits on top of the provider
+	// clients' own transport retry — 5 attempts with exponential backoff and jitter (OpenAI,
+	// Ollama, and Anthropic via retryhttp, all DefaultMaxAttempts = 5). Three application
+	// attempts over five transport attempts is up to 15 requests for one completion, and the
+	// callers stack further: the structured→unstructured fallback and the quality retry each
+	// call this path again. Against a flapping provider that is a self-inflicted load
+	// multiplier, and every request is billed.
+	//
+	// Resilience is not reduced below the retry bundle's baseline, because that baseline IS the
+	// transport retry and it is untouched: after five attempts with backoff have failed, a sixth
+	// issued immediately afterwards is not a meaningfully different bet. The truncation
+	// escalation keeps its own separate budget — it re-asks a DIFFERENT question (a larger
+	// output cap), so it must not draw from this one.
+	const maxRetries = 2
 	var result *model.CompleteResult
 	var err error
 	escalations := 0

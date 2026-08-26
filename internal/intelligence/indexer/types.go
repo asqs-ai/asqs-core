@@ -75,12 +75,14 @@ type ChunkPlan struct {
 	EndLine   int
 	RepoID    string
 	// SymbolFQ is the primary symbol for symbol_id resolution (first symbol when merged).
-	SymbolFQ      string
-	SymbolKind    string
-	ChunkIndex    int // 0 = single or first slice; >0 for large-symbol continuations (Phase D).
-	ParentFQ      string
-	SecondaryRole string // e.g. route_manifest, angular_template_file (Phase C); empty for normal chunks.
-	MetadataJSON  []byte // stored as chunk_metadata JSONB when non-nil (Phases A–D).
+	// The symbol's kind and any secondary role travel in MetadataJSON (`symbol_kind`,
+	// `chunk_role`) — they were also plain fields here once, set at every construction site and
+	// read by nothing, which made it ambiguous whether the metadata or the field was the record.
+	// The metadata is.
+	SymbolFQ     string
+	ChunkIndex   int // 0 = single or first slice; >0 for large-symbol continuations (Phase D).
+	ParentFQ     string
+	MetadataJSON []byte // stored as chunk_metadata JSONB when non-nil (Phases A–D).
 }
 
 // ChunkToEmbed is a chunk ready for embedding and storage (no vector yet).

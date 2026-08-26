@@ -323,7 +323,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `in review` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `in review` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `in review` |
-| CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
+| CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `in review` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
 
 ### P4 — LLM transport and prompt budget
@@ -1684,7 +1684,7 @@ tree, which is recorded because it changes what the work was.
 
 ### CP24 — Review-findings cleanup
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low (one user-visible change)
+- **Status:** `in review` (done 2026-08-26 — see the record; **release note required for item 2**) · **Effort:** 2–3 d · **Risk:** low (one user-visible change)
 
 Six independent items; each needs a test that fails before the change.
 
@@ -1710,6 +1710,33 @@ Six independent items; each needs a test that fails before the change.
 
 **Acceptance.** Item-by-item unit tests. `src/TestData/Model.cs` is no longer a test file. A source
 file with `/*` inside a string literal survives sanitisation intact.
+
+**Implementation record (2026-08-26).** All six items closed, each with its failing-first test.
+
+1. `sanitize.go` ported whole with `sanitize_literals_test.go`: `stripBlockComments` is now
+   literal-aware, so `/*` inside a string or regex no longer swallows source to the next `*/`.
+2. **User-visible — RELEASE NOTE:** `IsLikelyTestSourcePath` uses `fileBaseNamesATest`
+   (word-boundary matching on the BASE NAME) instead of `strings.Contains(path, "Test")`.
+   `src/TestData/Model.cs` is production again — every repository with a TestData directory
+   gains gaps — while `TestimonialService.java` and `ContestEntry.java` stay non-test and a file
+   literally named `*Test.*` still classifies. The JS branch also gains the cypress/playwright/
+   `.e2e.` patterns so `files.is_test` stays aligned with the js-ts indexer's E2E_SPEC emission.
+3. Retry stacking: the generator's application-level loop is ONE retry (was three) over the
+   provider clients' untouched 5-attempt transport retry (M-18: 3×5 = up to 15 billed requests
+   per completion before the fallback/quality callers stack further). Core already had the
+   truncation escalation on its own budget — the half of upstream's fix that mattered most was
+   pre-split here; only the constant moved.
+4. `edgetypes.go` registry ported (+tests); `dependencyEdgeConfidence` now reads
+   `indexer.EdgeTypeConfidence` — the single list replaces the hand-agreed switch (the remaining
+   CP22-skipped profiles.go delta, owned here). No check constraint: upstream added none.
+5. Decided explicitly, both halves: `ChunkPlan.SymbolKind`/`SecondaryRole` are DELETED — every
+   value they carried already persists in chunk_metadata (`symbol_kind`, `chunk_role`), so the
+   fields were set at five sites and read by nothing; the type's comment now names the metadata
+   as the record. `ParsedEdge.SignatureJSON` is KEPT with its existing explicit "not persisted on
+   metadata.Edge today" comment — upstream made the same call, and deleting it would orphan the
+   helper-emitted PACKAGE_EXPORT condition chains it carries.
+6. `dedupeGraphEdges` deleted (zero callers — upstream had already removed it); the `ListGapsE2E`
+   decomposition landed with CP23 (recorded there).
 
 ### CP57 — *(optional)* Retrieval IR eval harness and golden suite
 

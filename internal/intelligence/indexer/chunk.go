@@ -55,7 +55,6 @@ func ChunkFromParsedFile(parsed *ParsedFile, repoID, repoRoot string, cfg ChunkC
 			EndLine:      part.endLine,
 			RepoID:       repoID,
 			SymbolFQ:     part.sym.FQName,
-			SymbolKind:   part.sym.Kind,
 			ChunkIndex:   part.chunkIndex,
 			ParentFQ:     parentFQ,
 			MetadataJSON: metaJSON,

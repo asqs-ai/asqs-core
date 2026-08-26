@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
@@ -433,36 +434,12 @@ func sortGraphEdges(raw []graphEdge, profile RetrievalProfile) {
 	})
 }
 
-// dependencyEdgeConfidence returns a rough confidence rank (higher = more reliable signal).
-// Semantic, behavior-coupled edges rank above broad structural/import-only edges.
+// dependencyEdgeConfidence ranks a dependency edge for retrieval.
+//
+// The bands used to be a switch here, which meant the list of edge types existed in two places (this
+// file and the producers) and agreed by hand. An edge type absent from the switch silently fell to
+// the default band, so a producer typo and a deliberately-weak edge were indistinguishable. The
+// registry in the indexer package is now the single list; this reads it.
 func dependencyEdgeConfidence(edgeType string) int {
-	switch strings.ToUpper(strings.TrimSpace(edgeType)) {
-	case "CALLS", "INJECTS", "INJECTS_NAMED",
-		"ROUTE_TO_HANDLER", "HANDLER_USES_DTO", "USES_GUARD", "USES_PIPE", "USES_INTERCEPTOR",
-		"TARGETS_API_ROUTE", "CALLS_API", "USES_SELECTOR",
-		"RENDERS", "USES_HOOK", "ACCEPTS_PROPS_TYPE",
-		"IMPLEMENTS_SERVICE", "REGISTERS_SERVICE":
-		return 3
-	case "EXTENDS", "IMPLEMENTS", "CONTAINS", "DECLARES",
-		"MODULE_IMPORTS", "MODULE_EXPORTS", "MODULE_PROVIDERS", "MODULE_REGISTERS":
-		return 2
-	case "IMPORTS", "DEPENDS_ON", "DEPENDS_ON_DEV",
-		"PACKAGE_MAIN", "PACKAGE_MODULE", "PACKAGE_EXPORT", "PACKAGE_ENTRY", "PACKAGE_BIN":
-		return 1
-	default:
-		return 2
-	}
-}
-
-func dedupeGraphEdges(raw []graphEdge) []graphEdge {
-	seen := make(map[string]bool)
-	var out []graphEdge
-	for _, g := range raw {
-		if g.otherID == "" || seen[g.otherID] {
-			continue
-		}
-		seen[g.otherID] = true
-		out = append(out, g)
-	}
-	return out
+	return indexer.EdgeTypeConfidence(edgeType)
 }
