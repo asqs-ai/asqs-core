@@ -14,6 +14,11 @@ import (
 
 // Config is the root configuration for the quality pipeline.
 type Config struct {
+	// SourcePath is the YAML file this config was loaded from ("" when env-only). Set by Load,
+	// never by YAML: the pipeline records the file's content as a config revision per run so the
+	// A/B report can join runs to the exact configuration that produced them.
+	SourcePath string `yaml:"-"`
+
 	// ClientID identifies the client/tenant; used for env overrides (e.g. ASQS_<ClientID>_*).
 	ClientID string `yaml:"client_id" env:"CLIENT_ID"`
 

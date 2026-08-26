@@ -20,6 +20,7 @@ import (
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
@@ -189,6 +190,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		return sum, fmt.Errorf("language indexer: %w", err)
 	}
 	runID := fmt.Sprintf("core_%d", time.Now().UnixNano())
+	// Join this run to the exact configuration that produced it (the A/B report groups on it).
+	// Best-effort: a run without a recorded revision still runs, it is just invisible to ab-report.
+	configRevisionID, crErr := ensureConfigRevisionForRun(ctx, meta, cfg.SourcePath)
+	if crErr != nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: record config revision: %v (run will not appear in ab-report)\n", crErr)
+	}
 	if _, err := indexer.Run(ctx, meta, emb, indexer.RunOptions{
 		CurrentFiles:      files,
 		RepoPath:          repoAbs,
@@ -201,6 +208,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		EmbeddingModel:    embedModel(cfg),
 		Audit:             audit,
 		IndexablePaths:    indexable,
+		ConfigRevisionID:  configRevisionID,
 	}); err != nil {
 		return sum, fmt.Errorf("index: %w", err)
 	}
@@ -224,6 +232,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	if plan == nil || len(plan.Items) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test gaps found — nothing to generate.")
+		// Evaluation never ran: completed with stable/iterations untouched and metrics NULL — an
+		// absent metrics row means "not measured", which must stay distinguishable from zeroes.
+		completeRun(ctx, meta, runID, nil, nil, nil)
 		return sum, nil
 	}
 	sum.GapsPlanned = len(plan.Items)
@@ -271,14 +282,18 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
 	rules := contract.ByLang(lang)
+	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
+	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).
+	runUsage := &model.UsageAccumulator{}
+	trackedChat := model.NewUsageTrackingChatCompleter(chat, runUsage)
 	gen := &generator.LLMGenerator{
-		LLM:                    chat,
+		LLM:                    trackedChat,
 		ContractRules:          &rules,
 		TwoPhaseTestGeneration: cfg.Runner.TwoPhaseTestGeneration,
 		RepoPath:               repoAbs,
 		Audit:                  audit,
 	}
-	fixer := &llmfix.Fixer{LLM: chat, Audit: audit}
+	fixer := &llmfix.Fixer{LLM: trackedChat, Audit: audit}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
@@ -434,6 +449,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	if len(artifactPaths) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test files were generated — skipping evaluation.")
+		completeRun(ctx, meta, runID, nil, nil, nil)
 		return sum, nil
 	}
 
@@ -493,6 +509,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			}
 		}
 	}
+
+	// Terminal DB state: status + stable/iterations, plus the first-wave metrics that make this
+	// run comparable in `asqs-core ab-report`. On an evaluation error the metrics stay NULL.
+	_, _, llmTotal := runUsage.Totals()
+	stable := sum.ProjectStable
+	iters := evalRes.Iterations
+	completeRun(ctx, meta, runID, &stable, &iters, evalFirstWaveMetricsForDB(&evalRes, eerr, llmTotal))
 	return sum, nil
 }
 

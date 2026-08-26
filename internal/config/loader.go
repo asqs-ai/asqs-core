@@ -60,6 +60,7 @@ func Load(opts LoadOptions) (*Config, error) {
 			return nil, fmt.Errorf("config: parse yaml: %w", err)
 		}
 		warnDeprecatedConfigYAML(data, opts.ConfigPath)
+		c.SourcePath = opts.ConfigPath
 	} else {
 		// Try default paths so "config.yaml" in cwd is used when -config and ASQS_CONFIG_PATH are unset
 		for _, name := range []string{"config.yaml", "config.yml"} {
@@ -69,6 +70,7 @@ func Load(opts LoadOptions) (*Config, error) {
 					return nil, fmt.Errorf("config: parse %s: %w", name, err)
 				}
 				warnDeprecatedConfigYAML(data, name)
+				c.SourcePath = name
 				break
 			}
 		}

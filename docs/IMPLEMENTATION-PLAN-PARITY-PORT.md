@@ -310,7 +310,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
-| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `ready` |
+| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
 
 ### P3 — Indexing and retrieval quality
 
@@ -320,7 +320,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
-| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP16)` |
+| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `ready` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
@@ -1175,7 +1175,7 @@ naming both numbers and the fix. The opt-in escape hatch is tested and off by de
 
 ### CP16 — First-wave metrics writer and A/B report
 
-- **Status:** `blocked (CP18)` · **Effort:** 2 d · **Risk:** low · **This is what makes P3/P7 acceptable**
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2 d · **Risk:** low · **This is what makes P3/P7 acceptable**
 
 **Verified state.** `index_runs`, `config_revisions` and `index_runs.first_wave_metrics` all exist in
 core's schema today, and `SetIndexRunFirstWaveMetrics` / `GetIndexRunFirstWaveMetrics` are already
@@ -1205,6 +1205,45 @@ as JSONB verbatim; do not "fix" the casing.
 
 **Note.** `CP18` is a hard prerequisite. Until gap selection is deterministic, two runs of an
 unchanged repository select different gaps, and the A/B compares different work.
+
+**Implementation record (2026-08-26).** All five tasks done; the run-completion bookkeeping core
+never had came with it.
+
+- **Core never called `SetRunCompleted` at all** — every `index_runs` row stayed `status='running'`
+  forever. The pipeline now records terminal state at its three endings: zero gaps and zero
+  generated artifacts complete with `(nil, nil)` and NULL metrics (evaluation never ran — absent
+  must stay distinguishable from zeroes), and the evaluated ending writes
+  `stable = ProjectStable` (green outright or green-after-discard, exactly what the console
+  reports), `iterations`, and the metrics row. Error returns before indexing leave no row;
+  later error returns keep today's behaviour.
+- `evalFirstWaveMetricsForDB` lives in `internal/pipeline` (task 1's placement): the CLI edition
+  of upstream's orchestrator projection — same fields, same snake_case JSONB keys, nil on
+  evaluation error. Core-authored unit tests pin the nil/row distinction, the field mapping, the
+  `tokens_to_stable` rules (stable AND tracked only), and stable-after-discard counting as
+  stable. Token totals come from `model.UsageAccumulator` + `NewUsageTrackingChatCompleter` —
+  present in core since CP25's wave but **wired to nothing**; the pipeline now wraps exactly the
+  generator and fixer completers (upstream's `RunLLMUsage` scope; doc pass and overview stay
+  untracked).
+- **Task 3 goes beyond upstream's end state, deliberately**: upstream fills
+  `config_revision_id` only on API-triggered runs, so CLI runs are invisible to its own report.
+  Core's `ensureConfigRevisionForRun` version-controls the CLI config file under one well-known
+  `configs` row (`"cli"`): an unchanged file reuses the latest revision (N runs of one
+  configuration share one revision — the A/B shape), a changed file appends, env-only configs
+  record nothing (no body to version; serializing the resolved struct would leak secrets).
+  `Config.SourcePath` (loader-set, `yaml:"-"`) carries the file path; the indexer's existing
+  `ConfigRevisionID → IndexRunStartExtras` plumbing does the rest. Live test covers reuse,
+  append, and the env-only no-op.
+- `ab_report.go` ported verbatim (`ABReportForRepo` groups completed runs by revision; rows with
+  NULL metrics or NULL revision are excluded). `asqs-core ab-report` adapted from upstream's cmd:
+  run counts on every row, the `← too few runs` flag under 10, the pass@1-AND-tokens decision
+  criterion, and the determinism note (upstream's trailing tool-calling sentence dropped until
+  the tool-calling bundles land). Dispatch gained the case CP07's extraction planned for;
+  the pinned dispatch tests still pass.
+- Acceptance verified end to end: the built binary ran `ab-report` against the live scratch DB
+  over two seeded revisions on one corpus — both rows printed with counts (2 and 1), both
+  low-sample flagged, averages correct from the JSONB (50%/100% pass@1, 1500/800 avg tokens);
+  `ABReportForRepo` live test additionally pins that NULL-metrics runs stay out of every
+  average. Keys on the wire are the struct tags, stored verbatim.
 
 ---
 
@@ -1351,7 +1390,7 @@ sources. (a)/(b) ship behind settings whose defaults are today's behaviour until
 
 ### CP21 — Lexical channel and RRF fusion
 
-- **Status:** `blocked (CP16)` · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
+- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
 
 **Read the upstream result before implementing.** Upstream measured RRF fusion against a labelled
 suite and it was a **regression**: nDCG@10 0.4792 → 0.2736, R@10 0.5500 → 0.2542. The default stayed
