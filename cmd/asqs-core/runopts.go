@@ -13,8 +13,8 @@ const (
 	defaultMaxGapsE2E = 0
 )
 
-// Where an effective gap cap came from. Reported on stderr so a run is self-explaining when the
-// flag and `indexer.max_gaps` / `indexer.max_gaps_e2e` disagree.
+// Where an effective value came from (gap caps, audit log). Reported on stderr so a run is
+// self-explaining when a flag and its config key disagree.
 const (
 	gapSourceFlag    = "flag"
 	gapSourceConfig  = "config"
@@ -34,6 +34,7 @@ type runFlags struct {
 	shipBranch string
 	baseBranch string
 	dryRun     bool
+	auditLog   string
 
 	// setFlags holds the names of the flags that were actually present on the command line, so
 	// resolveMaxGaps / resolveMaxGapsE2E can tell "user asked for this value" apart from "the
@@ -65,6 +66,7 @@ func parseRunFlags(args []string, out io.Writer) (*runFlags, error) {
 	shipBranch := fs.String("ship-branch", "", "branch to push when shipping (default: config or 'asqs-core')")
 	baseBranch := fs.String("base-branch", "", "PR base branch (default: config or 'main')")
 	dryRun := fs.Bool("dry-run", false, "generate + evaluate but never ship")
+	auditLog := fs.String("audit-log", "", "append structured audit JSONL (step + payload per line) to this file (default: audit.file_path from config; empty = no audit file)")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: asqs-core run [flags] [<repo-path-or-git-url>]\n\n")
 		fs.PrintDefaults()
@@ -103,9 +105,24 @@ func parseRunFlags(args []string, out io.Writer) (*runFlags, error) {
 		shipBranch: *shipBranch,
 		baseBranch: *baseBranch,
 		dryRun:     *dryRun,
+		auditLog:   *auditLog,
 		setFlags:   setFlags,
 		usage:      fs.Usage,
 	}, nil
+}
+
+// resolveAuditLogPath picks the audit JSONL path. Precedence: an explicitly passed --audit-log —
+// including an explicit empty value, which disables a config-set path for one run — then
+// audit.file_path from the config file (or ASQS_AUDIT_FILE_PATH, which config.Load has already
+// folded into cfgVal), then empty = no audit file, today's behaviour exactly.
+func resolveAuditLogPath(flagSet bool, flagVal, cfgVal string) (string, string) {
+	if flagSet {
+		return strings.TrimSpace(flagVal), gapSourceFlag
+	}
+	if v := strings.TrimSpace(cfgVal); v != "" {
+		return v, gapSourceConfig
+	}
+	return "", gapSourceDefault
 }
 
 // resolveMaxGaps picks the effective unit-gap cap. Precedence: an explicitly passed --max-gaps,

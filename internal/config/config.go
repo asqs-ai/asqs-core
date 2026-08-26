@@ -229,10 +229,16 @@ func (c *Config) EffectiveProjectIntel() ProjectIntelConfig {
 	return c.Runner.ProjectIntel
 }
 
-// AuditConfig configures where audit entries are persisted (DB + optional file).
+// AuditConfig configures where audit entries are persisted (structured JSONL file).
 type AuditConfig struct {
-	// FilePath is an optional file path to append audit entries (one JSON line per step). Empty = DB only.
+	// FilePath is an optional file path to append audit entries (one JSON line per step). Empty =
+	// no audit file (stderr step lines only). The --audit-log flag overrides it for one run.
 	FilePath string `yaml:"file_path" env:"AUDIT_FILE_PATH"`
+	// DumpPrompts restores full prompt/completion text in audit payloads. Off by default: prompt
+	// bodies carry repository source code, extracted configuration and compiler/test output, so
+	// the sink stores {sha256, len} for such fields instead. Enable for post-mortems.
+	// Env: ASQS_AUDIT_DUMP_PROMPTS.
+	DumpPrompts bool `yaml:"dump_prompts" env:"AUDIT_DUMP_PROMPTS"`
 }
 
 // CopilotConfig configures the optional GitHub Copilot SDK gap-agent intelligence layer.

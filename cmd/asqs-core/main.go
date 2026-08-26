@@ -62,6 +62,14 @@ func run() error {
 	fmt.Fprintf(os.Stderr, "asqs-core: max-gaps=%d (%s) max-gaps-e2e=%d (%s)\n",
 		maxGaps, maxGapsSrc, maxGapsE2E, maxGapsE2ESrc)
 
+	// --- Audit log -----------------------------------------------------------------------
+	// Precedence: --audit-log, then audit.file_path (or ASQS_AUDIT_FILE_PATH). Empty = no audit
+	// file; the run keeps its stderr step lines either way.
+	auditLogPath, auditLogSrc := resolveAuditLogPath(flags.setFlags["audit-log"], flags.auditLog, cfg.Audit.FilePath)
+	if auditLogPath != "" {
+		fmt.Fprintf(os.Stderr, "asqs-core: audit-log=%s (%s)\n", auditLogPath, auditLogSrc)
+	}
+
 	// --- Ship settings (resolved up front) ----------------------------------------------
 	// Ship targets the REPO WE RUN AGAINST: the ship branch is prepared on that repo *before*
 	// generation (asqs-go behaviour), so generated tests/docs are written and committed from it — and
@@ -147,13 +155,15 @@ func run() error {
 
 	// --- Run the pipeline ---------------------------------------------------------------
 	sum, err := pipeline.Run(ctx, cfg, pipeline.Options{
-		RepoPath:     repoDir,
-		RepoID:       repoID,
-		Lang:         flags.lang,
-		MaxGaps:      maxGaps,
-		MaxGapsE2E:   maxGapsE2E,
-		GenerateDocs: flags.docs,
-		Sandbox:      cfg.Runner.Type,
+		RepoPath:         repoDir,
+		RepoID:           repoID,
+		Lang:             flags.lang,
+		MaxGaps:          maxGaps,
+		MaxGapsE2E:       maxGapsE2E,
+		GenerateDocs:     flags.docs,
+		Sandbox:          cfg.Runner.Type,
+		AuditLogPath:     auditLogPath,
+		AuditDumpPrompts: cfg.Audit.DumpPrompts,
 	})
 	if err != nil {
 		return err

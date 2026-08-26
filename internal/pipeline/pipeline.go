@@ -41,6 +41,13 @@ type Options struct {
 	MaxGapsE2E   int    // e2e gaps cap (0 = skip e2e)
 	GenerateDocs bool   // also generate per-symbol docs (inserted above declarations)
 	Sandbox      string // "local" | "docker" (informational; sandbox built from cfg.Runner.Type)
+
+	// AuditLogPath, when non-empty, appends every audit step WITH its structured payload as JSONL
+	// to this file (see internal/audit). Empty = stderr step lines only, exactly as before.
+	AuditLogPath string
+	// AuditDumpPrompts restores full prompt/completion text in audit payloads (default: such
+	// fields are stored as {sha256, len} — see audit.RedactPayload).
+	AuditDumpPrompts bool
 }
 
 // GapOutcome is the per-gap result recorded in the summary.
@@ -74,21 +81,11 @@ func (s Summary) Stable() bool {
 	return s.ProjectStable && s.GapsGenerated > s.Discarded
 }
 
-// stdoutAuditor satisfies the (identical) Auditor interface declared by indexer / retrieval /
-// evaluator. It prints a compact line per step to stderr.
-type stdoutAuditor struct{}
-
-func (stdoutAuditor) Log(_ context.Context, step string, _ interface{}) {
-	fmt.Fprintf(os.Stderr, "  · %s\n", step)
-}
-func (stdoutAuditor) LogError(_ context.Context, step string, payload interface{}) {
-	fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", step, payload)
-}
-
 // Run executes the pipeline against opts.RepoPath (already a local working tree).
 func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error) {
 	var sum Summary
-	audit := stdoutAuditor{}
+	audit, closeAudit := buildRunAuditor(opts.AuditLogPath, opts.AuditDumpPrompts)
+	defer closeAudit()
 	repoAbs, err := filepath.Abs(opts.RepoPath)
 	if err != nil {
 		return sum, fmt.Errorf("resolve repo path: %w", err)
