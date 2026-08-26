@@ -82,16 +82,9 @@ func splitLargeSymbolToRaw(
 	var out []rawChunkPart
 	start := sym.StartLine
 	end := sym.EndLine
-	targetLines := (cfg.MaxTokens * cfg.CharsPerToken) / 80
-	if targetLines < 5 {
-		targetLines = 5
-	}
 	idx := 0
 	for start <= end {
-		chunkEnd := start + targetLines - 1
-		if chunkEnd > end {
-			chunkEnd = end
-		}
+		chunkEnd := lastLineWithinBudget(lines, start, end, cfg)
 		content := extractLines(lines, start, chunkEnd)
 		content = Sanitize(content, sanitize)
 		out = append(out, rawChunkPart{
@@ -99,9 +92,67 @@ func splitLargeSymbolToRaw(
 			content: content, chunkIndex: idx,
 		})
 		idx++
-		start = chunkEnd + 1
+		if chunkEnd >= end {
+			break
+		}
+		start = nextSplitStart(start, chunkEnd, cfg)
 	}
 	return out
+}
+
+// lastLineWithinBudget returns the highest line L in [start, end] whose content from start through L
+// still fits MaxTokens — or start itself when even one line exceeds the budget.
+//
+// This measures the content. The previous version computed a fixed line count:
+//
+//	targetLines := (cfg.MaxTokens * cfg.CharsPerToken) / 80
+//
+// which hardcodes 80 characters per line and so ignores the config it is derived from. On minified
+// or generated sources — a single line can be thousands of characters — that produced chunks many
+// times MaxTokens, which the embedding provider then rejected or truncated. On heavily indented or
+// declaration-dense code it produced chunks far under MinTokens, wasting the budget the config asked
+// for. ApproxTokens is the same estimator the caller already uses to decide whether a symbol needs
+// splitting at all, so this makes the split path agree with the decision that reached it.
+func lastLineWithinBudget(lines []string, start, end int, cfg ChunkConfig) int {
+	budget := cfg.MaxTokens
+	if budget <= 0 {
+		budget = DefaultChunkConfig().MaxTokens
+	}
+	last := start
+	for line := start; line <= end; line++ {
+		if cfg.ApproxTokens(extractLines(lines, start, line)) > budget && line > start {
+			break
+		}
+		last = line
+	}
+	return last
+}
+
+// nextSplitStart returns where the following chunk begins, backing up by roughly 10% of the chunk
+// just emitted so consecutive chunks overlap.
+//
+// Without overlap a method split at line 40 puts the loop header in one chunk and its body in the
+// next, and neither chunk is self-contained: retrieval that surfaces the second one shows the model
+// a body whose condition it cannot see. The oversize embedding fallback has always overlapped for
+// this reason; the primary path did not, so which behaviour a symbol got depended on whether it
+// happened to exceed the provider's input limit.
+//
+// The step is always at least one line, so a chunk that is a single long line cannot loop forever.
+func nextSplitStart(start, chunkEnd int, cfg ChunkConfig) int {
+	span := chunkEnd - start + 1
+	overlap := span / 10
+	if overlap < 1 {
+		overlap = 1
+	}
+	// Never re-emit the whole chunk: the next start must advance.
+	if overlap >= span {
+		overlap = span - 1
+	}
+	next := chunkEnd + 1 - overlap
+	if next <= start {
+		next = start + 1
+	}
+	return next
 }
 
 // extractLines returns the inclusive 1-based line range joined with newlines.

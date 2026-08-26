@@ -319,7 +319,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `in review` |
-| CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
+| CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `in review` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `ready` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
@@ -1400,7 +1400,7 @@ repo scoping); the file's remaining deltas were exactly this bundle.
 
 ### CP20 — Chunk overlap and honest segment line numbers
 
-- **Status:** `ready` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record; **(a)/(b) ship unconditional and unmeasured**, matching upstream's end state — the record explains the deviation from this bundle's own acceptance) · **Effort:** 2 d · **Risk:** medium
 
 **Three defects, one bundle.** (a) adjacent chunks have no overlap, so a symbol split across a
 boundary is retrievable from neither half; (b) chunk sizing is a guessed constant rather than measured
@@ -1414,6 +1414,36 @@ say so in the status line.
 
 **Acceptance.** (c) has an exact test: a merged segment's reported range equals the union of its
 sources. (a)/(b) ship behind settings whose defaults are today's behaviour until measured.
+
+**Implementation record (2026-08-26).** All three defects fixed; two deliberate deviations from
+this section's own text, both argued here.
+
+- **(a)+(b), one function pair in `chunk.go`:** the split loop's fixed
+  `targetLines = MaxTokens×CharsPerToken/80` guess (hardcoding 80 chars/line — chunks many times
+  MaxTokens on minified sources, far under MinTokens on declaration-dense ones) is replaced by
+  `lastLineWithinBudget`, which measures content with the same `ApproxTokens` estimator that
+  decided the symbol needed splitting; `nextSplitStart` backs up ~10% so consecutive chunks
+  overlap — the oversize embedding fallback always overlapped, so which behaviour a symbol got
+  used to depend on whether it happened to exceed the provider limit.
+- **(c) in `embed_fallback.go`:** segment line numbers are COUNTED (`prefixNewlineCounts`, one
+  pass per chunk) rather than interpolated from rune offsets — the ratio estimate drifted ~14
+  lines on ordinary Java, and those numbers become the generation prompt's `symbolLoc` and the
+  fixer's `errloc` window, where a wrong line is worse than none. The clustered-non-uniformity
+  test pins it (alternating lines would NOT discriminate; a block of long then short lines does).
+  The plan's "merged segment reports the first sub-chunk's range" is the same defect family; the
+  small-symbol merge (`chunk_merge.go`) already extended ranges to the union in both trees.
+- **Deviation 1 — no settings:** upstream ships (a)/(b) unconditional; there is no flag to port.
+  The golden labels the "behind settings" requirement protected died with CP57's withdrawal
+  (D16), and a core-only flag would be permanent divergence for CP49-style reconciliation to
+  trip over. The change ships **unmeasured** (rule 10, said in the status line) — and CP16's
+  ab-report now exists precisely to measure it: run the same corpus on the pre/post revisions.
+- **Deviation 2, in core's favour:** `chunk_secondary.go` was NOT taken from upstream — core is
+  ahead there (`SymbolKind` + `SecondaryRole` on secondary chunks), and core's extra
+  `SymbolKind: part.sym.Kind` in `chunk.go` is preserved.
+- Six upstream test files ported whole (`segment_lines_test`, `chunk_split_test`,
+  `embed_fallback_test`, `chunk_test`, `chunk_config_test`, `chunk_metadata_sig_test`) — the
+  indexer package had **zero** test files before this; it now runs 32, all green, and their
+  passing unmodified confirms core's chunk behaviour equals upstream's end state.
 
 ### CP21 — Lexical channel and RRF fusion
 
