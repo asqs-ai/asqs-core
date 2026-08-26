@@ -5,6 +5,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -143,9 +144,30 @@ func parseVectorColumnDim(pgFormatType string) int {
 	return d
 }
 
+// EnvAllowEmbeddingDimReset opts in to the destructive branch of alignChunksEmbeddingColumn.
+//
+// It is an environment variable rather than a config field on purpose: it is a break-glass switch
+// for a one-off operation, not a setting a deployment should carry, and putting it in YAML invites
+// someone to leave it enabled.
+const EnvAllowEmbeddingDimReset = "ASQS_ALLOW_EMBEDDING_DIM_RESET"
+
+// ErrEmbeddingDimMismatch is returned when the configured embedding dimension disagrees with a
+// corpus that already has rows.
+var ErrEmbeddingDimMismatch = errors.New("embeddings: configured dimension does not match the indexed corpus")
+
 // alignChunksEmbeddingColumn fixes chunks.embedding when an older schema used vector(1536) (or another size)
 // but this store expects s.dim. Existing vectors are incompatible after an embedding model/dimension change,
 // so rows are truncated before ALTER TYPE.
+//
+// The truncate is `TRUNCATE TABLE chunks` — EVERY repo in the database, not only the one being
+// indexed — and InitSchema runs on process start, so it fires before any command does its own work.
+// A single mistyped `-config` therefore destroyed the whole corpus silently: no prompt, no log, no
+// row count. That is not a theoretical footgun: configs commonly ship at both 768 (local Ollama
+// models) and 1536 (OpenAI), so indexing a second stack against an existing corpus hits it on the
+// first command.
+//
+// So: an empty table realigns freely (the legitimate "fresh database, changed the model" case), and
+// a populated one refuses unless the operator explicitly opts in via EnvAllowEmbeddingDimReset.
 func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 	var colType string
 	err := s.pool.QueryRow(ctx, `
@@ -168,6 +190,31 @@ func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 	cur := parseVectorColumnDim(colType)
 	if cur <= 0 || cur == s.dim {
 		return nil
+	}
+
+	// Count first. Realigning an empty table costs nothing and destroys nothing.
+	var rows int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM chunks`).Scan(&rows); err != nil {
+		return fmt.Errorf("embeddings: count chunks before dimension change: %w", err)
+	}
+	if rows > 0 && !embeddingDimResetAllowed() {
+		var repos string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COALESCE(string_agg(r, ', '), '') FROM (
+			   SELECT DISTINCT repo_id AS r FROM chunks WHERE repo_id <> '' ORDER BY 1 LIMIT 10) t`,
+		).Scan(&repos); err != nil {
+			repos = "(could not list)"
+		}
+		return fmt.Errorf("%w: column is vector(%d), config wants vector(%d), and %d chunk(s) are "+
+			"indexed across: %s.\nRealigning would TRUNCATE every chunk in this database — all repos, "+
+			"not just the one being indexed.\nEither point -config at a %d-dimension configuration, or "+
+			"use a separate database for the new dimension. To destroy this corpus deliberately, set %s=1",
+			ErrEmbeddingDimMismatch, cur, s.dim, rows, repos, cur, EnvAllowEmbeddingDimReset)
+	}
+	if rows > 0 {
+		// Opted in, but a destructive operation should still announce itself.
+		fmt.Fprintf(os.Stderr, "embeddings: %s set — TRUNCATING %d chunk(s) to change vector(%d) -> vector(%d)\n",
+			EnvAllowEmbeddingDimReset, rows, cur, s.dim)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -740,4 +787,15 @@ func nullUUID(s string) interface{} {
 
 func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// embeddingDimResetAllowed reports whether the operator has opted in to destroying an indexed
+// corpus in order to change the embedding dimension.
+func embeddingDimResetAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvAllowEmbeddingDimReset))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

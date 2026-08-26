@@ -309,7 +309,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
-| CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
+| CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `in review` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
 
 ### P3 — Indexing and retrieval quality
@@ -1163,7 +1163,7 @@ never blocks a run on failure.
 
 ### CP15 — Fail closed on embedding-dimension mismatch
 
-- **Status:** `ready` · **Effort:** 0.5 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 0.5 d · **Risk:** low
 
 **Goal.** A dimension mismatch between the configured model and the existing `vector(n)` column must
 stop the run with a clear message, not proceed and write garbage. Explicitly **out of scope**:
@@ -1172,6 +1172,19 @@ decision (`embeddingDimResetAllowed()` gates it behind an explicit opt-in).
 
 **Acceptance.** Configured dimension ≠ column dimension → the run fails at store-open with an error
 naming both numbers and the fix. The opt-in escape hatch is tested and off by default.
+
+**Implementation record (2026-08-26).** Done. Core's `alignChunksEmbeddingColumn` TRUNCATEd the
+whole chunks table — every repository, on process start, from one mistyped `-config` — silently.
+Now: an empty table realigns freely (the legitimate fresh-database case); a populated one refuses
+with an error carrying `ErrEmbeddingDimMismatch`, both dimensions, the row count, the affected
+repo ids and the two safe fixes; the destructive branch is gated behind
+`ASQS_ALLOW_EMBEDDING_DIM_RESET` — an env var, not a config field, deliberately: a break-glass
+switch for a one-off operation must not be a setting a deployment carries — and announces the
+TRUNCATE when opted in. Ported `dim_guard_test.go` (opt-in parsing, populated-corpus refusal)
+and `dim_guard_live_test.go` (refuses on a populated live corpus with both numbers in the
+message; realigns freely when empty; its `scratchEmbeddingsURL` helper carries its own
+test/scratch name check), all green on `asqs_scratch`. `llm.DimensionMismatchWarning` is NOT
+ported — it lives in upstream's embedding-fallback file, which belongs to that feature's bundle.
 
 ### CP16 — First-wave metrics writer and A/B report
 
