@@ -1,5 +1,6 @@
-// Command asqs-core is the open-source CLI: a single `run` command that generates unit/E2E tests
-// (and, optionally, ships them) for a local folder or a remote git repository.
+// Command asqs-core is the open-source CLI: `run` generates unit/E2E tests (and, optionally,
+// ships them) for a local folder or a remote git repository; `migrate` applies one-shot schema
+// and data migrations.
 package main
 
 import (
@@ -18,18 +19,40 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := dispatch(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: %v\n", err)
 		os.Exit(2)
 	}
 }
 
-func run() error {
-	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "usage: asqs-core run [flags] [<repo-path-or-git-url>]\n")
-		return fmt.Errorf("the only supported command is `run`")
+// dispatch routes to a subcommand. Extracted once, here, so later subcommands (`ab-report`,
+// `config reference`) are one case each rather than a third ad-hoc branch on os.Args — which is
+// how a CLI becomes untestable. `run`'s flags and behaviour are unchanged by the extraction, and
+// a parity test pins its flag set and usage text.
+func dispatch(args []string) error {
+	if len(args) < 1 {
+		printTopLevelUsage()
+		return fmt.Errorf("missing command")
 	}
-	flags, err := parseRunFlags(os.Args[2:], os.Stderr)
+	switch args[0] {
+	case "run":
+		return runRun(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
+	default:
+		printTopLevelUsage()
+		return fmt.Errorf("unknown command %q (supported: run, migrate)", args[0])
+	}
+}
+
+func printTopLevelUsage() {
+	fmt.Fprintf(os.Stderr, "usage: asqs-core <command> [flags]\n\ncommands:\n"+
+		"  run      generate unit/E2E tests for a repo and evaluate them (see `asqs-core run` for flags)\n"+
+		"  migrate  apply one-shot schema/data migrations recorded in schema_migrations\n")
+}
+
+func runRun(args []string) error {
+	flags, err := parseRunFlags(args, os.Stderr)
 	if err != nil {
 		return err
 	}
