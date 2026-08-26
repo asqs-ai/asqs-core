@@ -36,6 +36,8 @@ type Store struct {
 type Config struct {
 	ConnString string // Postgres connection string (same DB as metadata is fine)
 	Dimension  int    // embedding dimension; 0 = DefaultEmbeddingDim (1536)
+	// MaxConns caps the pool. 0 leaves pgxpool's default, which is max(4, NumCPU).
+	MaxConns int32
 }
 
 // Open creates a connection pool and registers pgvector types. Call InitSchema to create tables.
@@ -59,6 +61,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	config, err := pgxpool.ParseConfig(cfg.ConnString)
 	if err != nil {
 		return nil, fmt.Errorf("embeddings: parse config: %w", err)
+	}
+	if cfg.MaxConns > 0 {
+		config.MaxConns = cfg.MaxConns
 	}
 	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
 		return pgxvec.RegisterTypes(ctx, conn)

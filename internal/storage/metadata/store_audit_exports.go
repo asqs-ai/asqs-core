@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // AuditExportRow tracks an async audit export job.
@@ -35,7 +37,7 @@ func (s *Store) InsertAuditExport(ctx context.Context, runID, format string) (id
 	if format != "json" && format != "ndjson" {
 		return "", fmt.Errorf("format must be json or ndjson")
 	}
-	err = s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRow(ctx, `
 INSERT INTO audit_exports (run_id, format, status) VALUES ($1, $2, 'pending')
 RETURNING id::text`, runID, format).Scan(&id)
 	return id, err
@@ -43,14 +45,14 @@ RETURNING id::text`, runID, format).Scan(&id)
 
 // ClaimPendingAuditExport locks one pending job and sets status to processing. Returns (nil, nil) if none.
 func (s *Store) ClaimPendingAuditExport(ctx context.Context) (*AuditExportRow, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var id, runID, format string
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRow(ctx, `
 UPDATE audit_exports e
 SET status = 'processing'
 FROM (
@@ -63,13 +65,13 @@ FROM (
 WHERE e.id = sub.id
 RETURNING e.id::text, e.run_id, e.format
 `).Scan(&id, &runID, &format)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return &AuditExportRow{ID: id, RunID: runID, Format: format, Status: "processing"}, nil
@@ -77,7 +79,7 @@ RETURNING e.id::text, e.run_id, e.format
 
 // CompleteAuditExportReady marks the job done and stores the artifact file name (basename under export dir).
 func (s *Store) CompleteAuditExportReady(ctx context.Context, id string, fileName string, lineCount int64) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.Exec(ctx, `
 UPDATE audit_exports
 SET status = 'ready', file_name = $2, line_count = $3, completed_at = NOW(), error_message = ''
 WHERE id = $1::uuid AND status = 'processing'`,
@@ -85,7 +87,7 @@ WHERE id = $1::uuid AND status = 'processing'`,
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	if err != nil {
 		return err
 	}
@@ -97,7 +99,7 @@ WHERE id = $1::uuid AND status = 'processing'`,
 
 // CompleteAuditExportFailed marks the job failed with a message.
 func (s *Store) CompleteAuditExportFailed(ctx context.Context, id, errMsg string) error {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.Exec(ctx, `
 UPDATE audit_exports
 SET status = 'failed', error_message = $2, completed_at = NOW(), file_name = '', line_count = 0
 WHERE id = $1::uuid AND status = 'processing'`,
@@ -105,7 +107,7 @@ WHERE id = $1::uuid AND status = 'processing'`,
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	if err != nil {
 		return err
 	}
@@ -123,13 +125,13 @@ func (s *Store) GetAuditExport(ctx context.Context, id string) (*AuditExportRow,
 	}
 	var r AuditExportRow
 	var createdAt, completedAt sql.NullTime
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRow(ctx, `
 SELECT id::text, run_id, format, status, line_count, COALESCE(error_message, ''), COALESCE(file_name, ''),
        created_at, completed_at
 FROM audit_exports WHERE id = $1::uuid`, id).Scan(
 		&r.ID, &r.RunID, &r.Format, &r.Status, &r.LineCount, &r.ErrorMessage, &r.FileName,
 		&createdAt, &completedAt)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {

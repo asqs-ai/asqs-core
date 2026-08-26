@@ -2,10 +2,11 @@ package metadata
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // CreateConfigWithInitialRevision creates configs + version 1 revision in one transaction.
@@ -15,14 +16,14 @@ func (s *Store) CreateConfigWithInitialRevision(ctx context.Context, name, descr
 	if name == "" {
 		return "", "", 0, fmt.Errorf("config name required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return "", "", 0, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var cid string
-	err = tx.QueryRowContext(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO configs (name, description, updated_at) VALUES ($1, $2, NOW()) RETURNING id`,
 		name, strings.TrimSpace(description),
 	).Scan(&cid)
@@ -31,7 +32,7 @@ func (s *Store) CreateConfigWithInitialRevision(ctx context.Context, name, descr
 	}
 
 	var rid string
-	err = tx.QueryRowContext(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO config_revisions (config_id, version, yaml_body, created_by) VALUES ($1, 1, $2, $3) RETURNING id`,
 		cid, yamlBody, strings.TrimSpace(createdBy),
 	).Scan(&rid)
@@ -39,7 +40,7 @@ func (s *Store) CreateConfigWithInitialRevision(ctx context.Context, name, descr
 		return "", "", 0, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return "", "", 0, err
 	}
 	return cid, rid, 1, nil
@@ -47,14 +48,14 @@ func (s *Store) CreateConfigWithInitialRevision(ctx context.Context, name, descr
 
 // AppendConfigRevision appends the next version for an existing config.
 func (s *Store) AppendConfigRevision(ctx context.Context, configID, yamlBody, createdBy string) (revisionID string, version int, err error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return "", 0, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var next int
-	err = tx.QueryRowContext(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT COALESCE(MAX(version), 0) + 1 FROM config_revisions WHERE config_id = $1`,
 		configID,
 	).Scan(&next)
@@ -66,7 +67,7 @@ func (s *Store) AppendConfigRevision(ctx context.Context, configID, yamlBody, cr
 	}
 
 	var rid string
-	err = tx.QueryRowContext(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO config_revisions (config_id, version, yaml_body, created_by) VALUES ($1, $2, $3, $4) RETURNING id`,
 		configID, next, yamlBody, strings.TrimSpace(createdBy),
 	).Scan(&rid)
@@ -74,12 +75,12 @@ func (s *Store) AppendConfigRevision(ctx context.Context, configID, yamlBody, cr
 		return "", 0, err
 	}
 
-	_, err = tx.ExecContext(ctx, `UPDATE configs SET updated_at = NOW() WHERE id = $1`, configID)
+	_, err = tx.Exec(ctx, `UPDATE configs SET updated_at = NOW() WHERE id = $1`, configID)
 	if err != nil {
 		return "", 0, err
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return "", 0, err
 	}
 	return rid, next, nil
@@ -93,7 +94,7 @@ FROM configs c
 LEFT JOIN config_revisions r ON r.config_id = c.id
 GROUP BY c.id, c.name, c.description, c.updated_at
 ORDER BY c.name ASC`
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -120,10 +121,10 @@ FROM config_revisions r
 WHERE r.config_id = $1::uuid AND r.version = $2`
 	var rev Revision
 	var at time.Time
-	err := s.db.QueryRowContext(ctx, query, strings.TrimSpace(configID), version).Scan(
+	err := s.db.QueryRow(ctx, query, strings.TrimSpace(configID), version).Scan(
 		&rev.ID, &rev.Version, &at, &rev.CreatedBy, &rev.YAMLBody,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -142,10 +143,10 @@ WHERE r.id = $1::uuid`
 	var rev Revision
 	var at time.Time
 	var cfgID string
-	err := s.db.QueryRowContext(ctx, query, strings.TrimSpace(revisionID)).Scan(
+	err := s.db.QueryRow(ctx, query, strings.TrimSpace(revisionID)).Scan(
 		&rev.ID, &rev.Version, &at, &rev.CreatedBy, &rev.YAMLBody, &cfgID,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, "", nil
 	}
 	if err != nil {
@@ -157,7 +158,7 @@ WHERE r.id = $1::uuid`
 
 // ListConfigRevisions lists revision metadata for a config (no YAML).
 func (s *Store) ListConfigRevisions(ctx context.Context, configID string) ([]RevisionMeta, error) {
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.Query(ctx,
 		`SELECT id, version, created_at, created_by FROM config_revisions WHERE config_id = $1::uuid ORDER BY version DESC`,
 		strings.TrimSpace(configID),
 	)
@@ -189,10 +190,10 @@ ORDER BY r.version DESC
 LIMIT 1`
 	var rev Revision
 	var at time.Time
-	err := s.db.QueryRowContext(ctx, query, strings.TrimSpace(configID)).Scan(
+	err := s.db.QueryRow(ctx, query, strings.TrimSpace(configID)).Scan(
 		&rev.ID, &rev.Version, &at, &rev.CreatedBy, &rev.YAMLBody,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -205,11 +206,11 @@ LIMIT 1`
 // GetConfigByID returns config row if exists (id, name, description, updated_at).
 func (s *Store) GetConfigByID(ctx context.Context, configID string) (name, description string, updatedAt string, err error) {
 	var t time.Time
-	err = s.db.QueryRowContext(ctx,
+	err = s.db.QueryRow(ctx,
 		`SELECT name, description, updated_at FROM configs WHERE id = $1::uuid`,
 		strings.TrimSpace(configID),
 	).Scan(&name, &description, &t)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return "", "", "", nil
 	}
 	if err != nil {
@@ -224,24 +225,24 @@ func (s *Store) UpdateConfigMetadata(ctx context.Context, configID, name, descri
 	if name == "" {
 		return false, fmt.Errorf("name required")
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE configs SET name = $1, description = $2, updated_at = NOW() WHERE id = $3`,
 		name, strings.TrimSpace(description), configID,
 	)
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	return n > 0, err
 }
 
 // DeleteConfig deletes config and revisions (CASCADE).
 func (s *Store) DeleteConfig(ctx context.Context, configID string) (deleted bool, err error) {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM configs WHERE id = $1`, configID)
+	res, err := s.db.Exec(ctx, `DELETE FROM configs WHERE id = $1`, configID)
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	return n > 0, err
 }
 
@@ -251,7 +252,7 @@ func (s *Store) InsertRunJob(ctx context.Context, configRevisionID string, runAt
 	if projectID == "" {
 		return "", fmt.Errorf("project_id required")
 	}
-	err = s.db.QueryRowContext(ctx,
+	err = s.db.QueryRow(ctx,
 		`INSERT INTO run_jobs (config_revision_id, project_id, run_at, status) VALUES ($1, $2::uuid, $3, 'pending') RETURNING id::text`,
 		configRevisionID, projectID, runAt,
 	).Scan(&jobID)
@@ -268,7 +269,7 @@ func (s *Store) InsertRecurringRunJob(ctx context.Context, configRevisionID, pro
 	if cronExpression == "" {
 		return "", fmt.Errorf("cron_expression required")
 	}
-	err = s.db.QueryRowContext(ctx,
+	err = s.db.QueryRow(ctx,
 		`INSERT INTO run_jobs (config_revision_id, project_id, run_at, status, cron_expression) VALUES ($1, $2::uuid, $3, 'pending', $4) RETURNING id::text`,
 		configRevisionID, projectID, runAt.UTC(), cronExpression,
 	).Scan(&jobID)

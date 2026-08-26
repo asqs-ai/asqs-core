@@ -523,7 +523,9 @@ type DatabaseConfig struct {
 	// EmbeddingsDimension is the vector dimension (e.g. 1536 for OpenAI). 0 = default 1536.
 	EmbeddingsDimension int `yaml:"embeddings_dimension" env:"DATABASE_EMBEDDINGS_DIMENSION"`
 
-	// MaxOpenConns limits pool size for metadata (database/sql). 0 = default.
+	// MaxOpenConns caps each connection pool (metadata and embeddings size from it separately,
+	// so two pools per process can hold up to twice this). 0 leaves pgxpool's default of
+	// max(4, NumCPU).
 	MaxOpenConns int `yaml:"max_open_conns" env:"DATABASE_MAX_OPEN_CONNS"`
 }
 

@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/asqs/asqs-core/internal/sqlsplit"
 )
@@ -17,27 +19,93 @@ import (
 //go:embed schema.sql
 var schemaFS embed.FS
 
-// Store provides access to metadata tables (symbols, edges, files).
-type Store struct {
-	db *sql.DB
+// querier is the subset of *pgxpool.Pool this package uses. Production always holds a real pool;
+// the interface exists so connection-failure tests (the retry tests arriving with the materialize
+// port) can still inject transient errors, which they used to do by registering a fake
+// database/sql driver — an option pgxpool does not offer.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+	Ping(ctx context.Context) error
 }
 
-// Open opens a Postgres connection and returns a Store. connString must be a valid libpq connection string.
+var _ querier = (*pgxpool.Pool)(nil)
+
+// Store provides access to metadata tables (symbols, edges, files).
+//
+// Nullable columns are still scanned into database/sql's sql.NullX types. That is deliberate and
+// not leftover: pgx routes any destination implementing sql.Scanner through the codec's
+// DecodeDatabaseSQLValue, which yields the same value database/sql delivered, so null semantics
+// and scanned values are unchanged by the pgx migration. Rewriting 60-odd destinations to
+// pgtype/pointer equivalents would have been 60 chances to change behaviour in a bundle whose
+// whole point is that behaviour does not change.
+type Store struct {
+	db querier
+	// pool is the handle db is backed by, or nil when a test injected a fake. It owns Close and
+	// exposes pool statistics; every query goes through db.
+	pool *pgxpool.Pool
+}
+
+// Config configures the metadata connection pool. Only ConnString is required.
+type Config struct {
+	// ConnString is a libpq connection string or postgres:// URL.
+	ConnString string
+	// MaxConns caps the pool. 0 leaves pgxpool's default, which is max(4, NumCPU).
+	MaxConns int32
+	// MinConns is the pool floor kept warm. 0 leaves pgxpool's default of 0.
+	MinConns int32
+}
+
+// Open opens a Postgres connection pool with default sizing and returns a Store. connString must be
+// a valid libpq connection string. Use OpenWithConfig to size the pool.
 func Open(connString string) (*Store, error) {
-	db, err := sql.Open("pgx", connString)
+	return OpenWithConfig(context.Background(), Config{ConnString: connString})
+}
+
+// OpenWithConfig opens a Postgres connection pool with explicit sizing and returns a Store.
+func OpenWithConfig(ctx context.Context, cfg Config) (*Store, error) {
+	if strings.TrimSpace(cfg.ConnString) == "" {
+		return nil, fmt.Errorf("metadata open: ConnString required")
+	}
+	poolCfg, err := pgxpool.ParseConfig(cfg.ConnString)
 	if err != nil {
 		return nil, fmt.Errorf("metadata open: %w", err)
 	}
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
+	if cfg.MaxConns > 0 {
+		poolCfg.MaxConns = cfg.MaxConns
+	}
+	if cfg.MinConns > 0 {
+		poolCfg.MinConns = cfg.MinConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("metadata open: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("metadata ping: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: pool, pool: pool}, nil
 }
 
-// Close closes the database connection.
+// Close closes the connection pool. It returns an error only to keep the call sites that check one
+// compiling; pgxpool.Close cannot fail.
 func (s *Store) Close() error {
-	return s.db.Close()
+	if s.pool != nil {
+		s.pool.Close()
+	}
+	return nil
+}
+
+// PoolStat reports connection pool statistics, or nil when the store is backed by a test fake.
+func (s *Store) PoolStat() *pgxpool.Stat {
+	if s.pool == nil {
+		return nil
+	}
+	return s.pool.Stat()
 }
 
 // InitSchema runs the embedded schema.sql to create tables and indexes if they do not exist.
@@ -57,7 +125,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		if stmt == "" {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := s.db.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("exec schema %q: %w", truncate(stmt, 60), err)
 		}
 	}
@@ -90,7 +158,7 @@ func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err e
 	if sym.EndColumn != nil {
 		endCol = *sym.EndColumn
 	}
-	err = s.db.QueryRowContext(ctx, query,
+	err = s.db.QueryRow(ctx, query,
 		sym.Lang, sym.Kind, sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig,
 	).Scan(&id)
 	return id, err
@@ -98,17 +166,16 @@ func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err e
 
 // DeleteSymbolsByFile deletes all symbols (and their edges via cascade) for the given file. Use before reindexing.
 func (s *Store) DeleteSymbolsByFile(ctx context.Context, file string) (deleted int64, err error) {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM symbols WHERE file = $1", file)
+	res, err := s.db.Exec(ctx, "DELETE FROM symbols WHERE file = $1", file)
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	return n, err
+	return res.RowsAffected(), nil
 }
 
 // DeleteFile deletes the file row. Call after DeleteSymbolsByFile when removing a file from the index.
 func (s *Store) DeleteFile(ctx context.Context, file string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM files WHERE file = $1", file)
+	_, err := s.db.Exec(ctx, "DELETE FROM files WHERE file = $1", file)
 	return err
 }
 
@@ -120,11 +187,11 @@ func (s *Store) GetSymbolByID(ctx context.Context, id string) (*Symbol, error) {
 	var sym Symbol
 	var sig sql.Null[[]byte]
 	var startCol, endCol sql.NullInt32
-	err := s.db.QueryRowContext(ctx, query, id).Scan(
+	err := s.db.QueryRow(ctx, query, id).Scan(
 		&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 		&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -142,7 +209,7 @@ func (s *Store) ListSymbolsByFile(ctx context.Context, file string) ([]*Symbol, 
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 		FROM symbols WHERE file = $1 ORDER BY start_line`
-	rows, err := s.db.QueryContext(ctx, query, file)
+	rows, err := s.db.Query(ctx, query, file)
 	if err != nil {
 		return nil, err
 	}
@@ -168,7 +235,7 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, lim
 		WHERE strpos(lower(fq_name), lower($1)) > 0
 		ORDER BY fq_name
 		LIMIT $2`
-	rows, err := s.db.QueryContext(ctx, query, needle, limit)
+	rows, err := s.db.Query(ctx, query, needle, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +248,7 @@ func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symb
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 		FROM symbols WHERE fq_name = $1 ORDER BY file, start_line`
-	rows, err := s.db.QueryContext(ctx, query, fqName)
+	rows, err := s.db.Query(ctx, query, fqName)
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +280,7 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName stri
 		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`
-	rows, err := s.db.QueryContext(ctx, query, simpleName, limit)
+	rows, err := s.db.Query(ctx, query, simpleName, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +294,7 @@ func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string)
 		query := `
 			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 			FROM symbols WHERE lang = $1 AND kind = $2 ORDER BY file, start_line`
-		rows, err := s.db.QueryContext(ctx, query, lang, kind)
+		rows, err := s.db.Query(ctx, query, lang, kind)
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +304,7 @@ func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string)
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 		FROM symbols WHERE lang = $1 ORDER BY file, start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang)
+	rows, err := s.db.Query(ctx, query, lang)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +323,7 @@ func applySymbolColumns(sym *Symbol, startCol, endCol sql.NullInt32) {
 	}
 }
 
-func scanSymbols(rows *sql.Rows) ([]*Symbol, error) {
+func scanSymbols(rows pgx.Rows) ([]*Symbol, error) {
 	var list []*Symbol
 	for rows.Next() {
 		var sym Symbol
@@ -287,7 +354,7 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string
 		WHERE f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		  AND LOWER(s.file) NOT LIKE '%.d.ts'
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -303,7 +370,7 @@ func (s *Store) ListSymbolsInTestFiles(ctx context.Context, lang, kind string) (
 		INNER JOIN files f ON s.file = f.file
 		WHERE f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, kind)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +386,7 @@ func (s *Store) InsertEdge(ctx context.Context, e *Edge) error {
 		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO NOTHING`
-	_, err := s.db.ExecContext(ctx, query, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType)
+	_, err := s.db.Exec(ctx, query, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType)
 	return err
 }
 
@@ -328,7 +395,7 @@ func (s *Store) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*Edg
 	query := `
 		SELECT caller_symbol_id, callee_symbol_id, edge_type
 		FROM edges WHERE caller_symbol_id = $1`
-	rows, err := s.db.QueryContext(ctx, query, callerSymbolID)
+	rows, err := s.db.Query(ctx, query, callerSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +409,7 @@ func (s *Store) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*Edge,
 	query := `
 		SELECT caller_symbol_id, callee_symbol_id, edge_type
 		FROM edges WHERE callee_symbol_id = $1`
-	rows, err := s.db.QueryContext(ctx, query, calleeSymbolID)
+	rows, err := s.db.Query(ctx, query, calleeSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +417,7 @@ func (s *Store) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*Edge,
 	return scanEdges(rows)
 }
 
-func scanEdges(rows *sql.Rows) ([]*Edge, error) {
+func scanEdges(rows pgx.Rows) ([]*Edge, error) {
 	var list []*Edge
 	for rows.Next() {
 		var e Edge
@@ -370,7 +437,7 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 	lang = strings.TrimSpace(lang)
 	var (
 		query string
-		rows  *sql.Rows
+		rows  pgx.Rows
 		err   error
 	)
 	if lang == "" {
@@ -380,7 +447,7 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
 		WHERE s1.lang = s2.lang`
-		rows, err = s.db.QueryContext(ctx, query)
+		rows, err = s.db.Query(ctx, query)
 	} else {
 		query = `
 		SELECT s1.file AS caller_file, s2.file AS callee_file, e.edge_type
@@ -388,7 +455,7 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
 		WHERE s1.lang = $1 AND s2.lang = $1`
-		rows, err = s.db.QueryContext(ctx, query, lang)
+		rows, err = s.db.Query(ctx, query, lang)
 	}
 	if err != nil {
 		return nil, err
@@ -413,7 +480,7 @@ func (s *Store) UpsertFile(ctx context.Context, f *File) error {
 		INSERT INTO files (file, sha, lang, module, is_test)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (file) DO UPDATE SET sha = $2, lang = $3, module = $4, is_test = $5`
-	_, err := s.db.ExecContext(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest)
+	_, err := s.db.Exec(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest)
 	return err
 }
 
@@ -421,8 +488,8 @@ func (s *Store) UpsertFile(ctx context.Context, f *File) error {
 func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
 	query := `SELECT file, sha, lang, module, is_test FROM files WHERE file = $1`
 	var f File
-	err := s.db.QueryRowContext(ctx, query, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, query, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest)
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -435,7 +502,7 @@ func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
 func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*File, error) {
 	if lang != "" && isTest != nil {
 		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 AND is_test = $2 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, lang, *isTest)
+		rows, err := s.db.Query(ctx, query, lang, *isTest)
 		if err != nil {
 			return nil, err
 		}
@@ -444,7 +511,7 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 	}
 	if lang != "" {
 		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, lang)
+		rows, err := s.db.Query(ctx, query, lang)
 		if err != nil {
 			return nil, err
 		}
@@ -453,7 +520,7 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 	}
 	if isTest != nil {
 		query := `SELECT file, sha, lang, module, is_test FROM files WHERE is_test = $1 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, *isTest)
+		rows, err := s.db.Query(ctx, query, *isTest)
 		if err != nil {
 			return nil, err
 		}
@@ -461,7 +528,7 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 		return scanFiles(rows)
 	}
 	query := `SELECT file, sha, lang, module, is_test FROM files ORDER BY file`
-	rows, err := s.db.QueryContext(ctx, query)
+	rows, err := s.db.Query(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +536,7 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 	return scanFiles(rows)
 }
 
-func scanFiles(rows *sql.Rows) ([]*File, error) {
+func scanFiles(rows pgx.Rows) ([]*File, error) {
 	var list []*File
 	for rows.Next() {
 		var f File
@@ -524,7 +591,7 @@ func (s *Store) InsertIndexRun(ctx context.Context, runID, repoID, commitSHA str
 			projectID = sql.NullString{String: id, Valid: true}
 		}
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		`INSERT INTO index_runs (run_id, repo_id, commit_sha, started_at, last_heartbeat_at, current_iteration, status, stable, trigger_source, repo_url, repo_local_path, config_revision_id, project_id) VALUES ($1, $2, $3, $4, $4, $5, 'running', NULL, $6, $7, $8, $9, $10)
 		 ON CONFLICT (run_id) DO UPDATE SET started_at = EXCLUDED.started_at, last_heartbeat_at = EXCLUDED.last_heartbeat_at, finished_at = 0, scheduled_rerun_at = NULL, status = 'running', first_wave_metrics = NULL, trigger_source = EXCLUDED.trigger_source, repo_url = EXCLUDED.repo_url, repo_local_path = EXCLUDED.repo_local_path, config_revision_id = EXCLUDED.config_revision_id, project_id = EXCLUDED.project_id`,
 		runID, repoID, commitSHA, startedAt, currentIteration, ts, repoURL, repoLocalPath, configRev, projectID)
@@ -534,22 +601,22 @@ func (s *Store) InsertIndexRun(ctx context.Context, runID, repoID, commitSHA str
 // SetIndexRunFirstWaveMetrics writes first-wave quality metrics for the run (JSONB). Nil m clears the column.
 func (s *Store) SetIndexRunFirstWaveMetrics(ctx context.Context, runID string, m *FirstWaveRunMetrics) error {
 	if m == nil {
-		_, err := s.db.ExecContext(ctx, `UPDATE index_runs SET first_wave_metrics = NULL WHERE run_id = $1`, runID)
+		_, err := s.db.Exec(ctx, `UPDATE index_runs SET first_wave_metrics = NULL WHERE run_id = $1`, runID)
 		return err
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE index_runs SET first_wave_metrics = $1 WHERE run_id = $2`, b, runID)
+	_, err = s.db.Exec(ctx, `UPDATE index_runs SET first_wave_metrics = $1 WHERE run_id = $2`, b, runID)
 	return err
 }
 
 // GetIndexRunFirstWaveMetrics returns stored metrics or (nil, nil) when the column is NULL or missing row.
 func (s *Store) GetIndexRunFirstWaveMetrics(ctx context.Context, runID string) (*FirstWaveRunMetrics, error) {
 	var ns sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT first_wave_metrics::text FROM index_runs WHERE run_id = $1`, runID).Scan(&ns)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, `SELECT first_wave_metrics::text FROM index_runs WHERE run_id = $1`, runID).Scan(&ns)
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -569,18 +636,18 @@ func (s *Store) GetIndexRunFirstWaveMetrics(ctx context.Context, runID string) (
 // Only rows with status = 'running' are updated so duplicate completion calls are idempotent no-ops.
 func (s *Store) SetRunCompleted(ctx context.Context, runID string, stable *bool, iterations *int) error {
 	if stable == nil && iterations == nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed' WHERE run_id = $1 AND status = 'running'", runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed' WHERE run_id = $1 AND status = 'running'", runID)
 		return err
 	}
 	if stable != nil && iterations != nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', stable = $1, iterations = $2 WHERE run_id = $3 AND status = 'running'", *stable, *iterations, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', stable = $1, iterations = $2 WHERE run_id = $3 AND status = 'running'", *stable, *iterations, runID)
 		return err
 	}
 	if stable != nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', stable = $1 WHERE run_id = $2 AND status = 'running'", *stable, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', stable = $1 WHERE run_id = $2 AND status = 'running'", *stable, runID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', iterations = $1 WHERE run_id = $2 AND status = 'running'", *iterations, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', iterations = $1 WHERE run_id = $2 AND status = 'running'", *iterations, runID)
 	return err
 }
 
@@ -588,8 +655,8 @@ func (s *Store) SetRunCompleted(ctx context.Context, runID string, stable *bool,
 func (s *Store) GetRunStatus(ctx context.Context, runID string) (status string, stable *bool, err error) {
 	var st string
 	var sval sql.NullBool
-	err = s.db.QueryRowContext(ctx, "SELECT status, stable FROM index_runs WHERE run_id = $1", runID).Scan(&st, &sval)
-	if err == sql.ErrNoRows {
+	err = s.db.QueryRow(ctx, "SELECT status, stable FROM index_runs WHERE run_id = $1", runID).Scan(&st, &sval)
+	if err == pgx.ErrNoRows {
 		return "", nil, nil
 	}
 	if err != nil {
@@ -604,8 +671,8 @@ func (s *Store) GetRunStatus(ctx context.Context, runID string) (status string, 
 // GetCurrentIteration returns the current_iteration for the run (max evaluation fix-iteration budget). Returns 0 if the run does not exist.
 func (s *Store) GetCurrentIteration(ctx context.Context, runID string) (int, error) {
 	var cur int
-	err := s.db.QueryRowContext(ctx, "SELECT current_iteration FROM index_runs WHERE run_id = $1", runID).Scan(&cur)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, "SELECT current_iteration FROM index_runs WHERE run_id = $1", runID).Scan(&cur)
+	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
 	return cur, err
@@ -617,10 +684,10 @@ func (s *Store) UpdateCurrentIterationAndScheduledRerun(ctx context.Context, run
 		currentIteration = 3
 	}
 	if scheduledRerunAt == nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = NULL WHERE run_id = $2", currentIteration, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = NULL WHERE run_id = $2", currentIteration, runID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = $2 WHERE run_id = $3", currentIteration, *scheduledRerunAt, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = $2 WHERE run_id = $3", currentIteration, *scheduledRerunAt, runID)
 	return err
 }
 
@@ -632,7 +699,7 @@ type ScheduledRerun struct {
 
 // ListRunsDueForRerun returns runs where scheduled_rerun_at is set and <= nowMs (unix milliseconds). Used by the scheduler to trigger reruns.
 func (s *Store) ListRunsDueForRerun(ctx context.Context, nowMs int64) ([]ScheduledRerun, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT run_id, repo_id FROM index_runs WHERE scheduled_rerun_at IS NOT NULL AND scheduled_rerun_at <= $1", nowMs)
+	rows, err := s.db.Query(ctx, "SELECT run_id, repo_id FROM index_runs WHERE scheduled_rerun_at IS NOT NULL AND scheduled_rerun_at <= $1", nowMs)
 	if err != nil {
 		return nil, err
 	}
@@ -650,14 +717,14 @@ func (s *Store) ListRunsDueForRerun(ctx context.Context, nowMs int64) ([]Schedul
 
 // UpdateIndexRunFinished sets the finished_at timestamp for a run.
 func (s *Store) UpdateIndexRunFinished(ctx context.Context, runID string, finishedAt int64) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET finished_at = $1 WHERE run_id = $2", finishedAt, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET finished_at = $1 WHERE run_id = $2", finishedAt, runID)
 	return err
 }
 
 // CountIndexRuns returns the number of index runs for the given repo_id (for first-run detection).
 func (s *Store) CountIndexRuns(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM index_runs WHERE repo_id = $1", repoID).Scan(&n)
+	err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM index_runs WHERE repo_id = $1", repoID).Scan(&n)
 	return n, err
 }
 
@@ -668,7 +735,7 @@ func (s *Store) CountIndexRuns(ctx context.Context, repoID string) (int64, error
 // delta (A.7).
 func (s *Store) CountSymbols(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbols`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM symbols`).Scan(&n)
 	return n, err
 }
 
@@ -677,7 +744,7 @@ func (s *Store) CountSymbols(ctx context.Context) (int64, error) {
 // IndexPhaseResult.EdgesTotal (A.7).
 func (s *Store) CountEdges(ctx context.Context) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
 	return n, err
 }
 
@@ -693,7 +760,7 @@ func (s *Store) InsertAudit(ctx context.Context, runID, step, level string, payl
 			return err
 		}
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		"INSERT INTO audit_log (run_id, step, payload, level) VALUES ($1, $2, $3, $4)",
 		runID, step, raw, level)
 	return err
@@ -732,7 +799,7 @@ func (s *Store) ListAuditEntries(ctx context.Context, opts ListAuditOptions) ([]
 	query += fmt.Sprintf(" ORDER BY id ASC LIMIT $%d", argNum)
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -772,7 +839,7 @@ func (s *Store) ListAuditRunIDs(ctx context.Context, since, until *time.Time) ([
 	}
 	query += " GROUP BY run_id ORDER BY MAX(at) DESC"
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

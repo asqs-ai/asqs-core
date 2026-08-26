@@ -301,29 +301,29 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP07 | Migration mechanism + `asqs-core migrate` | B04 (infra) | CP05 | 2 d | `blocked (CP05)` |
-| CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `blocked (CP07)` |
-| CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `blocked (CP05)` |
-| CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `blocked (CP09)` |
-| CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `blocked (CP07, CP09)` |
+| CP07 | Migration mechanism + `asqs-core migrate` | B04 (infra) | CP05 | 2 d | `in review` |
+| CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `ready` |
+| CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `in review` |
+| CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `ready` |
+| CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `ready` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `blocked (CP11)` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP11, CP55)` |
-| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `blocked (CP07, CP08)` |
+| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `blocked (CP08)` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `blocked (CP08)` |
-| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `blocked (CP09, CP18)` |
+| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `blocked (CP18)` |
 
 ### P3 — Indexing and retrieval quality
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
-| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `blocked (CP07, CP11)` |
-| CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `blocked (CP09)` |
+| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `blocked (CP11)` |
+| CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `blocked (CP08)` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP08, CP16)` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `blocked (CP08)` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `blocked (CP18)` |
-| CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `blocked (CP05)` |
+| CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
 
 ### P4 — LLM transport and prompt budget
@@ -732,7 +732,8 @@ coverage arrives with their consumers (CP42/CP43/CP53/CP59), so rule 3 is satisf
 
 ### CP07 — Migration mechanism and `asqs-core migrate`
 
-- **Status:** `blocked (CP05)` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26, commit `ff191f7` — see the record at the end of this
+  bundle) · **Effort:** 2 d · **Risk:** medium
 
 **Why it exists.** `InitSchema` re-runs the whole embedded `schema.sql` on every process start.
 That is fine for idempotent DDL and impossible for one-shot work: data backfills,
@@ -758,9 +759,28 @@ run` behaves exactly as before — a CLI parity test pins the flag set and the u
 **Review focus.** The dispatch extraction is the risky half, not the migration runner. `runopts.go`
 already has 351 lines of tests; they must still pass unchanged.
 
+**Implementation record (2026-08-26, commit `ff191f7`).** All three tasks done.
+
+- `internal/storage/migrate/migrate.go` is a verbatim port (`Migration{ID, Description,
+  Concurrent, Apply}`, `schema_migrations` DDL, `Run`/`Pending`); `migrations.go` is core-authored
+  with **empty** `MetadataMigrations()`/`EmbeddingsMigrations()` per task 3 and the rules
+  doc-comment (never reuse IDs; migrate never runs schema.sql, so create what you index; no
+  `l2_norm` on `vector`). The upstream source guards (`migrations_guard_test.go`) are active; a
+  core-authored live test covers the runner contract (apply 2 → re-run no-op → third applies
+  alone → `Pending` empty).
+- CLI dispatch extracted once in `cmd/asqs-core/main.go` (`dispatch(args)`; former `run()` body
+  became `runRun`, byte-identical); `migrate_cmd.go` adapted from upstream `runMigrate` (flags
+  `-config`/`-dry-run`, `ValidateMode: "audit"`, metadata + embeddings targets, embeddings URL
+  defaulting to metadata's). Upstream's `CountUnscopedRows`/reindex-warning tail is **omitted** —
+  that arrives with the bundles that add those queries (CP11/CP55).
+- `dispatch_test.go` pins `run`'s flag set + usage header and asserts unknown commands error
+  naming the valid set. Live verification against `asqs_scratch` passed; scratch probe rows
+  cleaned up (note: cleanup must be a `defer` registered after pool creation, not `t.Cleanup`,
+  which runs after the deferred pool close).
+
 ### CP08 — Vector metric alignment and filtered-ANN recall
 
-- **Status:** `blocked (CP07)` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
 
 **Goal.** Two defects that quietly degrade every retrieval result: the embedding vectors and the
 index's distance metric disagree, and filtered ANN searches under-return without saying so.
@@ -790,7 +810,7 @@ that under-returns retries at the ceiling and the widen is counted. Live-DB test
 
 ### CP09 — Metadata store → `pgxpool`, pool sizing
 
-- **Status:** `blocked (CP05)` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 3–4 d · **Risk:** medium
 
 **Goal.** One driver stack. `internal/storage/embeddings` is already `pgxpool`; the metadata store
 still opens `database/sql` with the `pgx` stdlib shim (`store.go:12`). Two stacks means two pool
@@ -818,9 +838,53 @@ live run produces byte-identical query results. Pool size is observable via `Poo
 **Review focus.** `ExecContext`/`QueryRowContext` → `Exec`/`QueryRow` is mechanical; the transaction
 paths are not. Check every `Begin`/`Commit`/`Rollback` and every place a `*sql.Tx` was passed down.
 
+**Implementation record (2026-08-26).** All four tasks done; package-wide conversion (10 store
+files) plus config wiring on both stores.
+
+- `store.go` head is the upstream end state minus the `simpleName`/`trigram` probe fields (those
+  arrive with the migration bundles): `querier` interface (`Query`/`QueryRow`/`Exec`/`Begin`/
+  `BeginTx`/`Ping`), `Store{db querier; pool *pgxpool.Pool}` with the sql.NullX rationale comment,
+  `Config{ConnString, MaxConns, MinConns}`, `Open` → `OpenWithConfig`, error-shaped `Close`,
+  `PoolStat`.
+- Mechanical sweep over every non-test file: `XxxContext` → `Xxx`, `sql.ErrNoRows` →
+  `pgx.ErrNoRows`, `*sql.Rows` → `pgx.Rows`, `*sql.Tx` → `pgx.Tx` (`scanLatestRevisionTx`),
+  `BeginTx(ctx, nil)` → `Begin(ctx)`, `&sql.TxOptions{ReadOnly: true}` →
+  `pgx.TxOptions{AccessMode: pgx.ReadOnly}` (`GetProjectAPIBundle`), `tx.Commit/Rollback` gain
+  `ctx`, and `RowsAffected()` loses its error return (both the `n, err :=` and `n, _ :=` shapes).
+  All `sql.NullX` / `sql.Null[[]byte]` scan destinations kept per task 4.
+- **Driver-stack consequence ported into `isTransientConnError`** (materialize_tests_source.go):
+  on native pgx the retryable signal is `pgconn.SafeToRetry`, a connection-class SQLSTATE
+  (08xxx/57P0x), or "conn closed"/"unexpected EOF" — `driver.ErrBadConn` can no longer be
+  produced. Without this the retry loop became a no-op for its only real use case. The dead
+  database/sql sentinels are retained (upstream does the same). "conn busy" is deliberately NOT
+  matched: that is the deterministic nested-cursor protocol violation, which native pgx names
+  distinctly. **Correction to this bundle's Goal / CP19's framing:** the nested-cursor defect is
+  *not* erased by the real pool — native pgx reports it as "conn busy" (upstream's historical
+  note confirms it failed on 100% of runs with test classes either way). CP19's restructure
+  (drain-then-resolve-then-write, honest retry, backoff + `Ping` between attempts, 4 attempts)
+  is still required and still owns that fix.
+- Config wiring: `database.max_open_conns` — previously one of CP60's zero-reader keys — now caps
+  **both** pools via `poolMaxConns()`; `MetadataStoreConfig()` added; `EmbeddingsStoreConfig()`
+  gains `MaxConns`; `embeddings.Config`/`Open` gain and honour `MaxConns`;
+  `OpenMetadataStore` → `metadata.OpenWithConfig`. **Deliberate deviation:** upstream defaults the
+  ceiling from `gap_concurrency`+writers; core's gap loop is sequential and D15 deletes that key
+  (CP36), so deriving from it would hand the doomed key a reader. Core defaults to 0 = pgxpool's
+  own max(4, NumCPU); the derivation returns if the loop ever goes concurrent (noted at
+  `poolMaxConns`).
+- Open paths: `pipeline.go` reaches the pool through `cfg.OpenMetadataStore()` (only production
+  call site); live tests keep using `metadata.Open(url)`; `migrate` already speaks `pgxpool.New`.
+- Acceptance: build/vet clean, all tests green with zero assertion changes, `make test-live` +
+  both InitSchema live tests green on `asqs_scratch`. Two transient in-package live probes
+  (deleted after running, scratch rows cleaned) exercised every converted call shape against the
+  live DB: NullInt32/NullBool/NullString and absent-row `ErrNoRows` paths, `RowsAffected`,
+  JSONB audit write/read, `MaterializeTestsSourceEdges` (Begin/Commit),
+  `CreateConfigWithInitialRevision`/`AppendConfigRevision` (multi-statement tx), and
+  `GetProjectAPIBundle` (ReadOnly `BeginTx`) — plus `PoolStat` observability (`MaxConns=3`
+  honoured, pool held 2 conns with `MinConns=1`).
+
 ### CP10 — Batched inserts, `COPY`, batched FQName resolution
 
-- **Status:** `blocked (CP09)` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 2 d · **Risk:** medium
 
 **Goal.** Index-write throughput. Upstream measured **4.8×** on a realistic shape and **7.5×** at
 1 ms round-trip latency — the second number is the one that matters for a hosted database.
@@ -835,7 +899,7 @@ wall-clock threshold.
 
 ### CP11 — Repo-scoped `symbols` / `edges` / `files`
 
-- **Status:** `blocked (CP07, CP09)` · **Effort:** 4–5 d · **Risk:** high · **Widest blast radius in the plan**
+- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high · **Widest blast radius in the plan**
 
 **Verified defect.** Core scopes **chunks** by `repo_id` (`embeddings/types.go`, `indexer/chunk.go`)
 but **not** `symbols`, `edges` or `files`. `files.file` is the bare primary key
@@ -938,7 +1002,7 @@ commits; `symbol_versions` gains one row per changed symbol and none per unchang
 
 ### CP14 — Embedding input limits and embedding cache
 
-- **Status:** `blocked (CP07, CP08)` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `blocked (CP08)` · **Effort:** 2–3 d · **Risk:** low
 
 **Goal.** Stop re-embedding identical content, and stop silently truncating oversized inputs.
 
@@ -972,7 +1036,7 @@ naming both numbers and the fix. The opt-in escape hatch is tested and off by de
 
 ### CP16 — First-wave metrics writer and A/B report
 
-- **Status:** `blocked (CP09, CP18)` · **Effort:** 2 d · **Risk:** low · **This is what makes P3/P7 acceptable**
+- **Status:** `blocked (CP18)` · **Effort:** 2 d · **Risk:** low · **This is what makes P3/P7 acceptable**
 
 **Verified state.** `index_runs`, `config_revisions` and `index_runs.first_wave_metrics` all exist in
 core's schema today, and `SetIndexRunFirstWaveMetrics` / `GetIndexRunFirstWaveMetrics` are already
@@ -1036,7 +1100,7 @@ later bundle in this plan fails the build unless wired in the same change.
 
 ### CP18 — Plan determinism and hot-path lookups
 
-- **Status:** `blocked (CP07, CP11)` · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
+- **Status:** `blocked (CP11)` · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
 
 **Verified defect**, `internal/intelligence/retrieval/plan.go:760-774`. `sortByPriority` is a
 hand-written insertion sort — O(n²) over **every non-test method in the repository** — whose
@@ -1074,7 +1138,7 @@ set shows the O(n log n) shape. The abstention-gate regression is covered by a t
 
 ### CP19 — `TESTS_SOURCE` nested-cursor fix and honest retry semantics
 
-- **Status:** `blocked (CP09)` · **Effort:** 1–2 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 1–2 d · **Risk:** medium
 
 **Defect.** `insertTestsSourceFromNamingConvention` issues per-row queries **inside** a `rows.Next()`
 loop on the same pinned transaction. The `pgx` stdlib shim cannot carry two active cursors on one
@@ -1169,7 +1233,7 @@ Existing gap counts on repos with no routes are unchanged.
 
 ### CP24 — Review-findings cleanup
 
-- **Status:** `blocked (CP05)` · **Effort:** 2–3 d · **Risk:** low (one user-visible change)
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low (one user-visible change)
 
 Six independent items; each needs a test that fails before the change.
 
