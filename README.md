@@ -65,6 +65,18 @@ This starts `pgvector/pgvector:pg16` (db/user/password = `asqs`) on port 5432. T
 edges, files, index_runs, and the `chunks` table with a `vector(1536)` column + HNSW index) is
 applied automatically on first run.
 
+**Live tests use a separate scratch database, never `asqs`.** The `*_live_test.go` suites write
+fixtures, so they only run when `ASQS_TEST_METADATA_URL` points at a database whose *name*
+contains `test` or `scratch` — anything else is refused, so an indexed corpus cannot be written to
+by accident:
+
+```bash
+docker compose exec postgres createdb -U asqs asqs_scratch   # once
+ASQS_TEST_METADATA_URL='postgres://asqs:asqs@localhost:5432/asqs_scratch?sslmode=disable' make test-live
+```
+
+With the variable unset, `make test-live` skips every live test and exits 0.
+
 ## 2. Build the language indexers
 
 ```bash
