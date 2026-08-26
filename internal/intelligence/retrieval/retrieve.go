@@ -442,7 +442,7 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 			}
 			sortMMRPool(pool)
 			lambda := normalizeSimilarMMRLambda(req.SimilarMMRLambda)
-			for _, ch := range maximalMarginalRelevance(query, pool, assemblyPoolLimit, lambda) {
+			for _, ch := range maximalMarginalRelevance(query, pool, mmrSelectionSize(limit), lambda) {
 				addChunk(ch)
 			}
 		}
@@ -473,6 +473,24 @@ type embeddingSegmentInfo struct {
 type indexedSegmentChunk struct {
 	ch  *embeddings.Chunk
 	idx int
+}
+
+// mmrSelectionSize is the k passed to maximalMarginalRelevance.
+//
+// It is NOT simply `limit`. assembleSegmentedContextWindows collapses embedding segments of the
+// same source file into windows of up to maxSegmentsPerWindow chunks, so in the worst case each of
+// the `limit` output windows consumes maxSegmentsPerWindow selected chunks. Selecting only `limit`
+// (or limit+3) under-fills on segment-heavy corpora — a large TS spec file split into six segments
+// would crowd out the breadth the caller asked for. TestGatherSimilarReferenceChunks_segmentedPerFileCapPreservesBreadth
+// covers exactly that case.
+//
+// maximalMarginalRelevance caps k at the pool size internally, so this never over-selects; for a
+// typical limit of 5 it asks for 15 rather than the old 120.
+func mmrSelectionSize(limit int) int {
+	if limit <= 0 {
+		return maxSegmentsPerWindow
+	}
+	return limit * maxSegmentsPerWindow
 }
 
 func assembleSegmentedContextWindows(in []*embeddings.Chunk, limit int) []*embeddings.Chunk {
@@ -705,7 +723,11 @@ func listChunksByType(ctx context.Context, chunks ChunkReader, repoID, lang, chu
 }
 
 func listChunksByPathPattern(ctx context.Context, chunks ChunkReader, repoID, lang string, substrings []string, limit int) []*embeddings.Chunk {
-	list, err := chunks.List(ctx, embeddings.ListOptions{RepoID: repoID, Limit: 100})
+	// Fixtures and config chunks are rendered into the prompt as text and never scored: they do
+	// not reach MMR (which needs pairwise cosines) or the abstention gate (which cosines the
+	// SimilarTests against the target). Skipping the vector column avoids decoding 100 x ~6 KB of
+	// []float32 per gap for data nothing measures.
+	list, err := chunks.List(ctx, embeddings.ListOptions{RepoID: repoID, Limit: 100, OmitEmbedding: true})
 	if err != nil {
 		return nil
 	}

@@ -310,19 +310,19 @@ implementation record can be found; it is provenance, not instruction.
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
-| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `blocked (CP18)` |
+| CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `ready` |
 
 ### P3 — Indexing and retrieval quality
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
-| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `ready` |
+| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP16)` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
-| CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `blocked (CP18)` |
+| CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
 
@@ -1239,7 +1239,7 @@ later bundle in this plan fails the build unless wired in the same change.
 
 ### CP18 — Plan determinism and hot-path lookups
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle; **testability ranking ships at upstream defaults, unmeasured** per rule 7/10 — CP16 owns measuring it) · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
 
 **Verified defect**, `internal/intelligence/retrieval/plan.go:760-774`. `sortByPriority` is a
 hand-written insertion sort — O(n²) over **every non-test method in the repository** — whose
@@ -1274,6 +1274,48 @@ deterministic order". It is neither:
 **identical** gap list, asserted by FQName order. A planning benchmark over a synthetic 30 k-symbol
 set shows the O(n log n) shape. The abstention-gate regression is covered by a test that fails if
 `OmitEmbedding` leaks onto the `SimilarTests` path.
+
+**Implementation record (2026-08-26).** All five tasks done.
+
+1. `sortByPriority` is upstream's `sort.SliceStable` with the total order (Priority desc → FQName
+   → File → StartLine, nil symbols last). Ported `plan_determinism_test.go` covers UUID-churn
+   stability, input-order independence, the deeper tie-breaks, and a 20k-element correctness
+   pass — **upstream's end state has no Benchmark function**; the 20k test is what shipped.
+2. Planning-path lookups: `enclosingTypeSymbol` memoised per declaring FQName (`sync.Map` shared
+   across the candidate loop), `hasInboundTestsSourceTraceWithType` reusing it (the old helper
+   fetched and discarded the type per candidate; it stays for other callers), on top of CP12's
+   materialized centrality and CP10's indexer-side prefetch. These live in the ported
+   `gap_shortlist.go` — **whole**, including `refineShortlistWithBranchIntents`: core already
+   had `inferBranchIntentsFromContent` (branch_gaps.go), so the two-stage
+   `ListGapsWithChunks` (stage 1: span/arity/outbound + eligibility over data in hand; stage 2:
+   chunk fetch + branch intents for the top 4×MaxGaps only) ports intact. `ListGaps` is now the
+   nil-chunks wrapper; `CreateTestPlan` passes its chunk reader. The churn block in upstream's
+   `ListGapsWithChunks` head is CP13's and is not ported.
+3. MMR selection is `mmrSelectionSize(limit)` = limit × maxSegmentsPerWindow (15 for the typical
+   5, not the old pool-size 120 core passed); the ported
+   segmented-per-file-cap breadth test pins the under-fill case.
+4. `testability.go` ported whole (score + eligibility filter + fallback-when-all-filtered +
+   `MinGapTestabilityScore`, default 0 = rank-only) with `plan_testability_test.go`.
+   **Unmeasured, per this bundle's own warning**: it ships at upstream defaults and CP16's A/B
+   is what measures it. `BareFQName` (fqname.go) pulled forward as `isTrivialAccessorName`'s
+   dependency — on core corpora it is the identity function until CP55's C# parameterization;
+   `TestAssignDupOrdinals` in its test file is deferred to CP13 in-file.
+5. `OmitEmbedding` on `SearchOptions` + `ListOptions` with the column/scan elision, set ONLY on
+   `listChunksByPathPattern` (fixtures/config — rendered as text, never scored). The
+   core-authored `TestOmitEmbedding_staysOffTheSimilarTestsPath` is the acceptance's leak guard:
+   it fails if `listChunksByType` (the SimilarTests/abstention feed) ever sets it, and if the
+   fixture path ever stops setting it.
+
+Also in this bundle (the storage half of B05): write-time lowercasing of `lang`/`kind`
+(`symbolInsertArgs`), `normalizeSymbolKind` on every exact kind comparison, migration
+`0001_lowercase_symbol_lang_kind` (live-verified backfilling an uppercase legacy row), and the
+ported `kind_case_guard_test.go`/`kind_case_live_test.go`. Migration `0007` (concurrent
+repo-scoped index variants + simple_name tail) stays with CP55, whose column it probes.
+`plan_test.go` and `retrieve_cache_test.go` — never ported before this bundle — came along whole
+(the mock infrastructure the new tests need lives there). **Noted, not fixed (CP24 candidate):**
+`output_contract.go`/`context_builder.go` compare returned `sym.Kind` against UPPERCASE literals,
+which lowercase storage makes dead branches — upstream has the identical comparisons, so core
+copies the end state rather than diverging on unmeasured prompt shaping.
 
 ### CP19 — `TESTS_SOURCE` nested-cursor fix and honest retry semantics
 

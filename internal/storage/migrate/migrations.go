@@ -57,11 +57,30 @@ UPDATE chunks
 
 // MetadataMigrations are one-shot migrations for the metadata database.
 //
-// IDs 0001–0003 are reserved: upstream's bodies for those (case normalization, simple_name and
-// trigram aids) arrive with the bundles that add their readers, and reusing or renumbering an ID
-// would desynchronize the ledger from upstream's.
+// IDs 0002–0003 are reserved: upstream's bodies for those (the simple_name and trigram lookup
+// aids) arrive with the bundle that adds their readers, and reusing or renumbering an ID would
+// desynchronize the ledger from upstream's.
 func MetadataMigrations() []Migration {
 	return []Migration{
+		{
+			ID:          "0001_lowercase_symbol_lang_kind",
+			Description: "lowercase symbols.lang / symbols.kind so queries can drop LOWER() and use an index",
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// Queries used LOWER(s.lang) = LOWER($1), which defeats idx_symbols_lang because
+				// there is no matching expression index. Normalizing at write time (InsertSymbol)
+				// plus this one-shot backfill lets the queries compare directly.
+				for _, q := range []string{
+					`UPDATE symbols SET lang = lower(lang) WHERE lang <> lower(lang)`,
+					`UPDATE symbols SET kind = lower(kind) WHERE kind <> lower(kind)`,
+					`UPDATE edges SET edge_type = upper(edge_type) WHERE edge_type <> upper(edge_type)`,
+				} {
+					if _, err := pool.Exec(ctx, q); err != nil {
+						return fmt.Errorf("normalize case: %w", err)
+					}
+				}
+				return nil
+			},
+		},
 		{
 			ID:          "0004_symbols_repo_id",
 			Description: "repo_id on symbols so per-file deletes cannot cross repositories",

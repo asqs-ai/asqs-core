@@ -332,6 +332,17 @@ type SearchOptions struct {
 	Module string
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (PostgreSQL @>). Empty = no filter.
 	MetadataContains []byte
+	// OmitEmbedding skips selecting and decoding the embedding column. Every result row otherwise
+	// carries a full vector — ~6 KB at 1536 dims — most of it discarded by callers that only
+	// render content.
+	//
+	// Set it on any caller that does not feed MMR (which needs pairwise cosines): plain listings
+	// and fixture/config lookups. Leave it false when the results reach
+	// maximalMarginalRelevance — a nil embedding there degrades silently to the
+	// 1/(1+Distance) relevance fallback rather than erroring.
+	//
+	// Default false preserves the previous behaviour for every existing caller.
+	OmitEmbedding bool
 }
 
 // Search returns chunks ordered by L2 distance to the query vector (nearest first). Optional filters apply.
@@ -402,12 +413,16 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 	if len(where) > 0 {
 		whereClause = " WHERE " + strings.Join(where, " AND ")
 	}
+	embeddingCol := "embedding, "
+	if opts.OmitEmbedding {
+		embeddingCol = ""
+	}
 	q := fmt.Sprintf(`
-		SELECT id, content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id,
+		SELECT id, content, %ssymbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id,
 		       embedding <-> $1 AS distance
 		FROM chunks %s
 		ORDER BY embedding <-> $1
-		LIMIT $%d`, whereClause, argNum)
+		LIMIT $%d`, embeddingCol, whereClause, argNum)
 
 	// pgvector walks the HNSW graph collecting roughly ef_search candidates and only then applies
 	// the WHERE clause. With the default ef_search of 40 and a conjunction of several selective
@@ -426,7 +441,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 	defer conn.Release()
 
 	ef := efSearchFor(limit)
-	results, err := s.searchWithEF(ctx, conn, q, args, ef)
+	results, err := s.searchWithEF(ctx, conn, q, args, opts, ef)
 	if err != nil {
 		return nil, err
 	}
@@ -436,7 +451,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 	// unranked listing. Emitting the widen event is how the real hit rate becomes measurable —
 	// today the shortfall is completely invisible.
 	if len(results) < limit/2 && ef < maxEFSearch {
-		widened, werr := s.searchWithEF(ctx, conn, q, args, maxEFSearch)
+		widened, werr := s.searchWithEF(ctx, conn, q, args, opts, maxEFSearch)
 		if werr == nil && len(widened) > len(results) {
 			s.noteANNWidened(ctx, limit, len(results), len(widened))
 			return widened, nil
@@ -446,7 +461,7 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 }
 
 // searchWithEF runs the prepared search on conn with hnsw.ef_search set to ef.
-func (s *Store) searchWithEF(ctx context.Context, conn pooledConn, q string, args []interface{}, ef int) ([]SearchResult, error) {
+func (s *Store) searchWithEF(ctx context.Context, conn pooledConn, q string, args []interface{}, opts SearchOptions, ef int) ([]SearchResult, error) {
 	if err := setEFSearch(ctx, conn, ef); err != nil {
 		return nil, err
 	}
@@ -462,11 +477,18 @@ func (s *Store) searchWithEF(ctx context.Context, conn pooledConn, q string, arg
 		var symbolID *string
 		var meta []byte
 		var parentID *string
-		err := rows.Scan(&r.ID, &r.Content, &vec, &symbolID, &r.File, &r.Lang, &r.ChunkType, &r.StartLine, &r.EndLine, &r.RepoID, &meta, &parentID, &r.Distance)
-		if err != nil {
+		scanTargets := []any{&r.ID, &r.Content}
+		if !opts.OmitEmbedding {
+			scanTargets = append(scanTargets, &vec)
+		}
+		scanTargets = append(scanTargets, &symbolID, &r.File, &r.Lang, &r.ChunkType,
+			&r.StartLine, &r.EndLine, &r.RepoID, &meta, &parentID, &r.Distance)
+		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, err
 		}
-		r.Embedding = vec.Slice()
+		if !opts.OmitEmbedding {
+			r.Embedding = vec.Slice()
+		}
 		if symbolID != nil {
 			r.SymbolID = *symbolID
 		}
@@ -494,6 +516,10 @@ type ListOptions struct {
 	Module         string // chunk_metadata->>'module' exact match; empty = no filter
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (@>).
 	MetadataContains []byte
+	// OmitEmbedding skips selecting and decoding the embedding column (~6 KB/row at 1536 dims).
+	// See SearchOptions.OmitEmbedding for when it is safe: not for anything that reaches MMR or
+	// the abstention gate.
+	OmitEmbedding bool
 }
 
 // List returns chunks matching the filters, ordered by file and start_line. Use for fetching context by file/symbol.
@@ -553,7 +579,11 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 	if len(where) > 0 {
 		whereClause = " WHERE " + strings.Join(where, " AND ")
 	}
-	q := "SELECT id, content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id FROM chunks " + whereClause + " ORDER BY file, start_line"
+	listEmbeddingCol := "embedding, "
+	if opts.OmitEmbedding {
+		listEmbeddingCol = ""
+	}
+	q := "SELECT id, content, " + listEmbeddingCol + "symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id FROM chunks " + whereClause + " ORDER BY file, start_line"
 	if opts.Limit > 0 {
 		argNum++
 		q += fmt.Sprintf(" LIMIT $%d", argNum)
@@ -571,10 +601,18 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 		var symbolID *string
 		var meta []byte
 		var parentID *string
-		if err := rows.Scan(&c.ID, &c.Content, &vec, &symbolID, &c.File, &c.Lang, &c.ChunkType, &c.StartLine, &c.EndLine, &c.RepoID, &meta, &parentID); err != nil {
+		listTargets := []any{&c.ID, &c.Content}
+		if !opts.OmitEmbedding {
+			listTargets = append(listTargets, &vec)
+		}
+		listTargets = append(listTargets, &symbolID, &c.File, &c.Lang, &c.ChunkType,
+			&c.StartLine, &c.EndLine, &c.RepoID, &meta, &parentID)
+		if err := rows.Scan(listTargets...); err != nil {
 			return nil, err
 		}
-		c.Embedding = vec.Slice()
+		if !opts.OmitEmbedding {
+			c.Embedding = vec.Slice()
+		}
 		if symbolID != nil {
 			c.SymbolID = *symbolID
 		}

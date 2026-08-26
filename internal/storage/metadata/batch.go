@@ -21,6 +21,10 @@ const symbolInsertQuery = `
 		RETURNING id`
 
 // symbolInsertArgs normalizes one symbol into the bind parameters symbolInsertQuery expects.
+//
+// lang/kind are lowercased at write time: queries used to compare LOWER(s.lang) = LOWER($1), which
+// defeats idx_symbols_lang because there is no matching expression index, so the gap-listing hot
+// path could not use an index at all.
 func symbolInsertArgs(sym *Symbol) []any {
 	var sig *[]byte
 	if len(sym.SignatureJSON) > 0 {
@@ -34,7 +38,7 @@ func symbolInsertArgs(sym *Symbol) []any {
 		endCol = *sym.EndColumn
 	}
 	return []any{
-		sym.Lang, sym.Kind,
+		strings.ToLower(strings.TrimSpace(sym.Lang)), strings.ToLower(strings.TrimSpace(sym.Kind)),
 		sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig,
 		strings.TrimSpace(sym.RepoID),
 	}

@@ -34,6 +34,12 @@ type TestGap struct {
 	Kind     GapKind
 	Reason   string
 	Priority int
+	// TestabilityScore is the positive behaviour signal added into Priority (see testability.go).
+	// Kept separately so audits can show why a gap ranked where it did.
+	TestabilityScore int
+	// BranchIntents is the shortlist-stage branch analysis, reused instead of recomputing it from
+	// the same chunk.
+	BranchIntents []string
 }
 
 // GapMetaReader is the subset of metadata needed to list gaps (symbols, files, edges for centrality).
@@ -92,6 +98,11 @@ type PlanOptions struct {
 	MaxGapsE2E int
 	// MaxGapsPerFileE2E caps E2E gaps per file (0 = default 2).
 	MaxGapsPerFileE2E int
+	// MinGapTestabilityScore drops candidates whose positive testability score is below this
+	// value. Default 0 = rank only, never drop: low-value symbols sink instead of disappearing, so
+	// a repo of getters still produces a plan rather than an empty run. Raise it to make the
+	// planner abstain on genuinely untestable candidates.
+	MinGapTestabilityScore int
 	// RetrievalProfileE2E selects retrieval profile for E2E items. Empty in PlanOptions is unusual (orchestrator sets DefaultRetrievalProfileE2E: http_api for Java/C#, e2e_playwright for JS/TS when config omits both profile fields).
 	RetrievalProfileE2E string
 	// E2EFramework is the detected stack for audit/context hints (playwright, cypress, playwright-java, playwright-dotnet, selenium, …).
@@ -179,6 +190,20 @@ func isPrivateJavaMethod(sym *metadata.Symbol) bool {
 // prioritized by business-critical modules (payment, auth, …) and central dependencies (many callers).
 // Private Java methods are excluded (we do not test private members). Metadata calls (GetFile, GetEdgesTo) run concurrently with bounded concurrency.
 func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*TestGap, error) {
+	return ListGapsWithChunks(ctx, meta, nil, opts)
+}
+
+// ListGapsWithChunks is ListGaps with an optional chunk reader enabling the second scoring stage.
+//
+// Stage 1 scores every candidate from data already in hand (span, arity, outbound call edges) and
+// applies the eligibility filter. Stage 2 takes only the top 4×MaxGaps and fetches each one's chunk
+// to add branch-intent evidence. Two stages because a chunk fetch per candidate is unaffordable on
+// a large repo (tens of thousands of symbols) while ~40 fetches at concurrency 16 is ~3 round-trip
+// batches.
+//
+// chunks may be nil (ListGaps, and any caller without a chunk store): stage 2 is then skipped and
+// stage-1 scoring stands. That is the back-compat seam.
+func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkReader, opts PlanOptions) ([]*TestGap, error) {
 	if opts.Lang == "" {
 		opts.Lang = "java"
 	}
@@ -224,6 +249,11 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 	g.SetLimit(maxConcurrencyListGaps)
 	var mu sync.Mutex
 	var list []*TestGap
+	// filtered keeps ineligible candidates so an over-aggressive filter can never produce an empty
+	// plan: if nothing survives, we fall back to the unfiltered ranking and say so loudly.
+	var filtered []*TestGap
+	filteredByReason := map[string]int{}
+	enclosingCache := &sync.Map{}
 	for _, sym := range allSymbols {
 		sym := sym
 		g.Go(func() error {
@@ -251,6 +281,21 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 				gap.Reason = "business-critical module"
 				gap.Priority += 30 // highest band: critical beats "no tests" and "has tests"
 			}
+			// Resolve the declaring type ONCE and share it between the eligibility filter and
+			// the TESTS_SOURCE trace lookup (which used to fetch and discard it). Net new DB
+			// calls for the filter: zero.
+			enclosing := enclosingTypeSymbol(gctx, meta, opts.RepoID, sym, enclosingCache)
+			edgesFromRaw, _ := meta.GetEdgesFrom(gctx, opts.RepoID, sym.ID)
+			outboundCalls := len(edgesExcludingTypes(edgesFromRaw, "IMPORTS"))
+			if eligible, reason := gapEligibility(sym, enclosing, outboundCalls); !eligible {
+				mu.Lock()
+				filtered = append(filtered, gap)
+				filteredByReason[reason]++
+				mu.Unlock()
+				return nil
+			}
+			gap.TestabilityScore = TestabilityScore(sym, outboundCalls, nil)
+			gap.Priority += gap.TestabilityScore
 			// Inbound-edge count for the centrality signal, read from the materialized column
 			// rather than one GetEdgesTo per candidate — on a 30k-symbol repository that was 30k
 			// queries per run.
@@ -282,7 +327,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 					gap.Reason = "extend existing test file (add test for this symbol)"
 				}
 			}
-			if hasInboundTestsSourceTrace(gctx, meta, opts.RepoID, sym) {
+			if hasInboundTestsSourceTraceWithType(gctx, meta, opts.RepoID, sym, enclosing) {
 				gap.Priority -= 38
 				if gap.Reason == "no tests detected" {
 					gap.Reason = "traceability: tests link to this symbol (TESTS_SOURCE)"
@@ -298,7 +343,32 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 		return nil, err
 	}
 
+	if opts.MinGapTestabilityScore > 0 {
+		kept := list[:0]
+		for _, g := range list {
+			if g.TestabilityScore >= opts.MinGapTestabilityScore {
+				kept = append(kept, g)
+				continue
+			}
+			filtered = append(filtered, g)
+			filteredByReason["below_min_testability_score"]++
+		}
+		list = kept
+	}
+
+	totalCandidates := len(list) + len(filtered)
+	if len(list) == 0 && len(filtered) > 0 {
+		// Never hand back an empty plan because the filter was too eager. Ranking still applies —
+		// the low-value candidates simply sink — but the run produces output and the audit says
+		// exactly what happened.
+		auditGapFilterFallback(ctx, opts, filteredByReason, totalCandidates)
+		list = filtered
+	} else {
+		auditGapFilter(ctx, opts, filteredByReason, totalCandidates, len(list))
+	}
+
 	list = sortByPriority(list)
+	list = refineShortlistWithBranchIntents(ctx, chunks, opts, list)
 	list = selectGapsWithDiversity(list, opts.MaxGaps, maxPerFile)
 	return list, nil
 }
@@ -772,19 +842,30 @@ func isCritical(filePath, module string, prefixes []string) bool {
 	return false
 }
 
+// sortByPriority orders gaps by Priority descending with a TOTAL, reindex-stable tie-break.
+//
+// The previous implementation was a hand-written insertion sort — O(n²) over every non-test method
+// in the repository — whose tie-break was Symbol.ID, a UUID regenerated on every reindex. Two
+// consecutive runs on an UNCHANGED repository could therefore select disjoint gap sets, which
+// breaks incremental improvement and makes any A/B comparison meaningless.
 func sortByPriority(list []*TestGap) []*TestGap {
-	// Sort by Priority descending; break ties by Symbol.ID for stable, deterministic order.
-	for i := 1; i < len(list); i++ {
-		for j := i; j > 0; j-- {
-			higher := list[j].Priority > list[j-1].Priority
-			tie := list[j].Priority == list[j-1].Priority && list[j].Symbol != nil && list[j-1].Symbol != nil && list[j].Symbol.ID < list[j-1].Symbol.ID
-			if higher || tie {
-				list[j], list[j-1] = list[j-1], list[j]
-			} else {
-				break
-			}
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority > list[j].Priority
 		}
-	}
+		a, b := list[i].Symbol, list[j].Symbol
+		if a == nil || b == nil {
+			// Nil symbols sort last, deterministically.
+			return b == nil && a != nil
+		}
+		if a.FQName != b.FQName {
+			return a.FQName < b.FQName
+		}
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		return a.StartLine < b.StartLine
+	})
 	return list
 }
 
@@ -835,7 +916,7 @@ type testPlanBuildParams struct {
 // similar tests, fixtures, config. Retrieve runs concurrently with bounded concurrency; results
 // are assembled in gap order for stable audit and plan.Items.
 func CreateTestPlan(ctx context.Context, gapMeta GapMetaReader, retrievalMeta MetaReader, chunks ChunkReader, opts PlanOptions) (*TestPlan, error) {
-	gapList, err := ListGaps(ctx, gapMeta, opts)
+	gapList, err := ListGapsWithChunks(ctx, gapMeta, chunks, opts)
 	if err != nil {
 		return nil, err
 	}

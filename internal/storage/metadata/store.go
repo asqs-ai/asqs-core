@@ -302,13 +302,20 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 	return scanSymbols(rows)
 }
 
+// normalizeSymbolKind mirrors InsertSymbol's write-time normalization so kind comparisons stay
+// symmetric: the store lowercases kind on the way in, and every exact comparison must lowercase
+// its argument or SCREAMING_CASE callers (API_ROUTE, E2E_SPEC, PAGE_ROUTE) silently match nothing.
+func normalizeSymbolKind(kind string) string {
+	return strings.ToLower(strings.TrimSpace(kind))
+}
+
 // ListSymbolsByLang returns symbols for the given language, optionally filtered by kind.
 func (s *Store) ListSymbolsByLang(ctx context.Context, repoID, lang string, kind string) ([]*Symbol, error) {
 	if kind != "" {
 		query := `
 			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 			FROM symbols WHERE repo_id = $3 AND lang = $1 AND kind = $2 ORDER BY file, start_line`
-		rows, err := s.db.Query(ctx, query, lang, kind, repoID)
+		rows, err := s.db.Query(ctx, query, strings.ToLower(strings.TrimSpace(lang)), normalizeSymbolKind(kind), repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -372,7 +379,7 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kin
 		WHERE s.repo_id = $3 AND f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		  AND LOWER(s.file) NOT LIKE '%.d.ts'
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.Query(ctx, query, lang, kind, repoID)
+	rows, err := s.db.Query(ctx, query, lang, normalizeSymbolKind(kind), repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +395,7 @@ func (s *Store) ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind s
 		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
 		WHERE s.repo_id = $3 AND f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.Query(ctx, query, lang, kind, repoID)
+	rows, err := s.db.Query(ctx, query, lang, normalizeSymbolKind(kind), repoID)
 	if err != nil {
 		return nil, err
 	}
