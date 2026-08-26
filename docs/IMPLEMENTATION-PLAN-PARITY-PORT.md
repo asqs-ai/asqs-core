@@ -302,14 +302,14 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP07 | Migration mechanism + `asqs-core migrate` | B04 (infra) | CP05 | 2 d | `in review` |
-| CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `ready` |
+| CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `in review` |
 | CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `in review` |
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `ready` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `ready` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `blocked (CP11)` |
 | CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP11, CP55)` |
-| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `blocked (CP08)` |
-| CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `blocked (CP08)` |
+| CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
+| CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `blocked (CP18)` |
 
 ### P3 — Indexing and retrieval quality
@@ -319,9 +319,9 @@ implementation record can be found; it is provenance, not instruction.
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `blocked (CP11)` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
-| CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `blocked (CP08)` |
-| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP08, CP16)` |
-| CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `blocked (CP08)` |
+| CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
+| CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP16)` |
+| CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `blocked (CP18)` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
@@ -780,7 +780,7 @@ already has 351 lines of tests; they must still pass unchanged.
 
 ### CP08 — Vector metric alignment and filtered-ANN recall
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2–3 d · **Risk:** medium
 
 **Goal.** Two defects that quietly degrade every retrieval result: the embedding vectors and the
 index's distance metric disagree, and filtered ANN searches under-return without saying so.
@@ -807,6 +807,34 @@ on CP09.
 that under-returns retries at the ceiling and the widen is counted. Live-DB test (CP04) covers both.
 
 **Measurement.** Mechanical correctness — confirm, do not A/B.
+
+**Implementation record (2026-08-26).** All three tasks done, with one correction to the task list:
+**upstream never changes the index opclass.** With unit-norm vectors L2² = 2 − 2·cos, so the
+existing `vector_l2_ops` index and `<->` ordering *are* cosine ordering — the migration is a
+corpus normalize (`l2_normalize` in place), not an index rebuild. Core copies that end state.
+
+- `internal/llm/embeddings/normalize.go` gained `L2Normalize`/`IsUnitNorm`/`NormalizingEmbedder`
+  verbatim (the `NormalizeTextsWithLimit`/truncation-counter half of upstream's file is CP14's);
+  `normalize_vector_test.go` ported whole. `llm.NewEmbedder` now wraps `newRawEmbedder` (core's
+  former body) so every provider's vectors are unit length at the boundary; the CP14 cache must
+  later wrap *outside* normalization (upstream's `NewCachedEmbedder` comment records why).
+- `ef_search.go` + `ef_search_test.go` ported verbatim: `efSearchFor` clamps to [40, 400],
+  `setEFSearch` degrades on unknown GUC, `ANNWidenEvent`/`ANNWidenCount`/`SetANNWidenHook`.
+  `Search` now pins a pooled conn (`Acquire`), sets `hnsw.ef_search`, and retries once at the
+  ceiling when a filtered search returns < limit/2 — counting and emitting the widen event.
+  **The hook has no production consumer upstream either** (the `retrieve.ann_widened` audit
+  wiring named in its comment does not exist yet); core copies that end state rather than
+  inventing wiring — the counter + hook satisfy "emit a counter". Core's `Search` keeps its own
+  filter set (upstream's `ExcludeChunkType`/`OmitEmbedding` fields belong to later bundles).
+- `EmbeddingsMigrations()` gained its first real body, `0001_normalize_chunk_embeddings`,
+  verbatim (skip-if-unit re-run cheapness, `l2_normalize`, `inner_product` norm — the guard
+  tests strip comments, so its prose about `l2_norm(` does not trip them). **Known sharp edge,
+  faithful to upstream:** the UPDATE assumes `chunks` exists, so `asqs-core migrate` against a
+  never-indexed embeddings database errors here rather than skipping (candidate for CP24).
+- Live coverage (core-authored, both green on `asqs_scratch`): a migration live test (denormalized
+  vector → unit norm with direction preserved; zero vector untouched; re-run recorded as skipped)
+  and a search-path probe through the pinned-conn/SET path. schema.sql needed no change
+  (opclass stays `vector_l2_ops`, same as upstream).
 
 ### CP09 — Metadata store → `pgxpool`, pool sizing
 
@@ -1002,7 +1030,7 @@ commits; `symbol_versions` gains one row per changed symbol and none per unchang
 
 ### CP14 — Embedding input limits and embedding cache
 
-- **Status:** `blocked (CP08)` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low
 
 **Goal.** Stop re-embedding identical content, and stop silently truncating oversized inputs.
 
@@ -1024,7 +1052,7 @@ never blocks a run on failure.
 
 ### CP15 — Fail closed on embedding-dimension mismatch
 
-- **Status:** `blocked (CP08)` · **Effort:** 0.5 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 0.5 d · **Risk:** low
 
 **Goal.** A dimension mismatch between the configured model and the existing `vector(n)` column must
 stop the run with a clear message, not proceed and write garbage. Explicitly **out of scope**:
@@ -1153,7 +1181,7 @@ count; a forced inner failure surfaces as an error and a counter, not as success
 
 ### CP20 — Chunk overlap and honest segment line numbers
 
-- **Status:** `blocked (CP08)` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 2 d · **Risk:** medium
 
 **Three defects, one bundle.** (a) adjacent chunks have no overlap, so a symbol split across a
 boundary is retrievable from neither half; (b) chunk sizing is a guessed constant rather than measured
@@ -1170,7 +1198,7 @@ sources. (a)/(b) ship behind settings whose defaults are today's behaviour until
 
 ### CP21 — Lexical channel and RRF fusion
 
-- **Status:** `blocked (CP08, CP16)` · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
+- **Status:** `blocked (CP16)` · **Effort:** 3–4 d · **Risk:** medium · **Ships `fusion: dense`**
 
 **Read the upstream result before implementing.** Upstream measured RRF fusion against a labelled
 suite and it was a **regression**: nDCG@10 0.4792 → 0.2736, R@10 0.5500 → 0.2542. The default stayed
@@ -1201,7 +1229,7 @@ recorded in this file.
 
 ### CP22 — Relevance-driven fixtures/config and doc-link boost
 
-- **Status:** `blocked (CP08)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
 
 **Goal.** Fixture and config chunks are currently selected by type, not by relevance to the target;
 and a symbol's own documentation is not preferentially retrieved for it.

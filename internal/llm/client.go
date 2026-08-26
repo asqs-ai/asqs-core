@@ -141,7 +141,18 @@ func NewChatCompleter(cfg *config.Config) (model.ChatCompleter, error) {
 
 // NewEmbedder returns an Embedder for the configured provider.
 // When EmbeddingProvider is set (e.g. openai while Provider is anthropic), that provider and its key are used so you can use Anthropic for chat and OpenAI for embeddings. Returns (nil, nil) when both Provider and EmbeddingProvider are empty.
+// Every provider is wrapped so its vectors are L2-normalized before they reach the store — see
+// llembed.L2Normalize for why the ANN metric and the scoring metric must agree.
 func NewEmbedder(cfg *config.Config) (model.Embedder, error) {
+	inner, err := newRawEmbedder(cfg)
+	if err != nil || inner == nil {
+		return inner, err
+	}
+	return llembed.NewNormalizingEmbedder(inner), nil
+}
+
+// newRawEmbedder builds the provider embedder without the normalization wrapper.
+func newRawEmbedder(cfg *config.Config) (model.Embedder, error) {
 	p := strings.ToLower(strings.TrimSpace(cfg.LLM.EmbeddingProvider))
 	if p == "" {
 		p = strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))

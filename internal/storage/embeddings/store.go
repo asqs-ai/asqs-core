@@ -30,6 +30,9 @@ const defaultDimension = 1536
 type Store struct {
 	pool *pgxpool.Pool
 	dim  int
+	// onANNWiden is notified when a filtered search under-returns and is retried at the ef_search
+	// ceiling. Installed via SetANNWidenHook; nil by default so the store stays audit-agnostic.
+	onANNWiden func(context.Context, ANNWidenEvent)
 }
 
 // Config configures the embeddings store.
@@ -380,7 +383,49 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 		FROM chunks %s
 		ORDER BY embedding <-> $1
 		LIMIT $%d`, whereClause, argNum)
-	rows, err := s.pool.Query(ctx, q, args...)
+
+	// pgvector walks the HNSW graph collecting roughly ef_search candidates and only then applies
+	// the WHERE clause. With the default ef_search of 40 and a conjunction of several selective
+	// predicates (repo_id AND lang AND chunk_type AND module AND file prefix), most of those 40 are
+	// discarded and the query silently returns far fewer rows than LIMIT — sometimes zero — even
+	// though thousands of matching rows exist. There is no error and no signal; retrieval just
+	// falls through to an unranked listing. This is the most likely explanation for a "similar
+	// tests section is empty on a repo that obviously has similar tests" report.
+	//
+	// SET LOCAL needs an explicit transaction or a pinned connection, hence Acquire rather than
+	// s.pool.Query, which would take an arbitrary pooled conn and lose the setting.
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	ef := efSearchFor(limit)
+	results, err := s.searchWithEF(ctx, conn, q, args, ef)
+	if err != nil {
+		return nil, err
+	}
+	// Filtered-recall guard: a materially short result set under a selective conjunction almost
+	// always means post-filtering discarded most of the ef_search candidates rather than that the
+	// corpus is genuinely small. Retry once at the ceiling before the caller falls through to an
+	// unranked listing. Emitting the widen event is how the real hit rate becomes measurable —
+	// today the shortfall is completely invisible.
+	if len(results) < limit/2 && ef < maxEFSearch {
+		widened, werr := s.searchWithEF(ctx, conn, q, args, maxEFSearch)
+		if werr == nil && len(widened) > len(results) {
+			s.noteANNWidened(ctx, limit, len(results), len(widened))
+			return widened, nil
+		}
+	}
+	return results, nil
+}
+
+// searchWithEF runs the prepared search on conn with hnsw.ef_search set to ef.
+func (s *Store) searchWithEF(ctx context.Context, conn pooledConn, q string, args []interface{}, ef int) ([]SearchResult, error) {
+	if err := setEFSearch(ctx, conn, ef); err != nil {
+		return nil, err
+	}
+	rows, err := conn.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
