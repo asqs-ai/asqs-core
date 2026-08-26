@@ -195,7 +195,15 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 
 	res.Candidates = ranked
 
-	// Phase 3: build the pre-computed markdown block (fallback / default path).
+	// Phase 3: resolve symbol references from doc content.
+	if in.SymbolResolver != nil {
+		for i := range ranked {
+			refs := ExtractSymbolRefs(ranked[i].Content)
+			ranked[i].LinkedSymbolIDs, ranked[i].LinkedFQNames = ResolveDocSymbolLinksWithNames(ctx, in.RepoID, refs, in.SymbolResolver)
+		}
+	}
+
+	// Phase 4: build the pre-computed markdown block (fallback for callers that don't use SelectForGap).
 	var b strings.Builder
 	b.WriteString("## Repository documentation and agent skills (ASQS project intel)\n\n")
 	b.WriteString("The following excerpts summarize **existing** repo docs and Cursor-style skills. Where these repo-specific conventions conflict with generic skill pack guidance in the system prompt, **these repo conventions take precedence**. Do not contradict indexed source code.\n\n")
@@ -249,11 +257,13 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 		var diskCands []diskCacheCandidate
 		for _, rc := range ranked {
 			diskCands = append(diskCands, diskCacheCandidate{
-				RelPath:      rc.RelPath,
-				Kind:         string(rc.Kind),
-				Score:        rc.Score,
-				Content:      rc.Content,
-				DocEmbedding: append([]float32(nil), rc.DocEmbedding...),
+				RelPath:         rc.RelPath,
+				Kind:            string(rc.Kind),
+				Score:           rc.Score,
+				Content:         rc.Content,
+				DocEmbedding:    append([]float32(nil), rc.DocEmbedding...),
+				LinkedSymbolIDs: append([]string(nil), rc.LinkedSymbolIDs...),
+				LinkedFQNames:   append([]string(nil), rc.LinkedFQNames...),
 			})
 		}
 		dc := diskCache{

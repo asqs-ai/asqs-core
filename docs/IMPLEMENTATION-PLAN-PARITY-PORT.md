@@ -321,7 +321,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `in review` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `in review` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `in review` |
-| CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
+| CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `in review` |
 | CP23 | Route-aware E2E gaps and branch gaps | (post-B05 plan work) | CP18 | 2 d | `ready` |
 | CP24 | Review-findings cleanup | B31 | CP05 | 2–3 d | `ready` |
 | CP57 | *(optional)* Retrieval IR eval harness and golden suite | B06 | CP21 | 4–5 d + labelling | `withdrawn (D16)` |
@@ -1515,7 +1515,7 @@ default stays `dense`, per the upstream measurement quoted above.
 
 ### CP22 — Relevance-driven fixtures/config and doc-link boost
 
-- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` (done 2026-08-26 — see the record; **ships unconditional and unmeasured**, matching upstream's end state — the record explains the deviation from this bundle's acceptance) · **Effort:** 2 d · **Risk:** low
 
 **Goal.** Fixture and config chunks are currently selected by type, not by relevance to the target;
 and a symbol's own documentation is not preferentially retrieved for it.
@@ -1528,6 +1528,43 @@ core, contrary to older notes).
 setting defaulting to today's behaviour; the default moves only on a CP16 result. Note upstream's
 own finding: this path is **disjoint from what a retrieval-IR suite scores**, so CP57 cannot measure
 it — CP16's run-outcome metrics are the only available evidence.
+
+**Implementation record (2026-08-26).** Both halves done; one CP20-style deviation, argued below.
+
+- **Fixtures by relevance, config by proximity** (`fixtures.go`, ported whole with its tests):
+  `relevantChunksByPathPattern` ranks path-matched chunks by vector distance to the target via
+  CP21's `SearchByPathPattern` (falling back to the alphabetical listing when the store lacks the
+  seam or the target has no embedding — behaviour degrades rather than breaking), and
+  `configChunksByPathProximity` orders config by DIRECTORY DISTANCE, deliberately not cosine:
+  `application-test.yml` shares no vocabulary with a method body, so vector distance there is a
+  different kind of arbitrary. Both wired at the `Retrieve` fixture/config sites with
+  `targetChunk = out.TargetMethod.Chunk`.
+- **Doc-link boost** (`projectintel`): `symbol_refs.go` ported (capitalized-reference extraction
+  + noise list + `ResolveDocSymbolLinksWithNames`; the metadata store satisfies
+  `SymbolResolver`); `RankedCandidate` gained `LinkedSymbolIDs`/`LinkedFQNames`, populated in
+  `Run` phase 3 and round-tripped through the disk cache (fields `omitempty`;
+  `CacheFormatVersion` stays 2, matching upstream — old caches load with empty links, benign);
+  `RankByEmbeddingWithLinks`/`SelectForGapWithLinks` add +0.35 when a doc names the target
+  symbol, +0.15 for its enclosing type, matched on FQ NAME because symbol ids churn per reindex,
+  and never boosting the no-embedding sentinel. **The pipeline now does per-gap selection at
+  all**: core prepended the same run-wide snapshot to every gap prompt despite `Result.Candidates`
+  documenting `SelectForGap` as its purpose — `projectIntelForGap` re-ranks per item with the
+  boost, capped by the existing project-intel config knobs.
+- **Deviation — no setting:** upstream ships all of it unconditional; the "flags" are the
+  graceful-degradation seams (`pathPatternSearcher` optional interface, embedding-less fallback,
+  nil resolver skips linkage). A core-only flag would be permanent divergence. Unmeasured per
+  rule 10, said in the status line — and as this section itself notes, CP16's run-outcome metrics
+  are the only instrument that CAN measure it.
+- **Not taken, recorded:** `profiles.go`'s upstream deltas belong elsewhere
+  (`ParseRetrievalProfile`/config alias table = config-restructure family;
+  `indexer.EdgeTypeConfidence` registry = the edge-registry bundle), as do `retrieve.go`'s
+  `memberSummaryForType` chunk-miss fallback (CP45's file-map row) and `isBootstrapSmokeArtifact`
+  (P12). The upstream MMR call-site comment rode along (comment only, CP18 material).
+- Acceptance verified live on `asqs_scratch`: two fixture chunks with orthogonal embeddings, two
+  targets — the top-ranked fixture follows the target (the exact "selection changes with the
+  target symbol" test); ported unit tests cover ranked-vs-fallback, proximity ordering and
+  limits; relevance tests updated to upstream's (boost cases included). `projectintel/types.go`
+  was finally gofmt-ed — the repo's last pre-existing unformatted file under internal/ is gone.
 
 ### CP23 — Route-aware E2E gaps and branch gaps
 

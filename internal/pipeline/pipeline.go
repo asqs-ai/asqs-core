@@ -248,7 +248,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	piCfg := cfg.EffectiveProjectIntel()
 	if piCfg.EffectiveEnabled() {
 		piIn := projectintel.Input{
-			RepoAbs:           repoAbs,
+			RepoAbs: repoAbs,
+			// RepoID scopes doc→symbol resolution; the metadata store satisfies SymbolResolver.
+			RepoID:            opts.RepoID,
+			SymbolResolver:    meta,
 			Lang:              lang,
 			CurrentFiles:      files,
 			ConfigFingerprint: piCfg.ConfigFingerprintHash(),
@@ -364,7 +367,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		out := GapOutcome{Symbol: planItemSymbol(item)}
 		ctxStr := retrieval.BuildLLMContextForGap(item, formatOpts)
 		if piResult != nil {
-			if piMarkdown := strings.TrimSpace(piResult.Snapshot.Markdown); piMarkdown != "" {
+			if piMarkdown := strings.TrimSpace(projectIntelForGap(piResult, piCfg, item)); piMarkdown != "" {
 				ctxStr = piMarkdown + "\n\n" + ctxStr
 			}
 		}
@@ -809,4 +812,34 @@ func planItemSymbol(item *retrieval.TestPlanItem) string {
 
 func isE2E(item *retrieval.TestPlanItem) bool {
 	return item != nil && strings.EqualFold(strings.TrimSpace(item.Layer), "e2e")
+}
+
+// projectIntelForGap returns the project-intel markdown for one gap: candidates re-ranked against
+// the gap's target embedding, with a boost for documents that explicitly NAME the target symbol or
+// its enclosing type (matched on FQ name — symbol ids churn on every reindex). Falls back to the
+// run-wide snapshot when candidates are absent (cache formats predating them) or the gap has no
+// embedded target chunk.
+func projectIntelForGap(pi *projectintel.Result, piCfg config.ProjectIntelConfig, item *retrieval.TestPlanItem) string {
+	if pi == nil {
+		return ""
+	}
+	fallback := strings.TrimSpace(pi.Snapshot.Markdown)
+	if len(pi.Candidates) == 0 || item == nil {
+		return fallback
+	}
+	var targetEmbedding []float32
+	if item.Context != nil && item.Context.TargetMethod != nil && item.Context.TargetMethod.Chunk != nil {
+		targetEmbedding = item.Context.TargetMethod.Chunk.Embedding
+	}
+	// A document that explicitly names the target symbol beats one that merely embeds similarly.
+	var boost projectintel.SymbolLinkBoost
+	if item.Gap != nil && item.Gap.Symbol != nil {
+		boost.TargetFQName = item.Gap.Symbol.FQName
+	}
+	if item.Context != nil && item.Context.TargetClass != nil && item.Context.TargetClass.Symbol != nil {
+		boost.ContainerFQName = item.Context.TargetClass.Symbol.FQName
+	}
+	return projectintel.SelectForGapWithLinks(pi.Candidates, targetEmbedding,
+		piCfg.EffectiveMaxDocFiles(), piCfg.EffectiveMaxSkillFiles(), piCfg.EffectiveMaxTotalRunes(),
+		fallback, boost)
 }

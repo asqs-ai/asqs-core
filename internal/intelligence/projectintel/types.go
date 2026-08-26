@@ -37,6 +37,12 @@ type RankedCandidate struct {
 	Score        float64
 	Content      string    // full or truncated read text used for ranking/summary
 	DocEmbedding []float32 // embedding of the summary; nil when not computed
+	// LinkedSymbolIDs lists symbol IDs referenced by the doc content, resolved via SymbolResolver.
+	LinkedSymbolIDs []string
+	// LinkedFQNames are the fully-qualified names those ids resolved from. Matching is done on FQ
+	// name (see RankByEmbeddingWithLinks): symbol ids are regenerated on every reindex, so an
+	// id-keyed boost would silently stop working after the next index run.
+	LinkedFQNames []string
 }
 
 // Snapshot is the material injected into generation prompts and persisted in the cache file.
@@ -64,18 +70,26 @@ type Options struct {
 
 // Input is one project-intel execution.
 type Input struct {
-	RepoAbs       string
-	MonoWorkspace string // normalized repo-relative prefix, empty = whole repo
-	Lang          string
-	TestFramework string
-	E2EFramework  string
-	CurrentFiles  []indexer.FileVersion
-	Skip          bool   // policy or caller: skip all work
-	ConfigFingerprint string // hash of relevant config slice (caller supplies)
-	LLM           model.ChatCompleter // optional; nil => extractive only
+	RepoAbs string
+	// RepoID scopes SymbolResolver lookups. Doc-to-symbol linkage resolves free-text names like
+	// "OrderService" against the symbol table, so without it a doc in one repository links to an
+	// identically named class in another.
+	RepoID string
+
+	MonoWorkspace     string // normalized repo-relative prefix, empty = whole repo
+	Lang              string
+	TestFramework     string
+	E2EFramework      string
+	CurrentFiles      []indexer.FileVersion
+	Skip              bool                // policy or caller: skip all work
+	ConfigFingerprint string              // hash of relevant config slice (caller supplies)
+	LLM               model.ChatCompleter // optional; nil => extractive only
 	// Embedder produces vectors for doc summaries when UseEmbeddingsRank is true.
 	Embedder model.Embedder
-	Opts     Options
+	// SymbolResolver is an optional capability for resolving symbol names to IDs during
+	// doc-to-symbol linkage. Nil skips that step.
+	SymbolResolver SymbolResolver
+	Opts           Options
 }
 
 // Result carries the snapshot plus audit-friendly counters.
@@ -92,14 +106,14 @@ type Result struct {
 	ScannedRelPaths        []string
 	ScannedRelPathsOmitted int
 
-	FilesScanned      int
-	DocsSelected      int
-	SkillsSelected    int
-	LLMSummarizeCalls int
-	Truncations       int
-	ApproxRunes       int
-	Mode              string // off|lexical|embedding|cache_hit
-	FilesFingerprint  string
+	FilesScanned         int
+	DocsSelected         int
+	SkillsSelected       int
+	LLMSummarizeCalls    int
+	Truncations          int
+	ApproxRunes          int
+	Mode                 string // off|lexical|embedding|cache_hit
+	FilesFingerprint     string
 	RelevanceFingerprint string
-	DurationMs        int64
+	DurationMs           int64
 }

@@ -156,13 +156,19 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	// Fixtures / helpers: test-related chunks
 	out.Fixtures = listChunksByType(ctx, chunks, req.RepoID, req.Lang, "fixture", req.MaxFixtures, "")
 	if len(out.Fixtures) < req.MaxFixtures {
-		extra := listChunksByPathPattern(ctx, chunks, req.RepoID, req.Lang, []string{"fixture", "helper", "builder"}, req.MaxFixtures-len(out.Fixtures))
+		// Ranked by relevance to the target rather than by alphabetical file path — see
+		// relevantChunksByPathPattern for what the previous behaviour actually returned.
+		extra := relevantChunksByPathPattern(ctx, chunks, targetChunk, req.RepoID, req.Lang,
+			[]string{"fixture", "helper", "builder"}, req.MaxFixtures-len(out.Fixtures))
 		out.Fixtures = append(out.Fixtures, extra...)
 	}
 	annotateChunkGroupProvenance(out.Fixtures, "fixtures", "fixture/helper candidates for setup and test data")
 
 	// Config: DI, Spring, test runner
-	out.Config = listChunksByPathPattern(ctx, chunks, req.RepoID, req.Lang, []string{"config", "context", "spring", "test-config"}, req.MaxConfigChunks)
+	// Config is ranked by PATH PROXIMITY, not vector distance: application-test.yml shares almost no
+	// vocabulary with a service method body, so cosine between them is noise.
+	out.Config = configChunksByPathProximity(ctx, chunks, targetChunk, req.RepoID, req.Lang,
+		[]string{"config", "context", "spring", "test-config"}, req.MaxConfigChunks)
 	annotateChunkGroupProvenance(out.Config, "config", "configuration/DI/runtime context likely needed for wiring")
 
 	applyFailureLocalizedRetrieval(out, req.FailureHint)
@@ -490,6 +496,14 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 			}
 			sortMMRPool(pool)
 			lambda := normalizeSimilarMMRLambda(req.SimilarMMRLambda)
+			// MMR selects the FINAL k; the larger pool exists to give it candidates to choose
+			// among. Asking it for k = assemblyPoolLimit (up to 120) meant fully ordering the pool
+			// and then discarding all but ~5 — and because greedy MMR is prefix-stable, the output
+			// was byte-identical to asking for k = limit. Pure waste: the greedy loop is O(k·n·d),
+			// so k=120 vs k=5 is a ~24x difference, ~1.3 GFLOP per run for a discarded result.
+			//
+			// The margin covers chunks that assembleSegmentedContextWindows may drop while
+			// regrouping embedding segments, so selecting exactly `limit` cannot under-fill.
 			for _, ch := range maximalMarginalRelevance(query, pool, mmrSelectionSize(limit), lambda) {
 				addChunk(ch)
 			}
