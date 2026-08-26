@@ -25,19 +25,6 @@ func dotnetOnPATH() bool {
 	return err == nil
 }
 
-// EffectivePostGenerateFormatCommand returns runner.format_command when set; for C# when empty, defaults to "dotnet format".
-func EffectivePostGenerateFormatCommand(lang, configured string) string {
-	if s := strings.TrimSpace(configured); s != "" {
-		return s
-	}
-	switch strings.ToLower(strings.TrimSpace(lang)) {
-	case "csharp", "cs":
-		return "dotnet format"
-	default:
-		return ""
-	}
-}
-
 // IsDotNetFormatCommand is true when the format step should use dotnet format --include (format_only_added path).
 func IsDotNetFormatCommand(cmd string) bool {
 	c := strings.TrimSpace(cmd)

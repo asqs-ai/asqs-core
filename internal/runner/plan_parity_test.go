@@ -50,6 +50,8 @@ var permittedDifferences = map[string]string{
 	// Permanent: no bundle removes these entries.
 	"dotnet-multitarget/Argv[coverage]": "§1-5",
 	"dotnet-multitarget/Argv[test]":     "§1-5",
+	"dotnet-overrides/Argv[coverage]":   "§1-5",
+	"dotnet-overrides/Argv[test]":       "§1-5",
 	"dotnet/Argv[coverage]":             "§1-5",
 	"dotnet/Argv[test]":                 "§1-5",
 }
@@ -323,27 +325,63 @@ func writeNested(t *testing.T, root, rel, body string, executable bool) {
 	}
 }
 
-// Every whitelist row must be attributable: either to a permanent §1 structural difference, or to
-// the open CP bundle (CP31–CP35) that removes it. CP35 closes the whitelist and tightens this test
-// to §1-only — the upstream end-state form — at which point "the two targets are unified" becomes
-// a fact about the code rather than a claim in a document.
+// The whitelist has reached its end state (CP35). Every remaining entry must be attributed to a
+// §1 row — a difference that exists only because of WHERE the process runs — and none to an open
+// bundle. This is the assertion that "the two targets are unified" is a fact about the code rather
+// than a claim in a document: a future bundle number appearing here means a gap was reopened.
 func TestPermittedDifferences_containOnlyStructuralRows(t *testing.T) {
 	if len(permittedDifferences) == 0 {
 		t.Fatal("the whitelist is empty; CP30 lands with core's local/docker disagreements enumerated, and the §1 structural rows cannot vanish even at the end state")
 	}
-	validOwner := func(owner string) bool {
-		if strings.HasPrefix(owner, "§1-") {
-			return true
-		}
-		switch owner {
-		case "CP31", "CP32", "CP33", "CP34", "CP35":
-			return true
-		}
-		return false
-	}
 	for key, owner := range permittedDifferences {
-		if !validOwner(owner) {
-			t.Errorf("%s is attributed to %q; every difference must name a §1 structural row or the CP31–CP35 bundle that removes it", key, owner)
+		if !strings.HasPrefix(owner, "§1-") {
+			t.Errorf("%s is attributed to %q; every remaining difference must be a §1 row, "+
+				"or it is an open gap masquerading as a permitted one", key, owner)
+		}
+	}
+}
+
+// A step that does not run (CP34): must report the same Summary on both targets. This asserts the EXECUTORS surface them identically, which is what the fix loop
+// and the ship/discard decision actually read.
+func TestStepResultParity_skipReasonsAreIdentical(t *testing.T) {
+	stubToolsOnPATH(t, "mvn", "gradle", "npm", "dotnet", "node")
+	cases := []struct {
+		name  string
+		lang  string
+		files map[string]string
+	}{
+		{"java without jacoco", "java", map[string]string{"pom.xml": "<project/>"}},
+		{"js without a test script", "typescript", map[string]string{"package.json": `{"scripts":{"build":"tsc"}}`}},
+		{"js without package.json", "typescript", map[string]string{"README.md": "x"}},
+		{"unsupported language", "python", map[string]string{"main.py": "print(1)"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := writeRepoTree(t, tc.files, nil)
+			local, _ := (&Sandbox{Type: "local", Timeout: "30s"}).buildStepPlan(repo, tc.lang, "")
+			docker, _ := (&Sandbox{Type: "docker", Timeout: "30s"}).buildStepPlan(repo, tc.lang, "")
+			for _, step := range planSteps {
+				l, d := local.DecisionFor(step), docker.DecisionFor(step)
+				if l.Action != d.Action || l.Reason != d.Reason {
+					t.Errorf("%s: local %s/%q vs docker %s/%q", step, l.Action, l.Reason, d.Action, d.Reason)
+				}
+			}
+		})
+	}
+}
+
+// A step that PASSES must also read the same. Docker built "<Label> ok" from its own human label
+// while local said "compile ok"/"tests ok", and Docker's coverage could never name a report.
+func TestStepResultParity_successSummariesAreIdentical(t *testing.T) {
+	stubToolsOnPATH(t, "mvn")
+	repo := writeRepoTree(t, map[string]string{"pom.xml": jacocoPom}, nil)
+	local, _ := (&Sandbox{Type: "local", Timeout: "30s"}).buildStepPlan(repo, "java", "")
+	docker, _ := (&Sandbox{Type: "docker", Timeout: "30s"}).buildStepPlan(repo, "java", "")
+	for _, step := range planSteps {
+		l := stepSuccessSummary(step, local, repo)
+		d := stepSuccessSummary(step, docker, repo)
+		if l != d {
+			t.Errorf("%s: local %q vs docker %q", step, l, d)
 		}
 	}
 }

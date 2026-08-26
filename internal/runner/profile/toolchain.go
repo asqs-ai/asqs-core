@@ -27,14 +27,12 @@ const (
 
 // ToolchainProfile defines argv and image for Docker eval jobs.
 type ToolchainProfile struct {
-	ID               ToolchainID
-	Image            string
-	Restore          []string
-	Compile          []string
-	Test             []string
-	Coverage         []string
-	CacheTargetPaths []string
-	ArtifactPaths    []string
+	ID       ToolchainID
+	Image    string
+	Restore  []string
+	Compile  []string
+	Test     []string
+	Coverage []string
 }
 
 const DefaultMavenImage = "maven:3.9-eclipse-temurin-21"
@@ -61,11 +59,9 @@ func mavenToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 		// test-compile (not compile) so the compile step also builds the generated TEST sources:
 		// otherwise a syntax error in a generated test only surfaces in the test phase as a
 		// confusing "Compile ok" followed by a COMPILATION ERROR. -DskipTests keeps it compile-only.
-		Compile:          []string{"mvn", "-q", "-B", "-DskipTests", "test-compile"},
-		Test:             []string{"mvn", "-q", "-B", "test"},
-		Coverage:         []string{"mvn", "-q", "-B", "test", "jacoco:report"},
-		CacheTargetPaths: []string{"/root/.m2"},
-		ArtifactPaths:    []string{"target/surefire-reports", "target/site/jacoco"},
+		Compile:  []string{"mvn", "-q", "-B", "-DskipTests", "test-compile"},
+		Test:     []string{"mvn", "-q", "-B", "test"},
+		Coverage: []string{"mvn", "-q", "-B", "test", "jacoco:report"},
 	}
 }
 
@@ -80,11 +76,9 @@ func gradleToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 		Restore: []string{"gradle", "--no-daemon", "-q", "dependencies"},
 		// compileTestJava (depends on compileJava) so the compile step also builds the generated
 		// TEST sources — see the Maven note above.
-		Compile:          []string{"gradle", "--no-daemon", "-q", "compileTestJava"},
-		Test:             []string{"gradle", "--no-daemon", "-q", "test"},
-		Coverage:         []string{"gradle", "--no-daemon", "-q", "test", "jacocoTestReport"},
-		CacheTargetPaths: []string{"/root/.gradle"},
-		ArtifactPaths:    []string{"build/reports/tests", "build/reports/jacoco"},
+		Compile:  []string{"gradle", "--no-daemon", "-q", "compileTestJava"},
+		Test:     []string{"gradle", "--no-daemon", "-q", "test"},
+		Coverage: []string{"gradle", "--no-daemon", "-q", "test", "jacocoTestReport"},
 	}
 }
 
@@ -136,11 +130,9 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			Image:   img,
 			Restore: []string{"sh", "-c", "corepack enable && pnpm install --frozen-lockfile"},
 			// Prepend node_modules/.bin so scripts that call `tsc` find the local typescript package (common with node:lts / slim images).
-			Compile:          []string{"sh", "-c", "corepack enable && export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && pnpm run build"},
-			Test:             []string{"sh", "-c", "corepack enable && CI=true pnpm test --if-present"},
-			Coverage:         []string{"sh", "-c", "corepack enable && CI=true pnpm run test:coverage --if-present || CI=true pnpm test --if-present"},
-			CacheTargetPaths: []string{"/root/.npm", "/root/.local/share/pnpm/store"},
-			ArtifactPaths:    []string{"coverage/lcov.info"},
+			Compile:  []string{"sh", "-c", "corepack enable && export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && pnpm run build"},
+			Test:     []string{"sh", "-c", "corepack enable && CI=true pnpm test --if-present"},
+			Coverage: []string{"sh", "-c", "corepack enable && CI=true pnpm run test:coverage --if-present || CI=true pnpm test --if-present"},
 		}
 	case TypeScriptYarn:
 		img := strings.TrimSpace(imageNode)
@@ -148,14 +140,12 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			img = nodeImageIfUnset
 		}
 		return ToolchainProfile{
-			ID:               TypeScriptYarn,
-			Image:            img,
-			Restore:          []string{"yarn", "install", "--frozen-lockfile"},
-			Compile:          []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && yarn run build"},
-			Test:             []string{"sh", "-c", "CI=true yarn test"},
-			Coverage:         []string{"sh", "-c", "CI=true yarn run coverage || CI=true yarn test"},
-			CacheTargetPaths: []string{"/root/.npm", "/usr/local/share/.cache/yarn"},
-			ArtifactPaths:    []string{"coverage/lcov.info"},
+			ID:       TypeScriptYarn,
+			Image:    img,
+			Restore:  []string{"yarn", "install", "--frozen-lockfile"},
+			Compile:  []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && yarn run build"},
+			Test:     []string{"sh", "-c", "CI=true yarn test"},
+			Coverage: []string{"sh", "-c", "CI=true yarn run coverage || CI=true yarn test"},
 		}
 	case CSharpDotnet:
 		img := resolveDotNetDockerImage(imageDotNet, repoPath)
@@ -166,9 +156,7 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			Compile: []string{"dotnet", "build", "-c", "Release", "--no-restore"},
 			Test:    []string{"dotnet", "test", "-c", "Release", "--no-build"},
 			// Two argv elements: a single --collect:"…" token can be misparsed so MSBuild sees a /p: name with spaces (MSB4177).
-			Coverage:         []string{"dotnet", "test", "-c", "Release", "--no-build", "--collect", "XPlat Code Coverage"},
-			CacheTargetPaths: []string{"/root/.nuget/packages"},
-			ArtifactPaths:    []string{"TestResults"},
+			Coverage: []string{"dotnet", "test", "-c", "Release", "--no-build", "--collect", "XPlat Code Coverage"},
 		}
 	case TypeScriptNPM:
 		fallthrough
@@ -178,14 +166,12 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			img = nodeImageIfUnset
 		}
 		return ToolchainProfile{
-			ID:               TypeScriptNPM,
-			Image:            img,
-			Restore:          []string{"npm", "install"},
-			Compile:          []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && npm run build"},
-			Test:             []string{"sh", "-c", "CI=true npm test"},
-			Coverage:         []string{"sh", "-c", "CI=true npm run coverage --if-present || CI=true npm test"},
-			CacheTargetPaths: []string{"/root/.npm"},
-			ArtifactPaths:    []string{"coverage/lcov.info"},
+			ID:       TypeScriptNPM,
+			Image:    img,
+			Restore:  []string{"npm", "install"},
+			Compile:  []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && npm run build"},
+			Test:     []string{"sh", "-c", "CI=true npm test"},
+			Coverage: []string{"sh", "-c", "CI=true npm run coverage --if-present || CI=true npm test"},
 		}
 	}
 }

@@ -19,9 +19,6 @@ import (
 //
 // A warning rather than an error: shared configs legitimately carry both Docker and local
 // settings, and refusing to start would break them.
-//
-// (CP35 adds normaliseAndValidateRunnerType here — the startup rejection of an unrecognised
-// runner.type that today silently stubs every evaluation step green.)
 func warnInertDockerKeysForLocalRunner(c *Config) {
 	if c == nil || strings.EqualFold(strings.TrimSpace(c.Runner.Type), "docker") {
 		return
@@ -66,4 +63,27 @@ func warnDeprecatedBuildToolWrapperAlias(c *Config) {
 			"build tool comes from PATH on a local runner and from the toolchain image under docker. "+
 			"Set runner.build_tool to %q to silence this.\n",
 		strings.TrimSpace(c.Runner.BuildTool), canonical, canonical)
+}
+
+// normaliseAndValidateRunnerType canonicalises runner.type and rejects anything unrecognised.
+//
+// Normalising first means "Docker" and " docker " behave as "docker" everywhere, rather than only
+// where a caller remembered to fold case.
+//
+// The rejection matters more than it looks. An unrecognised value used to be accepted silently,
+// and every evaluation step then returned {OK: true, Summary: "stub"} — so `runner.type: dcoker`
+// green-lit a run that compiled nothing, tested nothing, and shipped. Startup is where an operator
+// can still act on it.
+func normaliseAndValidateRunnerType(c *Config) error {
+	if c == nil {
+		return nil
+	}
+	c.Runner.Type = strings.ToLower(strings.TrimSpace(c.Runner.Type))
+	if c.Runner.Type == "" {
+		c.Runner.Type = "local"
+	}
+	if c.Runner.Type != "local" && c.Runner.Type != "docker" {
+		return fmt.Errorf("config validation: runner.type must be \"local\" or \"docker\"; got %q", c.Runner.Type)
+	}
+	return nil
 }

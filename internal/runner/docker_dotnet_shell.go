@@ -96,13 +96,21 @@ func parseSimpleDotnetShellArgv(script string) ([]string, bool) {
 	return parts, true
 }
 
+// argvToShellSingleCommandLine re-serialises a dotnet argv as a shell command line.
+//
+// It quotes only tokens that need it. Quoting EVERY token — which it used to do — produced
+// `"dotnet" "test" "-c" "Release"`, and every downstream matcher looks for the literal substring
+// `dotnet test`: the hang-mitigation props, the VSTest session timeout and the build-server
+// shutdown all silently became no-ops on scripts ASQS had itself produced. That hit every C# run
+// with a configured compile_command/test_command, which is precisely where `dotnet test` hanging
+// until the job timeout is least affordable.
 func argvToShellSingleCommandLine(argv []string) string {
 	var b strings.Builder
 	for i, a := range argv {
 		if i > 0 {
 			b.WriteByte(' ')
 		}
-		b.WriteString(strconv.Quote(a))
+		b.WriteString(shellQuoteTokenIfNeeded(a))
 	}
 	return b.String()
 }
@@ -266,7 +274,7 @@ func argvHasRunConfigurationTestSessionTimeout(argv []string) bool {
 func applyDotnetTestDockerVSTestShellScript(script string, timeoutMs int) string {
 	s := strings.TrimSpace(script)
 	low := strings.ToLower(s)
-	if !strings.Contains(low, "dotnet test") {
+	if !shellScriptRunsDotnetTest(low) {
 		return script
 	}
 	if strings.Contains(low, "--logger") && strings.Contains(low, "runconfiguration.testsessiontimeout=") {
@@ -283,7 +291,7 @@ func WrapDotnetTestWithBuildServerShutdown(argv []string) []string {
 	if len(argv) == 3 && argv[0] == "sh" && argv[1] == "-c" {
 		s := strings.TrimSpace(argv[2])
 		low := strings.ToLower(s)
-		if !strings.Contains(low, "dotnet test") {
+		if !shellScriptRunsDotnetTest(low) {
 			return argv
 		}
 		if strings.Contains(low, "build-server shutdown") {
@@ -483,4 +491,23 @@ func applyDotnetShellScriptTargetFrameworkFallback(script, cwdAbs, fallback stri
 		return m[1] + prop, nil
 	}
 	return s + " " + prop, nil
+}
+
+// shellQuoteTokenIfNeeded quotes a token only when the shell would otherwise reinterpret it.
+func shellQuoteTokenIfNeeded(a string) string {
+	if a == "" {
+		return `""`
+	}
+	if strings.ContainsAny(a, " \t\n\"'$`\\|&;<>()*?[]{}~#!") {
+		return strconv.Quote(a)
+	}
+	return a
+}
+
+// shellScriptRunsDotnetTest reports whether a shell script invokes `dotnet test`, tolerating
+// quoting. Defence in depth alongside argvToShellSingleCommandLine's quoting: a producer of a
+// quoted script ("dotnet" "test" …) must not silently disable the C# test protections.
+func shellScriptRunsDotnetTest(script string) bool {
+	unquoted := strings.NewReplacer(`"`, "", `'`, "").Replace(strings.ToLower(script))
+	return strings.Contains(unquoted, "dotnet test")
 }

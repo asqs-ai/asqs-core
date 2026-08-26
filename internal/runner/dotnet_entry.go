@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/runner/profile"
@@ -391,4 +392,28 @@ func ensureDotnetProjectArgPreferred(p profile.ToolchainProfile, argv []string, 
 	out := append([]string(nil), argv...)
 	out = append(out, rel)
 	return out, nil
+}
+
+// dotnetShellLineWithProject appends a quoted repo-relative project/solution path for `sh -c` local runs (cwd = repo).
+// When fallbackTFM is set and the entry is a .csproj without a concrete in-file TFM, inserts /p:TargetFramework=… before the project path.
+func dotnetShellLineWithProject(repo, commandPrefix string, fallbackTFM string) (string, error) {
+	repo = filepath.Clean(repo)
+	rel, err := resolveDotnetEntryRel(repo)
+	if err != nil {
+		return "", err
+	}
+	if rel == "" {
+		return "", fmt.Errorf("no .sln/.slnx or SDK-style .csproj found under %q", repo)
+	}
+	line := strings.TrimSpace(commandPrefix)
+	fallbackTFM = strings.TrimSpace(fallbackTFM)
+	if fallbackTFM != "" && strings.HasSuffix(strings.ToLower(rel), ".csproj") {
+		abs := filepath.Join(repo, filepath.FromSlash(rel))
+		ok, err := CsprojDeclaresConcreteTargetFramework(abs)
+		if err != nil || !ok {
+			line += " /p:TargetFramework=" + fallbackTFM
+		}
+	}
+	line += " " + strconv.Quote(rel)
+	return line, nil
 }

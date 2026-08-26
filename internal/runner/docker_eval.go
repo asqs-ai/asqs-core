@@ -31,12 +31,16 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	}
 	// Since CP31 the step plan is the single source of argv, restore and skip/fail decisions —
 	// the same plan the parity harness compares and the local target executes.
-	plan, err := s.buildStepPlan(abs, lang, imageOverride)
-	if err != nil {
-		return evaluator.StepResult{Step: stepEval, OK: false, Summary: err.Error(), Output: ""}
+	plan, perr := s.buildStepPlan(abs, lang, imageOverride)
+	if perr != nil {
+		return evaluator.StepResult{Step: stepEval, OK: false, Summary: perr.Error(), Output: ""}
 	}
 	p := plan.Profile
-	s.logDockerEvalEnvOnce(p, abs)
+	// An empty Image means the toolchain did not resolve, in which case every step is a skip and
+	// the pre-plan code did not log the env block either.
+	if plan.Image != "" {
+		s.logEvalEnvOnce(plan, abs)
+	}
 
 	switch dec := plan.DecisionFor(stepEval); dec.Action {
 	case ActionSkip:
@@ -87,21 +91,30 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=main argv=[%s] network=%s\n", label, strings.Join(argv, " "), network)
 	res, runErr := s.runDockerJob(ctx, abs, p, argv, network, dockerImageNeedsPlaywrightIPC(p.Image))
 	out := res.CombinedOutput
-	if runErr != nil && res.ExitCode == 0 {
-		return evaluator.StepResult{Step: stepEval, OK: false, Summary: runErr.Error(), Output: out}
+	// A non-nil runErr means the JOB failed to run to completion — the CLI would not start, the
+	// JobSpec was rejected, or the deadline fired — as distinct from the container running and
+	// exiting non-zero, which jobrunner reports as (res, nil) via its ExitError branch.
+	//
+	// The gate used to be `runErr != nil && res.ExitCode == 0`, which silently dropped every
+	// timeout: CommandContext SIGKILLs the docker CLI, so ProcessState.ExitCode() is -1 and the
+	// branch was skipped. CommandContext also discards the buffered output on a kill, so the step
+	// fell through to a bare "failed" summary with an empty Output — which the evaluator treats as
+	// in-scope, handing the fixer a blank prompt. See the package comment on step_failure.go.
+	if runErr != nil {
+		return sandboxStepFailure(stepEval, out, runErr, s.jobTimeout())
 	}
 	ok := res.ExitCode == 0
-	if !ok && stepEval == evaluator.StepTest && (lang == "javascript" || lang == "typescript") && jsTestOutputSummaryShowsZeroFailures(out) {
+	if !ok && stepEval == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
 		ok = true
 	}
-	summary := label + " ok"
+	// Result shaping comes from the shared helpers, so a step that passes reads the same on both
+	// targets — including the coverage summary, which used to be a flat "<label> ok" here and
+	// could never name the report it produced.
+	summary := stepSuccessSummary(stepEval, plan, s.evalHostCwd(abs))
 	if !ok {
-		summary = firstLines(out, 5)
-		if summary == "" {
-			summary = "failed"
-		}
-	} else if res.ExitCode != 0 && stepEval == evaluator.StepTest && (lang == "javascript" || lang == "typescript") && strings.Contains(summary, " ok") {
-		summary = label + " ok (summary all passed; exit code ignored)"
+		summary = failedStepSummary(stepEval, out, 5)
+	} else if res.ExitCode != 0 && stepEval == evaluator.StepTest && isJSLang(lang) {
+		summary += jsExitCodeIgnoredSuffix
 	}
 	if ok {
 		fmt.Fprintf(os.Stderr, "  %s (docker): ok.\n", label)

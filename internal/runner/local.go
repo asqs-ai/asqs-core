@@ -362,13 +362,14 @@ func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand st
 // runLocalPlannedStep executes one evaluation step on the host from the StepPlan. Since CP31 every
 // local ecosystem runs what the plan records — the plan is the single source of argv, restore and
 // skip/fail decisions, which is what makes the parity harness's claims about the local target true
-// rather than aspirational. Step summaries keep core's existing wording; CP34 unifies them with
-// the Docker target's.
+// rather than aspirational. Failures route through sandboxStepFailure and successes through
+// stepSuccessSummary, the same shaping the Docker target uses (CP34).
 func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang string, step evaluator.SandboxStep, label string) evaluator.StepResult {
 	plan, err := s.buildStepPlan(gitRootAbs, lang, "")
 	if err != nil {
 		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
 	}
+	s.logEvalEnvOnce(plan, gitRootAbs)
 	if plan.Toolchain == profile.CSharpDotnet {
 		// Said before the restore that would otherwise fail with NU1301 and no stated cause.
 		s.warnLocalNuGetCredentialProviderMissing()
@@ -383,7 +384,7 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 		return evaluator.StepResult{Step: step, OK: true, Summary: dec.Reason}
 	case ActionFail:
 		fmt.Fprintf(os.Stderr, "  %s: %s\n", label, dec.Reason)
-		return evaluator.StepResult{Step: step, OK: false, Summary: dec.Reason}
+		return evaluator.StepResult{Step: step, OK: false, Summary: dec.Reason, Output: dec.Reason}
 	}
 	argv := plan.ArgvFor(step)
 	if len(argv) == 0 {
@@ -391,7 +392,7 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 	}
 	if err := requireLocalToolchain(argv[0]); err != nil {
 		fmt.Fprintf(os.Stderr, "  %s: %v\n", label, err)
-		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
+		return sandboxStepFailure(step, "", err, s.timeoutDuration())
 	}
 	if step == evaluator.StepCompile && isCSharpLang(lang) {
 		// Drop lingering MSBuild/VBCSCompiler nodes so a prior timed-out test/build cannot keep
@@ -405,33 +406,35 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 	// The plan's env is the explicit delta; a host process receives it appended to os.Environ(),
 	// which is where its toolchain, PATH and ~/.m2 come from (§1).
 	cmd.Env = append(os.Environ(), plan.EnvFor(step)...)
+	logLocalEvalStep(step, cmd)
 	out, runErr := runCommand(ctx, cmd, s.timeoutDuration())
 	if runErr != nil {
 		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
 			fmt.Fprintf(os.Stderr, "  %s: non-zero exit but the runner's own summary shows zero failures (treating as ok; often Jest open handles). %s\n", label, firstLines(out, 2))
-			return evaluator.StepResult{Step: step, OK: true, Summary: "tests ok (summary all passed; exit code ignored)", Output: out}
+			return evaluator.StepResult{Step: step, OK: true, Summary: "tests ok" + jsExitCodeIgnoredSuffix, Output: out}
 		}
-		lines := 5
-		fallback := "tests failed"
-		if step == evaluator.StepCompile {
-			lines, fallback = 3, "compile failed"
-		}
-		summary := fallback
-		if out != "" {
-			summary = firstLines(out, lines)
-		}
-		fmt.Fprintf(os.Stderr, "  %s: failed. %s\n", label, firstLines(summary, 2))
-		return evaluator.StepResult{Step: step, OK: false, Summary: summary, Output: out}
+		res := sandboxStepFailure(step, out, runErr, s.timeoutDuration())
+		fmt.Fprintf(os.Stderr, "  %s: failed. %s\n", label, firstLines(res.Summary, 2))
+		return res
 	}
-	var summary string
-	switch step {
-	case evaluator.StepCompile:
-		summary = "compile ok"
-	case evaluator.StepCoverage:
-		summary = coverageSummaryFromPlan(cwd, plan)
-	default:
-		summary = "tests ok"
-	}
+	summary := stepSuccessSummary(step, plan, cwd)
 	fmt.Fprintf(os.Stderr, "  %s: %s\n", label, summary)
 	return evaluator.StepResult{Step: step, OK: true, Summary: summary, Output: out}
+}
+
+func filterFormatFilesByExtension(files, extensions []string) []string {
+	if len(extensions) == 0 {
+		return files
+	}
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		lf := strings.ToLower(f)
+		for _, ext := range extensions {
+			if strings.HasSuffix(lf, strings.ToLower(ext)) {
+				out = append(out, f)
+				break
+			}
+		}
+	}
+	return out
 }

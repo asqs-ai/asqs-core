@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -188,25 +189,31 @@ func (s *Sandbox) timeoutDuration() time.Duration {
 func (s *Sandbox) Compile(ctx context.Context, repoPath, lang string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		s.logLocalEvalEnvOnce(repoPath)
 		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepCompile, "Compile")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCompile), "Compile")
 	}
-	return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepCompile)
 }
 
 // Test runs the test suite.
 func (s *Sandbox) Test(ctx context.Context, repoPath, lang string) evaluator.StepResult {
+	return s.testWithLabel(ctx, repoPath, lang, "Tests")
+}
+
+// testWithLabel runs the test step under a human label. The label is what the step announces in
+// the evaluation log; the E2E pass uses a distinct one so the two test passes of a single round
+// are told apart at a glance, on both targets.
+func (s *Sandbox) testWithLabel(ctx context.Context, repoPath, lang, label string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepTest, "Tests")
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepTest, label)
 	}
 	if s.Type == "docker" {
-		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepTest), "Tests")
+		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepTest), label)
 	}
-	return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepTest)
 }
 
 // TestWithCommand runs the test step using testCommand instead of the sandbox's configured TestCommand (dual unit/E2E eval).
@@ -245,7 +252,10 @@ func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, 
 	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	if s2.Type != "docker" {
-		return s2.Test(ctx, repoPath, lang)
+		// No image to swap in, so the host must already have browsers. Bootstrap installs them
+		// when enabled; when it has not, say so before the runner fails with a stack trace.
+		s2.warnLocalE2EBrowsersMissing(lang, e2eFramework)
+		return s2.testWithLabel(ctx, repoPath, lang, "Tests (E2E)")
 	}
 	img := ""
 	if usePlaywrightDockerForJSE2E(lang, e2eFramework) {
@@ -279,7 +289,7 @@ func (s *Sandbox) Coverage(ctx context.Context, repoPath, lang string) evaluator
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCoverage), "Coverage")
 	}
-	return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepCoverage)
 }
 
 // Mutation runs mutation tests for critical modules.
@@ -288,3 +298,44 @@ func (s *Sandbox) Mutation(ctx context.Context, repoPath, lang string, criticalM
 }
 
 var _ evaluator.E2EPassDockerRunner = (*Sandbox)(nil)
+
+// stepSuccessSummary is the Summary of a step that passed, identical on both targets.
+//
+// The two used to disagree in wording and in substance: Docker built "<Label> ok" from its own
+// human label while local said "compile ok"/"tests ok", and Docker's coverage step reported a flat
+// "Coverage ok" that could never name a report. One lookup now serves both, for every ecosystem.
+func stepSuccessSummary(step evaluator.SandboxStep, plan StepPlan, cwd string) string {
+	switch step {
+	case evaluator.StepCompile:
+		return "compile ok"
+	case evaluator.StepCoverage:
+		return coverageSummaryFromPlan(cwd, plan)
+	default:
+		return "tests ok"
+	}
+}
+
+// jsExitCodeIgnoredSuffix marks a JS/TS test step whose runner exited non-zero while its own
+// summary reported no failures — most often Jest holding an open handle after the suite passed.
+const jsExitCodeIgnoredSuffix = " (summary all passed; exit code ignored)"
+
+// validRunnerTypes is the single source of the accepted runner.type values. Config validation
+// rejects anything else at startup (config.normaliseAndValidateRunnerType names the same two), and
+// the executor backstop below fails rather than stubbing — a future type cannot be added without
+// updating this set, which the tests enumerate.
+var validRunnerTypes = map[string]bool{
+	string(TargetLocal):  true,
+	string(TargetDocker): true,
+}
+
+// unknownRunnerTypeResult fails a step whose runner.type is neither local nor docker.
+//
+// This used to report {OK: true, Summary: "stub"}, so a typo in runner.type produced a run that
+// compiled nothing, tested nothing, and reported success all the way to the ship decision. Config
+// validation now rejects such a value at startup, which is where an operator can act on it; this
+// is the backstop for a Sandbox constructed directly, and it fails loudly rather than passing
+// quietly.
+func unknownRunnerTypeResult(runnerType string, step evaluator.SandboxStep) evaluator.StepResult {
+	msg := fmt.Sprintf("%s step did not run: runner.type is %q, which is neither \"local\" nor \"docker\"", step, runnerType)
+	return evaluator.StepResult{Step: step, OK: false, Summary: msg, Output: msg}
+}

@@ -1,13 +1,14 @@
 package runner
 
 import (
+	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
-)
 
-// (Upstream's planner tests additionally include the plan-agrees-with-the-executor pair and the
-// unknown-runner-type executor backstop; those land with CP34 and CP35 respectively.)
+	"github.com/asqs/asqs-core/internal/evaluator"
+)
 
 func TestPlanDocker_unresolvableToolchainSkipsEveryStep(t *testing.T) {
 	sb := &Sandbox{Type: "docker", Timeout: "30s"}
@@ -25,9 +26,8 @@ func TestPlanDocker_unresolvableToolchainSkipsEveryStep(t *testing.T) {
 		if d.Action != ActionSkip {
 			t.Errorf("step %s: Action = %q, want skip", step, d.Action)
 		}
-		// CP34 unifies this wording with the local target's "skip (unsupported lang)".
-		if !strings.HasPrefix(d.Reason, "skip (docker: ") {
-			t.Errorf("step %s: reason %q, want the docker-side skip wording", step, d.Reason)
+		if d.Reason != unsupportedLangSkipReason {
+			t.Errorf("step %s: reason %q, want the shared %q", step, d.Reason, unsupportedLangSkipReason)
 		}
 	}
 }
@@ -69,5 +69,169 @@ func TestPlanRestoreKey_stableAcrossReplansOfTheSameRepo(t *testing.T) {
 	}
 	if fmt.Sprintf("%v", p1.Restore) != fmt.Sprintf("%v", p2.Restore) {
 		t.Fatalf("Restore argv unstable across replans: %v vs %v", p1.Restore, p2.Restore)
+	}
+}
+
+// reLoggedStepArgv matches the line every step emits just before it executes:
+//
+//	[asqs-eval] step=<step> phase=main argv=[<argv>] ...
+//
+// Both targets print it (logLocalEvalStep for local, runDockerEvalWithImageOverride for docker),
+// which makes it the one place a test can observe what the sandbox ACTUALLY ran without stubbing
+// the execution layer.
+var reLoggedStepArgv = regexp.MustCompile(`\[asqs-eval\] step=(\S+) phase=main argv=\[(.*?)\] (?:cwd|network)=`)
+
+// loggedArgv extracts the argv the sandbox executed, keyed by the step label it logged under.
+// Space-joined rather than a []string because the log line is itself space-joined; comparing the
+// joined form keeps the test honest about what it can actually observe.
+func loggedArgv(stderr string) map[string]string {
+	out := map[string]string{}
+	for _, m := range reLoggedStepArgv.FindAllStringSubmatch(stderr, -1) {
+		out[m[1]] = m[2]
+	}
+	return out
+}
+
+// The plan must describe what the local path really runs, not a parallel re-derivation of it.
+// Each case executes the real step against stubbed tools and compares the logged argv with the
+// plan's. If planLocal* ever branches differently from runLocal*, this fails.
+func TestPlanLocal_agreesWithWhatTheLocalPathExecutes(t *testing.T) {
+	cases := []struct {
+		name  string
+		files map[string]string
+		exec  map[string]bool
+		stub  []string
+		lang  string
+		steps []evaluator.SandboxStep
+	}{
+		{
+			name:  "maven",
+			files: map[string]string{"pom.xml": jacocoPom},
+			stub:  []string{"mvn", "gradle"},
+			lang:  "java",
+			steps: []evaluator.SandboxStep{evaluator.StepCompile, evaluator.StepTest, evaluator.StepCoverage},
+		},
+		{
+			name:  "gradle",
+			files: map[string]string{"build.gradle": "plugins { id 'jacoco' }"},
+			stub:  []string{"mvn", "gradle"},
+			lang:  "java",
+			steps: []evaluator.SandboxStep{evaluator.StepCompile, evaluator.StepTest, evaluator.StepCoverage},
+		},
+		{
+			name: "npm",
+			files: map[string]string{
+				"package.json": `{"scripts":{"build":"tsc","test":"jest","coverage":"jest --coverage"}}`,
+			},
+			stub:  []string{"npm", "node"},
+			lang:  "typescript",
+			steps: []evaluator.SandboxStep{evaluator.StepCompile, evaluator.StepTest, evaluator.StepCoverage},
+		},
+		{
+			name: "dotnet",
+			files: map[string]string{
+				"App.csproj": `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>`,
+			},
+			stub:  []string{"dotnet"},
+			lang:  "csharp",
+			steps: []evaluator.SandboxStep{evaluator.StepCompile, evaluator.StepTest, evaluator.StepCoverage},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubToolsOnPATH(t, tc.stub...)
+			repo := writeRepo(t, tc.files, tc.exec)
+			sb := &Sandbox{Type: "local", Timeout: "30s"}
+
+			plan, err := sb.buildStepPlan(repo, tc.lang, "")
+			if err != nil {
+				t.Fatalf("buildStepPlan: %v", err)
+			}
+
+			stderr := captureStderr(t, func() {
+				ctx := context.Background()
+				sb.Compile(ctx, repo, tc.lang)
+				sb.Test(ctx, repo, tc.lang)
+				sb.Coverage(ctx, repo, tc.lang)
+			})
+			ran := loggedArgv(stderr)
+
+			for _, step := range tc.steps {
+				want, logged := ran[string(step)]
+				if !logged {
+					// A step the plan skips legitimately never logs an argv line.
+					if plan.DecisionFor(step).Action != ActionRun {
+						continue
+					}
+					t.Errorf("step %s: plan says Run but the local path executed nothing\n%s", step, stderr)
+					continue
+				}
+				if got := strings.Join(plan.ArgvFor(step), " "); got != want {
+					t.Errorf("step %s argv disagrees:\n  plan     %q\n  executed %q", step, got, want)
+				}
+			}
+		})
+	}
+}
+
+// The docker path now reads its argv from the plan, so agreement is structural. This asserts the
+// wiring actually holds end to end — the argv reaching `docker run` is the plan's.
+func TestPlanDocker_agreesWithWhatTheDockerPathExecutes(t *testing.T) {
+	sb, repo := fakeDockerSandbox(t, "30s", "exit 0")
+
+	plan, err := sb.buildStepPlan(repo, "java", "")
+	if err != nil {
+		t.Fatalf("buildStepPlan: %v", err)
+	}
+
+	stderr := captureStderr(t, func() {
+		sb.Test(context.Background(), repo, "java")
+	})
+	ran := loggedArgv(stderr)
+
+	// The docker path logs under its human label ("Tests"), not the step name.
+	want, ok := ran["Tests"]
+	if !ok {
+		t.Fatalf("no main-phase argv logged:\n%s", stderr)
+	}
+	if got := strings.Join(plan.Test, " "); got != want {
+		t.Errorf("docker test argv disagrees:\n  plan     %q\n  executed %q", got, want)
+	}
+}
+
+func TestUnknownRunnerType_failsEveryStepInsteadOfPassing(t *testing.T) {
+	sb := &Sandbox{Type: "dcoker", Timeout: "30s"}
+	repo := writeRepo(t, map[string]string{"pom.xml": "<project/>"}, nil)
+	ctx := context.Background()
+
+	for _, res := range []evaluator.StepResult{
+		sb.Compile(ctx, repo, "java"),
+		sb.Test(ctx, repo, "java"),
+		sb.Coverage(ctx, repo, "java"),
+	} {
+		if res.OK {
+			t.Errorf("%s reported OK for an unrecognised runner.type", res.Step)
+		}
+		if !strings.Contains(res.Summary, "dcoker") {
+			t.Errorf("%s summary %q should name the offending value", res.Step, res.Summary)
+		}
+		if strings.TrimSpace(res.Output) == "" {
+			t.Errorf("%s left Output empty, which the evaluator treats as in-scope for the fixer", res.Step)
+		}
+	}
+}
+
+// The valid runner.type set lives in one place; config validation and the executor backstop must
+// name the same two values, so a future type cannot be added to one and missed by the other.
+func TestValidRunnerTypes_isTheSingleSource(t *testing.T) {
+	if len(validRunnerTypes) != 2 || !validRunnerTypes["local"] || !validRunnerTypes["docker"] {
+		t.Fatalf("validRunnerTypes = %v, want exactly {local, docker}", validRunnerTypes)
+	}
+	for typ := range validRunnerTypes {
+		sb := &Sandbox{Type: typ}
+		if _, err := sb.buildStepPlan(t.TempDir(), "java", ""); err != nil {
+			t.Errorf("planner rejects valid runner.type %q: %v", typ, err)
+		}
 	}
 }

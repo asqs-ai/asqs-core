@@ -345,8 +345,8 @@ implementation record can be found; it is provenance, not instruction.
 | CP31 | Restore stage; JS plan and coverage paths | U4, U2a, U2b | CP30 | 3 d | `in review` |
 | CP32 | Build-tool resolution; wrapper-free argv | U3b, U3 | CP30, CP06 | 3 d | `in review` |
 | CP33 | Step environment, credential seam, log redaction | U5, U6, U6b | CP30 | 2 d | `in review` |
-| CP34 | Browser preflight; local steps onto the plan | U7, U8 | CP31, CP32, CP33 | 5–6 d | `blocked (CP31, CP32, CP33)` |
-| CP35 | Retire `docker_argv.go`; reject unknown sandbox type; per-file format | U9, U10 | CP34 | 2 d | `blocked (CP34)` |
+| CP34 | Browser preflight; local steps onto the plan | U7, U8 | CP31, CP32, CP33 | 5–6 d | `in review` |
+| CP35 | Retire `docker_argv.go`; reject unknown sandbox type; per-file format | U9, U10 | CP34 | 2 d | `in review` |
 
 ### P6 — Configuration schema v2 *(hard cutover; no v1 support window)*
 
@@ -1573,7 +1573,7 @@ message at plan time.
 
 ### CP34 — Browser preflight; local steps onto the plan
 
-- **Status:** `blocked (CP31, CP32, CP33)` · **Effort:** 5–6 d · **Risk:** high · **The largest single diff in P5**
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 5–6 d · **Risk:** high · **The largest single diff in P5**
 
 1. `e2e_preflight.go` + `errclass.KindBrowsersMissing`. This earns its place in core specifically:
    core's evaluator already consults `errclass.Kind` on the E2E step.
@@ -1593,9 +1593,50 @@ like a test failure. Fix it here and count it (CP03).
 **Acceptance.** Parity harness green. A dedicated test asserts the plan agrees with what the **local**
 executor actually does — the one guard the upstream tests cannot provide for core.
 
+**Implementation record (2026-08-26).** Done; smaller than estimated because CP31 had already moved
+all local steps onto the plan — this bundle landed the failure/summary/logging/policy half.
+
+- **The step-policy table, as decided** (open question 2 resolves by adoption of upstream's
+  *implemented* state; every row now identical on both targets unless marked):
+
+  | Repo state | Decision on BOTH targets |
+  |---|---|
+  | JS, no `package.json` | skip (`skip (no package.json)`) — since CP31 |
+  | JS, no `test` script | skip (`skip (no test script)`) — since CP31 |
+  | JS, no `coverage`/`test:coverage` script | skip — since CP31 |
+  | JS, `build` runs start/install | skip with the named reason — since CP31 |
+  | Java, no JaCoCo plugin | coverage skips (`skip (no JaCoCo plugin declared in the build file)`) — since CP31 |
+  | Unsupported language | skip (`skip (unsupported lang)`), one shared string — this bundle |
+  | Java, no `pom.xml`/`build.gradle` | **FAIL on both** — local plan-fails with the resolver error; Docker runs `mvn` and fails at runtime |
+  | Step killed at `runner.timeout` | **FAIL, named** (`<step> step timed out after … (runner.timeout)`), classified `KindStepTimeout` — this bundle |
+
+  **[correction] The Java-no-manifest row does NOT flip to skip.** This bundle's blurb inherited
+  U8's spec paragraph ("the unification flips both to skip"), but upstream never implemented that
+  flip — its end-state planner still fails compile/test on `ErrNoBuildFile`, and no upstream parity
+  fixture compares that shape. Core copies the implemented state (rule 2). FAIL is also the
+  conservative side: flipping to skip would let a repo that used to be blocked from shipping ship.
+- **U7:** `e2e_preflight.go` ported (warn-once, not a hard failure — the upstream rationale about
+  `channel: "chrome"` false-positives is preserved); `errclass` gained the whole host-execution
+  block (`KindToolchainMissing/NotExecutable/BrowsersMissing/StepTimeout`, `IsHostExecutionKind`,
+  `Remediation`, `kindHostExecution` — needles match core's `runner.*` key spellings). Core's
+  existing E2E `errclass.Kind` consultation benefits immediately; the loop-stopping caller of
+  `IsHostExecutionKind` arrives with CP50/CP52. Local E2E now reports the "Tests (E2E)" label via
+  `testWithLabel`.
+- **U8 timeout honesty:** `step_failure.go` + `failed_step_summary.go` ported (with
+  `errout/test_failure_blocks.go`, pulled forward from its A.1 CP52/CP53 forecast — this is its
+  first consumer). The Docker gate is `runErr != nil` (was `&& ExitCode == 0`, which discarded
+  every deadline); both targets route failures through `sandboxStepFailure` and successes through
+  `stepSuccessSummary`; the same gate fix applied to the three docker format sites via
+  `dockerJobRunError`. `eval_log.go` replaced with the unified one-block env log driven by the
+  plan, plus `logLocalEvalStep`.
+- Tests ported: docker_eval_failure (timeout named/classified ×6), jobrunner/docker_timeout (pins
+  the ExitCode -1 premise), step_failure, failed_step_summary, eval_log, e2e_preflight, errout
+  blocks, **both plan-agrees-with-executor tests** (the acceptance's named guard) and both
+  `TestStepResultParity_*` tests — all needles adapted to core's v1 key spellings.
+
 ### CP35 — Retire `docker_argv.go`; reject unknown sandbox type; per-file format
 
-- **Status:** `blocked (CP34)` · **Effort:** 2 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 2 d · **Risk:** medium
 
 1. Delete `docker_argv.go` and the write-only `profile` fields. Its `Coverage → Test` fallback is
    **dead** — all six builtin profiles set `Coverage`, and the override path sets it too — so keep it
@@ -1608,6 +1649,36 @@ executor actually does — the one guard the upstream tests cannot provide for c
 
 **Acceptance.** `runner.type: dokcer` fails the run with an error naming the valid values. A test
 enumerates the valid set from one place so a future type cannot be added without it.
+
+**Implementation record (2026-08-26).** Done.
+
+- `docker_argv.go` deleted (`profileArgvForStep` in the planner keeps the defensive Coverage→Test
+  fallback, unfixtured as specified); the write-only `ToolchainProfile.ArtifactPaths` and
+  `.CacheTargetPaths` fields deleted. `profile/language.go`'s `ForLang`/`ImageFor` stay — upstream
+  kept them too.
+- **`runner.type` is rejected at startup** (`config.normaliseAndValidateRunnerType`, which also
+  canonicalises case/whitespace) and the executor stubs are gone: `unknownRunnerTypeResult` fails
+  the step, names the offending value, and fills Output so the evaluator does not hand the fixer a
+  blank prompt. `validRunnerTypes` is the single source; a test enumerates it.
+- **The format path is Target-aware end to end:** `format_resolve.go` and `format_after_fix.go`
+  replaced with the upstream end state — availability probed on the host only for the local target
+  (docker's image supplies mvn/gradle/dotnet), per-file prettier is repo-relative in a container
+  with no host-GOOS `.cmd` suffix, and the Docker per-file format path exists. The pipeline's two
+  call sites now resolve **per repository through `ResolveFormatCommand`** for every language and
+  pass the resolved result; `EffectivePostGenerateFormatCommand` (which only defaulted for C#, so
+  a Java repo with `format_command` empty never wired the after-fix hook and the fix loop burned
+  its budget hand-formatting) is deleted.
+- Ride-alongs the ported tests surfaced, fixed to upstream's state: `argvToShellSingleCommandLine`
+  over-quoted every token, which made every downstream `dotnet test` matcher a silent no-op on
+  configured C# commands (hang-mitigation, VSTest timeout, build-server shutdown) — it now quotes
+  only what needs quoting, with the quoting-tolerant `shellScriptRunsDotnetTest` as defence in
+  depth; `dotnetShellLineWithProject` was restored (CP31's record called it dead; upstream keeps
+  it, with tests). The fix made override scripts matchable, so the two `dotnet-overrides` §1-5
+  rows appeared and are whitelisted — **the whitelist is now exactly upstream's end-state set: 13
+  permanent §1 rows** (6 ×§1-5, 4 ×§1-1, 3 ×§1-4), and
+  `TestPermittedDifferences_containOnlyStructuralRows` is tightened to its final §1-only form.
+- Tests: the full upstream format/dotnet-shell/entry/multitarget/playwright/credprovider/js-exit
+  batch ported (nine files), plus the unknown-runner-type executor test and the valid-set test.
 
 ---
 

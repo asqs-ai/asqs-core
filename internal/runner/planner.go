@@ -46,8 +46,9 @@ func (s *Sandbox) buildStepPlan(gitRootAbs, lang, imageOverride string) (StepPla
 		plan.Target = TargetDocker
 		s.planDocker(&plan, abs, s.evalHostCwd(abs), imageOverride)
 	default:
-		// CP35 turns an unrecognised runner.type into a run failure. Until then production keeps
-		// its "stub" behaviour; only the planner is strict, so nothing depends on this yet.
+		// Config validation rejects this at startup (config.normaliseAndValidateRunnerType); the
+		// executor backstop is unknownRunnerTypeResult. The planner stays strict for Sandboxes
+		// constructed directly.
 		return StepPlan{}, fmt.Errorf("plan: unknown runner type %q (want local or docker)", s.Type)
 	}
 	return plan, nil
@@ -77,9 +78,13 @@ func (s *Sandbox) planDocker(plan *StepPlan, absGitRoot, absCwd, imageOverride s
 	p, err := profile.ResolveToolchain(absCwd, plan.Lang, s.EvalProfile,
 		s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet)
 	if err != nil {
-		// CP34 unifies this wording with the local target's unsupported-lang skip.
+		// An unresolvable toolchain skips every step rather than failing the run. The reason is
+		// deliberately the same string the local target uses (CP34): the only case that reaches
+		// here is a language neither target can evaluate — JS without a package.json is handled by
+		// planJS above — and naming the sandbox in the reason implied the language was supported
+		// somewhere else, which it is not.
 		for _, step := range planSteps {
-			plan.Decisions[step] = skipStep(fmt.Sprintf("skip (docker: %v)", err))
+			plan.Decisions[step] = skipStep(unsupportedLangSkipReason)
 		}
 		return
 	}
@@ -134,7 +139,7 @@ func (s *Sandbox) planProfileStep(plan *StepPlan, p profile.ToolchainProfile, st
 		// prefix 'jacoco'". Local has always skipped; Docker appended jacoco:report regardless.
 		return skipStep("skip (no JaCoCo plugin declared in the build file)")
 	}
-	argv := dockerArgvForStep(s, p, step)
+	argv := profileArgvForStep(p, step)
 	if len(argv) == 0 {
 		return skipStep("skip (no command)")
 	}
@@ -179,7 +184,7 @@ func (s *Sandbox) planLocal(plan *StepPlan, absGitRoot, absCwd string) {
 		plan.CoverageReportPaths = coverageReportPathsFor(plan.Toolchain)
 	default:
 		for _, step := range planSteps {
-			plan.Decisions[step] = skipStep("skip (unsupported lang)")
+			plan.Decisions[step] = skipStep(unsupportedLangSkipReason)
 		}
 		return
 	}
@@ -277,6 +282,10 @@ func (p *StepPlan) setArgv(step evaluator.SandboxStep, argv []string) {
 	}
 }
 
+// unsupportedLangSkipReason is shared so a language neither target can evaluate reports the same
+// thing on both.
+const unsupportedLangSkipReason = "skip (unsupported lang)"
+
 // localGoalFor maps a sandbox step onto the goal string localBuildCommand takes.
 func localGoalFor(step evaluator.SandboxStep) string {
 	switch step {
@@ -357,4 +366,27 @@ func javaProfileForBuildTool(current profile.ToolchainID, buildTool string) (pro
 		want = gradle
 	}
 	return want, want != current
+}
+
+// profileArgvForStep returns the argv a toolchain profile defines for a step. Config
+// compile_command / test_command are already folded in by profile.ApplyCommandOverrides.
+//
+// The Coverage→Test fallback is the single place that decision is made; StepPlan.ArgvFor is a plain
+// lookup, so a plan's recorded argv and its decision cannot disagree. No builtin profile actually
+// leaves Coverage unset, so the fallback is defensive rather than load-bearing — worth keeping,
+// not worth a fixture.
+func profileArgvForStep(p profile.ToolchainProfile, step evaluator.SandboxStep) []string {
+	switch step {
+	case evaluator.StepCompile:
+		return append([]string(nil), p.Compile...)
+	case evaluator.StepTest, evaluator.StepTestE2E:
+		return append([]string(nil), p.Test...)
+	case evaluator.StepCoverage:
+		if len(p.Coverage) > 0 {
+			return append([]string(nil), p.Coverage...)
+		}
+		return append([]string(nil), p.Test...)
+	default:
+		return nil
+	}
 }

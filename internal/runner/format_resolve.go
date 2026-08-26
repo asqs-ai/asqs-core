@@ -17,18 +17,37 @@ type FormatResolveResult struct {
 	PerFile                     bool
 }
 
-// ResolveFormatCommand picks the effective format command from explicit config or repo auto-detection.
-// When onlyAdded is true, only per-file formatters are returned (never repo-wide Maven/Gradle plugin goals).
-func ResolveFormatCommand(repoPath, lang, configuredCmd, buildTool string, onlyAdded bool) FormatResolveResult {
+// ResolveFormatCommand picks the effective format command from explicit config or repo
+// auto-detection.
+//
+// When onlyAdded is true, auto-detection returns only per-file formatters, never a repo-wide
+// Maven/Gradle goal. An explicitly CONFIGURED command is always honoured, but it is only treated as
+// per-file when appending a path to it would actually format that path — see
+// formatCommandIsPerFileCapable. A configured `mvn spring-javaformat:apply` therefore runs
+// repo-wide even under only_added, rather than being handed a file it cannot accept.
+//
+// target says WHERE the resolved command will run. It matters because availability was probed on
+// the host unconditionally: under runner.type: docker on a host without mvn/gradle/dotnet, the
+// format step was silently skipped even though the toolchain image supplies exactly those
+// binaries. See formatBinaryAvailable.
+// WithPerFile returns a copy with PerFile overridden. Used where a caller has already narrowed the
+// decision for one invocation — the post-generate step formats only the paths it just wrote — while
+// keeping the resolver's command, source and skip reason intact.
+func (r FormatResolveResult) WithPerFile(perFile bool) FormatResolveResult {
+	r.PerFile = perFile
+	return r
+}
+
+func ResolveFormatCommand(repoPath, lang, configuredCmd, buildTool string, onlyAdded bool, target Target) FormatResolveResult {
 	configuredCmd = strings.TrimSpace(configuredCmd)
 	if configuredCmd != "" {
-		perFile := onlyAdded && (IsDotNetFormatCommand(configuredCmd) || !formatCommandNeedsShell(configuredCmd))
+		perFile := onlyAdded && formatCommandIsPerFileCapable(configuredCmd)
 		r := FormatResolveResult{
 			Command: configuredCmd,
 			Source:  "config",
 			PerFile: perFile,
 		}
-		if reason := formatAvailabilitySkipReason(repoPath, r); reason != "" {
+		if reason := formatAvailabilitySkipReason(repoPath, r, target); reason != "" {
 			r.Command = ""
 			r.SkipReason = reason
 		}
@@ -37,12 +56,12 @@ func ResolveFormatCommand(repoPath, lang, configuredCmd, buildTool string, onlyA
 
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	if onlyAdded {
-		return resolveFormatOnlyAdded(repoPath, lang)
+		return resolveFormatOnlyAdded(repoPath, lang, target)
 	}
-	return resolveFormatRepoWide(repoPath, lang, buildTool)
+	return resolveFormatRepoWide(repoPath, lang, buildTool, target)
 }
 
-func resolveFormatOnlyAdded(repoPath, lang string) FormatResolveResult {
+func resolveFormatOnlyAdded(repoPath, lang string, target Target) FormatResolveResult {
 	switch lang {
 	case "java":
 		if _, err := exec.LookPath("google-java-format"); err == nil {
@@ -81,7 +100,7 @@ func resolveFormatOnlyAdded(repoPath, lang string) FormatResolveResult {
 			PerFile: true,
 		}
 	case "javascript", "js", "typescript", "ts":
-		cmd, ok := prettierPerFileCommand(repoPath)
+		cmd, ok := prettierPerFileCommand(repoPath, target)
 		if !ok {
 			return FormatResolveResult{
 				Source:     "none",
@@ -101,12 +120,12 @@ func resolveFormatOnlyAdded(repoPath, lang string) FormatResolveResult {
 	}
 }
 
-func resolveFormatRepoWide(repoPath, lang, buildTool string) FormatResolveResult {
+func resolveFormatRepoWide(repoPath, lang, buildTool string, target Target) FormatResolveResult {
 	switch lang {
 	case "java":
 		if cmd, source, ok := javaRepoWideFormatCommand(repoPath, buildTool); ok {
 			r := FormatResolveResult{Command: cmd, Source: source, PerFile: false}
-			if reason := formatAvailabilitySkipReason(repoPath, r); reason != "" {
+			if reason := formatAvailabilitySkipReason(repoPath, r, target); reason != "" {
 				r.Command = ""
 				r.SkipReason = reason
 			}
@@ -141,7 +160,7 @@ func resolveFormatRepoWide(repoPath, lang, buildTool string) FormatResolveResult
 			PerFile: false,
 		}
 	case "javascript", "js", "typescript", "ts":
-		if cmd, ok := prettierRepoWideCommand(repoPath); ok {
+		if cmd, ok := prettierRepoWideCommand(repoPath, target); ok {
 			return FormatResolveResult{Command: cmd, Source: "auto_prettier", PerFile: false}
 		}
 		return FormatResolveResult{
@@ -202,6 +221,12 @@ func javaRepoWideFormatCommand(repoPath, buildTool string) (cmd, source string, 
 	}
 }
 
+// javaBuildPrefix returns the build-tool invocation the repo-wide Java format command is built on.
+//
+// It used to carry its own copy of the auto-detect logic, complete with a runtime.GOOS branch that
+// emitted "mvnw.cmd" — a Windows batch file — into a command that, under runner.type: docker, runs
+// inside a Linux container. Availability is no longer decided here either: the caller knows which
+// target will execute, and formatBinaryAvailable answers for that target.
 func javaBuildPrefix(dir, buildTool string, hasPom, hasGradle bool) (string, error) {
 	tool, err := buildtool.Resolve(dir, buildTool)
 	if err != nil {
@@ -227,9 +252,9 @@ var (
 	errUnsupportedBuildTool = errors.New("unsupported build tool")
 )
 
-func prettierPerFileCommand(repoPath string) (string, bool) {
+func prettierPerFileCommand(repoPath string, target Target) (string, bool) {
 	dir := filepath.Clean(strings.TrimSpace(repoPath))
-	if bin := localNodeBin(dir, "prettier"); bin != "" {
+	if bin := localNodeBin(dir, "prettier", target); bin != "" {
 		return bin + " --write", true
 	}
 	if _, err := exec.LookPath("npx"); err == nil {
@@ -241,12 +266,12 @@ func prettierPerFileCommand(repoPath string) (string, bool) {
 	return "", false
 }
 
-func prettierRepoWideCommand(repoPath string) (string, bool) {
+func prettierRepoWideCommand(repoPath string, target Target) (string, bool) {
 	dir := filepath.Clean(strings.TrimSpace(repoPath))
 	if !pathExists(filepath.Join(dir, "package.json")) {
 		return "", false
 	}
-	if bin := localNodeBin(dir, "prettier"); bin != "" {
+	if bin := localNodeBin(dir, "prettier", target); bin != "" {
 		return bin + " --write .", true
 	}
 	if _, err := exec.LookPath("npx"); err == nil {
@@ -258,13 +283,28 @@ func prettierRepoWideCommand(repoPath string) (string, bool) {
 	return "", false
 }
 
-func localNodeBin(repoPath, name string) string {
-	bin := filepath.Join(filepath.Clean(repoPath), "node_modules", ".bin", name)
-	if runtime.GOOS == "windows" {
-		bin += ".cmd"
+// localNodeBin returns the repo-local node binary to invoke, or "" when it is not installed.
+//
+// The shape depends on where the command will run, and getting that wrong was a live bug. For the
+// local target it is an absolute HOST path with the Windows ".cmd" suffix. For the Docker target an
+// absolute host path does not exist inside the container — the repository is mounted at /workspace
+// — so the command must be repo-relative, and it must never carry a ".cmd" suffix derived from the
+// host's OS, because the container is Linux. Existence is still checked on the host: node_modules
+// is in the bind-mounted repository, so what the host sees is what the container gets.
+func localNodeBin(repoPath, name string, target Target) string {
+	rel := filepath.Join("node_modules", ".bin", name)
+	hostPath := filepath.Join(filepath.Clean(repoPath), rel)
+	if target == TargetDocker {
+		if pathExists(hostPath) {
+			return filepath.ToSlash(rel)
+		}
+		return ""
 	}
-	if pathExists(bin) {
-		return bin
+	if runtime.GOOS == "windows" {
+		hostPath += ".cmd"
+	}
+	if pathExists(hostPath) {
+		return hostPath
 	}
 	return ""
 }
@@ -277,13 +317,13 @@ func readFileLower(path string) (string, bool) {
 	return strings.ToLower(string(b)), true
 }
 
-func formatAvailabilitySkipReason(repoPath string, r FormatResolveResult) string {
+func formatAvailabilitySkipReason(repoPath string, r FormatResolveResult, target Target) string {
 	cmd := strings.TrimSpace(r.Command)
 	if cmd == "" {
 		return ""
 	}
 	if formatCommandNeedsShell(cmd) {
-		return shellFormatAvailabilitySkipReason(repoPath, cmd)
+		return shellFormatAvailabilitySkipReason(repoPath, cmd, target)
 	}
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
@@ -302,33 +342,51 @@ func formatAvailabilitySkipReason(repoPath string, r FormatResolveResult) string
 		}
 		return "formatter_not_available:" + bin
 	}
-	if _, err := exec.LookPath(bin); err != nil {
+	if !formatBinaryAvailable(bin, target) {
 		return "formatter_not_available:" + bin
 	}
 	return ""
 }
 
-func shellFormatAvailabilitySkipReason(repoPath, cmd string) string {
+// imageProvidedFormatBinaries are supplied by the toolchain image, so probing the HOST's PATH for
+// them answers the wrong question on the Docker target. This was a silent capability loss: a host
+// without Maven skipped the format step even though every eval container had `mvn`.
+//
+// Deliberately narrow. Binaries that come from neither the image nor the repository — a standalone
+// google-java-format, say — keep the host probe: it is the wrong question there too, but assuming
+// an arbitrary binary exists inside the container would turn a silent skip into a hard failure,
+// and that call belongs to U10 along with the rest of the format-step parity work.
+var imageProvidedFormatBinaries = map[string]bool{
+	"mvn": true, "gradle": true, "dotnet": true,
+	"npx": true, "npm": true, "node": true, "yarn": true, "pnpm": true,
+}
+
+func formatBinaryAvailable(bin string, target Target) bool {
+	if target == TargetDocker && imageProvidedFormatBinaries[bin] {
+		return true
+	}
+	_, err := exec.LookPath(bin)
+	return err == nil
+}
+
+func shellFormatAvailabilitySkipReason(repoPath, cmd string, target Target) string {
 	low := strings.ToLower(cmd)
 	dir := filepath.Clean(strings.TrimSpace(repoPath))
 	switch {
+	// The presence of a repo wrapper used to count as "Maven is available". Since D3 (U3b) nothing
+	// invokes ./mvnw, so a repo that ships one says nothing about whether the command can run —
+	// keeping that branch let a host with no Maven resolve `mvn spotless:apply` and fail later.
 	case strings.Contains(low, "mvn") || strings.Contains(low, "mvnw"):
-		if pathExists(filepath.Join(dir, "mvnw")) || pathExists(filepath.Join(dir, "mvnw.cmd")) {
-			return ""
-		}
-		if _, err := exec.LookPath("mvn"); err != nil {
+		if !formatBinaryAvailable("mvn", target) {
 			return "formatter_not_available:mvn"
 		}
 	case strings.Contains(low, "gradle") || strings.Contains(low, "gradlew"):
-		if pathExists(filepath.Join(dir, "gradlew")) || pathExists(filepath.Join(dir, "gradlew.bat")) {
-			return ""
-		}
-		if _, err := exec.LookPath("gradle"); err != nil {
+		if !formatBinaryAvailable("gradle", target) {
 			return "formatter_not_available:gradle"
 		}
 	case strings.Contains(low, "prettier"):
-		if _, ok := prettierPerFileCommand(dir); !ok {
-			if _, ok := prettierRepoWideCommand(dir); !ok {
+		if _, ok := prettierPerFileCommand(dir, target); !ok {
+			if _, ok := prettierRepoWideCommand(dir, target); !ok {
 				return "formatter_not_available:prettier"
 			}
 		}
@@ -338,4 +396,48 @@ func shellFormatAvailabilitySkipReason(repoPath, cmd string) string {
 		}
 	}
 	return ""
+}
+
+// formatCommandIsPerFileCapable reports whether appending a file path to a format command formats
+// that file.
+//
+// This used to be inferred from "the command contains no shell operators", which is not the same
+// question and gets build tools wrong: `mvn spring-javaformat:apply -q src/Foo.java` makes Maven
+// read the path as a lifecycle phase and fail with "Unknown lifecycle phase". A repo-wide goal is
+// repo-wide however it is invoked.
+func formatCommandIsPerFileCapable(cmd string) bool {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return false
+	}
+	// `dotnet format` takes paths through --include rather than as a trailing argument, and the
+	// dedicated helper handles that shape.
+	if IsDotNetFormatCommand(cmd) {
+		return true
+	}
+	// With a shell operator the path would land after the LAST command in the chain, not on the
+	// formatter.
+	if formatCommandNeedsShell(cmd) {
+		return false
+	}
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return false
+	}
+	return !isBuildToolBinary(fields[0])
+}
+
+// isBuildToolBinary reports whether a command's first token is a Maven or Gradle invocation, in any
+// of the spellings that have appeared in configs: a bare binary, a repo wrapper, or a Windows
+// wrapper script. Wrappers are no longer produced by ASQS (D3) but an operator may still configure
+// one by hand.
+func isBuildToolBinary(bin string) bool {
+	b := strings.ToLower(filepath.Base(strings.TrimSpace(bin)))
+	b = strings.TrimSuffix(strings.TrimSuffix(b, ".cmd"), ".bat")
+	b = strings.TrimSuffix(b, ".exe")
+	switch b {
+	case "mvn", "mvnw", "gradle", "gradlew":
+		return true
+	}
+	return false
 }

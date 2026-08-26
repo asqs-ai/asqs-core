@@ -247,19 +247,3 @@ func TestRestoreMemo_emptyKeyAlwaysRuns(t *testing.T) {
 		t.Fatalf("runs = %d, want 2: an unfingerprintable restore must not be skipped", runs)
 	}
 }
-
-// fakeDockerSandbox returns a docker-type Sandbox whose "docker binary" is the given shell script,
-// plus a repo that resolves to the java-maven toolchain profile. (Upstream keeps this helper in
-// its docker-eval failure tests, which arrive with CP34.)
-func fakeDockerSandbox(t *testing.T, timeout, script string) (*Sandbox, string) {
-	t.Helper()
-	bin := filepath.Join(t.TempDir(), "docker")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"+script+"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	repo := t.TempDir()
-	if err := os.WriteFile(filepath.Join(repo, "pom.xml"), []byte("<project/>"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return &Sandbox{Type: "docker", Timeout: timeout, DockerBinary: bin}, repo
-}
