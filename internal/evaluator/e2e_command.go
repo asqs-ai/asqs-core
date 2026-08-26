@@ -2,9 +2,9 @@ package evaluator
 
 import (
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/buildtool"
 )
 
 // resolveE2ETestCommand returns the shell command for the E2E pass when RunE2ETestPass is enabled.
@@ -39,66 +39,22 @@ func defaultJavaE2EShellCommand(repoPath, buildTool, fw string) string {
 	default:
 		return ""
 	}
-	repoPath = filepath.Clean(strings.TrimSpace(repoPath))
-	tool := strings.ToLower(strings.TrimSpace(buildTool))
-	if tool == "" {
-		tool = "auto"
-	}
-	hasPom := fileExists(filepath.Join(repoPath, "pom.xml"))
-	hasMvnw := fileExists(filepath.Join(repoPath, "mvnw")) || fileExists(filepath.Join(repoPath, "mvnw.cmd"))
-	hasGradle := fileExists(filepath.Join(repoPath, "build.gradle")) || fileExists(filepath.Join(repoPath, "build.gradle.kts"))
-	hasGradlew := fileExists(filepath.Join(repoPath, "gradlew")) || fileExists(filepath.Join(repoPath, "gradlew.bat"))
-
-	if tool == "auto" {
-		if hasPom {
-			if hasMvnw {
-				tool = "mvnw"
-			} else {
-				tool = "mvn"
-			}
-		} else if hasGradle {
-			if hasGradlew {
-				tool = "gradlew"
-			} else {
-				tool = "gradle"
-			}
-		} else {
-			return ""
-		}
-	}
-
-	switch tool {
-	case "mvn", "mvnw":
-		if !hasPom {
-			return ""
-		}
-		if tool == "mvnw" && hasMvnw {
-			if runtime.GOOS == "windows" && fileExists(filepath.Join(repoPath, "mvnw.cmd")) {
-				return "mvnw.cmd -q -B failsafe:integration-test"
-			}
-			return "./mvnw -q -B failsafe:integration-test"
-		}
-		return "mvn -q -B failsafe:integration-test"
-	case "gradle", "gradlew":
-		if !hasGradle {
-			return ""
-		}
-		var name string
-		if tool == "gradlew" && hasGradlew {
-			if runtime.GOOS == "windows" && fileExists(filepath.Join(repoPath, "gradlew.bat")) {
-				name = "gradlew.bat"
-			} else {
-				name = "./gradlew"
-			}
-		} else if tool == "gradlew" {
-			return ""
-		} else {
-			name = "gradle"
-		}
-		return name + " --no-daemon -q integrationTest"
-	default:
+	// One resolver for the whole pipeline (CP32). Two things this deliberately no longer does:
+	// it does not prefer a repo wrapper, and it does not branch on the HOST's runtime.GOOS. The
+	// string built here is handed to TestE2EPass, which under runner.type: docker runs it inside a
+	// Linux container via `sh -c` — so a Windows operator used to emit `mvnw.cmd …` for a container
+	// that has no such file.
+	tool, err := buildtool.Resolve(repoPath, buildTool)
+	if err != nil {
 		return ""
 	}
+	switch tool.Kind {
+	case buildtool.Maven:
+		return tool.Binary + " -q -B failsafe:integration-test"
+	case buildtool.Gradle:
+		return tool.Binary + " --no-daemon -q integrationTest"
+	}
+	return ""
 }
 
 func defaultCSharpE2EShellCommand(fw string) string {

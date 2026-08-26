@@ -79,6 +79,8 @@ func Load(opts LoadOptions) (*Config, error) {
 	}
 	applyEnv(&c, prefix, opts.ClientID)
 	warnDeprecatedConfigEnv(prefix, opts.ClientID)
+	warnInertDockerKeysForLocalRunner(&c)
+	warnDeprecatedBuildToolWrapperAlias(&c)
 	// Slice fields are not set by applyEnv; support INDEXER_SKIP_PATH_PREFIXES (comma-separated)
 	if s := os.Getenv(prefix + "INDEXER_SKIP_PATH_PREFIXES"); s != "" {
 		var list []string

@@ -295,7 +295,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP05 | `internal/sqlsplit` and honest schema splitting | B31 (L-3) | — | 0.5 d | `in review` |
-| CP06 | Seven dependency-free helper packages | B18, B19, B07, F02, F08, U3b | — | 1 d | `ready` |
+| CP06 | Seven dependency-free helper packages | B18, B19, B07, F02, F08, U3b | — | 1 d | `in review` |
 
 ### P2 — Storage and schema *(the widest blast radius in the plan)*
 
@@ -343,8 +343,8 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP30 | Shared run state, plan/planner, **parity harness** | U0, U1 | — | 3–4 d | `in review` |
 | CP31 | Restore stage; JS plan and coverage paths | U4, U2a, U2b | CP30 | 3 d | `in review` |
-| CP32 | Build-tool resolution; wrapper-free argv | U3b, U3 | CP30, CP06 | 3 d | `blocked (CP30, CP06)` |
-| CP33 | Step environment, credential seam, log redaction | U5, U6, U6b | CP30 | 2 d | `blocked (CP30)` |
+| CP32 | Build-tool resolution; wrapper-free argv | U3b, U3 | CP30, CP06 | 3 d | `in review` |
+| CP33 | Step environment, credential seam, log redaction | U5, U6, U6b | CP30 | 2 d | `in review` |
 | CP34 | Browser preflight; local steps onto the plan | U7, U8 | CP31, CP32, CP33 | 5–6 d | `blocked (CP31, CP32, CP33)` |
 | CP35 | Retire `docker_argv.go`; reject unknown sandbox type; per-file format | U9, U10 | CP34 | 2 d | `blocked (CP34)` |
 
@@ -667,7 +667,7 @@ empty and re-initialise idempotently.
 
 ### CP06 — Seven dependency-free helper packages
 
-- **Status:** `ready` · **Effort:** 1 d · **Risk:** none
+- **Status:** `in review` (done 2026-08-26) · **Effort:** 1 d · **Risk:** none
 
 All seven were checked and import **nothing** from `internal/` (except `staticcheck` → `buildtool`),
 so they land as straight copies with the import rewrite and no adaptation.
@@ -689,6 +689,10 @@ The heuristic over-estimates, which is the safe direction, and a real tokenizer 
 `Counter` interface later with no caller change.
 
 **Acceptance.** `go build ./...` clean; each package's upstream tests ported and green.
+
+**Implementation record (2026-08-26).** Straight copies, no import rewrites needed (all seven are
+stdlib-only), tests ported and green. `pathsafe` and `jsonx` carry no tests upstream either — their
+coverage arrives with their consumers (CP42/CP43/CP53/CP59), so rule 3 is satisfied as-is.
 
 ---
 
@@ -1489,7 +1493,7 @@ restore and skip/fail decisions for every ecosystem, on both targets.
 
 ### CP32 — Build-tool resolution; wrapper-free argv
 
-- **Status:** `blocked (CP30, CP06)` · **Effort:** 3 d · **Risk:** medium-high
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 3 d · **Risk:** medium-high
 
 **Tasks**
 
@@ -1509,6 +1513,27 @@ restore and skip/fail decisions for every ecosystem, on both targets.
 **Invariant to pin with a test:** argv is repo-relative on both targets. Three producers branch on
 `runtime.GOOS`; after this bundle none may.
 
+**Implementation record (2026-08-26).** Done. `internal/buildtool` (CP06) is the single resolver
+for the four sites core has — `localBuildCommand`, `format_resolve.go`'s `javaBuildPrefix`,
+`evaluator/e2e_command.go`'s `defaultJavaE2EShellCommand` (the host-GOOS `.cmd`-in-a-Linux-container
+live bug), and the two testbootstrap wrapper preferences (`e2e_bootstrap_java.go`'s Docker argv
+helpers, `java_verify.go`, including the `chmod +x ./mvnw` docker-script variants). The staticcheck
+and apisurface halves have no code to change until CP49, exactly as the spec says. The Docker
+Gradle profile is wrapper-free (`gradle`, not `./gradlew`); the planner honours `runner.build_tool`
+on both targets via `javaProfileForBuildTool`; `requireLocalToolchain` lost its wrapper exemption.
+`internal/config/local_runner_warnings.go` landed with the `require_docker_bootstrap` startup
+warning and the `mvnw`/`gradlew` deprecated-alias warning, wired into `config.Load`
+(`normaliseAndValidateRunnerType` stays with CP35, noted in-file). No producer branches on
+`runtime.GOOS` any more — the remaining GOOS uses are executor concerns (process-group kill, the
+local-half `.cmd` suffix in `localNodeBin`, which upstream keeps too). Whitelist: all 8 CP32 rows
+converged and were deleted. Tests: `format_resolve_test.go` and `e2e_command_test.go` ported (the
+Target-aware format tests are marked in-file for CP35, which threads `Target` through
+`ResolveFormatCommand`); the GOOS invariant is enforced by `buildtool`'s own tests plus the parity
+rows rather than a separate grep-test. **Release notes:** Docker Gradle wrapper→binary is breaking
+for repos pinning an incompatible Gradle (remediate with `runner.image_java_gradle`); a local
+deployment relying on a repo wrapper with no `mvn`/`gradle` on PATH now fails with an actionable
+message at plan time.
+
 ### CP33 — Step environment, credential seam, log redaction
 
 - **Status:** `blocked (CP30)` · **Effort:** 2 d · **Risk:** low
@@ -1523,6 +1548,28 @@ restore and skip/fail decisions for every ecosystem, on both targets.
    `FormatDockerInvocation` printing every `-e` value including PATs; core never populates
    `DockerEvalExtraEnv`, so this is defensive here rather than urgent. Port it anyway; CP47 and CP48
    both add env-carried settings.
+
+**Implementation record (2026-08-26).** Done as specified.
+
+- `stepEnv`/`baseStepEnv` are the one source for both targets: CI=true on every step, the .NET
+  hygiene vars on C#, dockerExtra only for the container (delivery is the §1 difference —
+  os.Environ()-appended on a host). `dockerJobEnv` delegates to it; `newLocalBuildCmd` applies the
+  base env so restore processes get it too; the JS/java/dotnet planners record it; the local
+  executor sets exactly what the plan records. All 35 CP33 whitelist rows converged and were
+  deleted — **the parity whitelist now holds only permanent §1 rows** (4 ×§1-5 build-server
+  shutdown, 4 ×§1-1 credential-provider provisioning, 3 ×§1-4 `-s` settings flag), matching
+  upstream's end state.
+- `credentials.go` ported compile-only: `PrivateRegistryEcosystem` + the `Ecosystem` field live on
+  `private_registry_compat.go`'s placeholder, `Sandbox.PrivateRegistryCredentials` is populated
+  from the (always-nil) `MaterialisePrivateRegistryMounts` so the delivery path is shape-identical
+  to upstream; `localCredentialEnv`, `applyLocalMavenSettings` and the NuGet credential-provider
+  preflight (`warnLocalNuGetCredentialProviderMissing`, on the shared run state's Once) are all
+  wired and unreachable-in-effect, exactly as §10.4 prescribes. The two credential parity fixtures
+  are in the matrix and pin the §1-1/§1-4 rows.
+- `jobrunner/redact.go` ported with its tests; `FormatDockerInvocation` masks credential-bearing
+  `-e` values at the formatting boundary.
+- CP31's deferred `TestLocalBuildCommand_SetsCIEnv` restored; `credentials_test.go` ported whole
+  (one config-key needle adapted to core's v1 spelling until CP38).
 
 ### CP34 — Browser preflight; local steps onto the plan
 

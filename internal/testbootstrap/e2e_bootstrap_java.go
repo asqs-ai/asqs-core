@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -260,16 +259,8 @@ func mvnCmd(repo, pomAbs string) (name string, prefix []string, ok bool) {
 	if rel != "pom.xml" {
 		prefix = append([]string{"-f", rel}, prefix...)
 	}
-	if runtime.GOOS == "windows" {
-		mc := filepath.Join(repo, "mvnw.cmd")
-		if fileExists(mc) {
-			return mc, prefix, true
-		}
-	}
-	mw := filepath.Join(repo, "mvnw")
-	if fileExists(mw) {
-		return mw, prefix, true
-	}
+	// CP32: the PATH binary, never the repo wrapper, and no host-GOOS branch. See
+	// internal/buildtool.
 	return "mvn", prefix, true
 }
 
@@ -282,11 +273,9 @@ func mavenDockerArgv(repo, pomAbs string, goals ...string) ([]string, bool) {
 		return nil, false
 	}
 	rel = filepath.ToSlash(rel)
-	bin := "mvn"
-	if fileExists(filepath.Join(repo, "mvnw")) {
-		bin = "./mvnw"
-	}
-	argv := []string{bin}
+	// The image supplies Maven; a repo wrapper would download a second distribution inside the
+	// container (CP32).
+	argv := []string{"mvn"}
 	if rel != "pom.xml" {
 		argv = append(argv, "-f", rel)
 	}
@@ -304,11 +293,8 @@ func gradleDockerArgv(repoRoot, gradleFileAbs string, goals ...string) ([]string
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return nil, false
 	}
-	bin := "gradle"
-	if fileExists(filepath.Join(repoRoot, "gradlew")) {
-		bin = "./gradlew"
-	}
-	argv := []string{bin}
+	// As mavenDockerArgv: the image supplies Gradle (CP32).
+	argv := []string{"gradle"}
 	if rel != "." && rel != "" {
 		argv = append(argv, "-p", filepath.ToSlash(rel))
 	}
@@ -390,16 +376,7 @@ func gradleCmd(repoRoot, gradleFileAbs string) (name string, prefix []string, ok
 	if rel != "." && rel != "" {
 		prefix = append([]string{"-p", filepath.ToSlash(rel)}, prefix...)
 	}
-	gw := filepath.Join(repoRoot, "gradlew")
-	if runtime.GOOS == "windows" {
-		bat := filepath.Join(repoRoot, "gradlew.bat")
-		if fileExists(bat) {
-			return bat, prefix, true
-		}
-	}
-	if fileExists(gw) {
-		return gw, prefix, true
-	}
+	// As mvnCmd: PATH binary, no wrapper, no host-GOOS branch (CP32).
 	return "gradle", prefix, true
 }
 

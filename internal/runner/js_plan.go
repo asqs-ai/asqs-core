@@ -68,14 +68,14 @@ func (s *Sandbox) planJS(plan *StepPlan, absCwd string) {
 
 	hasPackageJSON := pathExists(filepath.Join(absCwd, "package.json"))
 	for _, step := range planSteps {
-		// The environment is still per-target: Docker sets CI=true (+extras) on every step, local
-		// only on test/coverage. CP33 replaces both with the shared step env. CI=true no longer
-		// rides inline in the argv the way the Docker profiles carried it.
-		if plan.Target == TargetDocker {
-			plan.Env[step] = append([]string{"CI=true"}, s.DockerEvalExtraEnv...)
-		} else if step != evaluator.StepCompile {
-			plan.Env[step] = []string{"CI=true"}
+		// From the shared source (CP33). CI=true lives in the environment rather than inline in
+		// the argv, which is why the argv no longer carries the `CI=true ` prefix the Docker
+		// profiles used.
+		env := stepEnv(plan.Toolchain, plan.Target, s.DockerEvalExtraEnv)
+		if plan.Target == TargetLocal {
+			env = append(env, s.localCredentialEnv(plan.Toolchain)...)
 		}
+		plan.Env[step] = env
 
 		if !hasPackageJSON {
 			plan.Decisions[step] = skipStep("skip (no package.json)")

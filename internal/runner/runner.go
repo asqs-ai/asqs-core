@@ -66,6 +66,12 @@ type Sandbox struct {
 	// design — the generated files are immutable for the life of the sandbox.
 	DockerEvalExtraMounts []jobrunner.CacheMount
 
+	// PrivateRegistryCredentials are the same generated files as DockerEvalExtraMounts, tagged by
+	// ecosystem so the LOCAL target can deliver them without a mount table (`mvn -s <path>`,
+	// npm_config_userconfig). Always empty in the open core — the enterprise seam never
+	// materialises a credential — but the delivery code compiles and the parity fixtures exercise it.
+	PrivateRegistryCredentials []CredentialFile
+
 	// run is the per-run state shared by every clone of this Sandbox (see run_state.go). Behind a
 	// pointer so TestWithCommand-style shallow copies share it structurally rather than by the
 	// accident of a field's type.
@@ -127,8 +133,12 @@ func NewSandboxFromConfig(cfg *config.Config) *Sandbox {
 		EvalWorkSubpath:               evalSub,
 		DotNetFallbackTargetFramework: strings.TrimSpace(r.DotNetFallbackTargetFramework),
 	}
-	// (asqs-core: Azure DevOps NuGet env + private-registry credential mounts are an enterprise
-	// feature and are intentionally omitted.)
+	// The enterprise seam: MaterialisePrivateRegistryMounts always returns nil in the open core
+	// (config/private_registry_compat.go), so no mount and no credential file ever appears here.
+	// The call stays so the delivery path is identical to upstream's shape.
+	if mounts, err := cfg.Runner.MaterialisePrivateRegistryMounts(); err == nil {
+		sb.PrivateRegistryCredentials = credentialFilesFromConfig(mounts)
+	}
 	sb.run = &sandboxRunState{}
 	return sb
 }

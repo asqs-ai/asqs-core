@@ -7,6 +7,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/asqs/asqs-core/internal/config"
 )
 
 // permittedDifferences enumerates every way the two sandbox targets are still allowed to disagree.
@@ -23,6 +25,24 @@ import (
 // upstream unification plan's four rows: 1 toolchain provenance, 2 filesystem isolation, 4
 // credential location, 5 machine-global blast radius) or the CP bundle that removes the entry.
 var permittedDifferences = map[string]string{
+	// PERMITTED (§1 row 1, toolchain provenance): with a credential envelope configured, the Docker
+	// argv is prefixed with a shell snippet that INSTALLS the Artifacts credential provider into the
+	// container, which the stock SDK image lacks. A host either has the plugin or does not, and ASQS
+	// must not install one into an operator's home directory — the local target gets a preflight
+	// warning instead (warnLocalNuGetCredentialProviderMissing). Permanent: no bundle removes it.
+	"dotnet-private-registry/Argv[compile]":  "§1-1",
+	"dotnet-private-registry/Argv[coverage]": "§1-1",
+	"dotnet-private-registry/Argv[test]":     "§1-1",
+	"dotnet-private-registry/Restore":        "§1-1",
+
+	// PERMITTED (§1 row 4, filesystem location): the generated Maven settings.xml reaches a
+	// container as a bind-mount at Maven's default path, so the container argv needs no flag; a host
+	// has no mount table and must be given `-s <hostpath>`. The credential is identical, its
+	// location follows the filesystem. Permanent: no bundle removes it.
+	"maven-private-registry/Argv[compile]":  "§1-4",
+	"maven-private-registry/Argv[coverage]": "§1-4",
+	"maven-private-registry/Argv[test]":     "§1-4",
+
 	// PERMITTED (§1 row 5, machine-global blast radius): the Docker target appends
 	// `dotnet build-server shutdown` after `dotnet test`. That kills EVERY MSBuild/Roslyn node on
 	// the machine — in a container that is the container, on a host it would reach a concurrent
@@ -32,56 +52,6 @@ var permittedDifferences = map[string]string{
 	"dotnet-multitarget/Argv[test]":     "§1-5",
 	"dotnet/Argv[coverage]":             "§1-5",
 	"dotnet/Argv[test]":                 "§1-5",
-
-	// CP32 — build-tool resolution honoured on both targets; wrapper-free argv (U3/U3b). The
-	// forced-gradle restore row is the build_tool half: Docker restores from the Maven profile
-	// while local obeys build_tool and restores with Gradle.
-	"gradle/Argv[compile]":                               "CP32",
-	"gradle/Argv[coverage]":                              "CP32",
-	"gradle/Argv[test]":                                  "CP32",
-	"java-both-build-files-forced-gradle/Argv[compile]":  "CP32",
-	"java-both-build-files-forced-gradle/Argv[coverage]": "CP32",
-	"java-both-build-files-forced-gradle/Argv[test]":     "CP32",
-	"java-both-build-files-forced-gradle/Restore":        "CP32",
-	"java-both-build-files-forced-gradle/Toolchain":      "CP32",
-
-	// CP33 — step environment parity: Docker sets CI=true (+ .NET hygiene vars) on every step,
-	// local adds CI=true only on test/coverage and nothing on compile (U5).
-	"dotnet-multitarget/Env[compile]":                   "CP33",
-	"dotnet-multitarget/Env[coverage]":                  "CP33",
-	"dotnet-multitarget/Env[test]":                      "CP33",
-	"dotnet-overrides/Env[compile]":                     "CP33",
-	"dotnet-overrides/Env[coverage]":                    "CP33",
-	"dotnet-overrides/Env[test]":                        "CP33",
-	"dotnet/Env[compile]":                               "CP33",
-	"dotnet/Env[coverage]":                              "CP33",
-	"dotnet/Env[test]":                                  "CP33",
-	"gradle/Env[compile]":                               "CP33",
-	"gradle/Env[coverage]":                              "CP33",
-	"gradle/Env[test]":                                  "CP33",
-	"java-both-build-files-forced-gradle/Env[compile]":  "CP33",
-	"java-both-build-files-forced-gradle/Env[coverage]": "CP33",
-	"java-both-build-files-forced-gradle/Env[test]":     "CP33",
-	"java-no-jacoco/Env[compile]":                       "CP33",
-	"java-no-jacoco/Env[coverage]":                      "CP33",
-	"java-no-jacoco/Env[test]":                          "CP33",
-	"js-build-runs-start/Env[compile]":                  "CP33",
-	"js-nest-no-build/Env[compile]":                     "CP33",
-	"js-no-package-json/Env[compile]":                   "CP33",
-	"js-no-test-script/Env[compile]":                    "CP33",
-	"js-test-coverage-only/Env[compile]":                "CP33",
-	"maven-overrides/Env[compile]":                      "CP33",
-	"maven-overrides/Env[coverage]":                     "CP33",
-	"maven-overrides/Env[test]":                         "CP33",
-	"maven/Env[compile]":                                "CP33",
-	"maven/Env[coverage]":                               "CP33",
-	"maven/Env[test]":                                   "CP33",
-	"mono-repo-subpath/Env[compile]":                    "CP33",
-	"mono-repo-subpath/Env[coverage]":                   "CP33",
-	"mono-repo-subpath/Env[test]":                       "CP33",
-	"npm/Env[compile]":                                  "CP33",
-	"pnpm/Env[compile]":                                 "CP33",
-	"yarn/Env[compile]":                                 "CP33",
 }
 
 // planParityFixture is one repository shape, planned for both targets from one Sandbox config.
@@ -183,6 +153,31 @@ func planParityFixtures() []planParityFixture {
 			name:  "js-no-package-json",
 			lang:  "typescript",
 			files: map[string]string{"README.md": "x"},
+		},
+		{
+			// The NuGet credential envelope reaches a container as `-e`; localCredentialEnv delivers
+			// the same variable to a host process, so the two Envs agree. What still differs is the
+			// docker argv: the credential-provider install shell is prepended INTO the container,
+			// which a host must never receive (§1 row 1 — toolchain provenance).
+			name:  "dotnet-private-registry",
+			lang:  "csharp",
+			files: map[string]string{"App.csproj": csproj},
+			mutate: func(s *Sandbox) {
+				s.DockerEvalExtraEnv = []string{`VSS_NUGET_EXTERNAL_FEED_ENDPOINTS={"endpointCredentials":[]}`}
+			},
+		},
+		{
+			// A generated Maven settings.xml. The container gets it mounted at Maven's default
+			// location and needs no flag; a host has no mount table, so the path must be named with
+			// `-s`. The argv therefore differs by construction, not by oversight (§1 row 4).
+			name:  "maven-private-registry",
+			lang:  "java",
+			files: map[string]string{"pom.xml": jacocoPom},
+			mutate: func(s *Sandbox) {
+				s.PrivateRegistryCredentials = []CredentialFile{
+					{Ecosystem: config.EcosystemMaven, HostPath: "/tmp/asqs-creds/maven-settings.xml"},
+				}
+			},
 		},
 		{
 			// Mono-repo: local pre-resolves the cwd, docker mounts the git root and sets -w. The

@@ -9,6 +9,7 @@ package runner
 import (
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -19,11 +20,15 @@ import (
 // skip rather than paying for a second full test run every fix-loop iteration.
 var errLocalCoverageUnavailable = errors.New("no JaCoCo plugin declared in the build file")
 
-// newLocalBuildCmd builds the exec.Cmd for a local build step. The environment is inherited from
-// the process; CP33 gives local steps the shared explicit step env the plan records.
+// newLocalBuildCmd builds the exec.Cmd for a local build step.
+//
+// The explicit environment comes from baseStepEnv, the same source StepPlan.Env is built from, so
+// the plan cannot claim an environment the process does not get. Java adds nothing beyond the
+// base; .NET does, and its steps run through the plan instead (runLocalPlannedStep).
 func newLocalBuildCmd(dir string, argv []string) *exec.Cmd {
 	c := exec.Command(argv[0], argv[1:]...)
 	c.Dir = dir
+	c.Env = append(os.Environ(), baseStepEnv()...)
 	return c
 }
 
@@ -42,12 +47,10 @@ func localBuildCmd(dir string, argv []string) (*exec.Cmd, error) {
 // actually change. Checking here rather than at config load is deliberate: build_tool: auto only
 // resolves to mvn or gradle once the repository is on disk.
 //
-// Repo wrappers (./mvnw, ./gradlew) and shell invocations are exempt: they are paths, not PATH
-// names. CP32 removes the wrapper case entirely.
+// Since CP32 there is no wrapper case to exempt: internal/buildtool never returns "./mvnw" or a
+// "mvnw.cmd", so argv[0] is always a PATH name. The remediation no longer offers a repo wrapper
+// either, because configuring one would not change what runs.
 func requireLocalToolchain(bin string) error {
-	if bin == "sh" || strings.ContainsAny(bin, "/\\") || strings.HasSuffix(bin, ".cmd") || strings.HasSuffix(bin, ".bat") {
-		return nil
-	}
 	if _, err := exec.LookPath(bin); err != nil {
 		return fmt.Errorf("runner.type is \"local\" but %q is not on PATH (%v). Install it on this host "+
 			"or set runner.type to docker", bin, err)

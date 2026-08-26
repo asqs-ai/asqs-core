@@ -13,7 +13,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/asqs/asqs-core/internal/buildtool"
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
 const defaultLocalTimeout = 5 * time.Minute
@@ -299,11 +301,10 @@ func RunFormatCommandFiles(ctx context.Context, repoPath, formatCommand string, 
 }
 
 // localBuildCommand returns the command for a local Java build step goal (compile, test,
-// coverage). compileCommand/testCommand override when set; otherwise buildTool
-// (auto|mvn|mvnw|gradle|gradlew) selects the executable and the argv comes goal-for-goal from the
-// same shapes the Docker toolchain profiles carry — same flags, same goals, flags before goals —
-// so the two targets produce the same string (CP31). The wrapper axis (mvnw/gradlew) is CP32's to
-// remove.
+// coverage). compileCommand/testCommand override when set; otherwise internal/buildtool resolves
+// Maven vs Gradle — one resolver for the whole pipeline, always the PATH binary, never a repo
+// wrapper and never a host-GOOS variant (CP32) — and the argv comes goal-for-goal from the same
+// shapes the Docker toolchain profiles carry, so the two targets produce the same string.
 func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand string) (*exec.Cmd, error) {
 	dir := filepath.Clean(repoPath)
 	if goal == "compile" && strings.TrimSpace(compileCommand) != "" {
@@ -312,47 +313,17 @@ func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand st
 	if (goal == "test" || goal == "default" || goal == "coverage") && strings.TrimSpace(testCommand) != "" {
 		return localBuildCmd(dir, []string{"sh", "-c", strings.TrimSpace(testCommand)})
 	}
-	tool := strings.TrimSpace(strings.ToLower(buildTool))
-	if tool == "" {
-		tool = "auto"
+	tool, terr := buildtool.Resolve(dir, buildTool)
+	if terr != nil {
+		return nil, terr
 	}
-	hasPom := pathExists(filepath.Join(dir, "pom.xml"))
-	hasMvnw := pathExists(filepath.Join(dir, "mvnw")) || pathExists(filepath.Join(dir, "mvnw.cmd"))
-	hasGradle := pathExists(filepath.Join(dir, "build.gradle")) || pathExists(filepath.Join(dir, "build.gradle.kts"))
-	hasGradlew := pathExists(filepath.Join(dir, "gradlew")) || pathExists(filepath.Join(dir, "gradlew.bat"))
-	if tool == "auto" {
-		switch {
-		case hasPom && hasMvnw:
-			tool = "mvnw"
-		case hasPom:
-			tool = "mvn"
-		case hasGradle && hasGradlew:
-			tool = "gradlew"
-		case hasGradle:
-			tool = "gradle"
-		default:
-			return nil, fmt.Errorf("no pom.xml or build.gradle in %s", dir)
-		}
-	}
-	switch tool {
-	case "mvn", "mvnw":
-		if !hasPom {
-			return nil, fmt.Errorf("build_tool is %s but no pom.xml in %s", tool, dir)
-		}
-		name := "mvn"
-		if tool == "mvnw" {
-			if !hasMvnw {
-				return nil, fmt.Errorf("build_tool is mvnw but mvnw not found in %s", dir)
-			}
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "mvnw.cmd")) {
-				name = "mvnw.cmd"
-			} else {
-				name = "./mvnw"
-			}
-		}
-		// -DskipTests on test-compile is inert (that phase runs no tests) and is carried only so
-		// the two targets produce the same string; test-compile (not compile) so generated TEST
-		// sources compile here too instead of first failing in the test phase.
+	switch tool.Kind {
+	case buildtool.Maven:
+		// Argv is byte-identical to the docker maven profile (profile/toolchain.go): same flags,
+		// same goals, flags before goals. -DskipTests on test-compile is inert (that phase runs no
+		// tests) and is carried only so the two targets produce the same string; test-compile (not
+		// compile) so generated TEST sources compile here too instead of first failing in the test
+		// phase.
 		args := []string{"-q", "-B", "-DskipTests", "test-compile"}
 		switch goal {
 		case "test", "default":
@@ -366,22 +337,8 @@ func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand st
 			}
 			args = []string{"-q", "-B", "test", "jacoco:report"}
 		}
-		return localBuildCmd(dir, append([]string{name}, args...))
-	case "gradle", "gradlew":
-		if !hasGradle {
-			return nil, fmt.Errorf("build_tool is %s but no build.gradle in %s", tool, dir)
-		}
-		name := "gradle"
-		if tool == "gradlew" {
-			if !hasGradlew {
-				return nil, fmt.Errorf("build_tool is gradlew but gradlew not found in %s", dir)
-			}
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "gradlew.bat")) {
-				name = "gradlew.bat"
-			} else {
-				name = "./gradlew"
-			}
-		}
+		return localBuildCmd(dir, append([]string{tool.Binary}, args...))
+	case buildtool.Gradle:
 		args := []string{"--no-daemon", "-q"}
 		switch goal {
 		case "compile":
@@ -397,9 +354,9 @@ func localBuildCommand(repoPath, goal, buildTool, compileCommand, testCommand st
 		default:
 			args = append(args, "test")
 		}
-		return localBuildCmd(dir, append([]string{name}, args...))
+		return localBuildCmd(dir, append([]string{tool.Binary}, args...))
 	}
-	return nil, fmt.Errorf("unsupported build_tool %q (want auto|mvn|mvnw|gradle|gradlew)", tool)
+	return nil, fmt.Errorf("build_tool %q resolved to no build system in %s", buildTool, dir)
 }
 
 // runLocalPlannedStep executes one evaluation step on the host from the StepPlan. Since CP31 every
@@ -411,6 +368,10 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 	plan, err := s.buildStepPlan(gitRootAbs, lang, "")
 	if err != nil {
 		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
+	}
+	if plan.Toolchain == profile.CSharpDotnet {
+		// Said before the restore that would otherwise fail with NU1301 and no stated cause.
+		s.warnLocalNuGetCredentialProviderMissing()
 	}
 	// Restore before the step, at most once per manifest fingerprint (see restore.go). Best-effort
 	// by contract, matching the Docker path.
@@ -439,10 +400,11 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 		shutdownDotnetBuildServers(cwd)
 	}
 	fmt.Fprintf(os.Stderr, "  %s...\n", label)
-	cmd := newLocalBuildCmd(cwd, argv)
-	if env := plan.EnvFor(step); len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = cwd
+	// The plan's env is the explicit delta; a host process receives it appended to os.Environ(),
+	// which is where its toolchain, PATH and ~/.m2 come from (§1).
+	cmd.Env = append(os.Environ(), plan.EnvFor(step)...)
 	out, runErr := runCommand(ctx, cmd, s.timeoutDuration())
 	if runErr != nil {
 		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {

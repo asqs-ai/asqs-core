@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/buildtool"
+	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/evaluator"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
@@ -80,6 +82,14 @@ func (s *Sandbox) planDocker(plan *StepPlan, absGitRoot, absCwd, imageOverride s
 			plan.Decisions[step] = skipStep(fmt.Sprintf("skip (docker: %v)", err))
 		}
 		return
+	}
+	// runner.build_tool selects Maven vs Gradle on BOTH targets (CP32). The Docker path ignored
+	// the key entirely: profile.DetectToolchainID reads only the repo layout, so a repository
+	// carrying both a pom.xml and a build.gradle ran Maven in the container while the local runner
+	// obeyed `build_tool: gradle` and ran Gradle — the same config evaluating a different build
+	// system depending on the sandbox.
+	if id, changed := javaProfileForBuildTool(p.ID, s.BuildTool); changed {
+		p = profile.BuiltinToolchain(id, s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet)
 	}
 	p = profile.ApplyCommandOverrides(p, s.CompileCommand, s.TestCommand)
 	if v := strings.TrimSpace(imageOverride); v != "" {
@@ -184,12 +194,21 @@ func (s *Sandbox) planLocal(plan *StepPlan, absGitRoot, absCwd string) {
 // test that cannot resolve a command FAILS, while a coverage that cannot is a SKIP.
 func (s *Sandbox) planLocalJava(plan *StepPlan, absCwd string) {
 	for _, step := range planSteps {
+		// Recorded before the decision so a skipped step still reports the environment it would
+		// have used. newLocalBuildCmd applies the same base env to the process it builds (CP33).
+		plan.Env[step] = stepEnv(plan.Toolchain, TargetLocal, nil)
 		cmd, err := localBuildCommand(absCwd, localGoalFor(step), s.BuildTool, s.CompileCommand, s.TestCommand)
 		if err != nil {
 			plan.Decisions[step] = localJavaFailure(step, err)
 			continue
 		}
-		plan.setArgv(step, cmd.Args)
+		argv := cmd.Args
+		if plan.Toolchain == profile.JavaMaven && s.credentialFor(config.EcosystemMaven) != "" {
+			// The container gets the settings.xml mounted at Maven's default location; a host has
+			// no mount table, so the path must be named (§1 row 4).
+			argv = applyLocalMavenSettings(argv, s.credentialFor(config.EcosystemMaven))
+		}
+		plan.setArgv(step, argv)
 		plan.Decisions[step] = runStep()
 	}
 }
@@ -237,11 +256,7 @@ func (s *Sandbox) planLocalDotnet(plan *StepPlan, absGitRoot, absCwd string) {
 		}
 	}
 	for _, step := range planSteps {
-		// Local adds CI=true (and the .NET extras) only on test/coverage today; CP33 unifies the
-		// step env across targets.
-		if step != evaluator.StepCompile {
-			plan.Env[step] = []string{"CI=true"}
-		}
+		plan.Env[step] = append(stepEnv(p.ID, TargetLocal, nil), s.localCredentialEnv(p.ID)...)
 		plan.Decisions[step] = s.planProfileStep(plan, p, step, absGitRoot, absCwd, TargetLocal)
 	}
 }
@@ -315,4 +330,31 @@ func isJavaToolchain(id profile.ToolchainID) bool {
 		return true
 	}
 	return false
+}
+
+// javaProfileForBuildTool swaps a Java toolchain profile onto the family runner.build_tool asks
+// for, preserving the JDK variant that eval_profile selected. It reports false when the profile is
+// not a Java one or build_tool expresses no preference, so C#/JS profiles and `auto` are untouched.
+func javaProfileForBuildTool(current profile.ToolchainID, buildTool string) (profile.ToolchainID, bool) {
+	canonical, _, ok := buildtool.Canonicalize(buildTool)
+	if !ok || canonical == "auto" {
+		return current, false
+	}
+	wantGradle := canonical == "gradle"
+	var maven, gradle profile.ToolchainID
+	switch current {
+	case profile.JavaMaven, profile.JavaGradle:
+		maven, gradle = profile.JavaMaven, profile.JavaGradle
+	case profile.JavaMaven11, profile.JavaGradle11:
+		maven, gradle = profile.JavaMaven11, profile.JavaGradle11
+	case profile.JavaMaven21, profile.JavaGradle21:
+		maven, gradle = profile.JavaMaven21, profile.JavaGradle21
+	default:
+		return current, false
+	}
+	want := maven
+	if wantGradle {
+		want = gradle
+	}
+	return want, want != current
 }

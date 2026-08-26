@@ -101,8 +101,25 @@ func TestLocalBuildCommand_TestCommandOverridesCoverage(t *testing.T) {
 	}
 }
 
-// (Upstream also asserts the local build command carries the shared CI env here; local step env
-// arrives with CP33 — port that test with it.)
+func TestLocalBuildCommand_SetsCIEnv(t *testing.T) {
+	stubToolsOnPATH(t, "mvn", "gradle")
+	dir := writeRepo(t, map[string]string{"pom.xml": "<project/>"}, nil)
+	for _, goal := range []string{"compile", "test"} {
+		c, err := localBuildCommand(dir, goal, "auto", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, kv := range c.Env {
+			if kv == "CI=true" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("goal %s: CI=true missing from env", goal)
+		}
+	}
+}
 
 // Guard against the local and docker coverage steps drifting apart again: docker has always run
 // the JaCoCo report goal, local used to run a bare `test`.

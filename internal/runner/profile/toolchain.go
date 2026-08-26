@@ -71,14 +71,18 @@ func mavenToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 
 func gradleToolchainProfile(id ToolchainID, img string) ToolchainProfile {
 	return ToolchainProfile{
-		ID:      id,
-		Image:   img,
-		Restore: []string{"./gradlew", "--no-daemon", "-q", "dependencies"},
+		ID:    id,
+		Image: img,
+		// `gradle`, not `./gradlew`: CP32 removed repo wrappers from every part of the pipeline,
+		// so the image's Gradle is used on both targets. This also removes a latent failure — the
+		// wrapper downloads its own distribution, which cannot happen on the network=none test
+		// step unless a gradle cache happens to be mounted.
+		Restore: []string{"gradle", "--no-daemon", "-q", "dependencies"},
 		// compileTestJava (depends on compileJava) so the compile step also builds the generated
-		// TEST sources — see the Maven note above. The `./gradlew` wrapper is CP32's to remove.
-		Compile:          []string{"./gradlew", "--no-daemon", "-q", "compileTestJava"},
-		Test:             []string{"./gradlew", "--no-daemon", "-q", "test"},
-		Coverage:         []string{"./gradlew", "--no-daemon", "-q", "test", "jacocoTestReport"},
+		// TEST sources — see the Maven note above.
+		Compile:          []string{"gradle", "--no-daemon", "-q", "compileTestJava"},
+		Test:             []string{"gradle", "--no-daemon", "-q", "test"},
+		Coverage:         []string{"gradle", "--no-daemon", "-q", "test", "jacocoTestReport"},
 		CacheTargetPaths: []string{"/root/.gradle"},
 		ArtifactPaths:    []string{"build/reports/tests", "build/reports/jacoco"},
 	}

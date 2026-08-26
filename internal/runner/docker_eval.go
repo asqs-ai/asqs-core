@@ -141,17 +141,40 @@ func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir strin
 	return (&jobrunner.DockerRunner{Docker: s.dockerBin()}).Run(ctx, spec)
 }
 
+// stepEnv is the environment an evaluation step sets explicitly, on either target (CP33).
+//
+// One source for both, so a variable cannot reach a container and quietly miss the host. The
+// .NET additions avoid MSBuild worker-node reuse holding outputs open across interrupted runs —
+// pairing with jobrunner's cidfile cleanup when the CLI is killed on timeout — and
+// DOTNET_EnableDiagnostics=0 stops the diagnostic IPC server keeping the process alive on some
+// Linux/Docker setups. None of that is container-specific; the host had simply never been given
+// them, and local compile had not even been given CI=true.
+//
+// How the environment is DELIVERED still differs, and that is the permitted difference (§1): a
+// container receives only these variables, while a host process receives them appended to
+// os.Environ() — which is where its toolchain, PATH and ~/.m2/settings.xml come from.
+//
+// dockerExtra carries the NuGet credential envelope, which reaches a container as `-e`; the local
+// target delivers the same variable through localCredentialEnv (credentials.go).
+func stepEnv(id profile.ToolchainID, target Target, dockerExtra []string) []string {
+	env := append([]string(nil), baseStepEnv()...)
+	if id == profile.CSharpDotnet {
+		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
+	}
+	if target == TargetDocker {
+		env = append(env, dockerExtra...)
+	}
+	return env
+}
+
+// baseStepEnv is what every step sets on every target: CI=true, so build plugins and watch-mode
+// test runners behave as they would in CI rather than waiting for a terminal.
+func baseStepEnv() []string { return []string{"CI=true"} }
+
 // dockerJobEnv is the environment a Docker eval job runs with. Shared by runDockerJobWithTimeout
 // and the step planner so the plan cannot disagree with what the container actually receives.
 func dockerJobEnv(p profile.ToolchainProfile, extra []string) []string {
-	env := []string{"CI=true"}
-	if p.ID == profile.CSharpDotnet {
-		// Avoid MSBuild worker node reuse holding outputs open across interrupted runs; pairs with jobrunner
-		// cidfile cleanup when the docker CLI is killed on timeout.
-		// DOTNET_EnableDiagnostics=0 avoids the diagnostic IPC server keeping the process alive in some Linux/Docker setups.
-		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
-	}
-	return append(env, extra...)
+	return stepEnv(p.ID, TargetDocker, extra)
 }
 
 func (s *Sandbox) dockerBin() string {

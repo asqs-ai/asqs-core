@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/buildtool"
 )
 
 // FormatResolveResult is the outcome of resolving which formatter to run after generation.
@@ -201,70 +203,23 @@ func javaRepoWideFormatCommand(repoPath, buildTool string) (cmd, source string, 
 }
 
 func javaBuildPrefix(dir, buildTool string, hasPom, hasGradle bool) (string, error) {
-	tool := strings.ToLower(strings.TrimSpace(buildTool))
-	if tool == "" {
-		tool = "auto"
+	tool, err := buildtool.Resolve(dir, buildTool)
+	if err != nil {
+		return "", err
 	}
-	hasMvnw := pathExists(filepath.Join(dir, "mvnw")) || pathExists(filepath.Join(dir, "mvnw.cmd"))
-	hasGradlew := pathExists(filepath.Join(dir, "gradlew")) || pathExists(filepath.Join(dir, "gradlew.bat"))
-
-	if tool == "auto" {
-		switch {
-		case hasPom:
-			if hasMvnw {
-				tool = "mvnw"
-			} else {
-				tool = "mvn"
-			}
-		case hasGradle:
-			if hasGradlew {
-				tool = "gradlew"
-			} else {
-				tool = "gradle"
-			}
-		default:
-			return "", errNoJavaBuildFile
-		}
-	}
-
-	switch tool {
-	case "mvn", "mvnw":
+	switch tool.Kind {
+	case buildtool.Maven:
 		if !hasPom {
 			return "", errNoJavaBuildFile
 		}
-		if tool == "mvnw" {
-			if !hasMvnw {
-				return "", errNoJavaBuildFile
-			}
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "mvnw.cmd")) {
-				return "mvnw.cmd", nil
-			}
-			return "./mvnw", nil
-		}
-		if _, err := exec.LookPath("mvn"); err != nil && !hasMvnw {
-			return "", err
-		}
-		return "mvn", nil
-	case "gradle", "gradlew":
+		return tool.Binary, nil
+	case buildtool.Gradle:
 		if !hasGradle {
 			return "", errNoJavaBuildFile
 		}
-		if tool == "gradlew" {
-			if !hasGradlew {
-				return "", errNoJavaBuildFile
-			}
-			if runtime.GOOS == "windows" && pathExists(filepath.Join(dir, "gradlew.bat")) {
-				return "gradlew.bat", nil
-			}
-			return "./gradlew", nil
-		}
-		if _, err := exec.LookPath("gradle"); err != nil && !hasGradlew {
-			return "", err
-		}
-		return "gradle", nil
-	default:
-		return "", errUnsupportedBuildTool
+		return tool.Binary, nil
 	}
+	return "", errNoJavaBuildFile
 }
 
 var (
