@@ -5,25 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
-// doOnce runs f at most once when o is non-nil; when o is nil (a Sandbox built without the
-// NewSandboxFromConfig constructor) it simply runs f. This lets the env-logging guards survive the
-// clone-and-override pattern in TestWithCommand / CompileWithCommand / TestE2EPass (s2 := *s)
-// without copying a sync.Once value.
-func doOnce(o *sync.Once, f func()) {
-	if o != nil {
-		o.Do(f)
-		return
-	}
-	f()
-}
-
+// The once-per-run guards live on sandboxRunState (run_state.go), which every clone shares —
+// replacing the old nil-tolerant doOnce over per-Sandbox *sync.Once fields.
 func (s *Sandbox) logLocalEvalEnvOnce(repoPath string) {
-	doOnce(s.localEvalEnvOnce, func() {
+	s.runState().localEvalEnvOnce.Do(func() {
 		abs := repoPath
 		if a, err := filepath.Abs(strings.TrimSpace(repoPath)); err == nil {
 			abs = a
@@ -35,7 +24,7 @@ func (s *Sandbox) logLocalEvalEnvOnce(repoPath string) {
 }
 
 func (s *Sandbox) logDockerEvalEnvOnce(p profile.ToolchainProfile, repoAbs string) {
-	doOnce(s.dockerEvalEnvOnce, func() {
+	s.runState().dockerEvalEnvOnce.Do(func() {
 		netRestore := strings.TrimSpace(s.JobNetworkRestore)
 		if netRestore == "" {
 			netRestore = "bridge"

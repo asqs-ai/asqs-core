@@ -776,12 +776,10 @@ func RunFormatCommandFiles(ctx context.Context, repoPath, formatCommand string, 
 
 // coverageSummary looks for jacoco report and returns a one-line summary (e.g. "line coverage 42%").
 func coverageSummary(repoPath string) string {
-	// Maven: target/site/jacoco/index.html or target/jacoco.exec
-	// Gradle: build/reports/jacoco/test/html/index.html
-	for _, rel := range []string{
-		"target/site/jacoco/index.html",
-		"build/reports/jacoco/test/html/index.html",
-	} {
+	// Maven: target/site/jacoco/index.html; Gradle: build/reports/jacoco/test/html/index.html.
+	// The list lives in localJavaCoverageReportPaths so the step plan reports the same locations
+	// this scan reads.
+	for _, rel := range localJavaCoverageReportPaths() {
 		p := filepath.Join(repoPath, rel)
 		if _, err := os.Stat(p); err == nil {
 			return "coverage report: " + rel

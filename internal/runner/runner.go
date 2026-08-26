@@ -6,7 +6,6 @@ import (
 	"context"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
@@ -67,8 +66,10 @@ type Sandbox struct {
 	// design — the generated files are immutable for the life of the sandbox.
 	DockerEvalExtraMounts []jobrunner.CacheMount
 
-	dockerEvalEnvOnce *sync.Once // log full docker eval environment once per Sandbox
-	localEvalEnvOnce  *sync.Once // log local eval once per Sandbox
+	// run is the per-run state shared by every clone of this Sandbox (see run_state.go). Behind a
+	// pointer so TestWithCommand-style shallow copies share it structurally rather than by the
+	// accident of a field's type.
+	run *sandboxRunState
 }
 
 // NewSandboxFromConfig builds a Sandbox from application config.
@@ -128,8 +129,7 @@ func NewSandboxFromConfig(cfg *config.Config) *Sandbox {
 	}
 	// (asqs-core: Azure DevOps NuGet env + private-registry credential mounts are an enterprise
 	// feature and are intentionally omitted.)
-	sb.dockerEvalEnvOnce = &sync.Once{}
-	sb.localEvalEnvOnce = &sync.Once{}
+	sb.run = &sandboxRunState{}
 	return sb
 }
 
@@ -201,7 +201,7 @@ func (s *Sandbox) Test(ctx context.Context, repoPath, lang string) evaluator.Ste
 
 // TestWithCommand runs the test step using testCommand instead of the sandbox's configured TestCommand (dual unit/E2E eval).
 func (s *Sandbox) TestWithCommand(ctx context.Context, repoPath, lang, testCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	return s2.Test(ctx, repoPath, lang)
 }
@@ -211,7 +211,7 @@ func (s *Sandbox) TestWithCommand(ctx context.Context, repoPath, lang, testComma
 // shared state (cache mount configuration, auth, docker binary, timeouts) is preserved while only the compile
 // command is overridden for this one invocation.
 func (s *Sandbox) CompileWithCommand(ctx context.Context, repoPath, lang, compileCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.CompileCommand = strings.TrimSpace(compileCommand)
 	return s2.Compile(ctx, repoPath, lang)
 }
@@ -232,7 +232,7 @@ func (s *Sandbox) ReportEvalWorkSubpath() string {
 
 // TestE2EPass runs the second (E2E) test pass. For Docker + JS/TS + Playwright/Cypress, uses the Playwright Node OCI image; for Docker + Java + playwright-java, uses mcr.microsoft.com/playwright/java (browsers + OS deps); for Docker + C# + playwright-dotnet, uses mcr.microsoft.com/playwright/dotnet (browsers + .NET SDK). Otherwise uses the normal toolchain image (plain sdk/maven images lack bundled browsers for Playwright).
 func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, e2eFramework string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	if s2.Type != "docker" {
 		return s2.Test(ctx, repoPath, lang)
@@ -250,7 +250,7 @@ func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, 
 
 // CoverageWithCommand runs coverage using testCommand (typically the unit test command so E2E is not re-run for coverage).
 func (s *Sandbox) CoverageWithCommand(ctx context.Context, repoPath, lang, testCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	return s2.Coverage(ctx, repoPath, lang)
 }

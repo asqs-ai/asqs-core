@@ -128,14 +128,7 @@ func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir strin
 	if jobTimeout > 0 {
 		t = jobTimeout
 	}
-	env := []string{"CI=true"}
-	if p.ID == profile.CSharpDotnet {
-		// Avoid MSBuild worker node reuse holding outputs open across interrupted runs; pairs with jobrunner
-		// cidfile cleanup when the docker CLI is killed on timeout.
-		// DOTNET_EnableDiagnostics=0 avoids the diagnostic IPC server keeping the process alive in some Linux/Docker setups.
-		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
-	}
-	env = append(env, s.DockerEvalExtraEnv...)
+	env := dockerJobEnv(p, s.DockerEvalExtraEnv)
 	spec := jobrunner.JobSpec{
 		Image:          p.Image,
 		HostWorkDir:    hostWorkDir,
@@ -153,6 +146,19 @@ func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir strin
 		IpcHost:        ipcHost,
 	}
 	return (&jobrunner.DockerRunner{Docker: s.dockerBin()}).Run(ctx, spec)
+}
+
+// dockerJobEnv is the environment a Docker eval job runs with. Shared by runDockerJobWithTimeout
+// and the step planner so the plan cannot disagree with what the container actually receives.
+func dockerJobEnv(p profile.ToolchainProfile, extra []string) []string {
+	env := []string{"CI=true"}
+	if p.ID == profile.CSharpDotnet {
+		// Avoid MSBuild worker node reuse holding outputs open across interrupted runs; pairs with jobrunner
+		// cidfile cleanup when the docker CLI is killed on timeout.
+		// DOTNET_EnableDiagnostics=0 avoids the diagnostic IPC server keeping the process alive in some Linux/Docker setups.
+		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
+	}
+	return append(env, extra...)
 }
 
 func (s *Sandbox) dockerBin() string {
