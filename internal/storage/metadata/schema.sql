@@ -200,7 +200,6 @@ DROP TABLE IF EXISTS repos;
 
 -- Agent-session engine (see docs/SESSIONS.md). Each qualitybot run produces one run_sessions row
 -- and N gap_sessions rows (one per plan item). session_attempts logs tool invocations
--- (do not use semicolons inside these line comments: store.go splitSQL splits on semicolon only)
 -- session_feedback stores normalized structured observations emitted by normalizers.
 -- Writes are best-effort from internal/session/engine. Failing to persist never aborts a run.
 CREATE TABLE IF NOT EXISTS run_sessions (

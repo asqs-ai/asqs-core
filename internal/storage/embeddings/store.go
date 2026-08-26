@@ -15,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	pgxvec "github.com/pgvector/pgvector-go/pgx"
+
+	"github.com/asqs/asqs-core/internal/sqlsplit"
 )
 
 //go:embed schema.sql
@@ -86,14 +88,16 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("embeddings: read schema: %w", err)
 	}
-	// Strip line comments before splitting on ';' — otherwise a semicolon inside "-- ...; ..." breaks statements
-	// (e.g. "instance; when" produced: syntax error at or near "when").
-	sql := stripSQLLineComments(string(b))
+	// sqlsplit understands string literals, dollar quotes and comments, so a semicolon inside any of
+	// them is no longer a statement boundary. The previous naive split on ';' had to be preceded by
+	// a line-comment stripper, and even then a semicolon inside a string literal would have broken
+	// the statement — e.g. "instance; when" produced: syntax error at or near "when".
+	sql := string(b)
 	// DDL defaults are OpenAI-sized (1536). Rewrite so fresh installs match this store's dimension.
 	sql = strings.ReplaceAll(sql, "vector(1536)", fmt.Sprintf("vector(%d)", s.dim))
 	sql = strings.ReplaceAll(sql, "DEFAULT 1536", fmt.Sprintf("DEFAULT %d", s.dim))
 	sql = strings.ReplaceAll(sql, "VALUES (1, '', '', 1536)", fmt.Sprintf("VALUES (1, '', '', %d)", s.dim))
-	for _, stmt := range splitSQL(sql) {
+	for _, stmt := range sqlsplit.Statements(sql) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
@@ -175,30 +179,6 @@ func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 		return fmt.Errorf("embeddings: migrate dimension commit: %w", err)
 	}
 	return nil
-}
-
-func splitSQL(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ";") {
-		if t := strings.TrimSpace(part); t != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
-// stripSQLLineComments removes PostgreSQL line comments (-- …) from each line before splitSQL runs.
-// DDL here does not use '--' inside string literals; this avoids semicolons inside comments splitting statements.
-func stripSQLLineComments(s string) string {
-	var b strings.Builder
-	for _, line := range strings.Split(s, "\n") {
-		if i := strings.Index(line, "--"); i >= 0 {
-			line = line[:i]
-		}
-		b.WriteString(strings.TrimRight(line, " \t\r"))
-		b.WriteByte('\n')
-	}
-	return b.String()
 }
 
 // Dimension returns the embedding dimension expected by this store.

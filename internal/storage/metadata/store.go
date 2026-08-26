@@ -10,6 +10,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/asqs/asqs-core/internal/sqlsplit"
 )
 
 //go:embed schema.sql
@@ -44,7 +46,12 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read schema: %w", err)
 	}
-	statements := splitSQL(string(b))
+	// sqlsplit understands string literals, dollar quotes and comments, so a semicolon inside any of
+	// them is no longer a statement boundary. This used to be a naive strings.Split on ';', under
+	// which a prose comment containing a semicolon split its statement in half and produced a
+	// "syntax error at end of input" naming the statement's opening comment rather than the comment
+	// that broke it.
+	statements := sqlsplit.Statements(string(b))
 	for _, stmt := range statements {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
@@ -55,16 +62,6 @@ func (s *Store) InitSchema(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func splitSQL(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ";") {
-		if t := strings.TrimSpace(part); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
 }
 
 func truncate(s string, n int) string {
