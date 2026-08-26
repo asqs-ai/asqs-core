@@ -46,6 +46,13 @@ type chatResponse struct {
 		Content string `json:"content"`
 	} `json:"message"`
 	Done bool `json:"done"`
+	// DoneReason is "stop" for a natural finish, "length" when the output cap was hit.
+	DoneReason string `json:"done_reason"`
+	// EvalCount is the number of completion tokens the server generated.
+	EvalCount int `json:"eval_count"`
+	// PromptEvalCount is the server's own count of prompt tokens it actually evaluated — the one
+	// signal available for detecting silent front-truncation without a tokenizer.
+	PromptEvalCount int `json:"prompt_eval_count"`
 }
 
 func chatEndpoint(cfg *config.Config) string {
@@ -154,7 +161,29 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		if err := json.Unmarshal(respBody, &out); err != nil {
 			return nil, fmt.Errorf("ollama chat: decode response: %w", err)
 		}
-		return &model.CompleteResult{Content: out.Message.Content}, nil
+		stopReason := strings.ToLower(strings.TrimSpace(out.DoneReason))
+		if model.IsLengthStopReason(stopReason) {
+			// MaxTokens is 0, not opts.MaxTokens: this client does not yet send opts.MaxTokens as
+			// num_predict (that lands with the capability contract), so the cap that was hit is the
+			// server's own default — reporting a number that was never sent would be a lie in the
+			// audit trail.
+			return nil, &model.TruncatedCompletionError{
+				Provider:  "ollama",
+				Reason:    stopReason,
+				MaxTokens: 0,
+				GotTokens: out.EvalCount,
+				Content:   out.Message.Content,
+			}
+		}
+		// A reasoning model puts its chain of thought in Content ahead of the answer; no caller
+		// wants it, and a plain-text contract cannot survive it. See model.StripReasoningBlock.
+		content, thought := model.StripReasoningBlock(out.Message.Content)
+		res := &model.CompleteResult{Content: content, StopReason: stopReason, ReasoningRunes: thought}
+		if w := promptOverflowWarning(out.PromptEvalCount, c.chatOptions); w != "" {
+			res.Warnings = append(res.Warnings, w)
+			log.Printf("[asqs] llm ollama: %s", w)
+		}
+		return res, nil
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("ollama chat: %w", lastErr)
@@ -167,4 +196,62 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// promptOverflowNearFraction is how close prompt_eval_count must come to num_ctx before the prompt
+// is reported as having overflowed.
+//
+// Not 1.0: Ollama drops whole messages, so a truncated prompt lands just under the window rather
+// than exactly on it, and an exact test would miss every real case. Not much lower either, because
+// a prompt legitimately filling 90% of the window is fine and a false warning trains operators to
+// ignore the real one.
+const promptOverflowNearFraction = 0.95
+
+// promptOverflowWarning reports that the prompt filled the context window and was therefore
+// silently truncated, or "" when it fits or num_ctx is unknown.
+//
+// Ollama drops the OLDEST messages when a prompt exceeds num_ctx and says nothing about it: the
+// response carries done_reason "stop" and looks entirely normal. For this system the oldest message
+// is the system prompt — the output contract, the artifact path — so an overflow silently removes
+// the instructions the reply is judged against, and the failure presents as "the model ignored the
+// format" rather than "the model never saw it".
+//
+// prompt_eval_count is the server's own count of the tokens it actually evaluated, so comparing it
+// to the configured num_ctx is the one signal available without a tokenizer. It only works when the
+// caller set llm.ollama_num_ctx; with the server default in force there is no number to compare to
+// and this stays silent rather than guessing.
+func promptOverflowWarning(promptTokens int, opts map[string]any) string {
+	if promptTokens <= 0 || len(opts) == 0 {
+		return ""
+	}
+	numCtx, ok := intOption(opts["num_ctx"])
+	if !ok || numCtx <= 0 {
+		return ""
+	}
+	if float64(promptTokens) < float64(numCtx)*promptOverflowNearFraction {
+		return ""
+	}
+	return fmt.Sprintf(
+		model.WarningPromptTruncatedPrefix+
+			"prompt used %d of %d context tokens (num_ctx); Ollama silently drops the oldest messages past this limit, "+
+			"so the system prompt may not have reached the model. Reduce the prompt or raise llm.ollama_num_ctx.",
+		promptTokens, numCtx)
+}
+
+// intOption reads an option value that may have been stored as any numeric type.
+func intOption(v any) (int, bool) {
+	switch n := v.(type) {
+	case int:
+		return n, true
+	case int32:
+		return int(n), true
+	case int64:
+		return int(n), true
+	case float64:
+		return int(n), true
+	case float32:
+		return int(n), true
+	default:
+		return 0, false
+	}
 }

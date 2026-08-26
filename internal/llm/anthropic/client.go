@@ -13,6 +13,8 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
+	"github.com/asqs/asqs-core/internal/llm/httpcfg"
+	"github.com/asqs/asqs-core/internal/llm/retryhttp"
 )
 
 const defaultAnthropicBaseURL = "https://api.anthropic.com"
@@ -60,7 +62,9 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, modelOverride str
 		modelID = "claude-sonnet-4-20250514"
 	}
 	return &Client{
-		httpClient: &http.Client{},
+		// httpcfg supplies the same 5-minute timeout OpenAI and Ollama use. A bare &http.Client{}
+		// has no timeout at all, so a hung connection parked a gap forever.
+		httpClient: httpcfg.HTTPClient(&cfg.LLM),
 		baseURL:    baseURL,
 		apiKey:     key,
 		model:      modelID,
@@ -88,7 +92,10 @@ type contentBlock struct {
 // response from POST /v1/messages
 type messagesResponse struct {
 	Content []contentBlock `json:"content"`
-	Usage   *struct {
+	// StopReason is "end_turn", "max_tokens", "stop_sequence" or "tool_use". "max_tokens" means the
+	// text above is a partial answer, returned with HTTP 200.
+	StopReason string `json:"stop_reason"`
+	Usage      *struct {
 		InputTokens  int `json:"input_tokens"`
 		OutputTokens int `json:"output_tokens"`
 	} `json:"usage"`
@@ -136,14 +143,19 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: encode request: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(raw))
-	if err != nil {
-		return nil, fmt.Errorf("anthropic: new request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", anthropicAPIVersion)
-	resp, err := c.httpClient.Do(req)
+	// Retry transient failures through the shared helper, so Anthropic has the same
+	// transient-failure tolerance as OpenAI and Ollama. Previously a single 429/502/EOF failed the
+	// gap outright here while the same failure was retried transparently on OpenAI.
+	resp, err := retryhttp.Do(ctx, c.httpClient, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/messages", bytes.NewReader(raw))
+		if err != nil {
+			return nil, fmt.Errorf("anthropic: new request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-api-key", c.apiKey)
+		req.Header.Set("anthropic-version", anthropicAPIVersion)
+		return req, nil
+	}, retryhttp.Options{})
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: request: %w", err)
 	}
@@ -162,7 +174,26 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 			text += b.Text
 		}
 	}
-	result := &model.CompleteResult{Content: text}
+	stopReason := strings.ToLower(strings.TrimSpace(out.StopReason))
+
+	// stop_reason "max_tokens" means text above is a partial answer, returned with HTTP 200.
+	if model.IsLengthStopReason(stopReason) {
+		trunc := &model.TruncatedCompletionError{
+			Provider:  "anthropic",
+			Reason:    stopReason,
+			MaxTokens: maxTokens,
+			Content:   text,
+		}
+		if out.Usage != nil {
+			trunc.GotTokens = out.Usage.OutputTokens
+		}
+		return nil, trunc
+	}
+
+	// Extended thinking arrives as its own content block and never reaches `text`; this covers a
+	// model that emits an inline <think> preamble anyway. See model.StripReasoningBlock.
+	text, thought := model.StripReasoningBlock(text)
+	result := &model.CompleteResult{Content: text, StopReason: stopReason, ReasoningRunes: thought}
 	if out.Usage != nil {
 		result.Usage = &model.Usage{
 			PromptTokens:     out.Usage.InputTokens,

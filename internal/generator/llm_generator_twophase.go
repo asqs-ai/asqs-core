@@ -174,11 +174,10 @@ func twoPhaseUserPhase2Footer(suggestedPath string) string {
 func (g *LLMGenerator) generateFromConversation(ctx context.Context, messages []model.Message, suggestedPath string, useStructured bool) (content string, path string, err error) {
 	structuredOn := useStructured
 	completeOpts := func(structured bool) model.CompleteOptions {
-		maxTok := 4096
-		if structured || useStructured {
-			maxTok = 8192
-		}
-		opts := model.CompleteOptions{MaxTokens: maxTok}
+		// One default for both shapes. The unstructured path was hardcoded to 4096 — the value it
+		// actually used, since this is the conversation path — and a full test class routinely
+		// exceeds that.
+		opts := model.CompleteOptions{MaxTokens: DefaultGenerateMaxTokens}
 		if structured {
 			opts.Structured = newGeneratedTestFilesStructuredSchema()
 		}

@@ -20,9 +20,18 @@ import (
 )
 
 // Fixer uses the LLM to produce fixed file content when compile or test fails.
+// FixAudit is the minimal audit sink this package needs. Deliberately narrow so llmfix does not
+// depend on the orchestrating package's Auditor.
+type FixAudit interface {
+	Log(ctx context.Context, step string, payload interface{})
+}
+
 type Fixer struct {
 	LLM    model.ChatCompleter
 	Prompt string // optional system prompt; empty = use default
+	// Audit is optional. When set, recovery paths that would otherwise be invisible in the audit
+	// trail — output-cap truncation and its retry, provider completion warnings — are recorded.
+	Audit FixAudit
 	// MultiTurnRepair when true (default when set from qualitybot via runner.disable_multi_turn_fixer=false), reuses prior user/assistant turns for the same repo path and sandbox step within one evaluation run. Follow-up user turns send new errors plus artifact files only, reducing repeated static context (conversational repair; see docs/DOCUMENTATION.md).
 	MultiTurnRepair bool
 	// DisableStructuredFixOutput when true, skips provider JSON-schema structured completions and relies on the prompt plus the existing multi-strategy parser (and optional repair turn). Default false: first completion uses structured output when supported (e.g. OpenAI); see runner.disable_structured_fix_output.
@@ -295,7 +304,15 @@ func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message,
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		result, err = f.LLM.Complete(ctx, messages, opts)
 		if err == nil {
+			f.auditFixCompletionWarnings(ctx, result)
 			return result, nil
+		}
+		if trunc, isTrunc := model.IsTruncatedCompletion(err); isTrunc {
+			was, retrying := bumpForTruncation(&opts, err)
+			f.auditTruncation(ctx, "secondary", trunc, was, opts.MaxTokens, retrying)
+			if retrying {
+				continue
+			}
 		}
 		if attempt == maxRetries-1 {
 			return nil, err
@@ -310,6 +327,96 @@ func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message,
 	return nil, err
 }
 
+// auditTruncation records an output-cap truncation and what was done about it.
+//
+// bumpForTruncation used to fire silently, so a round that hit the cap, doubled its budget and
+// retried looked identical in the log to one that never hit it — and a round that hit the cap while
+// ALREADY at maxFixerOutputTokens simply disappeared into a parse error.
+// was is the cap in force BEFORE the bump. bumpForTruncation reports 0 when it declines, which is
+// not a cap anyone set — fall back to the unchanged current value so the field cannot read as "the
+// previous limit was zero".
+func (f *Fixer) auditTruncation(ctx context.Context, turn string, trunc *model.TruncatedCompletionError, was, now int, retrying bool) {
+	if f.Audit == nil || trunc == nil {
+		return
+	}
+	if was <= 0 {
+		was = now
+	}
+	msg := fmt.Sprintf("Fix %s completion hit the output cap (provider %s, stop reason %q, max_tokens=%d, produced=%d); no headroom left at %d, so the partial reply is what the parser will see.",
+		turn, trunc.Provider, trunc.Reason, trunc.MaxTokens, trunc.GotTokens, maxFixerOutputTokens)
+	if retrying {
+		msg = fmt.Sprintf("Fix %s completion hit the output cap (provider %s, stop reason %q, max_tokens=%d, produced=%d); retrying at %d.",
+			turn, trunc.Provider, trunc.Reason, trunc.MaxTokens, trunc.GotTokens, now)
+	}
+	f.Audit.Log(ctx, "fix.completion_truncated", map[string]interface{}{
+		"message":         msg,
+		"turn":            turn,
+		"provider":        trunc.Provider,
+		"stop_reason":     trunc.Reason,
+		"max_tokens":      trunc.MaxTokens,
+		"produced_tokens": trunc.GotTokens,
+		"retrying":        retrying,
+		"max_tokens_was":  was,
+		"max_tokens_now":  now,
+		"partial_runes":   len([]rune(trunc.Content)),
+	})
+}
+
+// maxFixerOutputTokens bounds the truncation retry for fix attempts.
+const maxFixerOutputTokens = 16384
+
+// bumpForTruncation doubles opts.MaxTokens once when err is a truncated completion and there is
+// headroom left, reporting whether the caller should retry.
+//
+// Truncation matters more in the fixer than in the generator: an unparseable response consumes one
+// of a small number of fix attempts on a failure that had nothing to do with the model's reasoning,
+// and the repair turn then re-asks about content the model never finished writing.
+func bumpForTruncation(opts *model.CompleteOptions, err error) (int, bool) {
+	trunc, ok := model.IsTruncatedCompletion(err)
+	if !ok || trunc == nil {
+		return 0, false
+	}
+	if opts.MaxTokens >= maxFixerOutputTokens {
+		return 0, false
+	}
+	was := opts.MaxTokens
+	next := was * 2
+	if next > maxFixerOutputTokens {
+		next = maxFixerOutputTokens
+	}
+	opts.MaxTokens = next
+	return was, true
+}
+
+func hasPromptTruncatedWarning(res *model.CompleteResult) bool {
+	if res == nil {
+		return false
+	}
+	for _, w := range res.Warnings {
+		if model.IsPromptTruncatedWarning(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// auditFixCompletionWarnings mirrors the generator's auditCompletionWarnings: provider-side
+// conditions that did not fail the call but change how to read it. The fixer used to discard
+// these, which is how a run with three front-truncated fix prompts audited as clean requests
+// with unusable replies and no explanation.
+func (f *Fixer) auditFixCompletionWarnings(ctx context.Context, res *model.CompleteResult) {
+	if f.Audit == nil || res == nil || len(res.Warnings) == 0 {
+		return
+	}
+	for _, w := range res.Warnings {
+		f.Audit.Log(ctx, "fix.completion_warning", map[string]interface{}{
+			"message":          "Fixer completion warning: " + w,
+			"warning":          w,
+			"prompt_truncated": model.IsPromptTruncatedWarning(w),
+		})
+	}
+}
+
 // completeWithRetryBuilder calls Complete; on transient errors it bumps retryLevel, rebuilds messages
 // (tighter prompt budgets via build), sleeps with jitter, and retries. Returns the user string from the last build attempt.
 func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLevel int) ([]model.Message, string), opts model.CompleteOptions) (*model.CompleteResult, string, error) {
@@ -321,12 +428,35 @@ func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLe
 	var err error
 	retryLevel := 0
 	var sentUser string
+	truncationRebuilds := 0
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		msgs, u := build(retryLevel)
 		sentUser = u
 		result, err = f.LLM.Complete(ctx, msgs, opts)
 		if err == nil {
+			f.auditFixCompletionWarnings(ctx, result)
+			// A front-truncated prompt SUCCEEDED as far as the provider is concerned, but the
+			// model never saw the system prompt or the output contract — its reply is an answer to
+			// a different, smaller question. Rebuild once at the next tighter limit tier instead of
+			// consuming the reply. Once, not until it fits: the tiers deliberately never shrink
+			// artifacts, so a prompt that still overflows after one tightening will keep
+			// overflowing, and looping here would burn the retry budget on requests that cannot
+			// change. Observed upstream before this existed: three consecutive test-step rounds
+			// each sent ~136k runes into a 32k-token window, got unusable replies, and the warning
+			// saying exactly why was discarded unread.
+			if truncationRebuilds == 0 && hasPromptTruncatedWarning(result) && attempt < maxRetries-1 {
+				truncationRebuilds++
+				retryLevel++
+				continue
+			}
 			return result, sentUser, nil
+		}
+		if trunc, isTrunc := model.IsTruncatedCompletion(err); isTrunc {
+			was, retrying := bumpForTruncation(&opts, err)
+			f.auditTruncation(ctx, "main", trunc, was, opts.MaxTokens, retrying)
+			if retrying {
+				continue
+			}
 		}
 		if attempt == maxRetries-1 {
 			return nil, sentUser, err

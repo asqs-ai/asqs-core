@@ -276,8 +276,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		ContractRules:          &rules,
 		TwoPhaseTestGeneration: cfg.Runner.TwoPhaseTestGeneration,
 		RepoPath:               repoAbs,
+		Audit:                  audit,
 	}
-	fixer := &llmfix.Fixer{LLM: chat}
+	fixer := &llmfix.Fixer{LLM: chat, Audit: audit}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 

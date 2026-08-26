@@ -39,6 +39,17 @@ type LLMGenerator struct {
 	// MonoRepoWorkspace and MonoRepoTestWorkspace are normalized indexer.mono_repo_* values; when test is set, suggested paths for structured JSON / two-phase generation are remapped into the test project tree (see workspace.RemapSuggestedTestPathForMonoTestWorkspace).
 	MonoRepoWorkspace     string
 	MonoRepoTestWorkspace string
+	// Audit is optional; when set, output-truncation events (llm.output_truncated,
+	// llm.output_truncated_retry) and provider completion warnings are recorded so the frequency of
+	// provider-side truncation becomes visible instead of presenting as "the model produced garbage".
+	Audit Auditor
+}
+
+// Auditor is the audit sink this package needs (the same two-method shape the pipeline's auditor
+// satisfies everywhere else).
+type Auditor interface {
+	Log(ctx context.Context, step string, payload interface{})
+	LogError(ctx context.Context, step string, payload interface{})
 }
 
 func isJSTSLang(lang string) bool {
@@ -217,17 +228,57 @@ func pickGeneratedContentFromPathMap(m map[string]string, suggestedPath string) 
 	return ""
 }
 
+// DefaultGenerateMaxTokens is the output cap for test generation when the caller sets none.
+//
+// Raised from 4096: a full JUnit or xUnit test class with several test methods routinely exceeds
+// 4096 output tokens, and a structured response is a JSON object mapping path -> whole file content,
+// which makes the payload larger still. The fixer already used 8192.
+const DefaultGenerateMaxTokens = 8192
+
+// maxGenerateOutputTokens bounds the truncation retry so a pathological gap cannot escalate without
+// limit. One doubling from the default lands here.
+const maxGenerateOutputTokens = 16384
+
+// truncationEscalations bounds how often one generation may re-ask at a larger output cap. It is a
+// separate budget from the transient retries, because a truncated completion is not a failed
+// request: retrying the same request reproduces it exactly, so the escalation asks a DIFFERENT
+// question (a larger cap). Two escalations means a caller-set 4096 can still reach
+// maxGenerateOutputTokens.
+const truncationEscalations = 2
+
 func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
 	if opts.MaxTokens == 0 {
-		opts.MaxTokens = 4096
+		opts.MaxTokens = DefaultGenerateMaxTokens
 	}
 	const maxRetries = 3
 	var result *model.CompleteResult
 	var err error
+	escalations := 0
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		result, err = g.LLM.Complete(ctx, messages, opts)
 		if err == nil {
+			// Provider-side conditions that did not fail the call but change how to read it —
+			// notably an Ollama prompt that filled num_ctx and was silently truncated at the
+			// front, taking the system prompt with it. Auditing it here is what turns "the model
+			// ignored the output contract" into "the model never received the output contract".
+			g.auditCompletionWarnings(ctx, result)
 			return result, nil
+		}
+		// A truncated completion is not a transport failure: retrying the same request reproduces
+		// it exactly. Re-ask at a larger cap, then surface it. Never fall through to the partial
+		// content — the defensive path/content parsers would happily extract a fragment from a JSON
+		// object cut mid-string and write it to disk. Escalations do not consume transient attempts.
+		if trunc, ok := model.IsTruncatedCompletion(err); ok {
+			if opts.MaxTokens < maxGenerateOutputTokens && escalations < truncationEscalations {
+				was := opts.MaxTokens
+				opts.MaxTokens = min(was*2, maxGenerateOutputTokens)
+				escalations++
+				attempt--
+				g.auditTruncation(ctx, "llm.output_truncated_retry", trunc, was, opts.MaxTokens)
+				continue
+			}
+			g.auditTruncation(ctx, "llm.output_truncated", trunc, opts.MaxTokens, 0)
+			return nil, err
 		}
 		if attempt == maxRetries-1 {
 			return nil, err
@@ -238,6 +289,35 @@ func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages [
 		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 	}
 	return nil, err
+}
+
+func (g *LLMGenerator) auditTruncation(ctx context.Context, step string, trunc *model.TruncatedCompletionError, was, now int) {
+	if g.Audit == nil || trunc == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"provider":       trunc.Provider,
+		"stop_reason":    trunc.Reason,
+		"max_tokens":     was,
+		"produced":       trunc.GotTokens,
+		"partial_length": len(trunc.Content),
+	}
+	if now > 0 {
+		payload["retry_max_tokens"] = now
+	}
+	g.Audit.Log(ctx, step, payload)
+}
+
+// auditCompletionWarnings records non-fatal provider warnings attached to a completion.
+func (g *LLMGenerator) auditCompletionWarnings(ctx context.Context, res *model.CompleteResult) {
+	if g.Audit == nil || res == nil || len(res.Warnings) == 0 {
+		return
+	}
+	for _, w := range res.Warnings {
+		g.Audit.Log(ctx, "llm.completion_warning", map[string]interface{}{
+			"message": w,
+		})
+	}
 }
 
 // suggestedJavaE2EPathForRouteGap maps a controller file (API_ROUTE symbol file) to a parallel integration/E2E test path.
