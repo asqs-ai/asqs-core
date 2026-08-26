@@ -152,7 +152,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		_ = meta.UpdateIndexRunFinished(ctx, runID, time.Now().UnixMilli())
 	}()
 
-	changeSet, err := DetectChanges(ctx, currentFiles, meta)
+	changeSet, err := DetectChanges(ctx, currentFiles, meta, opts.RepoID)
 	if err != nil {
 		return nil, fmt.Errorf("indexer: detect changes: %w", err)
 	}
@@ -228,10 +228,10 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	// Remove stale: embeddings first, then symbols (cascade deletes edges), then file row
 	for _, path := range changeSet.Removed {
 		if emb != nil {
-			_, _ = emb.DeleteByFile(ctx, path)
+			_, _ = emb.DeleteByFile(ctx, opts.RepoID, path)
 		}
-		_, _ = meta.DeleteSymbolsByFile(ctx, path)
-		_ = meta.DeleteFile(ctx, path)
+		_, _ = meta.DeleteSymbolsByFile(ctx, opts.RepoID, path)
+		_, _ = meta.DeleteFile(ctx, opts.RepoID, path)
 	}
 	if opts.Audit != nil && len(changeSet.Removed) > 0 {
 		opts.Audit.Log(ctx, "index.removed", map[string]interface{}{
@@ -339,9 +339,9 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 
 		// Delete existing symbols/chunks for this file (reindex)
 		if emb != nil {
-			_, _ = emb.DeleteByFile(ctx, fv.Path)
+			_, _ = emb.DeleteByFile(ctx, opts.RepoID, fv.Path)
 		}
-		_, _ = meta.DeleteSymbolsByFile(ctx, fv.Path)
+		_, _ = meta.DeleteSymbolsByFile(ctx, opts.RepoID, fv.Path)
 
 		// Insert symbols and collect IDs
 		symbolIDByFQName := make(map[string]string)
@@ -403,7 +403,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if callerID == "" {
 				var amb bool
-				callerID, amb = resolveSymbolIDForFQName(ctx, meta, e.CallerFQName, edgeHintFiles, parsed.Lang)
+				callerID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, e.CallerFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("caller", e.CallerFQName)
 				}
@@ -418,7 +418,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if calleeID == "" {
 				var amb bool
-				calleeID, amb = resolveSymbolIDForFQName(ctx, meta, e.CalleeFQName, edgeHintFiles, parsed.Lang)
+				calleeID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, e.CalleeFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("callee", e.CalleeFQName)
 				}
@@ -434,7 +434,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 						calleeID = id
 					} else {
 						var amb bool
-						calleeID, amb = resolveSymbolIDForFQName(ctx, meta, normalized, edgeHintFiles, parsed.Lang)
+						calleeID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, normalized, edgeHintFiles, parsed.Lang)
 						if amb {
 							logAmbiguous("callee", normalized)
 						}
@@ -443,17 +443,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			// IMPORTS: JavaParser emits full declaration text ("import pkg.T;"); normalize and strip segments for static members.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") {
-				calleeID = resolveJavaImportCalleeID(ctx, meta, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveJavaImportCalleeID(ctx, meta, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			// C#: using directives reference namespaces; map to an indexed symbol by trimming suffixes.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") && parsed.Lang == "csharp" {
-				calleeID = resolveCSharpImportCalleeID(ctx, meta, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveCSharpImportCalleeID(ctx, meta, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			if calleeID == "" {
 				unresolvedCalleeByType[metricKey]++
 				continue
 			}
-			if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType}) == nil {
+			if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType, RepoID: opts.RepoID}) == nil {
 				edgesStored++
 			}
 		}
@@ -474,7 +474,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				}
 				if classID == "" {
 					var amb bool
-					classID, amb = resolveSymbolIDForFQName(ctx, meta, classFQName, edgeHintFiles, parsed.Lang)
+					classID, amb = resolveSymbolIDForFQName(ctx, meta, opts.RepoID, classFQName, edgeHintFiles, parsed.Lang)
 					if amb {
 						logAmbiguous("class", classFQName)
 					}
@@ -482,7 +482,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				methodID := symbolIDByFQName[sym.FQName]
 				if classID != "" && methodID != "" {
 					chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: classFQName, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-					if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS"}) == nil {
+					if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS", RepoID: opts.RepoID}) == nil {
 						edgesStored++
 					}
 				}
@@ -506,7 +506,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 					childID := symbolIDByFQName[sym.FQName]
 					if childID != "" {
 						chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: moduleFQ, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-						if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS"}) == nil {
+						if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS", RepoID: opts.RepoID}) == nil {
 							edgesStored++
 						}
 					}
@@ -514,7 +514,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 		}
 		// Upsert file
-		_ = meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest})
+		_ = meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest, RepoID: opts.RepoID})
 
 		// Chunk and optionally embed + store (include synthetic CONTAINS so parent_fq matches persisted graph).
 		forChunk := *parsed
@@ -618,7 +618,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 	// Match HTTP client symbols to backend routes by method + path (same run + fqNameToID).
-	if n := LinkAPIClientRequestsToRoutes(ctx, meta, fqNameToID); n > 0 {
+	if n := LinkAPIClientRequestsToRoutes(ctx, meta, opts.RepoID, fqNameToID); n > 0 {
 		edgesStored += n
 		if opts.Audit != nil {
 			opts.Audit.Log(ctx, "index.api_client_route_links", map[string]interface{}{
@@ -628,7 +628,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 
-	if n, err := meta.MaterializeTestsSourceEdges(ctx); err != nil {
+	if n, err := meta.MaterializeTestsSourceEdges(ctx, opts.RepoID); err != nil {
 		if opts.Audit != nil {
 			opts.Audit.LogError(ctx, "index.tests_source_materialize", map[string]interface{}{
 				"message": fmt.Sprintf("TESTS_SOURCE materialization failed: %v", err),
@@ -677,7 +677,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			})
 		}
 	}
-	if n, err := meta.CountSymbols(ctx); err == nil {
+	if n, err := meta.CountSymbols(ctx, opts.RepoID); err == nil {
 		symbolsTotal = n
 	} else if opts.Audit != nil {
 		opts.Audit.LogError(ctx, "index.totals_symbols_error", map[string]interface{}{
@@ -685,7 +685,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			"error":   err.Error(),
 		})
 	}
-	if n, err := meta.CountEdges(ctx); err == nil {
+	if n, err := meta.CountEdges(ctx, opts.RepoID); err == nil {
 		edgesTotal = n
 	} else if opts.Audit != nil {
 		opts.Audit.LogError(ctx, "index.totals_edges_error", map[string]interface{}{
@@ -864,6 +864,7 @@ func qualifiedSignatureToFQName(sig string) string {
 func resolveJavaImportCalleeID(
 	ctx context.Context,
 	meta MetadataWriter,
+	repoID string,
 	symbolIDByFQName, fqNameToID map[string]string,
 	raw string,
 ) string {
@@ -878,7 +879,7 @@ func resolveJavaImportCalleeID(
 		if id := fqNameToID[s]; id != "" {
 			return id
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, s); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, s); len(syms) > 0 {
 			return syms[0].ID
 		}
 		i := strings.LastIndex(s, ".")

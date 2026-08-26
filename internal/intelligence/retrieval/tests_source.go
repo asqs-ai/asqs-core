@@ -39,11 +39,11 @@ func edgeTypeEqual(e *metadata.Edge, want string) bool {
 
 // hasInboundTestsSourceTrace is true when materialized TESTS_SOURCE edges indicate a test-side link to this symbol
 // or to its enclosing class (Java-style pkg.Type#method → pkg.Type).
-func hasInboundTestsSourceTrace(ctx context.Context, meta GapMetaReader, sym *metadata.Symbol) bool {
+func hasInboundTestsSourceTrace(ctx context.Context, meta GapMetaReader, repoID string, sym *metadata.Symbol) bool {
 	if sym == nil || sym.ID == "" || meta == nil {
 		return false
 	}
-	edgesTo, err := meta.GetEdgesTo(ctx, sym.ID)
+	edgesTo, err := meta.GetEdgesTo(ctx, repoID, sym.ID)
 	if err != nil {
 		return false
 	}
@@ -56,7 +56,7 @@ func hasInboundTestsSourceTrace(ctx context.Context, meta GapMetaReader, sym *me
 	if !ok {
 		return false
 	}
-	candidates, err := meta.ListSymbolsByFQName(ctx, classFQ)
+	candidates, err := meta.ListSymbolsByFQName(ctx, repoID, classFQ)
 	if err != nil {
 		return false
 	}
@@ -70,7 +70,7 @@ func hasInboundTestsSourceTrace(ctx context.Context, meta GapMetaReader, sym *me
 		if c.File != sym.File {
 			continue
 		}
-		edgesClass, err := meta.GetEdgesTo(ctx, c.ID)
+		edgesClass, err := meta.GetEdgesTo(ctx, repoID, c.ID)
 		if err != nil {
 			continue
 		}

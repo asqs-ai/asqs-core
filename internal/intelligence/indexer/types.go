@@ -123,21 +123,21 @@ type MetadataWriter interface {
 	InsertSymbol(ctx context.Context, sym *metadata.Symbol) (string, error)
 	InsertEdge(ctx context.Context, e *metadata.Edge) error
 	UpsertFile(ctx context.Context, f *metadata.File) error
-	DeleteSymbolsByFile(ctx context.Context, file string) (int64, error)
-	DeleteFile(ctx context.Context, file string) error
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	ListFiles(ctx context.Context, lang string, isTest *bool) ([]*metadata.File, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
+	DeleteSymbolsByFile(ctx context.Context, repoID, file string) (int64, error)
+	DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
 	// MaterializeTestsSourceEdges rebuilds TESTS_SOURCE edges after indexing (test→SUT heuristics). Mocks may return (0, nil).
-	MaterializeTestsSourceEdges(ctx context.Context) (inserted int, err error)
+	MaterializeTestsSourceEdges(ctx context.Context, repoID string) (inserted int, err error)
 	InsertIndexRun(ctx context.Context, runID, repoID, commitSHA string, startedAt int64, currentIteration int, extras *metadata.IndexRunStartExtras) error
 	UpdateIndexRunFinished(ctx context.Context, runID string, finishedAt int64) error
 	// CountSymbols returns the total number of symbols currently stored. The indexer calls this
 	// after writes finish so RunResult.SymbolsTotal reports the post-run count (A.7). Mock
 	// implementations may return (0, nil); the indexer treats counting failures as best-effort.
-	CountSymbols(ctx context.Context) (int64, error)
+	CountSymbols(ctx context.Context, repoID string) (int64, error)
 	// CountEdges returns the total number of edges currently stored. Best-effort; see CountSymbols.
-	CountEdges(ctx context.Context) (int64, error)
+	CountEdges(ctx context.Context, repoID string) (int64, error)
 	// CountIndexRuns returns the number of index_runs rows for the given repo (including the
 	// current run, which has already been inserted by indexer.Run before this call). The
 	// indexer uses the count to detect "first run for this repo": when count <= 1, no prior
@@ -151,7 +151,7 @@ type MetadataWriter interface {
 // EmbeddingsWriter is the subset of embeddings.Store needed for indexing.
 type EmbeddingsWriter interface {
 	InsertChunks(ctx context.Context, chunks []*embeddings.Chunk) ([]string, error)
-	DeleteByFile(ctx context.Context, file string) (int64, error)
+	DeleteByFile(ctx context.Context, repoID, file string) (int64, error)
 	DeleteByRepo(ctx context.Context, repoID string) (int64, error)
 	SetEmbeddingProvider(ctx context.Context, provider, embeddingModel string, dimension int) error
 	// CountChunksByRepo returns the total number of chunks currently stored for the given repo

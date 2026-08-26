@@ -69,7 +69,7 @@ func TestIsOverviewIgnoredPath(t *testing.T) {
 }
 
 func TestBuildOverviewContext_nilMeta(t *testing.T) {
-	_, err := BuildOverviewContext(context.Background(), nil, "java")
+	_, err := BuildOverviewContext(context.Background(), nil, "", "java")
 	if err == nil {
 		t.Fatal("BuildOverviewContext(nil meta): want error")
 	}
@@ -96,19 +96,19 @@ func TestApplyOverviewContextSizeLimit(t *testing.T) {
 }
 
 func TestBuildFileDependencyGraphMermaid_nilOrEmpty(t *testing.T) {
-	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "java"); got != "" {
+	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "", "java"); got != "" {
 		t.Errorf("BuildFileDependencyGraphMermaid(nil meta): got %q; want empty", got)
 	}
-	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, ""); got != "" {
+	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "", ""); got != "" {
 		t.Errorf("BuildFileDependencyGraphMermaid(empty lang): got %q; want empty", got)
 	}
 }
 
 func TestBuildOverviewVisualSections_nilOrEmpty(t *testing.T) {
-	if got := BuildOverviewVisualSections(context.Background(), nil, "java", "", ""); got != "" {
+	if got := BuildOverviewVisualSections(context.Background(), nil, "", "java", "", ""); got != "" {
 		t.Errorf("BuildOverviewVisualSections(nil meta): got %q; want empty", got)
 	}
-	if got := BuildOverviewVisualSections(context.Background(), nil, "", "", ""); got != "" {
+	if got := BuildOverviewVisualSections(context.Background(), nil, "", "", "", ""); got != "" {
 		t.Errorf("BuildOverviewVisualSections(empty lang): got %q; want empty", got)
 	}
 }

@@ -38,13 +38,13 @@ type TestGap struct {
 
 // GapMetaReader is the subset of metadata needed to list gaps (symbols, files, edges for centrality).
 type GapMetaReader interface {
-	ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string) ([]*metadata.Symbol, error)
-	ListSymbolsInTestFiles(ctx context.Context, lang, kind string) ([]*metadata.Symbol, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	GetSymbolByID(ctx context.Context, id string) (*metadata.Symbol, error)
-	GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*metadata.Edge, error)
-	GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*metadata.Edge, error)
+	ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error)
+	ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	GetSymbolByID(ctx context.Context, repoID, id string) (*metadata.Symbol, error)
+	GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*metadata.Edge, error)
+	GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*metadata.Edge, error)
 }
 
 // TestPlanItem is one test-gap candidate with its symbol-aware retrieval context.
@@ -203,7 +203,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {
-			symbols, err := meta.ListSymbolsInNonTestFiles(ctx, lang, kind)
+			symbols, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, lang, kind)
 			if err != nil {
 				return nil, err
 			}
@@ -236,7 +236,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 			if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
 				return nil
 			}
-			f, err := meta.GetFile(gctx, sym.File)
+			f, err := meta.GetFile(gctx, opts.RepoID, sym.File)
 			if err != nil || f == nil {
 				return nil
 			}
@@ -251,7 +251,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 				gap.Reason = "business-critical module"
 				gap.Priority += 30 // highest band: critical beats "no tests" and "has tests"
 			}
-			edgesToRaw, _ := meta.GetEdgesTo(gctx, sym.ID)
+			edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
 			edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
 			if len(edgesToCentrality) >= 3 {
 				if gap.Priority < 30 {
@@ -267,7 +267,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 					gap.Reason = "extend existing test file (add test for this symbol)"
 				}
 			}
-			if hasInboundTestsSourceTrace(gctx, meta, sym) {
+			if hasInboundTestsSourceTrace(gctx, meta, opts.RepoID, sym) {
 				gap.Priority -= 38
 				if gap.Reason == "no tests detected" {
 					gap.Reason = "traceability: tests link to this symbol (TESTS_SOURCE)"
@@ -448,11 +448,11 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 			if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(route.File, opts.SkipPathPrefixes) {
 				return nil
 			}
-			f, err := meta.GetFile(gctx, route.File)
+			f, err := meta.GetFile(gctx, opts.RepoID, route.File)
 			if err != nil || f == nil {
 				return nil
 			}
-			edgesTo, err := meta.GetEdgesTo(gctx, route.ID)
+			edgesTo, err := meta.GetEdgesTo(gctx, opts.RepoID, route.ID)
 			if err != nil {
 				return nil
 			}
@@ -461,11 +461,11 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 				if e == nil || strings.TrimSpace(e.EdgeType) != "TARGETS_API_ROUTE" {
 					continue
 				}
-				caller, err := meta.GetSymbolByID(gctx, e.CallerSymbolID)
+				caller, err := meta.GetSymbolByID(gctx, opts.RepoID, e.CallerSymbolID)
 				if err != nil || caller == nil || caller.File == "" {
 					continue
 				}
-				cf, err := meta.GetFile(gctx, caller.File)
+				cf, err := meta.GetFile(gctx, opts.RepoID, caller.File)
 				if err != nil || cf == nil {
 					continue
 				}
@@ -485,7 +485,7 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 				tg.Priority += 30
 			}
 			// Outbound ROUTE_TO_HANDLER (and similar): central entrypoints bubble up.
-			edgesFrom, _ := meta.GetEdgesFrom(gctx, route.ID)
+			edgesFrom, _ := meta.GetEdgesFrom(gctx, opts.RepoID, route.ID)
 			if len(edgesFrom) >= 1 {
 				tg.Priority += len(edgesFrom)
 			}
@@ -538,7 +538,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	}
 	wl := strings.ToLower(strings.TrimSpace(opts.Lang))
 	if wl == "java" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, "java", "API_ROUTE")
+		routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "java", "API_ROUTE")
 		if err != nil {
 			return nil, err
 		}
@@ -562,7 +562,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 
 	// C# ASP.NET Core: same uncovered API_ROUTE model as Java; same e2e_playwright / full_stack fallthrough when all covered.
 	if wl == "csharp" || wl == "cs" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, "csharp", "API_ROUTE")
+		routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "csharp", "API_ROUTE")
 		if err != nil {
 			return nil, err
 		}
@@ -589,7 +589,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		seenR := make(map[string]bool)
 		var apiRoutes []*metadata.Symbol
 		for _, l := range langs {
-			routes, err := meta.ListSymbolsInNonTestFiles(ctx, l, "API_ROUTE")
+			routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "API_ROUTE")
 			if err != nil {
 				return nil, err
 			}
@@ -622,7 +622,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	var allSymbols []*metadata.Symbol
 	seenID := make(map[string]bool)
 	for _, q := range queries {
-		symbols, err := meta.ListSymbolsInTestFiles(ctx, q.lang, q.kind)
+		symbols, err := meta.ListSymbolsInTestFiles(ctx, opts.RepoID, q.lang, q.kind)
 		if err != nil {
 			return nil, err
 		}
@@ -645,7 +645,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 				if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
 					return nil
 				}
-				f, err := meta.GetFile(gctx, sym.File)
+				f, err := meta.GetFile(gctx, opts.RepoID, sym.File)
 				if err != nil || f == nil {
 					return nil
 				}
@@ -656,7 +656,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 					gap.Reason = "business-critical e2e coverage"
 					gap.Priority += 30
 				}
-				edgesToRaw, _ := meta.GetEdgesTo(gctx, sym.ID)
+				edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
 				edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
 				if len(edgesToCentrality) >= 2 {
 					gap.Priority += len(edgesToCentrality)
@@ -692,7 +692,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 				}
 			}
 			for _, l := range langs {
-				pages, err := meta.ListSymbolsInNonTestFiles(ctx, l, "PAGE_ROUTE")
+				pages, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
 				if err != nil {
 					return nil, err
 				}
@@ -709,7 +709,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 					if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
 						continue
 					}
-					f, err := meta.GetFile(ctx, sym.File)
+					f, err := meta.GetFile(ctx, opts.RepoID, sym.File)
 					if err != nil || f == nil {
 						continue
 					}
@@ -722,7 +722,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 						gap.Reason = "business-critical UI route — add or extend E2E coverage"
 						gap.Priority += 30
 					}
-					edgesToRaw, _ := meta.GetEdgesTo(ctx, sym.ID)
+					edgesToRaw, _ := meta.GetEdgesTo(ctx, opts.RepoID, sym.ID)
 					edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
 					if len(edgesToCentrality) >= 2 && gap.Kind == GapNoTests {
 						gap.Kind = GapLowCoverageCentral
@@ -852,22 +852,22 @@ func CreateE2ETestPlan(ctx context.Context, gapMeta GapMetaReader, retrievalMeta
 			}
 			wl := strings.ToLower(strings.TrimSpace(opts.Lang))
 			if wl == "csharp" || wl == "cs" {
-				routes, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, "csharp", "API_ROUTE")
+				routes, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "csharp", "API_ROUTE")
 				fields["indexed_csharp_api_route_count"] = len(routes)
-				if specs, err := gapMeta.ListSymbolsInTestFiles(ctx, "csharp", "E2E_SPEC"); err == nil {
+				if specs, err := gapMeta.ListSymbolsInTestFiles(ctx, opts.RepoID, "csharp", "E2E_SPEC"); err == nil {
 					fields["indexed_csharp_e2e_spec_count"] = len(specs)
 				}
 			}
 			if wl == "javascript" || wl == "typescript" || wl == "js" || wl == "ts" {
 				pr := 0
 				for _, l := range []string{"typescript", "javascript"} {
-					syms, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, l, "PAGE_ROUTE")
+					syms, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
 					pr += len(syms)
 				}
 				fields["indexed_page_route_non_test_count"] = pr
 				e2eN := 0
 				for _, l := range []string{"typescript", "javascript"} {
-					syms, _ := gapMeta.ListSymbolsInTestFiles(ctx, l, "E2E_SPEC")
+					syms, _ := gapMeta.ListSymbolsInTestFiles(ctx, opts.RepoID, l, "E2E_SPEC")
 					e2eN += len(syms)
 				}
 				fields["indexed_e2e_spec_count"] = e2eN

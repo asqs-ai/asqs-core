@@ -332,7 +332,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		go func() {
 			defer overviewWG.Done()
 			fmt.Fprintln(os.Stderr, "asqs-core: generating overview documentation (in parallel)…")
-			overviewContent, overviewPath, overviewErr = og.Generate(ctx, meta, lang, repoAbs, cfg.Indexer.OverviewMaxFilesPerSlice, cfg.Indexer.OverviewMaxIndexRunesPerSlice)
+			overviewContent, overviewPath, overviewErr = og.Generate(ctx, meta, opts.RepoID, lang, repoAbs, cfg.Indexer.OverviewMaxFilesPerSlice, cfg.Indexer.OverviewMaxIndexRunesPerSlice)
 		}()
 	}
 

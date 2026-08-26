@@ -22,40 +22,40 @@ type mockMetaReaderForRetrieve struct {
 
 // ListSymbolsByTypeSimpleName makes the mock satisfy typeSimpleNameResolver so the cross-package
 // resolution fallback can be unit-tested.
-func (m *mockMetaReaderForRetrieve) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*metadata.Symbol, error) {
+func (m *mockMetaReaderForRetrieve) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleName string, limit int) ([]*metadata.Symbol, error) {
 	if m.bySimpleName == nil {
 		return nil, nil
 	}
 	return m.bySimpleName[simpleName], nil
 }
 
-func (m *mockMetaReaderForRetrieve) GetSymbolByID(ctx context.Context, id string) (*metadata.Symbol, error) {
+func (m *mockMetaReaderForRetrieve) GetSymbolByID(ctx context.Context, repoID, id string) (*metadata.Symbol, error) {
 	return m.symbols[id], nil
 }
 
-func (m *mockMetaReaderForRetrieve) ListSymbolsByFile(ctx context.Context, file string) ([]*metadata.Symbol, error) {
+func (m *mockMetaReaderForRetrieve) ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*metadata.Symbol, error) {
 	return m.byFile[file], nil
 }
 
-func (m *mockMetaReaderForRetrieve) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*metadata.Edge, error) {
+func (m *mockMetaReaderForRetrieve) GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*metadata.Edge, error) {
 	return m.edgesFrom[callerSymbolID], nil
 }
 
-func (m *mockMetaReaderForRetrieve) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*metadata.Edge, error) {
+func (m *mockMetaReaderForRetrieve) GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*metadata.Edge, error) {
 	if m.edgesTo == nil {
 		return nil, nil
 	}
 	return m.edgesTo[calleeSymbolID], nil
 }
 
-func (m *mockMetaReaderForRetrieve) GetFile(ctx context.Context, file string) (*metadata.File, error) {
+func (m *mockMetaReaderForRetrieve) GetFile(ctx context.Context, repoID, file string) (*metadata.File, error) {
 	if m.files == nil {
 		return nil, nil
 	}
 	return m.files[file], nil
 }
 
-func (m *mockMetaReaderForRetrieve) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error) {
+func (m *mockMetaReaderForRetrieve) ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error) {
 	if m.byFQName == nil {
 		return nil, nil
 	}
@@ -73,16 +73,16 @@ func TestResolveTypeNameToSymbols_CrossPackageFallback(t *testing.T) {
 	}
 	// Caller lives in com.example.api → same-package guess (com.example.api.Order) misses; the
 	// repo-wide simple-name fallback resolves it.
-	got := resolveTypeNameToSymbols(context.Background(), m, "Order", "com.example.api")
+	got := resolveTypeNameToSymbols(context.Background(), m, "", "Order", "com.example.api")
 	if len(got) != 1 || got[0].ID != "s_order" {
 		t.Fatalf("cross-package resolve: want [s_order], got %+v", got)
 	}
 	// Fully-qualified name resolves directly.
-	if got := resolveTypeNameToSymbols(context.Background(), m, "com.example.model.Order", "com.example.api"); len(got) != 1 {
+	if got := resolveTypeNameToSymbols(context.Background(), m, "", "com.example.model.Order", "com.example.api"); len(got) != 1 {
 		t.Fatalf("qualified resolve failed: %+v", got)
 	}
 	// Unknown type resolves to nothing (not a false positive).
-	if got := resolveTypeNameToSymbols(context.Background(), m, "Nonexistent", "com.example.api"); got != nil {
+	if got := resolveTypeNameToSymbols(context.Background(), m, "", "Nonexistent", "com.example.api"); got != nil {
 		t.Fatalf("unknown type should be nil, got %+v", got)
 	}
 }
@@ -91,7 +91,7 @@ func TestResolveTypeNameToSymbols_CrossPackageFallback(t *testing.T) {
 // optional resolver must not panic and simply returns nothing for an unresolved name.
 func TestResolveTypeNameToSymbols_NoFallbackWhenUnsupported(t *testing.T) {
 	var meta MetaReader = &minimalMetaReader{}
-	if got := resolveTypeNameToSymbols(context.Background(), meta, "Order", "com.example.api"); got != nil {
+	if got := resolveTypeNameToSymbols(context.Background(), meta, "", "Order", "com.example.api"); got != nil {
 		t.Fatalf("want nil without resolver capability, got %+v", got)
 	}
 }
@@ -110,7 +110,7 @@ func TestReferencedTypeNames_GathersAllSourcesInPriorityOrder(t *testing.T) {
 	}
 	m := &mockMetaReaderForRetrieve{byFile: map[string][]*metadata.Symbol{"api/OrderResponse.java": {cls, field, target}}}
 	body := &embeddings.Chunk{Content: "return new OrderResponse(order.getId(), Status.OK);"}
-	got := referencedTypeNames(context.Background(), m, target, &SymbolChunk{Symbol: cls}, body)
+	got := referencedTypeNames(context.Background(), m, "", target, &SymbolChunk{Symbol: cls}, body)
 
 	idx := func(s string) int {
 		for i, v := range got {
@@ -176,7 +176,7 @@ func TestReferencedTypeNames_CollaboratorFromClassChunk(t *testing.T) {
 	field := &metadata.Symbol{ID: "f", Kind: "field", FQName: "com.example.api.OrderController#orderService", File: "api/OrderController.java", StartLine: 3, EndLine: 3}
 	m := &mockMetaReaderForRetrieve{byFile: map[string][]*metadata.Symbol{"api/OrderController.java": {cls, field, target}}}
 	classChunk := &embeddings.Chunk{Content: "public class OrderController {\n  private final OrderService orderService;\n  public OrderController(OrderService orderService) { this.orderService = orderService; }\n}"}
-	got := referencedTypeNames(context.Background(), m, target, &SymbolChunk{Symbol: cls, Chunk: classChunk}, nil)
+	got := referencedTypeNames(context.Background(), m, "", target, &SymbolChunk{Symbol: cls, Chunk: classChunk}, nil)
 	found := false
 	for _, n := range got {
 		if n == "OrderService" {
@@ -205,19 +205,21 @@ func TestIsLikelyCollaborator(t *testing.T) {
 // minimalMetaReader implements MetaReader but NOT typeSimpleNameResolver.
 type minimalMetaReader struct{}
 
-func (minimalMetaReader) GetSymbolByID(context.Context, string) (*metadata.Symbol, error) {
+func (minimalMetaReader) GetSymbolByID(context.Context, string, string) (*metadata.Symbol, error) {
 	return nil, nil
 }
-func (minimalMetaReader) ListSymbolsByFile(context.Context, string) ([]*metadata.Symbol, error) {
+func (minimalMetaReader) ListSymbolsByFile(context.Context, string, string) ([]*metadata.Symbol, error) {
 	return nil, nil
 }
-func (minimalMetaReader) GetEdgesFrom(context.Context, string) ([]*metadata.Edge, error) {
+func (minimalMetaReader) GetEdgesFrom(context.Context, string, string) ([]*metadata.Edge, error) {
 	return nil, nil
 }
-func (minimalMetaReader) GetEdgesTo(context.Context, string) ([]*metadata.Edge, error) {
+func (minimalMetaReader) GetEdgesTo(context.Context, string, string) ([]*metadata.Edge, error) {
 	return nil, nil
 }
-func (minimalMetaReader) GetFile(context.Context, string) (*metadata.File, error) { return nil, nil }
-func (minimalMetaReader) ListSymbolsByFQName(context.Context, string) ([]*metadata.Symbol, error) {
+func (minimalMetaReader) GetFile(context.Context, string, string) (*metadata.File, error) {
+	return nil, nil
+}
+func (minimalMetaReader) ListSymbolsByFQName(context.Context, string, string) ([]*metadata.Symbol, error) {
 	return nil, nil
 }

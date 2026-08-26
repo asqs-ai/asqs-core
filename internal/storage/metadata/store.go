@@ -144,8 +144,8 @@ func truncate(s string, n int) string {
 // InsertSymbol inserts a symbol and returns its generated ID.
 func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err error) {
 	query := `
-		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, repo_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		RETURNING id`
 	var sig *[]byte
 	if len(sym.SignatureJSON) > 0 {
@@ -159,35 +159,63 @@ func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err e
 		endCol = *sym.EndColumn
 	}
 	err = s.db.QueryRow(ctx, query,
-		sym.Lang, sym.Kind, sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig,
+		sym.Lang, sym.Kind, sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig, sym.RepoID,
 	).Scan(&id)
 	return id, err
 }
 
-// DeleteSymbolsByFile deletes all symbols (and their edges via cascade) for the given file. Use before reindexing.
-func (s *Store) DeleteSymbolsByFile(ctx context.Context, file string) (deleted int64, err error) {
-	res, err := s.db.Exec(ctx, "DELETE FROM symbols WHERE file = $1", file)
+// DeleteSymbolsByFile deletes the repository's symbols (and their edges via cascade) for the given
+// file. Use before reindexing. The repo_id predicate is what keeps two repositories sharing a
+// relative path — `pom.xml`, `package.json` — from stripping each other's rows mid-run.
+func (s *Store) DeleteSymbolsByFile(ctx context.Context, repoID, file string) (deleted int64, err error) {
+	res, err := s.db.Exec(ctx, "DELETE FROM symbols WHERE file = $1 AND repo_id = $2",
+		file, strings.TrimSpace(repoID))
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected(), nil
 }
 
-// DeleteFile deletes the file row. Call after DeleteSymbolsByFile when removing a file from the index.
-func (s *Store) DeleteFile(ctx context.Context, file string) error {
-	_, err := s.db.Exec(ctx, "DELETE FROM files WHERE file = $1", file)
-	return err
+// DeleteFile removes the repository's `files` row for a path. Call after DeleteSymbolsByFile when
+// removing a file from the index.
+//
+// This ran as `DELETE FROM files WHERE file = $1` — no repo predicate — while the cross-repo fix
+// scoped the symbol and chunk deletes around it. So repos A and B both indexed, both containing
+// `package.json`; B's tree drops it; B's run deletes B's chunks and symbols correctly and then
+// deletes A's `files` row. A's symbols and chunks survive but lose their `files` join, and with it
+// `is_test`, `lang`, `module` and `sha`: MaterializeTestsSourceEdges INNER JOINs `files` and drops
+// those symbols, GetFile returns nil in the retrieve path, and A's next DetectChanges reclassifies
+// the path as new.
+//
+// `files` now carries its own repo_id and is keyed (repo_id, file), so ownership is a column
+// predicate rather than an inference. An empty repoID still matches the empty repo_id exactly,
+// never as a wildcard, so an unscoped run cannot delete a scoped repository's row.
+//
+// Returns whether the row was actually removed, so a caller can report retained rows rather than
+// silently believing it cleaned up.
+func (s *Store) DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error) {
+	res, err := s.db.Exec(ctx, `DELETE FROM files WHERE repo_id = $2 AND file = $1`,
+		file, strings.TrimSpace(repoID))
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected() > 0, nil
 }
 
-// GetSymbolByID returns the symbol with the given ID, or nil if not found.
-func (s *Store) GetSymbolByID(ctx context.Context, id string) (*Symbol, error) {
+// GetSymbolByID returns a symbol by primary key, scoped to repoID, or nil if not found.
+//
+// The id is a UUID and therefore already unique across repositories, so the repo_id predicate is
+// not needed for correctness of the LOOKUP — it is needed because the id itself can arrive from
+// outside. Passing an empty repoID is a programming error and returns nothing rather than
+// everything.
+func (s *Store) GetSymbolByID(ctx context.Context, repoID, id string) (*Symbol, error) {
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE id = $1`
+		FROM symbols WHERE id = $1 AND repo_id = $2`
 	var sym Symbol
 	var sig sql.Null[[]byte]
 	var startCol, endCol sql.NullInt32
-	err := s.db.QueryRow(ctx, query, id).Scan(
+	err := s.db.QueryRow(ctx, query, id, repoID).Scan(
 		&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 		&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
 	)
@@ -205,11 +233,11 @@ func (s *Store) GetSymbolByID(ctx context.Context, id string) (*Symbol, error) {
 }
 
 // ListSymbolsByFile returns all symbols in the given file, ordered by start_line.
-func (s *Store) ListSymbolsByFile(ctx context.Context, file string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*Symbol, error) {
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE file = $1 ORDER BY start_line`
-	rows, err := s.db.Query(ctx, query, file)
+		FROM symbols WHERE repo_id = $1 AND file = $2 ORDER BY start_line`
+	rows, err := s.db.Query(ctx, query, repoID, file)
 	if err != nil {
 		return nil, err
 	}
@@ -218,7 +246,7 @@ func (s *Store) ListSymbolsByFile(ctx context.Context, file string) ([]*Symbol, 
 }
 
 // ListSymbolsByFQSubstring returns symbols whose fq_name contains needle (case-insensitive), ordered by fq_name, capped.
-func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, limit int) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, repoID, needle string, limit int) ([]*Symbol, error) {
 	if limit < 1 {
 		limit = 50
 	}
@@ -232,10 +260,10 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, lim
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 		FROM symbols
-		WHERE strpos(lower(fq_name), lower($1)) > 0
+		WHERE repo_id = $3 AND strpos(lower(fq_name), lower($1)) > 0
 		ORDER BY fq_name
 		LIMIT $2`
-	rows, err := s.db.Query(ctx, query, needle, limit)
+	rows, err := s.db.Query(ctx, query, needle, limit, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -244,11 +272,11 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, lim
 }
 
 // ListSymbolsByFQName returns all symbols with the given fully qualified name (may be multiple overloads/locations).
-func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*Symbol, error) {
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE fq_name = $1 ORDER BY file, start_line`
-	rows, err := s.db.Query(ctx, query, fqName)
+		FROM symbols WHERE repo_id = $1 AND fq_name = $2 ORDER BY file, start_line`
+	rows, err := s.db.Query(ctx, query, repoID, fqName)
 	if err != nil {
 		return nil, err
 	}
@@ -262,7 +290,7 @@ func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symb
 // anchored at the package separator ('.') so "Order" does NOT match "OrderController" or
 // "PurchaseOrder". Used by retrieval to resolve cross-package param/return/field types into domain
 // models + collaborators (the prior `<module>.<name>` guess only found same-package types). Capped.
-func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleName string, limit int) ([]*Symbol, error) {
 	simpleName = strings.TrimSpace(simpleName)
 	if simpleName == "" {
 		return nil, nil
@@ -276,11 +304,12 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName stri
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
 		FROM symbols
-		WHERE lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
+		WHERE repo_id = $3
+		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
 		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`
-	rows, err := s.db.Query(ctx, query, simpleName, limit)
+	rows, err := s.db.Query(ctx, query, simpleName, limit, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -289,12 +318,12 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName stri
 }
 
 // ListSymbolsByLang returns symbols for the given language, optionally filtered by kind.
-func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByLang(ctx context.Context, repoID, lang string, kind string) ([]*Symbol, error) {
 	if kind != "" {
 		query := `
 			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-			FROM symbols WHERE lang = $1 AND kind = $2 ORDER BY file, start_line`
-		rows, err := s.db.Query(ctx, query, lang, kind)
+			FROM symbols WHERE repo_id = $3 AND lang = $1 AND kind = $2 ORDER BY file, start_line`
+		rows, err := s.db.Query(ctx, query, lang, kind, repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -303,8 +332,8 @@ func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string)
 	}
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE lang = $1 ORDER BY file, start_line`
-	rows, err := s.db.Query(ctx, query, lang)
+		FROM symbols WHERE repo_id = $2 AND lang = $1 ORDER BY file, start_line`
+	rows, err := s.db.Query(ctx, query, lang, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -346,15 +375,18 @@ func scanSymbols(rows pgx.Rows) ([]*Symbol, error) {
 
 // ListSymbolsInNonTestFiles returns symbols of the given kind (e.g. "method") from files where is_test = false.
 // Used for test-gap analysis (find methods that may need tests).
-func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kind string) ([]*Symbol, error) {
+	// The join carries repo_id as well as file. Without it a symbol joins any repository's row for
+	// the same relative path, so `src/index.ts` being a test file in one repository hid the other
+	// repository's symbols from gap analysis entirely.
 	query := `
 		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
 		FROM symbols s
-		INNER JOIN files f ON s.file = f.file
-		WHERE f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
+		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
+		WHERE s.repo_id = $3 AND f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		  AND LOWER(s.file) NOT LIKE '%.d.ts'
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.Query(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, kind, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -363,14 +395,14 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string
 }
 
 // ListSymbolsInTestFiles returns symbols of the given kind from files where is_test = true (e.g. E2E specs).
-func (s *Store) ListSymbolsInTestFiles(ctx context.Context, lang, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind string) ([]*Symbol, error) {
 	query := `
 		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
 		FROM symbols s
-		INNER JOIN files f ON s.file = f.file
-		WHERE f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
+		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
+		WHERE s.repo_id = $3 AND f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.Query(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, kind, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -380,22 +412,27 @@ func (s *Store) ListSymbolsInTestFiles(ctx context.Context, lang, kind string) (
 
 // --- Edges ---
 
+// edgeInsertQuery writes an edge with its denormalized repo_id.
+//
+// ON CONFLICT DO UPDATE rather than DO NOTHING so a re-index repairs the repo_id of an edge written
+// before repository scoping, instead of silently keeping it unattributed forever.
+const edgeInsertQuery = `
+		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type, repo_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO UPDATE SET repo_id = EXCLUDED.repo_id`
+
 // InsertEdge inserts an edge. Idempotent if (caller, callee, type) already exists.
 func (s *Store) InsertEdge(ctx context.Context, e *Edge) error {
-	query := `
-		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO NOTHING`
-	_, err := s.db.Exec(ctx, query, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType)
+	_, err := s.db.Exec(ctx, edgeInsertQuery, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType, e.RepoID)
 	return err
 }
 
 // GetEdgesFrom returns all edges whose caller is the given symbol ID.
-func (s *Store) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*Edge, error) {
+func (s *Store) GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*Edge, error) {
 	query := `
-		SELECT caller_symbol_id, callee_symbol_id, edge_type
-		FROM edges WHERE caller_symbol_id = $1`
-	rows, err := s.db.Query(ctx, query, callerSymbolID)
+		SELECT caller_symbol_id, callee_symbol_id, edge_type, repo_id
+		FROM edges WHERE repo_id = $1 AND caller_symbol_id = $2`
+	rows, err := s.db.Query(ctx, query, repoID, callerSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -405,11 +442,11 @@ func (s *Store) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*Edg
 
 // GetEdgesTo returns all edges whose callee is the given symbol ID (inbound: who references this symbol).
 // Uses idx_edges_callee. Use for “who targets this route/DTO?” style expansion.
-func (s *Store) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*Edge, error) {
+func (s *Store) GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*Edge, error) {
 	query := `
-		SELECT caller_symbol_id, callee_symbol_id, edge_type
-		FROM edges WHERE callee_symbol_id = $1`
-	rows, err := s.db.Query(ctx, query, calleeSymbolID)
+		SELECT caller_symbol_id, callee_symbol_id, edge_type, repo_id
+		FROM edges WHERE repo_id = $1 AND callee_symbol_id = $2`
+	rows, err := s.db.Query(ctx, query, repoID, calleeSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -421,7 +458,7 @@ func scanEdges(rows pgx.Rows) ([]*Edge, error) {
 	var list []*Edge
 	for rows.Next() {
 		var e Edge
-		if err := rows.Scan(&e.CallerSymbolID, &e.CalleeSymbolID, &e.EdgeType); err != nil {
+		if err := rows.Scan(&e.CallerSymbolID, &e.CalleeSymbolID, &e.EdgeType, &e.RepoID); err != nil {
 			return nil, err
 		}
 		list = append(list, &e)
@@ -433,7 +470,7 @@ func scanEdges(rows pgx.Rows) ([]*Edge, error) {
 // If lang is empty, all languages are included (caller and callee always share the same lang on an edge).
 // If lang is non-empty, only edges whose symbols are that language (typical: workflow dominant lang).
 // Used to build a file-level dependency graph for the overview document.
-func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, error) {
+func (s *Store) ListEdgeFiles(ctx context.Context, repoID, lang string) ([]*EdgeFile, error) {
 	lang = strings.TrimSpace(lang)
 	var (
 		query string
@@ -446,16 +483,16 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
-		WHERE s1.lang = s2.lang`
-		rows, err = s.db.Query(ctx, query)
+		WHERE e.repo_id = $1 AND s1.repo_id = $1 AND s2.repo_id = $1 AND s1.lang = s2.lang`
+		rows, err = s.db.Query(ctx, query, repoID)
 	} else {
 		query = `
 		SELECT s1.file AS caller_file, s2.file AS callee_file, e.edge_type
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
-		WHERE s1.lang = $1 AND s2.lang = $1`
-		rows, err = s.db.Query(ctx, query, lang)
+		WHERE e.repo_id = $2 AND s1.repo_id = $2 AND s2.repo_id = $2 AND s1.lang = $1 AND s2.lang = $1`
+		rows, err = s.db.Query(ctx, query, lang, repoID)
 	}
 	if err != nil {
 		return nil, err
@@ -474,21 +511,27 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 
 // --- Files ---
 
-// UpsertFile inserts or updates a file row (by path).
+// UpsertFile inserts or updates a file row, keyed by (repo_id, file).
+//
+// The conflict target is the primary key as of the repo-scoping migration. On a database whose key
+// is still `file` alone this statement fails loudly with SQLSTATE 42P10 — which is the intended
+// failure mode: silently upserting under the old key is how one repository's SHA ended up
+// answering another repository's change detection. schema.sql moves the key itself (guarded DO
+// block), so any database that has been through InitSchema has the composite key.
 func (s *Store) UpsertFile(ctx context.Context, f *File) error {
 	query := `
-		INSERT INTO files (file, sha, lang, module, is_test)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (file) DO UPDATE SET sha = $2, lang = $3, module = $4, is_test = $5`
-	_, err := s.db.Exec(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest)
+		INSERT INTO files (file, sha, lang, module, is_test, repo_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (repo_id, file) DO UPDATE SET sha = $2, lang = $3, module = $4, is_test = $5`
+	_, err := s.db.Exec(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest, f.RepoID)
 	return err
 }
 
-// GetFile returns the file row for the given path, or nil if not found.
-func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
-	query := `SELECT file, sha, lang, module, is_test FROM files WHERE file = $1`
+// GetFile returns the file row for the given path within repoID, or nil if not found.
+func (s *Store) GetFile(ctx context.Context, repoID, file string) (*File, error) {
+	query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $1 AND file = $2`
 	var f File
-	err := s.db.QueryRow(ctx, query, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest)
+	err := s.db.QueryRow(ctx, query, repoID, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest, &f.RepoID)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -499,10 +542,10 @@ func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
 }
 
 // ListFiles returns all files, optionally filtered by lang and is_test.
-func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*File, error) {
+func (s *Store) ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*File, error) {
 	if lang != "" && isTest != nil {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 AND is_test = $2 ORDER BY file`
-		rows, err := s.db.Query(ctx, query, lang, *isTest)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $3 AND lang = $1 AND is_test = $2 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, lang, *isTest, repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -510,8 +553,8 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 		return scanFiles(rows)
 	}
 	if lang != "" {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 ORDER BY file`
-		rows, err := s.db.Query(ctx, query, lang)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $2 AND lang = $1 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, lang, repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -519,16 +562,16 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 		return scanFiles(rows)
 	}
 	if isTest != nil {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE is_test = $1 ORDER BY file`
-		rows, err := s.db.Query(ctx, query, *isTest)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $2 AND is_test = $1 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, *isTest, repoID)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
 		return scanFiles(rows)
 	}
-	query := `SELECT file, sha, lang, module, is_test FROM files ORDER BY file`
-	rows, err := s.db.Query(ctx, query)
+	query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $1 ORDER BY file`
+	rows, err := s.db.Query(ctx, query, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -540,7 +583,7 @@ func scanFiles(rows pgx.Rows) ([]*File, error) {
 	var list []*File
 	for rows.Next() {
 		var f File
-		if err := rows.Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest); err != nil {
+		if err := rows.Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest, &f.RepoID); err != nil {
 			return nil, err
 		}
 		list = append(list, &f)
@@ -728,23 +771,20 @@ func (s *Store) CountIndexRuns(ctx context.Context, repoID string) (int64, error
 	return n, err
 }
 
-// CountSymbols returns the total number of symbols currently stored across all repos. The
-// symbols table is intentionally repo-agnostic (see schema.sql) so the count is global. Used by
-// the indexer after a run finishes to populate IndexPhaseResult.SymbolsTotal so the
-// session_feedback "index_delta" payload reports e.g. "now 678 symbols" alongside the per-run
-// delta (A.7).
-func (s *Store) CountSymbols(ctx context.Context) (int64, error) {
+// CountSymbols returns the number of symbols stored for the repository. Used by the indexer after
+// a run finishes to populate IndexPhaseResult.SymbolsTotal so the session_feedback "index_delta"
+// payload reports e.g. "now 678 symbols" alongside the per-run delta (A.7).
+func (s *Store) CountSymbols(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM symbols`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE repo_id = $1`, repoID).Scan(&n)
 	return n, err
 }
 
-// CountEdges returns the total number of edges currently stored across all repos. As with
-// CountSymbols the edges table is repo-agnostic, so the count is global. Populates
+// CountEdges returns the number of edges stored for the repository. Populates
 // IndexPhaseResult.EdgesTotal (A.7).
-func (s *Store) CountEdges(ctx context.Context) (int64, error) {
+func (s *Store) CountEdges(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM edges WHERE repo_id = $1`, repoID).Scan(&n)
 	return n, err
 }
 
@@ -852,6 +892,28 @@ func (s *Store) ListAuditRunIDs(ctx context.Context, since, until *time.Time) ([
 			return nil, err
 		}
 		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ListSymbolFilesByRepo answers "which files does THIS repository have symbols for" — the
+// repo-scoped way for a reindex to list what to delete, where ListFiles used to enumerate the
+// whole database.
+func (s *Store) ListSymbolFilesByRepo(ctx context.Context, repoID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT file FROM symbols WHERE repo_id = $1 ORDER BY file`,
+		strings.TrimSpace(repoID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			return out, err
+		}
+		out = append(out, f)
 	}
 	return out, rows.Err()
 }

@@ -29,13 +29,13 @@ const materializeTestsSourceMaxAttempts = 3
 // reported "TESTS_SOURCE materialization failed: driver: bad connection" when a pooled
 // connection had been silently closed by the backend; retrying with a fresh transaction
 // recovers without affecting correctness.
-func (s *Store) MaterializeTestsSourceEdges(ctx context.Context) (int, error) {
+func (s *Store) MaterializeTestsSourceEdges(ctx context.Context, repoID string) (int, error) {
 	var (
 		n       int
 		lastErr error
 	)
 	for attempt := 1; attempt <= materializeTestsSourceMaxAttempts; attempt++ {
-		n, lastErr = s.materializeTestsSourceEdgesOnce(ctx)
+		n, lastErr = s.materializeTestsSourceEdgesOnce(ctx, repoID)
 		if lastErr == nil {
 			return n, nil
 		}
@@ -49,35 +49,39 @@ func (s *Store) MaterializeTestsSourceEdges(ctx context.Context) (int, error) {
 	return 0, fmt.Errorf("metadata: materialize TESTS_SOURCE after %d attempt(s): %w", materializeTestsSourceMaxAttempts, lastErr)
 }
 
-func (s *Store) materializeTestsSourceEdgesOnce(ctx context.Context) (inserted int, err error) {
+func (s *Store) materializeTestsSourceEdgesOnce(ctx context.Context, repoID string) (inserted int, err error) {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if _, err := tx.Exec(ctx, `DELETE FROM edges WHERE edge_type = $1`, EdgeTypeTestsSource); err != nil {
+	// Scoped. This DELETE was the one statement in the store with no repository predicate at all:
+	// indexing any repository wiped every repository's materialized trace links, and the next run
+	// of each of those repositories was the only thing that put them back.
+	if _, err := tx.Exec(ctx, `DELETE FROM edges WHERE edge_type = $1 AND repo_id = $2`, EdgeTypeTestsSource, repoID); err != nil {
 		return 0, fmt.Errorf("metadata: delete TESTS_SOURCE: %w", err)
 	}
 
 	// Call/import graph: test → production (same direction as "test references SUT").
 	q := `
-		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type)
-		SELECT DISTINCT e.caller_symbol_id, e.callee_symbol_id, $1
+		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type, repo_id)
+		SELECT DISTINCT e.caller_symbol_id, e.callee_symbol_id, $1, $2
 		FROM edges e
-		INNER JOIN symbols sc ON sc.id = e.caller_symbol_id
-		INNER JOIN symbols sv ON sv.id = e.callee_symbol_id
-		INNER JOIN files fc ON fc.file = sc.file
-		INNER JOIN files fv ON fv.file = sv.file
-		WHERE LOWER(e.edge_type) IN ('calls', 'imports')
+		INNER JOIN symbols sc ON sc.id = e.caller_symbol_id AND sc.repo_id = $2
+		INNER JOIN symbols sv ON sv.id = e.callee_symbol_id AND sv.repo_id = $2
+		INNER JOIN files fc ON fc.file = sc.file AND fc.repo_id = $2
+		INNER JOIN files fv ON fv.file = sv.file AND fv.repo_id = $2
+		WHERE e.repo_id = $2
+		  AND LOWER(e.edge_type) IN ('calls', 'imports')
 		  AND fc.is_test = TRUE
 		  AND fv.is_test = FALSE
 		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO NOTHING`
-	if _, err := tx.Exec(ctx, q, EdgeTypeTestsSource); err != nil {
+	if _, err := tx.Exec(ctx, q, EdgeTypeTestsSource, repoID); err != nil {
 		return 0, fmt.Errorf("metadata: insert TESTS_SOURCE from calls/imports: %w", err)
 	}
 
-	if err := insertTestsSourceFromNamingConvention(ctx, tx); err != nil {
+	if err := insertTestsSourceFromNamingConvention(ctx, tx, repoID); err != nil {
 		return 0, err
 	}
 
@@ -86,7 +90,7 @@ func (s *Store) materializeTestsSourceEdgesOnce(ctx context.Context) (inserted i
 	}
 
 	var n int
-	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::int FROM edges WHERE edge_type = $1`, EdgeTypeTestsSource).Scan(&n); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*)::int FROM edges WHERE edge_type = $1 AND repo_id = $2`, EdgeTypeTestsSource, repoID).Scan(&n); err != nil {
 		return 0, err
 	}
 	return n, nil
@@ -151,12 +155,12 @@ func isTransientConnError(err error) bool {
 	return false
 }
 
-func insertTestsSourceFromNamingConvention(ctx context.Context, tx pgx.Tx) error {
+func insertTestsSourceFromNamingConvention(ctx context.Context, tx pgx.Tx, repoID string) error {
 	rows, err := tx.Query(ctx, `
 		SELECT s.id, s.fq_name
 		FROM symbols s
-		INNER JOIN files f ON f.file = s.file
-		WHERE f.is_test = TRUE AND LOWER(s.kind) = 'class'`)
+		INNER JOIN files f ON f.file = s.file AND f.repo_id = s.repo_id
+		WHERE s.repo_id = $1 AND f.is_test = TRUE AND LOWER(s.kind) = 'class'`, repoID)
 	if err != nil {
 		return fmt.Errorf("metadata: list test classes: %w", err)
 	}
@@ -174,9 +178,9 @@ func insertTestsSourceFromNamingConvention(ctx context.Context, tx pgx.Tx) error
 		var sutID string
 		err := tx.QueryRow(ctx, `
 			SELECT s.id FROM symbols s
-			INNER JOIN files f ON f.file = s.file
-			WHERE s.fq_name = $1 AND LOWER(s.kind) = 'class' AND f.is_test = FALSE
-			LIMIT 1`, sutFQ).Scan(&sutID)
+			INNER JOIN files f ON f.file = s.file AND f.repo_id = s.repo_id
+			WHERE s.repo_id = $2 AND s.fq_name = $1 AND LOWER(s.kind) = 'class' AND f.is_test = FALSE
+			LIMIT 1`, sutFQ, repoID).Scan(&sutID)
 		if err != nil {
 			if err == pgx.ErrNoRows {
 				continue
@@ -184,10 +188,10 @@ func insertTestsSourceFromNamingConvention(ctx context.Context, tx pgx.Tx) error
 			return err
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type)
-			VALUES ($1, $2, $3)
+			INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type, repo_id)
+			VALUES ($1, $2, $3, $4)
 			ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO NOTHING`,
-			testClassID, sutID, EdgeTypeTestsSource)
+			testClassID, sutID, EdgeTypeTestsSource, repoID)
 		if err != nil {
 			return err
 		}

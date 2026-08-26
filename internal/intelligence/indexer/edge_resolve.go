@@ -95,12 +95,12 @@ func hintFileSet(hintFiles []string) map[string]struct{} {
 
 // resolveSymbolIDForFQName picks a symbol row when ListSymbolsByFQName returns multiple matches.
 // hintFiles should include the current source file and paths inferred from IMPORTS (MODULE) edges.
-func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, fqName string, hintFiles []string, preferLang string) (id string, ambiguous bool) {
+func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, repoID, fqName string, hintFiles []string, preferLang string) (id string, ambiguous bool) {
 	fqName = strings.TrimSpace(fqName)
 	if fqName == "" || meta == nil {
 		return "", false
 	}
-	syms, err := meta.ListSymbolsByFQName(ctx, fqName)
+	syms, err := meta.ListSymbolsByFQName(ctx, repoID, fqName)
 	if err != nil || len(syms) == 0 {
 		return "", false
 	}
@@ -143,7 +143,7 @@ func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, fqName s
 
 // resolveCSharpImportCalleeID maps a using-namespace string to an existing symbol id (TYPE, MODULE, …)
 // by trimming suffixes, similar to resolveJavaImportCalleeID.
-func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, symbolIDByFQName, fqNameToID map[string]string, raw string) string {
+func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, repoID string, symbolIDByFQName, fqNameToID map[string]string, raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return ""
@@ -155,7 +155,7 @@ func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, symbo
 		if id := fqNameToID[cur]; id != "" {
 			return id
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, cur); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, cur); len(syms) > 0 {
 			return syms[0].ID
 		}
 		i := strings.LastIndex(cur, ".")

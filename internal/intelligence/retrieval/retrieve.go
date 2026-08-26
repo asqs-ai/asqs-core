@@ -22,12 +22,12 @@ const (
 
 // MetaReader is the subset of metadata needed for symbol-aware retrieval.
 type MetaReader interface {
-	GetSymbolByID(ctx context.Context, id string) (*metadata.Symbol, error)
-	ListSymbolsByFile(ctx context.Context, file string) ([]*metadata.Symbol, error)
-	GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*metadata.Edge, error)
-	GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*metadata.Edge, error)
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
+	GetSymbolByID(ctx context.Context, repoID, id string) (*metadata.Symbol, error)
+	ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*metadata.Symbol, error)
+	GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*metadata.Edge, error)
+	GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*metadata.Edge, error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
 }
 
 // ChunkReader is the subset of embeddings store for listing chunks by symbol/file/repo/type.
@@ -64,14 +64,14 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	out := &RetrievalContext{}
 
 	// Target method + class
-	targetSym, err := meta.GetSymbolByID(ctx, req.SymbolID)
+	targetSym, err := meta.GetSymbolByID(ctx, req.RepoID, req.SymbolID)
 	if err != nil || targetSym == nil {
 		return nil, err
 	}
 	methodChunk := chunkForSymbol(ctx, chunks, req.SymbolID, req.RepoID)
 	out.TargetMethod = &SymbolChunk{Symbol: targetSym, Chunk: methodChunk}
 
-	containerSym := enclosingContainer(ctx, meta, targetSym)
+	containerSym := enclosingContainer(ctx, meta, req.RepoID, targetSym)
 	if containerSym != nil {
 		var classChunk *embeddings.Chunk
 		if containerSym.ID != targetSym.ID {
@@ -98,7 +98,7 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	// class's field declarations (= injected collaborators to mock), and the method body — then
 	// resolve each to a repo symbol. Resolution is cross-package: the prior `<module>.<name>` guess
 	// only found same-package types, so cross-package domain types (the common case) never resolved.
-	f, _ := meta.GetFile(ctx, targetSym.File)
+	f, _ := meta.GetFile(ctx, req.RepoID, targetSym.File)
 	fileModule := ""
 	if f != nil {
 		fileModule = strings.TrimSpace(f.Module)
@@ -112,16 +112,16 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 		out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
 	}
 	// Same-file types first (cheap, certain).
-	fileSyms, _ := meta.ListSymbolsByFile(ctx, targetSym.File)
+	fileSyms, _ := meta.ListSymbolsByFile(ctx, req.RepoID, targetSym.File)
 	for _, s := range fileSyms {
 		addDomainModel(s)
 	}
 	// Referenced type names, highest-signal source first so the budget fills with the most relevant.
-	for _, typeName := range referencedTypeNames(ctx, meta, targetSym, out.TargetClass, methodChunk) {
+	for _, typeName := range referencedTypeNames(ctx, meta, req.RepoID, targetSym, out.TargetClass, methodChunk) {
 		if len(out.DomainModels) >= maxDomainModels {
 			break
 		}
-		for _, s := range resolveTypeNameToSymbols(ctx, meta, typeName, fileModule) {
+		for _, s := range resolveTypeNameToSymbols(ctx, meta, req.RepoID, typeName, fileModule) {
 			addDomainModel(s)
 		}
 	}
@@ -221,7 +221,7 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 	if max <= 0 {
 		max = 15
 	}
-	graph := collectGraphEdges(ctx, meta, targetID, profile, req.DependencyMaxDepth)
+	graph := collectGraphEdges(ctx, meta, req.RepoID, targetID, profile, req.DependencyMaxDepth)
 	seen := map[string]bool{targetID: true}
 	var out []*DependencyEdge
 
@@ -237,7 +237,7 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 		if ge.otherID == "" || seen[ge.otherID] {
 			return false
 		}
-		callee, _ := meta.GetSymbolByID(ctx, ge.otherID)
+		callee, _ := meta.GetSymbolByID(ctx, req.RepoID, ge.otherID)
 		if callee == nil {
 			return false
 		}
@@ -821,28 +821,28 @@ var commonNonDomainTypeNames = map[string]bool{
 // package are looked up repo-wide by their simple name. Kept optional so existing MetaReader fakes
 // in tests need no changes.
 type typeSimpleNameResolver interface {
-	ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*metadata.Symbol, error)
+	ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleName string, limit int) ([]*metadata.Symbol, error)
 }
 
 // resolveTypeNameToSymbols resolves a (possibly simple) type name to repo type symbols. Order:
 // exact FQ name → same-package guess (<fileModule>.<name>) → bare name → repo-wide simple-name
 // fallback (cross-package, optional capability). Returns the first non-empty match.
-func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fileModule string) []*metadata.Symbol {
+func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, repoID, typeName, fileModule string) []*metadata.Symbol {
 	typeName = strings.TrimSpace(typeName)
 	if typeName == "" {
 		return nil
 	}
 	if strings.Contains(typeName, ".") {
-		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, typeName); len(syms) > 0 {
 			return syms
 		}
 	} else {
 		if fileModule != "" {
-			if syms, _ := meta.ListSymbolsByFQName(ctx, fileModule+"."+typeName); len(syms) > 0 {
+			if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, fileModule+"."+typeName); len(syms) > 0 {
 				return syms
 			}
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, typeName); len(syms) > 0 {
 			return syms
 		}
 	}
@@ -851,7 +851,7 @@ func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fi
 		simple = simple[i+1:]
 	}
 	if r, ok := meta.(typeSimpleNameResolver); ok && simple != "" {
-		if syms, _ := r.ListSymbolsByTypeSimpleName(ctx, simple, maxDomainModels); len(syms) > 0 {
+		if syms, _ := r.ListSymbolsByTypeSimpleName(ctx, repoID, simple, maxDomainModels); len(syms) > 0 {
 			return syms
 		}
 	}
@@ -861,11 +861,11 @@ func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fi
 // fieldTypeNamesForContainer returns the declared field/property types of the enclosing class —
 // these are exactly the injected collaborators a unit test must mock. Scoped to the container's
 // line range so other types in the same file don't leak in.
-func fieldTypeNamesForContainer(ctx context.Context, meta MetaReader, classSym *metadata.Symbol) []string {
+func fieldTypeNamesForContainer(ctx context.Context, meta MetaReader, repoID string, classSym *metadata.Symbol) []string {
 	if classSym == nil {
 		return nil
 	}
-	syms, _ := meta.ListSymbolsByFile(ctx, classSym.File)
+	syms, _ := meta.ListSymbolsByFile(ctx, repoID, classSym.File)
 	var out []string
 	for _, s := range syms {
 		if s == nil {
@@ -964,7 +964,7 @@ func typeNamesFromCodeBody(content string) []string {
 // reliably carry the declared TYPE (observed for Java: only the constructor signature names the
 // injected collaborator). Reading the class chunk recovers constructor-injected / field-declared
 // collaborators (e.g. `private final OrderService orderService`) regardless of field-symbol metadata.
-func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metadata.Symbol, targetClass *SymbolChunk, methodChunk *embeddings.Chunk) []string {
+func referencedTypeNames(ctx context.Context, meta MetaReader, repoID string, targetSym *metadata.Symbol, targetClass *SymbolChunk, methodChunk *embeddings.Chunk) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(names []string) {
@@ -980,7 +980,7 @@ func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metada
 	add(typeNamesFromSignature(targetSym))
 	if targetClass != nil {
 		if targetClass.Symbol != nil {
-			add(fieldTypeNamesForContainer(ctx, meta, targetClass.Symbol))
+			add(fieldTypeNamesForContainer(ctx, meta, repoID, targetClass.Symbol))
 		}
 		if targetClass.Chunk != nil {
 			add(typeNamesFromCodeBody(targetClass.Chunk.Content))

@@ -564,9 +564,17 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 	return list, rows.Err()
 }
 
-// DeleteByFile removes all chunks for the given file (e.g. before re-indexing).
-func (s *Store) DeleteByFile(ctx context.Context, file string) (deleted int64, err error) {
-	res, err := s.pool.Exec(ctx, "DELETE FROM chunks WHERE file = $1", file)
+// DeleteByFile removes a file's chunks for ONE repository (e.g. before re-indexing that file).
+//
+// The repoID argument is load-bearing. This was `DELETE FROM chunks WHERE file = $1`, called by the
+// indexer once per changed or removed file, so indexing repo B deleted repo A's chunks for every
+// shared path.
+//
+// An empty repoID matches rows whose repo_id is empty — exactly, not as a wildcard — so an unscoped
+// run cannot delete a scoped repository's chunks.
+func (s *Store) DeleteByFile(ctx context.Context, repoID, file string) (deleted int64, err error) {
+	res, err := s.pool.Exec(ctx, "DELETE FROM chunks WHERE file = $1 AND repo_id = $2",
+		file, strings.TrimSpace(repoID))
 	if err != nil {
 		return 0, err
 	}

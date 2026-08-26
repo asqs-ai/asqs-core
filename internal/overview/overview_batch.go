@@ -52,13 +52,13 @@ func resolveOverviewMaxIndexRunesPerSlice(cfgVal int) (maxRunes int, enabled boo
 }
 
 // refineOverviewBatchesByIndexRunes subdivides file batches whose built index snapshot exceeds maxRunes.
-func refineOverviewBatchesByIndexRunes(ctx context.Context, meta overviewMetaReader, lang string, batches [][]string, maxRunes int) ([][]string, error) {
+func refineOverviewBatchesByIndexRunes(ctx context.Context, meta overviewMetaReader, repoID, lang string, batches [][]string, maxRunes int) ([][]string, error) {
 	if maxRunes <= 0 || len(batches) == 0 {
 		return batches, nil
 	}
 	var out [][]string
 	for _, b := range batches {
-		sub, err := splitFileBatchByIndexRunes(ctx, meta, lang, b, maxRunes)
+		sub, err := splitFileBatchByIndexRunes(ctx, meta, repoID, lang, b, maxRunes)
 		if err != nil {
 			return nil, err
 		}
@@ -67,11 +67,11 @@ func refineOverviewBatchesByIndexRunes(ctx context.Context, meta overviewMetaRea
 	return out, nil
 }
 
-func splitFileBatchByIndexRunes(ctx context.Context, meta overviewMetaReader, lang string, files []string, maxRunes int) ([][]string, error) {
+func splitFileBatchByIndexRunes(ctx context.Context, meta overviewMetaReader, repoID, lang string, files []string, maxRunes int) ([][]string, error) {
 	if len(files) == 0 {
 		return nil, nil
 	}
-	body, err := buildOverviewContextForSourceFiles(ctx, meta, lang, files)
+	body, err := buildOverviewContextForSourceFiles(ctx, meta, repoID, lang, files)
 	if err != nil {
 		return nil, err
 	}
@@ -86,11 +86,11 @@ func splitFileBatchByIndexRunes(ctx context.Context, meta overviewMetaReader, la
 	if mid < 1 {
 		mid = 1
 	}
-	left, err := splitFileBatchByIndexRunes(ctx, meta, lang, files[:mid], maxRunes)
+	left, err := splitFileBatchByIndexRunes(ctx, meta, repoID, lang, files[:mid], maxRunes)
 	if err != nil {
 		return nil, err
 	}
-	right, err := splitFileBatchByIndexRunes(ctx, meta, lang, files[mid:], maxRunes)
+	right, err := splitFileBatchByIndexRunes(ctx, meta, repoID, lang, files[mid:], maxRunes)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +99,7 @@ func splitFileBatchByIndexRunes(ctx context.Context, meta overviewMetaReader, la
 
 // partitionOverviewFileBatches returns disjoint batches of repo-relative source file paths (non-test, overview-eligible),
 // ordered by module name then path. Each batch has at most maxFilesPerSlice paths; large modules are split across batches.
-func partitionOverviewFileBatches(ctx context.Context, meta overviewMetaReader, lang string, maxFilesPerSlice int) ([][]string, error) {
+func partitionOverviewFileBatches(ctx context.Context, meta overviewMetaReader, repoID, lang string, maxFilesPerSlice int) ([][]string, error) {
 	if meta == nil {
 		return nil, fmt.Errorf("overview: Meta required")
 	}
@@ -110,7 +110,7 @@ func partitionOverviewFileBatches(ctx context.Context, meta overviewMetaReader, 
 	maxFilesPerSlice = resolveOverviewMaxFilesPerSlice(maxFilesPerSlice)
 
 	isTest := false
-	files, err := meta.ListFiles(ctx, lang, &isTest)
+	files, err := meta.ListFiles(ctx, repoID, lang, &isTest)
 	if err != nil {
 		return nil, err
 	}
@@ -183,6 +183,7 @@ Continue the **same** repository overview as a single coherent document: do not 
 // built index text exceeds overview_max_index_runes_per_slice (see resolveOverviewMaxIndexRunesPerSlice).
 // Incremental mode runs one short delta LLM call per batch (same contract as single-slice delta).
 func (g *LLMOverviewDocGenerator) GenerateOverviewWithMeta(ctx context.Context, meta overviewMetaReader, lang string, maxFilesPerSlice, maxIndexRunesPerSlice int, opts OverviewGenerateOpts) (content string, path string, stat OverviewLLMStats, err error) {
+	repoID := opts.RepoID
 	if g.LLM == nil {
 		return "", "", stat, fmt.Errorf("llm overview generator: ChatCompleter required")
 	}
@@ -194,14 +195,14 @@ func (g *LLMOverviewDocGenerator) GenerateOverviewWithMeta(ctx context.Context, 
 		outPath = DefaultOverviewPath
 	}
 
-	batches, err := partitionOverviewFileBatches(ctx, meta, lang, maxFilesPerSlice)
+	batches, err := partitionOverviewFileBatches(ctx, meta, repoID, lang, maxFilesPerSlice)
 	if err != nil {
 		return "", "", stat, err
 	}
 	indexRunesCap, indexCapOn := resolveOverviewMaxIndexRunesPerSlice(maxIndexRunesPerSlice)
 	if indexCapOn {
 		before := len(batches)
-		batches, err = refineOverviewBatchesByIndexRunes(ctx, meta, lang, batches, indexRunesCap)
+		batches, err = refineOverviewBatchesByIndexRunes(ctx, meta, repoID, lang, batches, indexRunesCap)
 		if err != nil {
 			return "", "", stat, err
 		}
@@ -230,17 +231,17 @@ func (g *LLMOverviewDocGenerator) GenerateOverviewWithMeta(ctx context.Context, 
 	if incremental && len(existingOnDisk) > 0 {
 		narrative, _ := SplitOverviewNarrativeAndVisuals(string(existingOnDisk))
 		if strings.TrimSpace(narrative) != "" {
-			return g.generateOverviewIncrementalBatched(ctx, meta, lang, batches, narrative, outPath, &stat, indexRunesCap, indexCapOn)
+			return g.generateOverviewIncrementalBatched(ctx, meta, repoID, lang, batches, narrative, outPath, &stat, indexRunesCap, indexCapOn)
 		}
 		fmt.Fprintln(os.Stderr, "[asqs-overview] batched: incremental skipped (no narrative after split); using full batched narrative")
 	} else if incremental && len(existingOnDisk) == 0 {
 		fmt.Fprintln(os.Stderr, "[asqs-overview] batched: incremental skipped (no readable overview on disk); using full batched narrative")
 	}
 
-	return g.generateOverviewFullBatched(ctx, meta, lang, batches, outPath, &stat, indexRunesCap, indexCapOn)
+	return g.generateOverviewFullBatched(ctx, meta, repoID, lang, batches, outPath, &stat, indexRunesCap, indexCapOn)
 }
 
-func (g *LLMOverviewDocGenerator) generateOverviewFullBatched(ctx context.Context, meta overviewMetaReader, lang string, batches [][]string, outPath string, stat *OverviewLLMStats, indexBodyMaxRunes int, indexCapOn bool) (content string, path string, outStat OverviewLLMStats, err error) {
+func (g *LLMOverviewDocGenerator) generateOverviewFullBatched(ctx context.Context, meta overviewMetaReader, repoID, lang string, batches [][]string, outPath string, stat *OverviewLLMStats, indexBodyMaxRunes int, indexCapOn bool) (content string, path string, outStat OverviewLLMStats, err error) {
 	maxTok := 8192
 	if g.MaxCompletionTokensFull > 0 {
 		maxTok = g.MaxCompletionTokensFull
@@ -260,7 +261,7 @@ func (g *LLMOverviewDocGenerator) generateOverviewFullBatched(ctx context.Contex
 			case <-time.After(overviewInterSliceCooldown):
 			}
 		}
-		frag, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, lang, i, len(batches), files, i == 0, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, 0, stat)
+		frag, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, repoID, lang, i, len(batches), files, i == 0, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, 0, stat)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[asqs-overview] batched full slice %d Complete failed: %v\n", i+1, err)
 			return "", "", *stat, err
@@ -304,7 +305,7 @@ func overviewFullBatchedMessages(baseSystem string, logicalIndex, logicalTotal i
 func (g *LLMOverviewDocGenerator) completeOverviewFullSliceWithEOFResplit(
 	ctx context.Context,
 	meta overviewMetaReader,
-	lang string,
+	repoID, lang string,
 	logicalIndex, logicalTotal int,
 	files []string,
 	allowTopLevelHash bool,
@@ -318,7 +319,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewFullSliceWithEOFResplit(
 	if splitDepth > overviewMaxEOFResplitDepth {
 		return "", fmt.Errorf("overview: batched full EOF resplit exceeded max depth %d", overviewMaxEOFResplitDepth)
 	}
-	body, err := buildOverviewContextForSourceFiles(ctx, meta, lang, files)
+	body, err := buildOverviewContextForSourceFiles(ctx, meta, repoID, lang, files)
 	if err != nil {
 		return "", err
 	}
@@ -357,7 +358,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewFullSliceWithEOFResplit(
 		logicalIndex+1, logicalTotal, len(files), mid, len(files)-mid, splitDepth, err)
 	leftFiles := files[:mid]
 	rightFiles := files[mid:]
-	left, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, lang, logicalIndex, logicalTotal, leftFiles, allowTopLevelHash, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
+	left, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, repoID, lang, logicalIndex, logicalTotal, leftFiles, allowTopLevelHash, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
 	if err != nil {
 		return "", err
 	}
@@ -368,7 +369,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewFullSliceWithEOFResplit(
 		case <-time.After(overviewEOFResplitSiblingPause):
 		}
 	}
-	right, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, lang, logicalIndex, logicalTotal, rightFiles, false, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
+	right, err := g.completeOverviewFullSliceWithEOFResplit(ctx, meta, repoID, lang, logicalIndex, logicalTotal, rightFiles, false, baseSystem, maxTok, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
 	if err != nil {
 		return "", err
 	}
@@ -396,7 +397,7 @@ func normalizeIncrementalDeltaContent(raw string) string {
 func (g *LLMOverviewDocGenerator) completeOverviewIncrementalSliceWithEOFResplit(
 	ctx context.Context,
 	meta overviewMetaReader,
-	lang string,
+	repoID, lang string,
 	logicalIndex, logicalTotal int,
 	files []string,
 	narrative, system, today string,
@@ -408,7 +409,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewIncrementalSliceWithEOFResplit
 	if splitDepth > overviewMaxEOFResplitDepth {
 		return "", fmt.Errorf("overview: batched incremental EOF resplit exceeded max depth %d", overviewMaxEOFResplitDepth)
 	}
-	body, err := buildOverviewContextForSourceFiles(ctx, meta, lang, files)
+	body, err := buildOverviewContextForSourceFiles(ctx, meta, repoID, lang, files)
 	if err != nil {
 		return "", err
 	}
@@ -451,7 +452,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewIncrementalSliceWithEOFResplit
 		logicalIndex+1, logicalTotal, len(files), mid, len(files)-mid, splitDepth, err)
 	leftFiles := files[:mid]
 	rightFiles := files[mid:]
-	left, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, lang, logicalIndex, logicalTotal, leftFiles, narrative, system, today, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
+	left, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, repoID, lang, logicalIndex, logicalTotal, leftFiles, narrative, system, today, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
 	if err != nil {
 		return "", err
 	}
@@ -462,7 +463,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewIncrementalSliceWithEOFResplit
 		case <-time.After(overviewEOFResplitSiblingPause):
 		}
 	}
-	right, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, lang, logicalIndex, logicalTotal, rightFiles, narrative, system, today, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
+	right, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, repoID, lang, logicalIndex, logicalTotal, rightFiles, narrative, system, today, indexBodyMaxRunes, indexCapOn, splitDepth+1, stat)
 	if err != nil {
 		return "", err
 	}
@@ -476,7 +477,7 @@ func (g *LLMOverviewDocGenerator) completeOverviewIncrementalSliceWithEOFResplit
 	return strings.Join(parts, "\n\n"), nil
 }
 
-func (g *LLMOverviewDocGenerator) generateOverviewIncrementalBatched(ctx context.Context, meta overviewMetaReader, lang string, batches [][]string, narrative, outPath string, stat *OverviewLLMStats, indexBodyMaxRunes int, indexCapOn bool) (content string, path string, outStat OverviewLLMStats, err error) {
+func (g *LLMOverviewDocGenerator) generateOverviewIncrementalBatched(ctx context.Context, meta overviewMetaReader, repoID, lang string, batches [][]string, narrative, outPath string, stat *OverviewLLMStats, indexBodyMaxRunes int, indexCapOn bool) (content string, path string, outStat OverviewLLMStats, err error) {
 	system := strings.TrimSpace(g.DeltaPrompt)
 	if system == "" {
 		system = defaultOverviewDeltaPrompt
@@ -493,7 +494,7 @@ func (g *LLMOverviewDocGenerator) generateOverviewIncrementalBatched(ctx context
 			case <-time.After(overviewInterSliceCooldown):
 			}
 		}
-		delta, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, lang, i, len(batches), files, narrative, system, today, indexBodyMaxRunes, indexCapOn, 0, stat)
+		delta, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, meta, repoID, lang, i, len(batches), files, narrative, system, today, indexBodyMaxRunes, indexCapOn, 0, stat)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[asqs-overview] batched incremental slice %d Complete failed: %v\n", i+1, err)
 			return "", "", *stat, err

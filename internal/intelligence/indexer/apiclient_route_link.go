@@ -11,7 +11,7 @@ import (
 // matching API_CLIENT_REQUEST and API_ROUTE symbols by HTTP method + path (fq_name encoding).
 // Uses fqNameToID from the current run so ordering of files does not matter; symbols from
 // earlier runs are not considered unless their fq_name is still present in fqNameToID (re-index).
-func LinkAPIClientRequestsToRoutes(ctx context.Context, meta MetadataWriter, fqNameToID map[string]string) int {
+func LinkAPIClientRequestsToRoutes(ctx context.Context, meta MetadataWriter, repoID string, fqNameToID map[string]string) int {
 	routesByKey := make(map[string][]string)
 	for fq := range fqNameToID {
 		if !strings.HasPrefix(fq, "API_ROUTE:") {
@@ -45,7 +45,7 @@ func LinkAPIClientRequestsToRoutes(ctx context.Context, meta MetadataWriter, fqN
 			}
 			calleeID := fqNameToID[routeFQ]
 			if calleeID == "" {
-				syms, _ := meta.ListSymbolsByFQName(ctx, routeFQ)
+				syms, _ := meta.ListSymbolsByFQName(ctx, repoID, routeFQ)
 				if len(syms) > 0 {
 					calleeID = syms[0].ID
 				}

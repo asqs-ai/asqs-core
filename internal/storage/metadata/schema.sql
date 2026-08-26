@@ -7,12 +7,25 @@ CREATE TABLE IF NOT EXISTS symbols (
     file           TEXT NOT NULL,
     start_line     INTEGER NOT NULL,
     end_line       INTEGER NOT NULL,
-    signature_json JSONB
+    signature_json JSONB,
+    -- repo_id scopes per-file deletes. The indexer removes a file's symbols before re-inserting
+    -- them, and without this column that DELETE matched every repository sharing the path.
+    repo_id        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols (lang);
+
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already has `symbols`, so a column
+-- added to that definition never reaches an existing deployment and the index below then fails with
+-- `column "repo_id" does not exist`. Every column added after the table first shipped needs its own
+-- idempotent ALTER here.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols (file);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_file ON symbols (repo_id, file);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name ON symbols (fq_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_fq_name ON symbols (repo_id, fq_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_lang_kind ON symbols (repo_id, lang, kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols (kind);
 
 -- Optional precise span (see docs/DOCUMENTATION.md — Symbol line/column spans). NULL when unknown or line-only indexer.
@@ -20,29 +33,79 @@ ALTER TABLE symbols ADD COLUMN IF NOT EXISTS start_column INTEGER;
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS end_column INTEGER;
 
 -- edges: directed relationships between symbols (caller -> callee)
+--
+-- repo_id is denormalized from the caller symbol. It is redundant with symbols.repo_id and that is
+-- the point: edge traversal joins symbols on every hop, and a scoped traversal that has to reach
+-- through symbols to learn the repository cannot use an index on the edge itself.
 CREATE TABLE IF NOT EXISTS edges (
     caller_symbol_id UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
     callee_symbol_id UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
     edge_type       TEXT NOT NULL,
+    repo_id         TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (caller_symbol_id, callee_symbol_id, edge_type)
 );
+
+-- See the note on symbols: a column added after the table first shipped needs its own idempotent
+-- ALTER, because CREATE TABLE IF NOT EXISTS is a no-op on an existing deployment.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_edges_caller ON edges (caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges (callee_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges (edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_repo_caller ON edges (repo_id, caller_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_edges_repo_callee ON edges (repo_id, callee_symbol_id);
 
 -- files: tracked source and test files
+--
+-- The primary key is (repo_id, file), not file. `file` is a repo-RELATIVE path, so `pom.xml` and
+-- `src/index.ts` are the same key in every repository that has one — which made incremental
+-- change detection read another repository's SHA and skip files that had in fact changed.
 CREATE TABLE IF NOT EXISTS files (
-    file    TEXT PRIMARY KEY,
+    file    TEXT NOT NULL,
     sha     TEXT NOT NULL,
     lang    TEXT NOT NULL,
     module  TEXT NOT NULL DEFAULT '',
-    is_test BOOLEAN NOT NULL DEFAULT FALSE
+    is_test BOOLEAN NOT NULL DEFAULT FALSE,
+    repo_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo_id, file)
 );
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
+
+-- Move the primary key to (repo_id, file) on databases that predate it.
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on an existing deployment, so the composite key it
+-- declares never reached one. The repo-scoping migration moves the key too, but migrations are run
+-- by hand — and UpsertFile's ON CONFLICT (repo_id, file) requires the key to exist. On a database
+-- still keyed on `file` alone, EVERY file upsert fails with SQLSTATE 42P10, which produced a run
+-- that indexed 367 symbols, wrote zero `files` rows, and then planned zero gaps because every
+-- consumer of `files` returned nothing.
+--
+-- The key therefore belongs here alongside the added columns, for exactly the reason stated above
+-- them: structure the code depends on cannot be optional. The migration still owns the data
+-- backfill; this owns the shape.
+--
+-- Safe to run repeatedly, and safe on data: the old key made `file` unique, so (repo_id, file)
+-- cannot collide.
+DO $files_pk$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'files'::regclass
+           AND c.contype = 'p'
+           AND array_length(c.conkey, 1) = 1
+    ) THEN
+        ALTER TABLE files DROP CONSTRAINT files_pkey;
+        ALTER TABLE files ADD PRIMARY KEY (repo_id, file);
+    END IF;
+END
+$files_pk$;
 
 CREATE INDEX IF NOT EXISTS idx_files_lang ON files (lang);
 CREATE INDEX IF NOT EXISTS idx_files_module ON files (module);
 CREATE INDEX IF NOT EXISTS idx_files_is_test ON files (is_test);
+CREATE INDEX IF NOT EXISTS idx_files_repo_lang ON files (repo_id, lang);
+CREATE INDEX IF NOT EXISTS idx_files_repo_is_test ON files (repo_id, is_test);
 
 -- index_runs: versioning and scheduling of indexing (incremental updates)
 -- repo_id: required stable key for symbols/chunks/edges (derived from clone URL, explicit repo_id, or local path). Not a FK, separate from control-plane linkage below.

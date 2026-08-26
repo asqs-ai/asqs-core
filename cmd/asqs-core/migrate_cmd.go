@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/storage/metadata"
 	"github.com/asqs/asqs-core/internal/storage/migrate"
 )
 
@@ -82,6 +83,27 @@ func runMigrate(args []string) error {
 			return fmt.Errorf("%s: %w", tgt.name, err)
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d applied, %d already up to date\n", tgt.name, len(res.Applied), len(res.Skipped))
+	}
+
+	// The migration backfills what it can prove. Anything it could not — a path claimed by more
+	// than one repository, or a database whose index_runs name several repositories and whose
+	// symbols predate repo_id — stays at repo_id = '' and is invisible to every scoped read. Say so
+	// here, where the operator is already looking.
+	if metaURL != "" && !*dryRun {
+		store, err := metadata.Open(metaURL)
+		if err == nil {
+			defer func() { _ = store.Close() }()
+			if counts, cerr := store.CountUnscopedRows(ctx); cerr == nil {
+				if w := metadata.ReindexRequiredWarning(counts); w != "" {
+					fmt.Fprintf(os.Stderr, "\n%s\n", w)
+				}
+			}
+			if repos, rerr := store.ReposMissingFileRows(ctx); rerr == nil {
+				if w := metadata.MissingFileRowsWarning(repos); w != "" {
+					fmt.Fprintf(os.Stderr, "\n%s\n", w)
+				}
+			}
+		}
 	}
 	return nil
 }

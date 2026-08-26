@@ -231,11 +231,11 @@ func isEnclosingContainerKind(kind string) bool {
 // enclosingContainer returns the innermost symbol in the same file that spatially contains sym
 // (class/interface/struct/record or common JS/TS/Nest container kinds).
 // If line spans are missing or wrong, falls back to an incoming CONTAINS edge (caller in the same file).
-func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symbol) *metadata.Symbol {
+func enclosingContainer(ctx context.Context, meta MetaReader, repoID string, sym *metadata.Symbol) *metadata.Symbol {
 	if sym == nil {
 		return nil
 	}
-	syms, err := meta.ListSymbolsByFile(ctx, sym.File)
+	syms, err := meta.ListSymbolsByFile(ctx, repoID, sym.File)
 	if err != nil || len(syms) == 0 {
 		return nil
 	}
@@ -254,7 +254,7 @@ func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symb
 		return best
 	}
 	// Graph fallback: CONTAINS edges point parent (caller) → child (callee); callee = sym.
-	edges, err := meta.GetEdgesTo(ctx, sym.ID)
+	edges, err := meta.GetEdgesTo(ctx, repoID, sym.ID)
 	if err != nil || len(edges) == 0 {
 		return nil
 	}
@@ -264,7 +264,7 @@ func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symb
 		if strings.ToUpper(strings.TrimSpace(e.EdgeType)) != "CONTAINS" {
 			continue
 		}
-		caller, _ := meta.GetSymbolByID(ctx, e.CallerSymbolID)
+		caller, _ := meta.GetSymbolByID(ctx, repoID, e.CallerSymbolID)
 		if caller == nil || !isEnclosingContainerKind(caller.Kind) {
 			continue
 		}
@@ -293,7 +293,7 @@ type graphWalkNode struct {
 	path     []string
 }
 
-func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, profile RetrievalProfile, maxDepth int) []graphEdge {
+func collectGraphEdges(ctx context.Context, meta MetaReader, repoID, targetID string, profile RetrievalProfile, maxDepth int) []graphEdge {
 	if strings.TrimSpace(targetID) == "" {
 		return nil
 	}
@@ -311,7 +311,7 @@ func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, pr
 			continue
 		}
 		nextDepth := n.depth + 1
-		direct := collectDirectGraphEdges(ctx, meta, n.symbolID, profile)
+		direct := collectDirectGraphEdges(ctx, meta, repoID, n.symbolID, profile)
 		if len(direct) == 0 {
 			continue
 		}
@@ -366,15 +366,15 @@ func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, pr
 	return out
 }
 
-func collectDirectGraphEdges(ctx context.Context, meta MetaReader, symbolID string, profile RetrievalProfile) []graphEdge {
+func collectDirectGraphEdges(ctx context.Context, meta MetaReader, repoID, symbolID string, profile RetrievalProfile) []graphEdge {
 	var raw []graphEdge
-	if out, _ := meta.GetEdgesFrom(ctx, symbolID); out != nil {
+	if out, _ := meta.GetEdgesFrom(ctx, repoID, symbolID); out != nil {
 		for _, e := range out {
 			raw = append(raw, graphEdge{otherID: e.CalleeSymbolID, edgeType: e.EdgeType, inbound: false})
 		}
 	}
 	if profileUsesInboundExpansion(profile) {
-		if in, _ := meta.GetEdgesTo(ctx, symbolID); in != nil {
+		if in, _ := meta.GetEdgesTo(ctx, repoID, symbolID); in != nil {
 			for _, e := range in {
 				raw = append(raw, graphEdge{otherID: e.CallerSymbolID, edgeType: e.EdgeType, inbound: true})
 			}

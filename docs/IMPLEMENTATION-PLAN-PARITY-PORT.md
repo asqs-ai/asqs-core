@@ -305,9 +305,9 @@ implementation record can be found; it is provenance, not instruction.
 | CP08 | Vector metric alignment and filtered-ANN recall | B04 | CP07 | 2–3 d | `in review` |
 | CP09 | Metadata store → `pgxpool`, pool sizing | B27 | CP05 | 3–4 d | `in review` |
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `ready` |
-| CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `ready` |
-| CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `blocked (CP11)` |
-| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP11, CP55)` |
+| CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
+| CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `ready` |
+| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `ready` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `ready` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `blocked (CP18)` |
@@ -317,7 +317,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
-| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `blocked (CP11)` |
+| CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `ready` |
 | CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `blocked (CP16)` |
@@ -927,7 +927,7 @@ wall-clock threshold.
 
 ### CP11 — Repo-scoped `symbols` / `edges` / `files`
 
-- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high · **Widest blast radius in the plan**
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 4–5 d · **Risk:** high · **Widest blast radius in the plan**
 
 **Verified defect.** Core scopes **chunks** by `repo_id` (`embeddings/types.go`, `indexer/chunk.go`)
 but **not** `symbols`, `edges` or `files`. `files.file` is the bare primary key
@@ -967,9 +967,56 @@ metadata method rejects or scopes an empty `repoID` — decide which, and pin it
 CP13 references `repo_id`, so it must come **after** these `ALTER`s. Upstream had it before and
 `InitSchema` died mid-file, leaving a half-upgraded table.
 
+**Implementation record (2026-08-26).** All seven tasks done. **The open question on empty-`repoID`
+semantics is answered by upstream's end state, which core copies: empty matches only rows whose
+`repo_id` is empty — exact, never a wildcard.** A scoped run can never read or delete a legacy
+unscoped row and vice versa; "passing an empty repoID is a programming error and returns nothing
+rather than everything" (GetSymbolByID's comment). Pinned by the ported
+`TestDeleteFile_emptyRepoIDIsNotAWildcard` and the legacy-row tests.
+
+- `schema.sql`: `repo_id` + idempotent `ALTER`s on all three tables, the guarded `DO $files_pk$`
+  key move, and the seven composite indexes. The CP13 identity block will land AFTER these ALTERs
+  per the review focus. The ported `TestInitSchema_movesFilesPrimaryKeyOnAnUpgradedDatabase`
+  builds the pre-scoping shape in a scratch schema and proves the key moves with data intact; the
+  dev scratch database itself went through the upgrade path live (its `files` PK is now
+  `(repo_id, file)`).
+- Store: ~17 methods gained a leading `repoID`; `DeleteFile` also returns `(deleted bool, err)`;
+  `Symbol`/`Edge`/`File` gained `RepoID`; `InsertEdge` now upserts `repo_id` on conflict so a
+  re-index repairs pre-scoping edges; `UpsertFile` conflicts on `(repo_id, file)` and fails
+  loudly (42P10) on an unmigrated key — intended. `MaterializeTestsSourceEdges(ctx, repoID)` is
+  fully scoped (its DELETE was the one statement with no repository predicate anywhere).
+  `ListSymbolFilesByRepo` ported (its `reindex` CLI consumer arrives later);
+  `reindex_warning.go` ported whole (`CountUnscopedRows`/`ReindexRequiredWarning`/
+  `ReposMissingFileRows`/`MissingFileRowsWarning`/`ListRepoIDs`) and wired into
+  `asqs-core migrate`'s tail — the piece CP07 deferred here. Upstream's stale "repo-agnostic"
+  doc comments on `CountSymbols`/`CountEdges` were corrected rather than copied.
+- **Task 7 (destructive half) covers chunks too**: `embeddings.DeleteByFile(ctx, repoID, file)` —
+  the same cross-repo delete existed on the chunks side and upstream scoped it in the same wave.
+- Migrations `0004_symbols_repo_id` and `0006_repo_scope_edges_and_files` ported verbatim
+  (single-repo fast path from `index_runs`, caller-derived edge attribution, single-owner file
+  resolution, guarded key move). IDs 0001–0003/0005 stay reserved for CP18/CP13/CP12. Both
+  applied + re-ran as no-ops against the live scratch DB (ledger rows then removed so the plain
+  schema.sql path stays exercised). Note 0004 backfills from `chunks`, which assumes metadata and
+  embeddings share a database — same sharp edge class as CP08's 0001, faithful to upstream.
+- Callers: indexer (interface + run/detect/edge_resolve/apiclient_route_link — all writes stamp
+  `RepoID`, all deletes/lookups scoped by `opts.RepoID`), retrieval (both interfaces + plan/
+  retrieve/tests_source/profiles threading `opts.RepoID`/`req.RepoID`, helpers gaining explicit
+  `repoID` params in upstream's shape), overview (core-specific package: `repoID` threaded from
+  `pipeline`'s `opts.RepoID` through `OverviewGenerateOpts.RepoID` and explicit params).
+  `generator`/`evaluator` had no direct metadata call sites in core — they reach the store
+  through the retrieval structs, which carry `RepoID` already.
+- Acceptance: the two-repository suite is the ported upstream one — `two_repo_scope_test.go`
+  (shared paths + shared FQ names across two repos; every lookup family, `GetSymbolByID`
+  cross-tenant refusal, scoped counters, per-repo SHA divergence for change detection, the
+  delete-isolation regression, unscoped-row warning, missing-file-rows detection — its
+  `ExpandGraph` assertions arrive with CP12), plus `file_scope_test.go` (delete keeps the other
+  repository's row / removes when sole owner / legacy row untouched / empty-repoID-not-wildcard)
+  and `repo_scope_test.go` + `source_guard_test.go` source guards (`batch.go` rejoins the guard
+  list with CP10). All green live against `asqs_scratch`; full unit suite green.
+
 ### CP12 — Unified graph traversal and degree columns
 
-- **Status:** `blocked (CP11)` · **Effort:** 3 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 3 d · **Risk:** medium
 
 **Goal.** Replace the per-hop Go BFS with one bounded recursive CTE, and materialise the centrality
 signal that gap ranking recomputes.
@@ -993,7 +1040,7 @@ cross-check after a full run.
 
 ### CP13 — Stable symbol identity and churn signal
 
-- **Status:** `blocked (CP11, CP55)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `blocked (CP55)` · **Effort:** 3–4 d · **Risk:** high
 
 **Goal.** Symbol ids that survive a reindex, so `chunks.symbol_id` is durable and per-symbol history
 is possible at all.
@@ -1128,7 +1175,7 @@ later bundle in this plan fails the build unless wired in the same change.
 
 ### CP18 — Plan determinism and hot-path lookups
 
-- **Status:** `blocked (CP11)` · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium · **Gates CP16**
 
 **Verified defect**, `internal/intelligence/retrieval/plan.go:760-774`. `sortByPriority` is a
 hand-written insertion sort — O(n²) over **every non-test method in the repository** — whose
