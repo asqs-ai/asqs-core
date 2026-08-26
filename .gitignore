@@ -16,6 +16,19 @@ tools/js-ts-indexer/node_modules/
 tools/csharp-indexer/bin/
 tools/csharp-indexer/obj/
 tools/csharp-indexer/publish/
+# .NET build output inside C# test fixtures. MSBuild stamps the repository's own HEAD into
+# AssemblyInformationalVersionAttribute, so these files change on every commit and can never be
+# stable in the repo that produces them. No test reads them: the fixtures are copied file-by-file
+# into t.TempDir(), and the one whole-tree copy rsyncs with --exclude obj.
+#
+# NOTE: internal/evaluator/apisurface/testdata/cs_repo/bin/ is deliberately NOT ignored. Its
+# Microsoft.Playwright.xml is a real fixture — apisurface/csharp_test.go asserts on
+# api.Origin == "Microsoft.Playwright.xml" — so a wildcard **/bin/ or **/obj/ rule would delete it
+# and break that test. Keep these rules path-specific.
+internal/testbootstrap/testdata/csharp_csproj_bare/obj/
+internal/testbootstrap/testdata/e2e_csharp_playwright/obj/
+internal/testbootstrap/testdata/csharp_aspnetcore_no_test_project/**/obj/
+internal/testbootstrap/testdata/csharp_aspnetcore_no_test_project/**/bin/
 
 # Generated patches / scratch
 *.patch
