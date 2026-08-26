@@ -20,9 +20,9 @@ import (
 var schemaFS embed.FS
 
 // querier is the subset of *pgxpool.Pool this package uses. Production always holds a real pool;
-// the interface exists so connection-failure tests (the retry tests arriving with the materialize
-// port) can still inject transient errors, which they used to do by registering a fake
-// database/sql driver — an option pgxpool does not offer.
+// the interface exists so the connection-failure tests in materialize_tests_source_retry_test.go
+// can still inject transient errors, which they used to do by registering a fake database/sql
+// driver — an option pgxpool does not offer.
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row

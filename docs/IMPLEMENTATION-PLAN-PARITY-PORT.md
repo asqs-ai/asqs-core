@@ -318,7 +318,7 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP17 | Wire compaction, eliminate inert config | B03 | — | 2–3 d | `ready` |
 | CP18 | Plan determinism and hot-path lookups | B05 | CP07, CP11 | 2–3 d | `in review` |
-| CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `ready` |
+| CP19 | `TESTS_SOURCE` nested-cursor fix and honest retry semantics | R01 | CP09 | 1–2 d | `in review` |
 | CP20 | Chunk overlap and honest segment line numbers | B29 | CP08 | 2 d | `ready` |
 | CP21 | Lexical channel and RRF fusion — **ships `dense`** | B09, R04, R05 | CP08, CP16 | 3–4 d | `ready` |
 | CP22 | Relevance-driven fixtures/config and doc-link boost | B10 | CP08 | 2 d | `ready` |
@@ -1358,7 +1358,7 @@ copies the end state rather than diverging on unmeasured prompt shaping.
 
 ### CP19 — `TESTS_SOURCE` nested-cursor fix and honest retry semantics
 
-- **Status:** `ready` · **Effort:** 1–2 d · **Risk:** medium
+- **Status:** `in review` (done 2026-08-26 — see the record at the end of this bundle) · **Effort:** 1–2 d · **Risk:** medium
 
 **Defect.** `insertTestsSourceFromNamingConvention` issues per-row queries **inside** a `rows.Next()`
 loop on the same pinned transaction. The `pgx` stdlib shim cannot carry two active cursors on one
@@ -1370,6 +1370,33 @@ what it actually did; add a counter for rows that fail (CP03).
 
 **Acceptance.** A live-DB test (CP04) over a fixture repo produces the expected `TESTS_SOURCE` edge
 count; a forced inner failure surfaces as an error and a counter, not as success.
+
+**Implementation record (2026-08-26).** Done — upstream's `materialize_tests_source.go` at HEAD
+copied wholesale, since everything else in it had already landed (CP09's pgx classifier, CP11's
+repo scoping); the file's remaining deltas were exactly this bundle.
+
+- The nested-cursor pattern is gone: `insertTestsSourceFromNamingConvention` now runs three
+  strictly ordered phases — drain and close the test-class cursor (`listTestClasses`), resolve
+  every SUT in ONE round trip (`resolveProductionClassIDs`, `DISTINCT ON` under a total order so
+  which symbol wins is reproducible; generic markers stripped so `P.Repo` matches `P.Repo<T>`),
+  then write all pairs in one `unnest` statement (`insertTestsSourceEdgePairs`, three bind
+  parameters regardless of corpus size). The INVARIANT comment documents why `defer rows.Close()`
+  cannot satisfy the ordering.
+- Honest retry: attempts raised to 4 with a fixed (deliberately unjittered) backoff, a `Ping`
+  between attempts so pgxpool retires a dead connection instead of re-drawing it, and the
+  `sleepFn` clock seam so the schedule is assertable without elapsed time. The historical note
+  now states the true original cause (a deterministic protocol violation misread as
+  infrastructure) — including that the old loop "passed" while failing 100% of real runs.
+- The "counter" half of the acceptance is the caller's audit: the indexer's failure event now
+  names the consequence (gap ranking loses its −38 test-traceability penalty) and carries
+  `impact: gap_ranking_missing_tests_source_penalty`, which CP03's run auditor counts by step.
+- Tests ported whole: `materialize_tests_source_test.go` (the live fixture-repo tests — naming
+  convention covers every class, first-attempt success, rerunnability, plus the legacy
+  integration test) and `materialize_tests_source_retry_test.go` (the querier-injection fakes
+  CP09's interface was built for — backoff schedule, ping-between-attempts, no retry on
+  non-transient, context cancellation; its SCOPE comment says exactly what these cannot see).
+  All green live against `asqs_scratch` — the naming-derived edges that never materialized
+  before this fix now do.
 
 ### CP20 — Chunk overlap and honest segment line numbers
 

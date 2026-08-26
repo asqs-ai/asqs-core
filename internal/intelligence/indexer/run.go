@@ -688,9 +688,16 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 
 	if n, err := meta.MaterializeTestsSourceEdges(ctx, opts.RepoID); err != nil {
 		if opts.Audit != nil {
+			// This is not a cosmetic index warning. TESTS_SOURCE edges carry the strongest
+			// "already covered by tests" penalty in gap ranking (retrieval.ListGaps subtracts 38
+			// for an inbound trace edge). When materialization fails the penalty silently cannot
+			// fire, so already-tested symbols stop being deprioritised and the plan quietly gets
+			// worse — with nothing in the plan audit to explain why. Name that consequence here so
+			// an operator reading the log does not dismiss it.
 			opts.Audit.LogError(ctx, "index.tests_source_materialize", map[string]interface{}{
-				"message": fmt.Sprintf("TESTS_SOURCE materialization failed: %v", err),
+				"message": fmt.Sprintf("TESTS_SOURCE materialization failed: %v. Gap ranking loses its test-traceability penalty for this run, so symbols that already have tests will not be deprioritised.", err),
 				"error":   err.Error(),
+				"impact":  "gap_ranking_missing_tests_source_penalty",
 			})
 		}
 	} else if n > 0 && opts.Audit != nil {
