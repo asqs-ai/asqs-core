@@ -307,7 +307,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `in review` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
-| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP11)` |
+| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `ready` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `in review` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `in review` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
@@ -1104,7 +1104,7 @@ cross-check after a full run.
 
 ### CP13 — Stable symbol identity and churn signal
 
-- **Status:** `blocked (CP11)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** high
 
 **Goal.** Symbol ids that survive a reindex, so `chunks.symbol_id` is durable and per-symbol history
 is possible at all.
