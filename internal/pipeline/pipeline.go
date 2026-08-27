@@ -228,11 +228,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// Off by default: with it disabled the chunk counts are identical to before this existed.
 		// Reads only artifacts already on disk — no network, no subprocess.
 		DependencyDocs: indexer.DependencyDocOptions{
-			Enabled:                cfg.Indexer.DependencyDocs.Enabled,
-			MaxChunksPerDependency: cfg.Indexer.DependencyDocs.MaxChunksPerDependency,
-			MaxChunksTotal:         cfg.Indexer.DependencyDocs.MaxChunksTotal,
-			MavenRepoDir:           cfg.Indexer.DependencyDocs.MavenRepoDir,
-			NuGetPackagesDir:       cfg.Indexer.DependencyDocs.NuGetPackagesDir,
+			Enabled: cfg.Indexer.DependencyDocs.Enabled,
+			// FROZEN (CP37): the two chunk caps are left at zero so the indexer's own
+			// constants apply — 80 per dependency, 400 in total. They were pass-throughs for
+			// config keys no template ever set.
+			MavenRepoDir:     cfg.Indexer.DependencyDocs.MavenRepoDir,
+			NuGetPackagesDir: cfg.Indexer.DependencyDocs.NuGetPackagesDir,
 		},
 	}); err != nil {
 		return sum, fmt.Errorf("index: %w", err)
@@ -316,8 +317,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 				ExtraSkillGlobs:     piCfg.ExtraSkillGlobs,
 				CacheEnabled:        piCfg.EffectiveCacheEnabled(),
 				CachePath:           piCfg.EffectiveCachePath(),
-				ForceRefresh:        piCfg.ForceRefresh,
-				FingerprintMode:     piCfg.EffectiveFingerprintMode(),
+				// FROZEN (CP37, runner.policy.project_intel.force_refresh): a debug one-off that
+				// bypassed the cache for a single run. Deleting the cache file does the same thing
+				// without a permanent key inviting someone to leave it on.
+				ForceRefresh:    false,
+				FingerprintMode: piCfg.EffectiveFingerprintMode(),
 			},
 		}
 		if piCfg.UseEmbeddingsRank {
@@ -476,9 +480,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var overviewErr error
 	if opts.GenerateDocs && !cfg.Indexer.DisableOverviewDocGeneration {
 		og := &overview.LLMOverviewDocGenerator{
-			LLM:                     genChat,
-			Path:                    strings.TrimSpace(cfg.Indexer.OverviewDocPath),
-			MaxCompletionTokensFull: cfg.Indexer.OverviewMaxCompletionTokens,
+			LLM:  genChat,
+			Path: strings.TrimSpace(cfg.Indexer.OverviewDocPath),
+			// FROZEN (CP37, indexer.overview_max_completion_tokens): zero keeps the
+			// overview generator's own 8192 default for a full narrative.
+			MaxCompletionTokensFull: 0,
 			FullRewrite:             cfg.Indexer.OverviewFullRewrite,
 		}
 		overviewWG.Add(1)

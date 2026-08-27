@@ -21,7 +21,6 @@ indexer:
   mono_repo_workspace: services/api
   dependency_docs:
     enabled: true
-    max_chunks_total: 400
 
 retrieval:
   profile: java_unit

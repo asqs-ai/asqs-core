@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"strings"
 )
 
 // Config is the root configuration for the quality pipeline.
@@ -59,18 +58,18 @@ type RetrievalProfileBudget struct {
 	MaxFixtures         int `yaml:"max_fixtures"`
 }
 
-// ContextCompactConfig enables deterministic shrinking of retrieved chunks before LLM context assembly (see docs/DOCUMENTATION.md).
+// ContextCompactConfig switches deterministic shrinking of retrieved chunks on or off before LLM
+// context assembly.
+//
+// The on/off switch is ALL that remains configurable. CP17 wired compaction and passed only Enabled
+// through, so the rune caps and the merge/dedupe behaviours were already reaching their consumers as
+// zero — the four keys parsed and did nothing. CP37 deleted them: the caps are
+// retrieval.DefaultCompactMaxNonTargetChunkRunes (4096) and DefaultCompactBoilerplateScanRunes
+// (2048), and the two behaviours stay off until a measurement says otherwise, which is a code change
+// rather than an operator's.
 type ContextCompactConfig struct {
 	// Enabled: nil or true = compaction on (default when the key is omitted). Explicit false disables. Env: RETRIEVAL_CONTEXT_COMPACT_ENABLED (true/false/1/0).
 	Enabled *bool `yaml:"enabled" env:"RETRIEVAL_CONTEXT_COMPACT_ENABLED"`
-	// MaxNonTargetChunkRunes caps UTF-8 runes per non-target chunk after merge/dedupe; 0 = built-in default (4096). Env: RETRIEVAL_CONTEXT_COMPACT_MAX_CHUNK_RUNES.
-	MaxNonTargetChunkRunes int `yaml:"max_non_target_chunk_runes" env:"RETRIEVAL_CONTEXT_COMPACT_MAX_CHUNK_RUNES"`
-	// MergeSameFileDependencies merges dependency edges that share the same source file. Env: RETRIEVAL_CONTEXT_COMPACT_MERGE_SAME_FILE.
-	MergeSameFileDependencies bool `yaml:"merge_same_file_dependencies" env:"RETRIEVAL_CONTEXT_COMPACT_MERGE_SAME_FILE"`
-	// DedupeImportBoilerplate strips repeated leading import/package/using blocks after the first occurrence. Env: RETRIEVAL_CONTEXT_COMPACT_DEDUPE_IMPORTS.
-	DedupeImportBoilerplate bool `yaml:"dedupe_import_boilerplate" env:"RETRIEVAL_CONTEXT_COMPACT_DEDUPE_IMPORTS"`
-	// MaxBoilerplateScanRunes limits header detection from chunk starts; 0 = built-in default (2048). Env: RETRIEVAL_CONTEXT_COMPACT_BOILERPLATE_SCAN_RUNES.
-	MaxBoilerplateScanRunes int `yaml:"max_boilerplate_scan_runes" env:"RETRIEVAL_CONTEXT_COMPACT_BOILERPLATE_SCAN_RUNES"`
 }
 
 // ProjectIntelConfig configures repo doc / agent-skill scanning for generation context.
@@ -78,29 +77,12 @@ type ContextCompactConfig struct {
 type ProjectIntelConfig struct {
 	// Enabled when nil or true turns on project intel (still gated by run_hooks project_intel.enabled). Env: RETRIEVAL_PROJECT_INTEL_ENABLED.
 	Enabled *bool `yaml:"enabled" env:"RETRIEVAL_PROJECT_INTEL_ENABLED"`
-	// MaxTotalRunes caps UTF-8 runes in the injected markdown block (0 = default 12000).
-	MaxTotalRunes int `yaml:"max_total_runes" env:"RETRIEVAL_PROJECT_INTEL_MAX_TOTAL_RUNES"`
-	// MaxDocFiles / MaxSkillFiles cap how many ranked files of each kind are considered (0 = defaults 12 / 8).
-	MaxDocFiles   int `yaml:"max_doc_files" env:"RETRIEVAL_PROJECT_INTEL_MAX_DOC_FILES"`
-	MaxSkillFiles int `yaml:"max_skill_files" env:"RETRIEVAL_PROJECT_INTEL_MAX_SKILL_FILES"`
-	// MinRelevanceScore is a 0–1 lexical floor; 0 = default 0.08.
-	MinRelevanceScore float64 `yaml:"min_relevance_score" env:"RETRIEVAL_PROJECT_INTEL_MIN_RELEVANCE_SCORE"`
-	// SummarizeAboveRunes triggers LLM summarization for a single doc body when over this rune count (0 = default 6000).
-	SummarizeAboveRunes int `yaml:"summarize_above_runes" env:"RETRIEVAL_PROJECT_INTEL_SUMMARIZE_ABOVE_RUNES"`
 	// UseEmbeddingsRank reserved for future embedding rerank (default false).
 	UseEmbeddingsRank bool `yaml:"use_embeddings_rank" env:"RETRIEVAL_PROJECT_INTEL_USE_EMBEDDINGS_RANK"`
 	// ExtraDocGlobs optional additional glob patterns (repo-relative) for markdown docs.
 	ExtraDocGlobs []string `yaml:"extra_doc_globs" env:"RETRIEVAL_PROJECT_INTEL_EXTRA_DOC_GLOBS"`
 	// ExtraSkillGlobs optional additional globs for skill files.
 	ExtraSkillGlobs []string `yaml:"extra_skill_globs" env:"RETRIEVAL_PROJECT_INTEL_EXTRA_SKILL_GLOBS"`
-	// CacheEnabled when nil or true enables .asqs cache (default true). Env: RETRIEVAL_PROJECT_INTEL_CACHE_ENABLED.
-	CacheEnabled *bool `yaml:"cache_enabled" env:"RETRIEVAL_PROJECT_INTEL_CACHE_ENABLED"`
-	// CachePath is repo-relative JSON path (empty = .asqs/project-intel-cache.json).
-	CachePath string `yaml:"cache_path" env:"RETRIEVAL_PROJECT_INTEL_CACHE_PATH"`
-	// ForceRefresh bypasses cache for one run. Env: RETRIEVAL_PROJECT_INTEL_FORCE_REFRESH.
-	ForceRefresh bool `yaml:"force_refresh" env:"RETRIEVAL_PROJECT_INTEL_FORCE_REFRESH"`
-	// FingerprintMode: "stat" (default) uses path+size+mtime; "content" hashes small files fully.
-	FingerprintMode string `yaml:"fingerprint_mode" env:"RETRIEVAL_PROJECT_INTEL_FINGERPRINT_MODE"`
 }
 
 // EffectiveEnabled reports whether project intel is enabled at config layer.
@@ -111,71 +93,58 @@ func (c ProjectIntelConfig) EffectiveEnabled() bool {
 	return *c.Enabled
 }
 
+// The project-intel scan's shape is FROZEN (CP37). These were nine YAML keys with no plausible
+// per-deployment value: an operator has no basis on which to prefer 11 doc files to 12, and the
+// repository's own discipline is that a default earns a change through measurement.
+//
+// They stay as accessor METHODS rather than becoming bare constants because ConfigFingerprintHash
+// folds their values into the project-intel cache key. Keeping the call shape keeps that hash
+// byte-identical to its pre-freeze value, so no existing .asqs/project-intel-cache.json is
+// invalidated by this bundle. Turning them into a shorter expression would silently cold-start
+// every cache in the field.
+const (
+	projectIntelMaxTotalRunes       = 12000
+	projectIntelMaxDocFiles         = 12
+	projectIntelMaxSkillFiles       = 8
+	projectIntelMinRelevanceScore   = 0.08
+	projectIntelSummarizeAboveRunes = 6000
+	projectIntelFingerprintMode     = "stat"
+	// ProjectIntelCachePath is the committed-into-the-repository cache location. It is exported
+	// because the pre-ship preserve list names the same path, and two spellings of one path is how
+	// a cache silently stops surviving a ship.
+	ProjectIntelCachePath = ".asqs/project-intel-cache.json"
+)
+
 // EffectiveMaxTotalRunes returns cap runes for injected block.
-func (c ProjectIntelConfig) EffectiveMaxTotalRunes() int {
-	if c.MaxTotalRunes <= 0 {
-		return 12000
-	}
-	return c.MaxTotalRunes
-}
+func (c ProjectIntelConfig) EffectiveMaxTotalRunes() int { return projectIntelMaxTotalRunes }
 
-// EffectiveMaxDocFiles default 12.
-func (c ProjectIntelConfig) EffectiveMaxDocFiles() int {
-	if c.MaxDocFiles <= 0 {
-		return 12
-	}
-	return c.MaxDocFiles
-}
+// EffectiveMaxDocFiles is frozen at 12.
+func (c ProjectIntelConfig) EffectiveMaxDocFiles() int { return projectIntelMaxDocFiles }
 
-// EffectiveMaxSkillFiles default 8.
-func (c ProjectIntelConfig) EffectiveMaxSkillFiles() int {
-	if c.MaxSkillFiles <= 0 {
-		return 8
-	}
-	return c.MaxSkillFiles
-}
+// EffectiveMaxSkillFiles is frozen at 8.
+func (c ProjectIntelConfig) EffectiveMaxSkillFiles() int { return projectIntelMaxSkillFiles }
 
-// EffectiveMinRelevanceScore default 0.08.
+// EffectiveMinRelevanceScore is frozen at 0.08.
 func (c ProjectIntelConfig) EffectiveMinRelevanceScore() float64 {
-	if c.MinRelevanceScore <= 0 {
-		return 0.08
-	}
-	return c.MinRelevanceScore
+	return projectIntelMinRelevanceScore
 }
 
-// EffectiveSummarizeAboveRunes default 6000.
+// EffectiveSummarizeAboveRunes is frozen at 6000.
 func (c ProjectIntelConfig) EffectiveSummarizeAboveRunes() int {
-	if c.SummarizeAboveRunes <= 0 {
-		return 6000
-	}
-	return c.SummarizeAboveRunes
+	return projectIntelSummarizeAboveRunes
 }
 
-// EffectiveCacheEnabled default true.
-func (c ProjectIntelConfig) EffectiveCacheEnabled() bool {
-	if c.CacheEnabled == nil {
-		return true
-	}
-	return *c.CacheEnabled
-}
+// EffectiveCacheEnabled is frozen on. The cache is what makes a second run cheap, and it is
+// invalidated by the fingerprint rather than by a switch.
+func (c ProjectIntelConfig) EffectiveCacheEnabled() bool { return true }
 
-// EffectiveCachePath default .asqs/project-intel-cache.json.
-func (c ProjectIntelConfig) EffectiveCachePath() string {
-	if s := strings.TrimSpace(c.CachePath); s != "" {
-		return s
-	}
-	return ".asqs/project-intel-cache.json"
-}
+// EffectiveCachePath is frozen at the repo-relative committed location.
+func (c ProjectIntelConfig) EffectiveCachePath() string { return ProjectIntelCachePath }
 
-// EffectiveFingerprintMode returns "stat" or "content".
-func (c ProjectIntelConfig) EffectiveFingerprintMode() string {
-	switch strings.ToLower(strings.TrimSpace(c.FingerprintMode)) {
-	case "content":
-		return "content"
-	default:
-		return "stat"
-	}
-}
+// EffectiveFingerprintMode is frozen at "stat" — mtime+size rather than content hashing. The
+// "content" alternative cost a full re-read of every candidate doc on every run to catch a case the
+// stat pair already catches.
+func (c ProjectIntelConfig) EffectiveFingerprintMode() string { return projectIntelFingerprintMode }
 
 // ConfigFingerprintHash returns a stable hash string of options that affect ranking/selection.
 func (c ProjectIntelConfig) ConfigFingerprintHash() string {
@@ -203,8 +172,6 @@ type RetrievalConfig struct {
 	Profile string `yaml:"profile"`
 	// ProfileE2E is used for the E2E test plan when indexer.max_gaps_e2e > 0. Empty: inherits retrieval.profile when set; else http_api for Java and C# and e2e_playwright for JS/TS (orchestrator.DefaultRetrievalProfileE2E).
 	ProfileE2E string `yaml:"profile_e2e" env:"RETRIEVAL_PROFILE_E2E"`
-	// SimilarMMRLambda: MMR tradeoff for similar-chunk selection (0 or omit = default 0.5; 1.0 = relevance-only). See docs/DOCUMENTATION.md (symbol-aware retrieval).
-	SimilarMMRLambda float64 `yaml:"similar_mmr_lambda"`
 	// FailureHintFile is an optional repo-relative UTF-8 file (compiler/test stderr or CI log). When WorkflowInput.RetrievalFailureHint is empty, the orchestrator reads this path before planning. Must not contain ".." (stay under repo root). Env: RETRIEVAL_FAILURE_HINT_FILE.
 	FailureHintFile string `yaml:"failure_hint_file" env:"RETRIEVAL_FAILURE_HINT_FILE"`
 	// PersistLastEvalFailure when true, after evaluation removes this file on success or writes failing compile/test/e2e step output for the next run (same path as failure_hint_file, or default .asqs/last-eval-failure.log when failure_hint_file is empty).
@@ -226,12 +193,6 @@ type RetrievalConfig struct {
 	// this budget and unspent allowance flows to later sections; the target symbol and the output
 	// contract are never truncated. Env: RETRIEVAL_MAX_CONTEXT_TOKENS.
 	MaxContextTokens int `yaml:"max_context_tokens" env:"RETRIEVAL_MAX_CONTEXT_TOKENS"`
-	// MaxSimilarTests global default before profile_budgets (0 = use built-in default 5 in retrieval.ResolveRetrievalBudgets). Env: RETRIEVAL_MAX_SIMILAR_TESTS.
-	MaxSimilarTests int `yaml:"max_similar_tests" env:"RETRIEVAL_MAX_SIMILAR_TESTS"`
-	// MaxDependencyChunks global default before profile_budgets (0 = built-in 15). Env: RETRIEVAL_MAX_DEPENDENCY_CHUNKS.
-	MaxDependencyChunks int `yaml:"max_dependency_chunks" env:"RETRIEVAL_MAX_DEPENDENCY_CHUNKS"`
-	// MaxFixtures global default before profile_budgets (0 = built-in 5). Env: RETRIEVAL_MAX_FIXTURES.
-	MaxFixtures int `yaml:"max_fixtures" env:"RETRIEVAL_MAX_FIXTURES"`
 	// ProfileBudgets per RetrievalProfile (keys may be aliases; normalized to canonical names at load). Non-zero fields override globals for that profile only.
 	ProfileBudgets map[string]RetrievalProfileBudget `yaml:"profile_budgets"`
 	// AbstentionDisabled when true: turns off retrieval sufficiency checks (no abstention). Default false. Env: RETRIEVAL_ABSTENTION_DISABLED.
@@ -275,12 +236,6 @@ type DependencyDocsConfig struct {
 	// Enabled turns dependency doc ingestion on. Default false: with it off, chunk counts are
 	// identical to before this existed. Env: INDEXER_DEPENDENCY_DOCS_ENABLED.
 	Enabled bool `yaml:"enabled" env:"INDEXER_DEPENDENCY_DOCS_ENABLED"`
-	// MaxChunksPerDependency caps one dependency's contribution. 0 = 80.
-	// Env: INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_PER_DEPENDENCY.
-	MaxChunksPerDependency int `yaml:"max_chunks_per_dependency" env:"INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_PER_DEPENDENCY"`
-	// MaxChunksTotal caps the whole ingestion. 0 = 400.
-	// Env: INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_TOTAL.
-	MaxChunksTotal int `yaml:"max_chunks_total" env:"INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_TOTAL"`
 	// MavenRepoDir overrides the local Maven repository root. Empty = ~/.m2/repository.
 	// Env: INDEXER_DEPENDENCY_DOCS_MAVEN_REPO_DIR.
 	MavenRepoDir string `yaml:"maven_repo_dir" env:"INDEXER_DEPENDENCY_DOCS_MAVEN_REPO_DIR"`
@@ -315,12 +270,6 @@ type IndexerConfig struct {
 	// DockerMemory caps indexer container memory (e.g. "4g"). Empty = no --memory flag.
 	DockerMemory string `yaml:"docker_memory" env:"INDEXER_DOCKER_MEMORY"`
 
-	// DockerCPUs caps indexer container CPUs (e.g. 2). 0 = no --cpus flag.
-	DockerCPUs float64 `yaml:"docker_cpus" env:"INDEXER_DOCKER_CPUS"`
-
-	// DockerNetwork is passed to docker run --network (default "none" for indexing). Use "bridge" only if a future indexer needs outbound access.
-	DockerNetwork string `yaml:"docker_network" env:"INDEXER_DOCKER_NETWORK"`
-
 	// DockerNodeImage is the image for the JS/TS Node indexer container (e.g. node:20-bookworm). Empty with execution: docker uses a built-in default.
 	DockerNodeImage string `yaml:"docker_node_image" env:"INDEXER_DOCKER_NODE_IMAGE"`
 
@@ -332,11 +281,6 @@ type IndexerConfig struct {
 
 	// JSTIndexerPath is the path to the JS/TS indexer entry (e.g. tools/js-ts-indexer/dist/index.js). When set, the run/reindex commands use the Node indexer for repos that contain JS/TS files; build with cd tools/js-ts-indexer && npm run build.
 	JSTIndexerPath string `yaml:"jst_indexer_path" env:"INDEXER_JST_INDEXER_PATH"`
-
-	// JSTJsonlOut controls where the JS/TS indexer writes JSONL: empty = stdout (default, Go reads the pipe).
-	// "temp" (or "tmp", ":temp") = Go creates a temp .jsonl file, passes --jsonl-out to Node, reads the file after exit, then deletes it — avoids stdout/pipe issues on very large single-line records without changing indexer output.
-	// Any other non-empty string = path (absolute or relative to process cwd) for the JSONL file; parent directories are created. Same logical output as stdout mode.
-	JSTJsonlOut string `yaml:"jst_jsonl_out" env:"INDEXER_JST_JSONL_OUT"`
 
 	// CSharpIndexerDllPath is the absolute or cwd-relative path to published CSharpIndexer.dll (dotnet publish tools/csharp-indexer). When set and the repo has .cs files (and JS/TS does not win), the Roslyn indexer runs and merges with the Java advanced map when both apply.
 	CSharpIndexerDllPath string `yaml:"csharp_indexer_dll_path" env:"INDEXER_CSHARP_DLL_PATH"`
@@ -373,8 +317,6 @@ type IndexerConfig struct {
 	OverviewMaxFilesPerSlice int `yaml:"overview_max_files_per_slice" env:"INDEXER_OVERVIEW_MAX_FILES_PER_SLICE"`
 	// OverviewMaxIndexRunesPerSlice caps UTF-8 runes in the built index snapshot for one overview LLM request (after file batching). Dense symbol lists can be large with few files; 0 = default 120000; -1 disables extra split/clamp. Env: INDEXER_OVERVIEW_MAX_INDEX_RUNES_PER_SLICE.
 	OverviewMaxIndexRunesPerSlice int `yaml:"overview_max_index_runes_per_slice" env:"INDEXER_OVERVIEW_MAX_INDEX_RUNES_PER_SLICE"`
-	// OverviewMaxCompletionTokens when > 0, sets max completion tokens for a full overview LLM call (default otherwise 8192). Increment for long narratives. Delta/incremental mode stays 2048. Env: INDEXER_OVERVIEW_MAX_COMPLETION_TOKENS.
-	OverviewMaxCompletionTokens int `yaml:"overview_max_completion_tokens" env:"INDEXER_OVERVIEW_MAX_COMPLETION_TOKENS"`
 
 	// SkipPathPrefixes are repo-relative path prefixes to skip when scanning/indexing (e.g. "app/lib" to skip app/lib in AngularJS).
 	// Applied by the Go file scanner and by the JS/TS indexer. Paths use forward slashes; a prefix skips that folder and everything under it.
@@ -386,9 +328,6 @@ type IndexerConfig struct {
 	// MonoRepoTestWorkspace is an optional repo-relative directory (same path rules as mono_repo_workspace) where unit/E2E test framework bootstrap, generated test file paths, and evaluation working directory are rooted, while indexing, planning, gap filtering, and documentation/overview generation stay scoped to mono_repo_workspace.
 	// Requires mono_repo_workspace when set. The directory should contain a project root marker at that level. Empty = use mono_repo_workspace for tests and eval (legacy behavior). Env: INDEXER_MONO_REPO_TEST_WORKSPACE.
 	MonoRepoTestWorkspace string `yaml:"mono_repo_test_workspace" env:"INDEXER_MONO_REPO_TEST_WORKSPACE"`
-
-	// Chunk configures embedding chunk boundaries, headers, optional secondary chunks, and small-symbol merge.
-	Chunk IndexerChunkYAML `yaml:"chunk"`
 }
 
 // DatabaseConfig configures Postgres for metadata and embeddings stores.
@@ -484,23 +423,21 @@ type WebSearchConfig struct {
 	// AllowedHosts gates web_fetch: exact hosts or "*.example.org" wildcards. **EMPTY DISABLES
 	// FETCH** — search still works, pages cannot be read. Empty fails closed, never open.
 	AllowedHosts []string `yaml:"allowed_hosts"`
-	// CachePath overrides the replay cache location. Empty = .asqs/websearch-cache.json inside the
-	// repository under test. An ABSOLUTE path is honoured as-is, which is how you keep the cache
-	// out of the repository (and out of any pull request a shipped run opens).
-	// Env: WEBSEARCH_CACHE_PATH.
-	CachePath string `yaml:"cache_path" env:"WEBSEARCH_CACHE_PATH"`
 }
 
 // WebSearchCacheFileName is the cache document's name when only a directory is known.
 const WebSearchCacheFileName = "websearch-cache.json"
 
 // EffectiveCachePath resolves the replay cache file, repo-relative unless explicitly absolute.
-func (c WebSearchConfig) EffectiveCachePath() string {
-	if p := strings.TrimSpace(c.CachePath); p != "" {
-		return p
-	}
-	return ".asqs/" + WebSearchCacheFileName
-}
+// EffectiveCachePath is FROZEN (CP37) at the repo-relative location inside the clone.
+//
+// This took a capability with it, deliberately: an ABSOLUTE cache_path used to escape the per-run
+// workspace and give cross-run reuse without committing anything. Nothing shipped used it, and the
+// supported route to cross-run reuse is the one project-intel already takes — the file lives in the
+// repository under test and is preserved through ship, so the next clone brings it along. An
+// operator-settable absolute path also pointed the one component that egresses at a location outside
+// the sandbox, which is not a knob worth keeping for a capability nothing used.
+func (c WebSearchConfig) EffectiveCachePath() string { return ".asqs/" + WebSearchCacheFileName }
 
 // LLMConfig configures the LLM/embedding API used for generation and RAG.
 type LLMConfig struct {

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 )
 
 func writeAsqs(t *testing.T, root, rel, body string) string {
@@ -178,5 +179,27 @@ func TestShipPreserveRelPaths_allUnderAsqs(t *testing.T) {
 			t.Errorf("duplicate preserve entry %q", p)
 		}
 		seen[p] = true
+	}
+}
+
+// config and projectintel each name the project-intel cache path, in packages that cannot import
+// one another. If they drift, the scan writes one file and the pre-ship preserve list saves a
+// different one — so the cache is written, thrown away with the rest of .asqs, and every run starts
+// cold, with nothing in the diff to say why. Pinned here because pipeline is the one package that
+// sees both.
+func TestProjectIntelCachePathHasOneSpelling(t *testing.T) {
+	if config.ProjectIntelCachePath != projectintel.DefaultCachePathRel {
+		t.Errorf("cache path drifted: config says %q, projectintel says %q",
+			config.ProjectIntelCachePath, projectintel.DefaultCachePathRel)
+	}
+	// And the preserve list must actually name it, or the whole point is lost.
+	found := false
+	for _, p := range ShipPreserveRelPaths(&config.Config{}) {
+		if p == config.ProjectIntelCachePath {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the preserve list does not name %q; a ship would drop the cache", config.ProjectIntelCachePath)
 	}
 }

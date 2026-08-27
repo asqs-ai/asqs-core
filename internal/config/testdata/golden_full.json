@@ -136,18 +136,9 @@
     "Policy": null,
     "ProjectIntel": {
       "Enabled": null,
-      "MaxTotalRunes": 0,
-      "MaxDocFiles": 0,
-      "MaxSkillFiles": 0,
-      "MinRelevanceScore": 0,
-      "SummarizeAboveRunes": 0,
       "UseEmbeddingsRank": false,
       "ExtraDocGlobs": null,
-      "ExtraSkillGlobs": null,
-      "CacheEnabled": null,
-      "CachePath": "",
-      "ForceRefresh": false,
-      "FingerprintMode": ""
+      "ExtraSkillGlobs": null
     },
     "TwoPhaseTestGeneration": false,
     "RepeatedTestFailureThreshold": 0,
@@ -186,8 +177,6 @@
   "Indexer": {
     "DependencyDocs": {
       "Enabled": true,
-      "MaxChunksPerDependency": 0,
-      "MaxChunksTotal": 400,
       "MavenRepoDir": "",
       "NuGetPackagesDir": ""
     },
@@ -196,13 +185,10 @@
     "DockerCLI": "",
     "DockerJavaImage": "",
     "DockerMemory": "",
-    "DockerCPUs": 0,
-    "DockerNetwork": "",
     "DockerNodeImage": "",
     "DockerNodeHeapMB": 0,
     "AdvancedJarPath": "",
     "JSTIndexerPath": "",
-    "JSTJsonlOut": "",
     "CSharpIndexerDllPath": "",
     "DockerDotNetIndexerImage": "",
     "CriticalModulePrefixes": null,
@@ -215,43 +201,25 @@
     "OverviewFullRewrite": false,
     "OverviewMaxFilesPerSlice": 0,
     "OverviewMaxIndexRunesPerSlice": 0,
-    "OverviewMaxCompletionTokens": 0,
     "SkipPathPrefixes": null,
     "MonoRepoWorkspace": "services/api",
-    "MonoRepoTestWorkspace": "",
-    "Chunk": {
-      "MinTokens": 0,
-      "MaxTokens": 0,
-      "CharsPerToken": 0,
-      "EnrichChunkContent": null,
-      "MaxChunkHeaderRunes": 0,
-      "EnableSecondaryChunks": null,
-      "MergeSmallSymbols": null
-    }
+    "MonoRepoTestWorkspace": ""
   },
   "Retrieval": {
     "Profile": "java_unit",
     "ProfileE2E": "",
-    "SimilarMMRLambda": 0,
     "FailureHintFile": ".asqs/ci-build.log",
     "PersistLastEvalFailure": true,
     "DisableHybridModuleFilter": false,
     "DependencyMaxDepth": 0,
     "Fusion": "dense",
     "MaxContextTokens": 60000,
-    "MaxSimilarTests": 0,
-    "MaxDependencyChunks": 0,
-    "MaxFixtures": 0,
     "ProfileBudgets": null,
     "AbstentionDisabled": false,
     "MinSimilarTestsForGeneration": 0,
     "MinSimilarityCosine": 0,
     "ContextCompact": {
-      "Enabled": null,
-      "MaxNonTargetChunkRunes": 0,
-      "MergeSameFileDependencies": false,
-      "DedupeImportBoilerplate": false,
-      "MaxBoilerplateScanRunes": 0
+      "Enabled": null
     }
   },
   "Generation": {
@@ -271,8 +239,7 @@
     "Endpoint": "",
     "APIKey": "",
     "APIKeyFromEnv": "",
-    "AllowedHosts": null,
-    "CachePath": ""
+    "AllowedHosts": null
   },
   "Audit": {
     "FilePath": "/var/log/asqs/audit.jsonl",

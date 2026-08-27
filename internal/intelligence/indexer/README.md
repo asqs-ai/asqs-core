@@ -52,7 +52,7 @@ Helpers (e.g. `java -jar helper.jar`, `dotnet run` for C#) read source and write
 
 Use `ParsedFileFromJSON(stdout, source)` to convert to `ParsedFile`; then run chunking and storage.
 
-**JS/TS:** Go normally reads JSONL from the Node process **stdout** (`jstindexer.RunIndexer`). Set **`indexer.jst_jsonl_out: temp`** (or a file path) so Node writes the **same** JSONL via **`--jsonl-out`** and Go reads the file after exit — avoids pipe edge cases on very large lines without changing symbols/edges.
+**JS/TS:** Node always writes its JSONL to a temp file via **`--jsonl-out`**, which Go reads after the process exits. Streaming it back over stdout was the old local-execution path and could hit pipe limits on a single very large record; docker execution already used the file. Symbols and edges are identical either way, so this is a transport detail with no configuration.
 
 ## Structural edges (Java vs JS/TS)
 

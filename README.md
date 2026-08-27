@@ -118,12 +118,12 @@ cp config.example.yaml config.yaml
 # edit: database URL, llm provider + key/model, indexer artifact paths, runner type
 ```
 
-Project intel is on by default and needs no configuration. To tune or disable it, use the
-`runner.project_intel` block — `enabled`, `max_total_runes` (default 12000), `max_doc_files` (12),
-`max_skill_files` (8), `min_relevance_score` (0.08), `summarize_above_runes` (6000),
-`extra_doc_globs` / `extra_skill_globs`, `cache_enabled`, `cache_path`, `force_refresh`, and
-`fingerprint_mode` (`stat` | `content`). The same keys are settable via `RETRIEVAL_PROJECT_INTEL_*`
-environment variables. `use_embeddings_rank` embeds the selected docs but does not change what is
+Project intel is on by default and needs no configuration. The `runner.project_intel` block keeps
+`enabled`, `extra_doc_globs` / `extra_skill_globs` and `use_embeddings_rank`; the scan's shape — the
+rune budget, the file counts, the relevance floor, the cache location and the fingerprint mode — is
+fixed in code, because an operator has no basis on which to prefer 11 doc files to 12 and this
+project's discipline is that a default earns its change through measurement. The remaining keys are
+settable via `RETRIEVAL_PROJECT_INTEL_*` environment variables. `use_embeddings_rank` embeds the selected docs but does not change what is
 injected — asqs-core builds one shared context block per run rather than re-ranking it per gap.
 
 ## 5. Run

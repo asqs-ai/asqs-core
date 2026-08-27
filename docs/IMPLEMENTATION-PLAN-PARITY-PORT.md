@@ -353,8 +353,8 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `in review` |
-| CP37 | Constants freeze | C2 | CP36 | 1–2 d | `ready` |
-| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `blocked (CP37)` |
+| CP37 | Constants freeze | C2 | CP36 | 1–2 d | `in review` |
+| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `ready` |
 | CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `blocked (CP38)` |
 | CP40 | Rollout: README, deployment guide, examples, guards | C5, C7 | CP39 | 2 d | `blocked (CP39)` |
 
@@ -2545,14 +2545,77 @@ bundle's. The webhook/gating half of that duplication is gone regardless.
 
 ### CP37 — Constants freeze
 
-- **Status:** `ready` · **Effort:** 1–2 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 1–2 d · **Risk:** low
 
 Settings that are tuning knobs nobody tunes become constants: section budgets, chunk sizing, web
 search cache limits. Each removal must show the golden resolved config unchanged.
 
+#### Implementation record
+
+**The sweep ran first, before a single field was deleted** — upstream's C2 records that ordering as
+what turned its `profile_budgets` problem into a decision rather than a silent regression, and it is
+the only part of that bundle worth copying procedurally. Core's result was cleaner than upstream's:
+`config.example.yaml` is the one shipped template, and it sets **none** of the candidates. Every
+candidate resolved identically in a defaults load and a template load, and all sat at their zero
+value, because the real defaults already lived at the consumers (`indexer.DefaultChunkConfig()`,
+`retrieval.DefaultCompact*`, the `Effective*` methods). Freezing was deletion, not invention.
+
+**28 keys frozen.** `indexer.chunk.*` (7), `jst_jsonl_out`, `docker_network`, `docker_cpus`,
+`overview_max_completion_tokens`, the two `dependency_docs` chunk caps, four
+`retrieval.context_compact.*`, `similar_mmr_lambda`, the three global retrieval budgets, and nine
+`runner.policy.project_intel.*`. **`profile_budgets` is NOT frozen** — upstream struck it from its
+own table after finding it live, and core's `ResolveRetrievalBudgets` has the same shape, so
+per-profile tuning survives while the globals become constants. `context_compact.enabled` stays too:
+CP17 already established it as the one switch that block keeps.
+
+**Most of what was frozen turned out to be INERT, not merely un-tuned.** The entire `indexer.chunk.*`
+block: the pipeline never sets `indexer.RunOptions.ChunkConfig`, so `run.go` always fell back to
+`DefaultChunkConfig()` and all seven keys did nothing when set. Same for `similar_mmr_lambda` and the
+three global retrieval budgets — `buildPlanOptions` never passed them. That is five more instances of
+CP36's documented blind spot, all invisible to a name-based lint because `PlanOptions`,
+`RetrievalProfileBudget` and `indexer.ChunkConfig` declare identically named fields. Notably this
+means core froze `enable_secondary_chunks`, which upstream KEEPS configurable — justified here
+because core never wired the block at all.
+
+**Two changes that are not no-ops, both deliberate:**
+
+- `jst_jsonl_out` freezes to `temp`, the one behaviour change. Local execution now writes Node's JSONL
+  to a temp file instead of streaming it over stdout, matching what docker execution already did.
+  Invisible in the goldens by construction — they capture configuration, and this is a runtime path.
+  **Release note.**
+- `websearch.cache_path` freezing removes a capability: an *absolute* path used to escape the per-run
+  clone for cross-run reuse. Nothing shipped used it, the supported route is the one project-intel
+  takes (the file is committed and arrives with the next clone), and an operator-settable absolute
+  path aimed the one component that egresses at a location outside the sandbox.
+
+**`docker_network` → `none` is verified a no-op.** The struct comment claimed "default none" while the
+code passed the empty string straight through, which reads like a bug and is not one: all three
+indexers resolve an empty network to their own `"none"`. Checked before freezing, as upstream did.
+
+**The project-intel fingerprint survived, and that was the delicate part.** `ConfigFingerprintHash`
+folds five now-frozen values into the cache key, so the frozen accessors stay as *methods* returning
+constants rather than collapsing into a shorter expression. The pre-freeze hash for a default config
+was computed independently from the old formula and is pinned:
+`abc01acf12f24b9619c11d62739cb5f077ac5b453718572d4c7fb759fef90714`. Dropping those inputs would have
+cold-started every `.asqs/project-intel-cache.json` in the field as a side effect of a refactor.
+
+**Goldens: deletion-only, both fixtures.** 32 lines removed, zero added, zero modified — the same
+shape upstream reported. They also did their job unprompted: the golden failure is what surfaced the
+change for review rather than letting it pass. `internal/config/frozen_keys_test.go` now checks both
+directions (no frozen key back as a struct field; none left in a shipped template, where the lenient
+v1 loader would ignore it silently), plus that every frozen value is unchanged. Both directions
+mutation-checked.
+
+**Ride-along fix.** `ProjectIntelCachePath` is now an exported constant, and `projectintel` grew
+`DefaultCachePathRel` beside its former bare literal — two spellings of one path is how a cache
+silently stops being committed. `internal/pipeline` is the one package that imports both, so the
+equality is pinned there, together with the assertion that the pre-ship preserve list actually names
+it. The env-var sweep over deploy assets, Makefile, compose files and the guides found **zero** uses
+of any frozen variable.
+
 ### CP38 — v2 schema, strict loader, derived env, translation
 
-- **Status:** `blocked (CP37)` · **Effort:** 4–5 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high
 
 **Tasks**
 

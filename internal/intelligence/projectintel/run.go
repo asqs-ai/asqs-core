@@ -11,6 +11,13 @@ import (
 	"unicode/utf8"
 )
 
+// DefaultCachePathRel is where the scan caches itself when a caller names no path.
+//
+// It is FROZEN (CP37) and must stay equal to config.ProjectIntelCachePath, which the pre-ship
+// preserve list uses to decide what survives a ship. Two spellings of one path is how a cache
+// silently stops being committed and every run starts cold; pipeline pins the equality.
+const DefaultCachePathRel = ".asqs/project-intel-cache.json"
+
 const rankLeadRunes = 8000
 
 const maxScannedRelPathsInResult = 100
@@ -62,7 +69,7 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 
 	cachePath := strings.TrimSpace(in.Opts.CachePath)
 	if cachePath == "" {
-		cachePath = ".asqs/project-intel-cache.json"
+		cachePath = DefaultCachePathRel
 	}
 	res.CachePath = cachePath
 	if in.Opts.CacheEnabled && !in.Opts.ForceRefresh {
