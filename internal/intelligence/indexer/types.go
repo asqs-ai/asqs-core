@@ -130,6 +130,17 @@ type MetadataWriter interface {
 	InsertEdges(ctx context.Context, edges []*metadata.Edge) error
 	UpsertFile(ctx context.Context, f *metadata.File) error
 	DeleteSymbolsByFile(ctx context.Context, repoID, file string) (int64, error)
+	// DeleteSymbolsByFileExcept prunes a reindexed file's symbols down to the ids just upserted.
+	// It replaces the delete-then-insert flow: deleting first would destroy the stable ids that
+	// make chunks.symbol_id durable and per-symbol history possible (CP13).
+	DeleteSymbolsByFileExcept(ctx context.Context, repoID, file string, keep []string) (int64, error)
+	// DeleteOutboundEdgesForFile clears the edges a reindexed file used to declare. The old
+	// delete-symbols cascade did this as a side effect; with stable ids nothing does, so a call
+	// removed from the source would otherwise linger as an edge forever.
+	DeleteOutboundEdgesForFile(ctx context.Context, repoID, file string) (int64, error)
+	// InsertSymbolVersions records one (symbol, commit) observation each. Auxiliary: a failure
+	// costs a churn observation, never the run.
+	InsertSymbolVersions(ctx context.Context, versions []*metadata.SymbolVersion) error
 	DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error)
 	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
 	ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error)

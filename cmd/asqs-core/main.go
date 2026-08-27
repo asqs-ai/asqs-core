@@ -182,10 +182,26 @@ func runRun(args []string) error {
 		}
 	}
 
+	// The commit the working tree is at, for per-symbol history. Resolved HERE because this is where
+	// the repository is opened or cloned — pipeline.Options.CommitSHA has existed all along and
+	// nothing ever set it, so every symbol version would have been recorded against the empty commit
+	// and churn (distinct body hashes per commit window) could never have counted past one. Upstream
+	// shipped exactly that for weeks. Best-effort: a plain directory that is not a git checkout has
+	// no commit, and that is a supported way to run.
+	commitSHA := ""
+	if gitRepo != nil {
+		if sha, err := gitRepo.HeadSHA(); err == nil {
+			commitSHA = sha
+		} else {
+			fmt.Fprintf(os.Stderr, "asqs-core: could not resolve HEAD (%v); symbol history is not recorded for this run.\n", err)
+		}
+	}
+
 	// --- Run the pipeline ---------------------------------------------------------------
 	sum, err := pipeline.Run(ctx, cfg, pipeline.Options{
 		RepoPath:         repoDir,
 		RepoID:           repoID,
+		CommitSHA:        commitSHA,
 		Lang:             flags.lang,
 		MaxGaps:          maxGaps,
 		MaxGapsE2E:       maxGapsE2E,

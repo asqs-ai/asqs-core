@@ -148,8 +148,30 @@ func truncate(s string, n int) string {
 // InsertSymbol inserts a symbol and returns its generated ID. Batch callers (the indexer) go
 // through InsertSymbols; both run the shared symbolInsertQuery so the paths cannot drift.
 func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err error) {
-	err = s.db.QueryRow(ctx, symbolInsertQuery, symbolInsertArgs(sym)...).Scan(&id)
+	// A single insert is ordinal 1 by definition: batch callers (the indexer) always go through
+	// InsertSymbols, which numbers same-key symbols per file. Two same-key SINGLE inserts therefore
+	// upsert onto ONE row — a caller that needs collision rows must batch them.
+	err = s.db.QueryRow(ctx, symbolInsertQuery, symbolInsertArgs(sym, 1)...).Scan(&id)
 	return id, err
+}
+
+// DeleteOutboundEdgesForFile removes every edge whose CALLER is declared in the file. With stable
+// symbol ids the old delete-symbols cascade no longer clears a reindexed file's edges, so stale
+// outbound edges (calls that no longer exist) must be dropped explicitly before the fresh set is
+// inserted. Inbound edges belong to their calling files and are deliberately left alone.
+func (s *Store) DeleteOutboundEdgesForFile(ctx context.Context, repoID, file string) (int64, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return 0, fmt.Errorf("metadata: delete outbound edges: empty repoID")
+	}
+	ct, err := s.db.Exec(ctx, `
+		DELETE FROM edges e
+		USING symbols s
+		WHERE e.caller_symbol_id = s.id AND s.repo_id = $1 AND s.file = $2`, repoID, file)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
 }
 
 // DeleteSymbolsByFile deletes the repository's symbols (and their edges via cascade) for the given
@@ -162,6 +184,101 @@ func (s *Store) DeleteSymbolsByFile(ctx context.Context, repoID, file string) (d
 		return 0, err
 	}
 	return res.RowsAffected(), nil
+}
+
+// DeleteSymbolsByFileExcept removes a file's symbols whose ids are NOT in keep — the second half
+// of the CP13 upsert flow: upsert what the file declares now, then prune what it no longer does.
+// Cascade takes the pruned symbols' edges and symbol_versions. Chunks live in the embeddings
+// store and are rewritten per file in the same pass; keeping ids stable is what makes their
+// symbol_id references survive that rewrite.
+func (s *Store) DeleteSymbolsByFileExcept(ctx context.Context, repoID, file string, keep []string) (int64, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return 0, fmt.Errorf("metadata: delete symbols except: empty repoID")
+	}
+	if len(keep) == 0 {
+		return s.DeleteSymbolsByFile(ctx, repoID, file)
+	}
+	ct, err := s.db.Exec(ctx, `
+		DELETE FROM symbols
+		WHERE repo_id = $1 AND file = $2 AND NOT (id = ANY($3::uuid[]))`, repoID, file, keep)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// SymbolVersion is one observation of a symbol's body at a commit (CP13).
+type SymbolVersion struct {
+	SymbolID  string
+	CommitSHA string
+	BodyHash  string
+}
+
+// InsertSymbolVersions records body hashes for this run's commit in one round trip. Upsert on
+// (symbol_id, commit_sha): re-indexing the same commit refreshes rather than duplicates, and a
+// dirty worktree indexed twice under one sha keeps the latest observation. Churn queries count
+// DISTINCT body_hash, so re-observations of identical content never inflate the signal.
+func (s *Store) InsertSymbolVersions(ctx context.Context, versions []*SymbolVersion) error {
+	if len(versions) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, v := range versions {
+		if v == nil || strings.TrimSpace(v.SymbolID) == "" || strings.TrimSpace(v.CommitSHA) == "" {
+			continue
+		}
+		batch.Queue(`
+			INSERT INTO symbol_versions (symbol_id, commit_sha, body_hash)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (symbol_id, commit_sha) DO UPDATE SET body_hash = EXCLUDED.body_hash, seen_at = now()`,
+			v.SymbolID, v.CommitSHA, v.BodyHash)
+	}
+	if batch.Len() == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("metadata: insert symbol versions: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	br := tx.SendBatch(ctx, batch)
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
+			return fmt.Errorf("metadata: insert symbol version: %w", err)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("metadata: insert symbol versions: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// SymbolChurn returns, per symbol id, the number of DISTINCT body hashes observed since the given
+// time — the temporal signal CP13 exists to enable ("this symbol changed 4 times last month").
+// 1 means "seen, unchanged"; only values > 1 indicate churn. Symbols with no versions are absent.
+func (s *Store) SymbolChurn(ctx context.Context, repoID string, since time.Time) (map[string]int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT sv.symbol_id::text, count(DISTINCT sv.body_hash)::int
+		FROM symbol_versions sv
+		JOIN symbols sy ON sy.id = sv.symbol_id
+		WHERE sy.repo_id = $1 AND sv.seen_at >= $2
+		GROUP BY sv.symbol_id`, strings.TrimSpace(repoID), since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
 }
 
 // DeleteFile removes the repository's `files` row for a path. Call after DeleteSymbolsByFile when

@@ -36,6 +36,80 @@ CREATE INDEX IF NOT EXISTS idx_symbols_repo_fq_name ON symbols (repo_id, fq_name
 CREATE INDEX IF NOT EXISTS idx_symbols_repo_lang_kind ON symbols (repo_id, lang, kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols (kind);
 
+-- Stable symbol identity (CP13). The natural key is (repo_id, file, fq_name, kind, dup_ordinal):
+-- dup_ordinal is the 1-based order of appearance among same-key symbols in one file, and it exists
+-- because not every indexer can distinguish overloads in the FQName — the advanced Java indexer
+-- emits "Type#method" for every overload (C# stopped doing this in CP55). The ordinal keeps such
+-- collisions as SEPARATE stable rows instead of silently merging them; identity degrades only if
+-- overloads are REORDERED within the file, which is rare and self-heals on the next reindex.
+--
+-- InsertSymbols is an upsert on this key, so an unchanged file keeps its symbol ids across
+-- reindexes — which is what makes chunks.symbol_id durable and symbol_versions possible at all.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS dup_ordinal INTEGER NOT NULL DEFAULT 1;
+
+-- Existing databases carry same-key duplicates (Java overloads, pre-CP55 C#). Assign ordinals ONCE,
+-- before the unique index first builds, guarded on that index's absence.
+--
+-- The guard is the whole point. InitSchema runs on every startup, so an unguarded UPDATE would
+-- renumber ordinals on each one — and because the ordinal is part of the identity, renumbering
+-- REASSIGNS symbol ids. Durable ids that shuffle on restart are worse than no durable ids: they
+-- would silently re-point chunks.symbol_id and scatter each symbol's history across rows.
+DO $symbols_natural_key$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = current_schema() AND indexname = 'uq_symbols_natural_key'
+    ) THEN
+        UPDATE symbols SET dup_ordinal = ranked.rn
+        FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY repo_id, file, fq_name, kind
+                ORDER BY start_line, end_line, id
+            ) AS rn
+            FROM symbols
+        ) ranked
+        WHERE symbols.id = ranked.id AND symbols.dup_ordinal <> ranked.rn;
+        CREATE UNIQUE INDEX uq_symbols_natural_key
+            ON symbols (repo_id, file, fq_name, kind, dup_ordinal);
+    END IF;
+END
+$symbols_natural_key$;
+
+-- symbol_versions: one row per (symbol, commit) with the hash of the symbol's source span (CP13).
+-- Churn — count(DISTINCT body_hash) over a window — is the temporal ranking signal that stable
+-- identity exists to enable. Cascade: a symbol pruned from the index takes its history with it.
+CREATE TABLE IF NOT EXISTS symbol_versions (
+    symbol_id  UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
+    commit_sha TEXT NOT NULL,
+    body_hash  TEXT NOT NULL,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol_id, commit_sha)
+);
+
+-- CREATE TABLE IF NOT EXISTS is a no-op on a database that already has the table, and that is true
+-- of its CONSTRAINTS as well as its columns — the same trap this file already documents for
+-- `symbols`. A pre-existing symbol_versions without the foreign key would never gain it, and the
+-- cascade is not decoration: without it, deleting a symbol orphans its history rows, which then
+-- point at an id a later insert can reuse. Found live: a scratch database carrying an older copy of
+-- this table kept every version row after its symbol was deleted.
+DO $symbol_versions_fk$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'symbol_versions_symbol_id_fkey' AND conrelid = 'symbol_versions'::regclass
+    ) THEN
+        DELETE FROM symbol_versions sv
+        WHERE NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = sv.symbol_id);
+        ALTER TABLE symbol_versions
+            ADD CONSTRAINT symbol_versions_symbol_id_fkey
+            FOREIGN KEY (symbol_id) REFERENCES symbols (id) ON DELETE CASCADE;
+    END IF;
+END
+$symbol_versions_fk$;
+
+-- Churn reads the window by repo and time, joining back to symbols for the repo scope.
+CREATE INDEX IF NOT EXISTS idx_symbol_versions_seen_at ON symbol_versions (seen_at);
+
 -- Optional precise span (see docs/DOCUMENTATION.md — Symbol line/column spans). NULL when unknown or line-only indexer.
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS start_column INTEGER;
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS end_column INTEGER;

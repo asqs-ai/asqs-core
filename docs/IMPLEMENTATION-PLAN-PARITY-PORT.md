@@ -307,7 +307,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `in review` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
-| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `ready` |
+| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `in review` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `in review` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `in review` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
@@ -404,7 +404,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP56 | README, behaviour docs, release notes, operator actions | — | everything | 3 d | `blocked` |
+| CP56 | README, behaviour docs, release notes, operator actions | — | everything | 3 d | `ready` |
 
 ### Critical path and parallelism
 
@@ -1104,7 +1104,7 @@ cross-check after a full run.
 
 ### CP13 — Stable symbol identity and churn signal
 
-- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `in review` · **Effort:** 3–4 d · **Risk:** high
 
 **Goal.** Symbol ids that survive a reindex, so `chunks.symbol_id` is durable and per-symbol history
 is possible at all.
@@ -1134,6 +1134,52 @@ CP55 then makes unnecessary, and the reassignment shuffles identities exactly on
    pin it with the same guard.
 5. **Churn weight ships at 0.** The ranking term must earn a nonzero default through a CP16
    comparison; it may not be defaulted on in this bundle.
+
+#### Implementation record
+
+All five tasks done, live-verified against scratch Postgres.
+
+**The reindex flow had to be inverted, and that is the substance of the bundle.** Core deleted a
+file's symbols and re-inserted them; an upsert on the natural key is pointless if the rows were just
+deleted, so the sequence became **upsert → prune → clear outbound edges**. Both halves of that matter:
+`DeleteSymbolsByFileExcept` removes what the file no longer declares (nothing else would, now that
+the delete is gone), and `DeleteOutboundEdgesForFile` clears the file's old edges explicitly, because
+the delete-symbols cascade used to do that as a side effect. Without the second, a call removed from
+the source would linger as an edge forever — a silent graph corruption that would have shipped
+looking like a successful run.
+
+**The one-shot ordinal guard is the sharpest edge here.** `InitSchema` runs on every startup, so an
+unguarded `UPDATE symbols SET dup_ordinal = …` would renumber on each one — and since the ordinal is
+part of the identity, renumbering REASSIGNS ids. Durable ids that shuffle on restart are worse than
+no durable ids: they silently re-point `chunks.symbol_id` and scatter each symbol's history. The
+guard is the absence of `uq_symbols_natural_key`, and running `InitSchema` twice is part of the live
+test.
+
+**The latent bug the plan warned about was already in core, verbatim.** `pipeline.Options.CommitSHA`
+was plumbed from the CLI through the pipeline into the indexer and on to `symbol_versions` — and
+**nothing anywhere set it**. Every version row would have carried the empty commit, so churn
+(`count(DISTINCT body_hash)` per window) could never have counted past one; the table would have
+looked populated while holding no signal. Now resolved from `repo.HeadSHA()` where the repository is
+opened or cloned, best-effort so a plain non-git directory still runs, and pinned by a source guard —
+the failure is an absence, so there is no output to assert on, only wiring.
+
+**A defect found live, in the schema itself.** The first run of the cascade test left three
+`symbol_versions` rows behind after their symbol was deleted. Cause: the scratch database already
+carried an older copy of the table, and `CREATE TABLE IF NOT EXISTS` is a no-op on its CONSTRAINTS
+just as it is on its columns — the same trap this file already documents for `symbols`, one level
+down. The foreign key is now added idempotently, guarded on `pg_constraint`, with orphan rows swept
+first so the constraint can build. **Upstream has the same gap**, since it relies on the bare
+`CREATE TABLE IF NOT EXISTS`.
+
+**Churn ships at weight 0 and the term is ABSENT, not scaled to nothing** — no map fetch, no reason
+text, no priority change. There is deliberately no config key either: the knob arrives with the CP16
+measurement that would justify a value for it. Pinned by a test, because "we will measure it later"
+is exactly the intention that erodes.
+
+`dup_ordinal` collisions are counted and audited as `index.symbol_natural_key_collisions`: they are
+where the language indexer cannot name overloads apart (the advanced Java indexer's parameterless
+FQNames), and an invisible limitation never gets fixed. A run with no commit reports
+`index.symbol_versions_skipped` rather than silently recording nothing.
 
 **Acceptance.** Index the same unchanged commit twice; symbol ids are identical (live DB). Index two
 commits; `symbol_versions` gains one row per changed symbol and none per unchanged one. A run with no
@@ -4171,7 +4217,7 @@ against the filesystem after cleanup rather than against `git status`.
 
 ### CP56 — README, behaviour docs, release notes
 
-- **Status:** `blocked` · **Effort:** 3 d
+- **Status:** `ready` · **Effort:** 3 d
 
 1. `README.md`: the pipeline diagram gains the tool loop and the two knowledge sources; the config
    step points at the generated reference; the "Limitations" and "Not included" sections are

@@ -12,12 +12,24 @@ import (
 // column added to one and not the other would be a silent difference between indexing a file with
 // one symbol and indexing it with two.
 //
-// This is a plain insert: the upsert on the natural key (with dup_ordinal), which makes symbol ids
-// stable across reindexes, arrives with the stable-identity bundle (CP13) and upgrades this
-// constant in place.
+// UPSERT on the natural key (CP13), which is what makes a symbol id survive a reindex — and so what
+// makes chunks.symbol_id durable and per-symbol history possible at all. dup_ordinal disambiguates
+// same-key symbols the indexer cannot tell apart (Java overloads share an FQName); it also
+// guarantees one statement never hits the same key twice, which ON CONFLICT DO UPDATE would reject
+// outright.
+//
+// The SET list deliberately omits repo_id, file, fq_name and kind: they are the conflict target, so
+// assigning them would be a no-op that reads as though the row could move.
 const symbolInsertQuery = `
-		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, repo_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, repo_id, dup_ordinal)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		ON CONFLICT (repo_id, file, fq_name, kind, dup_ordinal) DO UPDATE SET
+			lang = EXCLUDED.lang,
+			start_line = EXCLUDED.start_line,
+			end_line = EXCLUDED.end_line,
+			start_column = EXCLUDED.start_column,
+			end_column = EXCLUDED.end_column,
+			signature_json = EXCLUDED.signature_json
 		RETURNING id`
 
 // symbolInsertArgs normalizes one symbol into the bind parameters symbolInsertQuery expects.
@@ -25,7 +37,7 @@ const symbolInsertQuery = `
 // lang/kind are lowercased at write time: queries used to compare LOWER(s.lang) = LOWER($1), which
 // defeats idx_symbols_lang because there is no matching expression index, so the gap-listing hot
 // path could not use an index at all.
-func symbolInsertArgs(sym *Symbol) []any {
+func symbolInsertArgs(sym *Symbol, ordinal int) []any {
 	var sig *[]byte
 	if len(sym.SignatureJSON) > 0 {
 		sig = &sym.SignatureJSON
@@ -40,8 +52,35 @@ func symbolInsertArgs(sym *Symbol) []any {
 	return []any{
 		strings.ToLower(strings.TrimSpace(sym.Lang)), strings.ToLower(strings.TrimSpace(sym.Kind)),
 		sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig,
-		strings.TrimSpace(sym.RepoID),
+		strings.TrimSpace(sym.RepoID), ordinal,
 	}
+}
+
+// assignDupOrdinals numbers same-natural-key symbols by order of appearance within one batch — the
+// batch is one file's symbols, so this is "order of appearance in the file".
+//
+// Identity for a colliding overload set is therefore POSITIONAL: stable while the file keeps its
+// overload order, reassigned when overloads are reordered. That is the known limit of this design,
+// and it is the right trade: the alternative is merging the overloads onto one row, which loses them
+// entirely rather than occasionally mixing their history. Reordering is rare and self-heals on the
+// next reindex.
+//
+// The key lowercases kind because InsertSymbol writes it lowercased; comparing the raw value here
+// would let "Method" and "method" take separate ordinals for one symbol and then collide in the
+// database.
+func assignDupOrdinals(syms []*Symbol) []int {
+	ordinals := make([]int, len(syms))
+	seen := make(map[string]int, len(syms))
+	for i, sym := range syms {
+		if sym == nil {
+			continue
+		}
+		key := strings.TrimSpace(sym.RepoID) + "\x00" + sym.File + "\x00" + sym.FQName + "\x00" +
+			strings.ToLower(strings.TrimSpace(sym.Kind))
+		seen[key]++
+		ordinals[i] = seen[key]
+	}
+	return ordinals
 }
 
 // InsertSymbols inserts many symbols in ONE round trip and returns their generated ids, in the same
@@ -86,12 +125,13 @@ func (s *Store) InsertSymbols(ctx context.Context, syms []*Symbol) ([]string, er
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
+	ordinals := assignDupOrdinals(syms)
 	batch := &pgx.Batch{}
-	for _, sym := range syms {
+	for i, sym := range syms {
 		if sym == nil {
 			return nil, fmt.Errorf("metadata: insert symbols: nil symbol at index %d", len(batch.QueuedQueries))
 		}
-		batch.Queue(symbolInsertQuery, symbolInsertArgs(sym)...)
+		batch.Queue(symbolInsertQuery, symbolInsertArgs(sym, ordinals[i])...)
 	}
 
 	br := tx.SendBatch(ctx, batch)

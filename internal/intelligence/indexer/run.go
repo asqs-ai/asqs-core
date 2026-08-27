@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -122,6 +123,13 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	if currentIteration <= 0 {
 		currentIteration = 3
 	}
+	// The commit this pass observes symbol bodies at. Empty means "not a git checkout", which is a
+	// supported way to run — history simply does not accumulate for it.
+	commitSHA := strings.TrimSpace(opts.CommitSHA)
+	// Same fq_name+kind declared twice in one file: stored as distinct rows via dup_ordinal, but
+	// counted because it marks where the language indexer cannot name overloads apart.
+	naturalKeyCollisions := 0
+
 	preFilterCount := len(opts.CurrentFiles)
 	currentFiles := opts.CurrentFiles
 	if len(opts.IndexablePaths) > 0 {
@@ -377,11 +385,15 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			})
 		}
 
-		// Delete existing symbols/chunks for this file (reindex)
+		// Chunks are still delete-then-write: they carry no identity of their own, and the embeddings
+		// store rewrites the file's set in this pass.
+		//
+		// SYMBOLS are not. Deleting them here would destroy the ids that CP13 exists to preserve —
+		// and with them chunks.symbol_id and every row of the symbol's history. The file is
+		// upserted on the natural key below, then pruned of what it no longer declares.
 		if emb != nil {
 			_, _ = emb.DeleteByFile(ctx, opts.RepoID, fv.Path)
 		}
-		_, _ = meta.DeleteSymbolsByFile(ctx, opts.RepoID, fv.Path)
 
 		// Insert symbols and collect IDs
 		symbolIDByFQName := make(map[string]string)
@@ -412,6 +424,54 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		ids, err := meta.InsertSymbols(ctx, metaSyms)
 		if err != nil {
 			return nil, fmt.Errorf("indexer: insert symbols for %s: %w", parsed.Path, err)
+		}
+		if len(ids) != len(metaSyms) {
+			return nil, fmt.Errorf("indexer: insert symbols for %s: got %d ids for %d symbols",
+				parsed.Path, len(ids), len(metaSyms))
+		}
+		// Natural-key collisions (the same fq_name+kind twice in one file) are stored as separate
+		// rows via dup_ordinal, but they mean the indexer cannot NAME the difference — the Java
+		// indexer's parameterless overload FQNames are the known case. Counted for the audit,
+		// because an invisible limitation never gets fixed.
+		{
+			keySeen := make(map[string]int, len(parsed.Symbols))
+			for _, sym := range parsed.Symbols {
+				k := sym.FQName + "\x00" + strings.ToLower(sym.Kind)
+				keySeen[k]++
+				if keySeen[k] == 2 {
+					naturalKeyCollisions++
+				}
+			}
+		}
+		// Prune what the file no longer declares. This is the second half of the upsert flow, and
+		// without it a deleted symbol would live forever now that nothing deletes the file's rows.
+		if _, derr := meta.DeleteSymbolsByFileExcept(ctx, opts.RepoID, parsed.Path, ids); derr != nil {
+			return nil, fmt.Errorf("indexer: prune symbols for %s: %w", parsed.Path, derr)
+		}
+		// Stable ids keep the file's OLD outbound edges alive — the delete-symbols cascade used to
+		// clear them as a side effect. Drop them before this pass re-derives the current set, or a
+		// call that was removed from the source lingers as an edge forever.
+		if _, derr := meta.DeleteOutboundEdgesForFile(ctx, opts.RepoID, parsed.Path); derr != nil {
+			return nil, fmt.Errorf("indexer: clear outbound edges for %s: %w", parsed.Path, derr)
+		}
+		if commitSHA != "" {
+			versions := make([]*metadata.SymbolVersion, 0, len(ids))
+			for i, sym := range parsed.Symbols {
+				versions = append(versions, &metadata.SymbolVersion{
+					SymbolID:  ids[i],
+					CommitSHA: commitSHA,
+					BodyHash:  symbolBodyHash(parsed.Source, sym.StartLine, sym.EndLine),
+				})
+			}
+			if verr := meta.InsertSymbolVersions(ctx, versions); verr != nil {
+				// History is auxiliary: losing a churn observation must not fail an index run.
+				if opts.Audit != nil {
+					opts.Audit.LogError(ctx, "index.symbol_versions_error", map[string]interface{}{
+						"message": fmt.Sprintf("Could not record symbol versions for %s: %v. Churn history misses this pass.", parsed.Path, verr),
+						"file":    parsed.Path, "error": verr.Error(),
+					})
+				}
+			}
 		}
 		for i, sym := range parsed.Symbols {
 			symbolIDByFQName[sym.FQName] = ids[i]
@@ -749,6 +809,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 
 	finished := time.Now().UnixMilli()
 	if opts.Audit != nil {
+		if naturalKeyCollisions > 0 {
+			opts.Audit.Log(ctx, "index.symbol_natural_key_collisions", map[string]interface{}{
+				"message": fmt.Sprintf("%d (file, fq_name, kind) key(s) are declared by more than one symbol and were stored under distinct dup_ordinal values — the language indexer cannot distinguish these overloads by name (Java's parameterless FQNames are the known case). Without dup_ordinal these symbols would collapse onto one row.", naturalKeyCollisions),
+				"count":   naturalKeyCollisions,
+			})
+		}
+		if commitSHA == "" && (len(changeSet.Added) > 0 || len(changeSet.Changed) > 0) {
+			opts.Audit.Log(ctx, "index.symbol_versions_skipped", map[string]interface{}{
+				"message": "No commit SHA on this run; symbol version history (churn) was not recorded for this pass.",
+			})
+		}
 		finishPayload := map[string]interface{}{
 			"message": fmt.Sprintf("Index run finished: %d added, %d changed, %d removed; %d symbols, %d edges, %d chunks; %d ms.", len(changeSet.Added), len(changeSet.Changed), len(changeSet.Removed), symbolsStored, edgesStored, chunksStored, finished-started),
 			"run_id":  runID, "added": len(changeSet.Added), "changed": len(changeSet.Changed),
@@ -1047,4 +1118,22 @@ func flushEdges(ctx context.Context, meta MetadataWriter, edges []*metadata.Edge
 		}
 	}
 	return stored
+}
+
+// symbolBodyHash hashes the symbol's source span (1-based inclusive lines) for symbol_versions.
+// Line-slice rather than chunk content on purpose: chunking has its own budgets and overlap, and
+// the identity question is "did the SOURCE of this symbol change", not "did its chunks".
+func symbolBodyHash(source string, startLine, endLine int) string {
+	lines := strings.Split(source, "\n")
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	if startLine > len(lines) || endLine < startLine {
+		return fmt.Sprintf("%x", sha256.Sum256(nil))
+	}
+	span := strings.Join(lines[startLine-1:endLine], "\n")
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(span)))
 }

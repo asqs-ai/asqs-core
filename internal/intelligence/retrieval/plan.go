@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
@@ -79,15 +80,22 @@ type PlanOptions struct {
 	Lang                   string
 	RepoID                 string
 	CriticalModulePrefixes []string
-	SkipPathPrefixes       []string // repo-relative path prefixes to exclude from gaps (e.g. "app/lib"); matches path and FQName-style (dots).
-	MaxGaps                int
-	MaxGapsPerFile         int // max gaps to select per source file (0 = no cap). Use 1–2 to spread selection across files so the same files are not picked every run.
-	MaxDependencyChunks    int
-	MaxSimilarTests        int
-	MaxFixtures            int
-	MaxConfigChunks        int
-	MaxContextChunks       int
-	DependencyMaxDepth     int
+	// ChurnWeight scales the churn signal (CP13): Priority += ChurnWeight * min(distinctHashes-1, 5),
+	// where distinctHashes counts a symbol's distinct body hashes over the last 90 days.
+	//
+	// It ships at 0, meaning the term is ABSENT. A ranking default has to earn its value through a
+	// measured comparison (CP16), and defaulting it on would change every plan on the strength of a
+	// plausible story. Requires a store implementing SymbolChurn; silently off otherwise.
+	ChurnWeight         int
+	SkipPathPrefixes    []string // repo-relative path prefixes to exclude from gaps (e.g. "app/lib"); matches path and FQName-style (dots).
+	MaxGaps             int
+	MaxGapsPerFile      int // max gaps to select per source file (0 = no cap). Use 1–2 to spread selection across files so the same files are not picked every run.
+	MaxDependencyChunks int
+	MaxSimilarTests     int
+	MaxFixtures         int
+	MaxConfigChunks     int
+	MaxContextChunks    int
+	DependencyMaxDepth  int
 	// ProfileBudgets optional per-profile caps (canonical keys). Nil = use globals + built-in defaults only.
 	ProfileBudgets map[string]config.RetrievalProfileBudget
 	// SimilarMMRLambda: see ContextRequest.SimilarMMRLambda (0 = default 0.5 in Retrieve).
@@ -196,6 +204,17 @@ func isPrivateJavaMethod(sym *metadata.Symbol) bool {
 // ListGaps returns a small set of test-gap candidates: public methods (or functions for JS/TS) with no tests, optionally
 // prioritized by business-critical modules (payment, auth, …) and central dependencies (many callers).
 // Private Java methods are excluded (we do not test private members). Metadata calls (GetFile, GetEdgesTo) run concurrently with bounded concurrency.
+// symbolChurnReader is the optional store capability behind the CP13 churn term.
+type symbolChurnReader interface {
+	SymbolChurn(ctx context.Context, repoID string, since time.Time) (map[string]int, error)
+}
+
+// churnWindow is the lookback for the churn signal — "changed recently".
+const churnWindow = 90 * 24 * time.Hour
+
+// churnCap bounds one symbol's contribution, so a single hot file cannot monopolize the plan.
+const churnCap = 5
+
 func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*TestGap, error) {
 	return ListGapsWithChunks(ctx, meta, nil, opts)
 }
@@ -216,6 +235,17 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	}
 	if opts.MaxGaps <= 0 {
 		opts.MaxGaps = 10
+	}
+	// Churn map, fetched ONCE per plan rather than per candidate, and only when the weight is on and
+	// the store can answer. Failure degrades to structural scoring with an empty map — churn is a
+	// bonus signal, never a gate.
+	churnBySymbol := map[string]int{}
+	if opts.ChurnWeight > 0 {
+		if cr, ok := meta.(symbolChurnReader); ok {
+			if m, err := cr.SymbolChurn(ctx, opts.RepoID, time.Now().Add(-churnWindow)); err == nil {
+				churnBySymbol = m
+			}
+		}
 	}
 	maxPerFile := opts.MaxGapsPerFile
 	if maxPerFile < 0 {
@@ -287,6 +317,19 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 				gap.Kind = GapBusinessCritical
 				gap.Reason = "business-critical module"
 				gap.Priority += 30 // highest band: critical beats "no tests" and "has tests"
+			}
+			// Churn (CP13): distinct body hashes in the window minus one is "times changed", capped
+			// so a hot file cannot monopolize the plan. Weight 0 means the term is absent entirely —
+			// no lookup, no reason text, no priority change.
+			if opts.ChurnWeight > 0 {
+				if changes := churnBySymbol[sym.ID] - 1; changes > 0 {
+					c := changes
+					if c > churnCap {
+						c = churnCap
+					}
+					gap.Priority += opts.ChurnWeight * c
+					gap.Reason += fmt.Sprintf("; changed %dx in 90d", changes)
+				}
 			}
 			// Resolve the declaring type ONCE and share it between the eligibility filter and
 			// the TESTS_SOURCE trace lookup (which used to fetch and discard it). Net new DB
