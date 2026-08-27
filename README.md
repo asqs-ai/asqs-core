@@ -89,6 +89,13 @@ make build-indexers
 Point `indexer.*_path` in your config at the produced artifacts (defaults shown in
 `config.example.yaml`).
 
+> **Rebuild the C# indexer after upgrading.** It now compiles per `.csproj` group — each project
+> together with the sources of the projects it transitively references — instead of one file at a
+> time. That is what lets a call from one project into another resolve to a fully-qualified callee
+> at all; a stale `publish/CSharpIndexer.dll` silently keeps the old per-file behaviour and simply
+> emits fewer `CALLS` edges. Each run now also reports how many invocations it resolved and how many
+> it could not, so the gap is visible rather than a silent `continue`.
+
 ## 3. Docker sandbox images (only when `runner.type: docker`)
 
 Pulled on first use; override any of them in config:

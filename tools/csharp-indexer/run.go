@@ -5,6 +5,7 @@ package csharpindexer
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -23,6 +24,21 @@ type RunConfig struct {
 	// AllowEmptyResult when true returns an empty map instead of an error if the indexer emits no JSONL
 	// (e.g. mono primary workspace has no C# while mono_repo_extra_paths holds a shared library).
 	AllowEmptyResult bool
+	// OnSummary receives the indexer's trailing run summary when the tool emits one.
+	// Older tool builds emit none; the callback is simply never invoked then.
+	OnSummary func(RunSummary)
+}
+
+// RunSummary is the trailing JSONL object the indexer emits after all file lines: how the repo
+// was compiled and how invocation resolution fared. `invocations_unresolved` is the health metric
+// per-project compilation exists to reduce — before per-project compilation an unresolved callee was a silent continue.
+type RunSummary struct {
+	Summary               string `json:"summary"` // "csharp_indexer_run"
+	Projects              int    `json:"projects"`
+	ProjectFiles          int    `json:"project_files"`
+	LooseFiles            int    `json:"loose_files"`
+	InvocationsResolved   int    `json:"invocations_resolved"`
+	InvocationsUnresolved int    `json:"invocations_unresolved"`
 }
 
 // Run executes the indexer against repoPath. dllPath must be absolute path to CSharpIndexer.dll (dotnet publish output).
@@ -74,10 +90,13 @@ func runLocal(ctx context.Context, absRepo, dllPath string, cfg RunConfig) (map[
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("csharp-indexer: start dotnet: %w", err)
 	}
-	byPath, scanErr := parseJSONL(stdout, &stderr)
+	byPath, summary, scanErr := parseJSONL(stdout, &stderr)
 	waitErr := cmd.Wait()
 	if scanErr != nil {
 		return nil, scanErr
+	}
+	if summary != nil && cfg.OnSummary != nil {
+		cfg.OnSummary(*summary)
 	}
 	if len(byPath) == 0 {
 		if cfg.AllowEmptyResult {
@@ -119,10 +138,13 @@ func runDocker(ctx context.Context, absRepo, dllPath string, cfg RunConfig) (map
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("csharp-indexer docker: start %s: %w", cli, err)
 	}
-	byPath, scanErr := parseJSONL(stdout, &stderr)
+	byPath, summary, scanErr := parseJSONL(stdout, &stderr)
 	waitErr := cmd.Wait()
 	if scanErr != nil {
 		return nil, scanErr
+	}
+	if summary != nil && cfg.OnSummary != nil {
+		cfg.OnSummary(*summary)
 	}
 	if len(byPath) == 0 {
 		if cfg.AllowEmptyResult {
@@ -140,8 +162,9 @@ func runDocker(ctx context.Context, absRepo, dllPath string, cfg RunConfig) (map
 	return byPath, nil
 }
 
-func parseJSONL(stdout io.Reader, stderr *strings.Builder) (map[string]*indexer.ParsedFile, error) {
+func parseJSONL(stdout io.Reader, stderr *strings.Builder) (map[string]*indexer.ParsedFile, *RunSummary, error) {
 	byPath := make(map[string]*indexer.ParsedFile)
+	var summary *RunSummary
 	scanner := bufio.NewScanner(stdout)
 	// Lines can be large for big files; extend buffer beyond default 64K.
 	const max = 64 * 1024 * 1024
@@ -150,6 +173,15 @@ func parseJSONL(stdout io.Reader, stderr *strings.Builder) (map[string]*indexer.
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			continue
+		}
+		// The summary line has no "path"; a strict prefix check keeps this from ever
+		// swallowing a real file document.
+		if strings.HasPrefix(line, `{"summary":"csharp_indexer_run"`) {
+			var sum RunSummary
+			if err := json.Unmarshal([]byte(line), &sum); err == nil && sum.Summary == "csharp_indexer_run" {
+				summary = &sum
+			}
 			continue
 		}
 		pf, err := indexer.ParsedFileFromJSON([]byte(line), "")
@@ -166,7 +198,7 @@ func parseJSONL(stdout io.Reader, stderr *strings.Builder) (map[string]*indexer.
 		byPath[path] = pf
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("csharp-indexer: read stdout: %w", err)
+		return nil, nil, fmt.Errorf("csharp-indexer: read stdout: %w", err)
 	}
-	return byPath, nil
+	return byPath, summary, nil
 }

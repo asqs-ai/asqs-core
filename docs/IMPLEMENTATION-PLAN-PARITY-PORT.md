@@ -390,8 +390,8 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP54 | C# per-project compilation | B24 | — | 4–5 d | `ready` |
-| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `blocked (CP54)` |
+| CP54 | C# per-project compilation | B24 | — | 4–5 d | `in review` |
+| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `ready` |
 
 ### P12 — Framework-aware test bootstrap *(a whole upstream wave, previously unbundled — §2.5-6)*
 
@@ -3578,7 +3578,7 @@ lines, `run.go` by 44, `docker_dotnet.go` by 8.
 
 ### CP54 — C# per-project compilation
 
-- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 4–5 d · **Risk:** medium
 
 Compile per csproj-group with transitive `ProjectReference` sources instead of one flat compilation.
 Measured upstream on a fixture repository: cross-file `CALLS` edges **0 → 4**, and `INJECTS` callees
@@ -3590,9 +3590,39 @@ became fully qualified. Unresolved invocations are counted and audited (CP03).
 **Operator action:** the C# indexer must be rebuilt (`dotnet publish -c Release -o publish`).
 `README.md` step 2 and the `indexers` CI job both need updating.
 
+**Implementation record (2026-08-27).**
+
+- `Program.cs` taken at upstream's end state. The 31 lines core held that upstream does not were
+  exactly the old flat per-file compilation loop this bundle replaces, so there was nothing
+  core-specific to preserve. `CSharpIndexer.csproj` was already identical.
+- **`run.go`** gained the trailing-summary channel: `RunSummary` + `OnSummary`, parsed by a strict
+  `{"summary":"csharp_indexer_run"` prefix check so it can never swallow a real file document, and
+  tolerant of older tool builds that emit none. Core's own config-key spelling in the empty-DLL
+  error (`indexer.csharp_indexer_dll_path`) was kept — upstream's names a key core does not have.
+  `docker_dotnet.go` was already identical; its diff here is `gofmt` alignment only.
+- **The MSBuildWorkspace decision is recorded in the code**, as this section requires: source
+  inclusion is used deliberately — no design-time build, no NuGet restore, no network, and "a
+  project that fails to load degrades to per-file" stays a local catch instead of a workspace-wide
+  failure mode.
+- **Verified by running it**, not by inspection. Built (`dotnet build`, clean) and published
+  (`dotnet publish -c Release -o publish`) on this machine, then run against a two-project fixture
+  where `App` has a `ProjectReference` on `Lib`. The cross-project call resolved to a fully
+  qualified callee — `App.Caller#Run() → Lib.Greeter#Hello(string)` as a `CALLS` edge — and the run
+  summary reported `projects: 2, project_files: 2, loose_files: 0, invocations_resolved: 1,
+  invocations_unresolved: 0`. Under the old per-file compilation that call had no reference to
+  resolve against, which is precisely the 0→N edge change the section measures.
+- **Operator action done.** `make build-indexers` already publishes the DLL, and the CI `indexers`
+  job already calls it, so what was actually missing was the *reason to rerun them*: README now
+  says a stale `publish/CSharpIndexer.dll` silently keeps the old per-file behaviour and simply
+  emits fewer `CALLS` edges, and that each run now reports resolved/unresolved invocation counts.
+- Full gate green (Go side). **Pre-existing, unrelated:** `tools/java-indexer/{minimal,spring_web}.go`
+  are committed unformatted — visible only because this bundle widened the `gofmt` check to
+  `tools/`. Left alone rather than mixed into this commit.
+
+
 ### CP55 — C# parameterized FQNames
 
-- **Status:** `blocked (CP54)` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
 
 Overloads become distinct end to end; edges bind the exact overload; generic declarations carry `<T>`.
 Needs a **forced reindex** on the legacy format (automatic, detected), a migration for the simple-name
