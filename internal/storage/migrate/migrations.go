@@ -264,5 +264,159 @@ SELECT COALESCE(string_agg(a.attname, ',' ORDER BY k.ord), '')
 				return nil
 			},
 		},
+		{
+			ID:          "0002_symbols_trigram_and_simple_name",
+			Description: "pg_trgm + fq_name trigram index, generated simple_name column and index",
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// ADD COLUMN ... GENERATED ... STORED rewrites the table on PG 12+, which is
+				// precisely why it is an operator action rather than a startup side effect.
+				stmts := []string{
+					`CREATE EXTENSION IF NOT EXISTS pg_trgm`,
+					// ListSymbolsByFQSubstring used strpos(lower(fq_name), lower($1)) — unindexable.
+					`ALTER TABLE symbols ADD COLUMN IF NOT EXISTS simple_name TEXT
+					   GENERATED ALWAYS AS (regexp_replace(fq_name, '^.*[.#]', '')) STORED`,
+				}
+				for _, s := range stmts {
+					if _, err := pool.Exec(ctx, s); err != nil {
+						return fmt.Errorf("symbols schema: %w", err)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			ID:          "0003_symbols_lookup_indexes",
+			Description: "trigram, simple_name and lower(lang) indexes for symbol lookup",
+			Concurrent:  true,
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				stmts := []string{
+					`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_fq_trgm
+					   ON symbols USING GIN (fq_name gin_trgm_ops)`,
+					// NOTE: this becomes (repo_id, simple_name) when the symbol graph is
+					// repo-scoped (Spec 1 / B23); the composite index supersedes this one.
+					`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_simple_name
+					   ON symbols (simple_name)`,
+					`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_lang_lower
+					   ON symbols (lower(lang))`,
+				}
+				for _, s := range stmts {
+					if _, err := pool.Exec(ctx, s); err != nil {
+						return fmt.Errorf("create index: %w", err)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			ID:          "0007_symbols_repo_scoped_lookup_indexes",
+			Description: "composite (repo_id, ...) lookup indexes so scoped reads stay indexed",
+			Concurrent:  true,
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// Every symbol lookup gained a repo_id predicate in B23. Without these the planner
+				// filters on repo_id after an index scan on the old single-column indexes, which is
+				// correct but reads the whole matching set of every repository first.
+				stmts := []string{
+					`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_repo_fq_name
+					   ON symbols (repo_id, fq_name)`,
+					`CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_repo_lang_kind
+					   ON symbols (repo_id, lang, kind)`,
+				}
+				for _, q := range stmts {
+					if _, err := pool.Exec(ctx, q); err != nil {
+						return fmt.Errorf("repo-scoped lookup indexes: %w", err)
+					}
+				}
+
+				// simple_name is OPTIONAL, and this migration must not assume otherwise.
+				//
+				// 0002 adds it as a STORED generated column, which rewrites the table — deliberately
+				// an operator action, not a startup side effect. The read path treats it the same
+				// way: hasSimpleNameColumn() probes for it and falls back to the unindexed predicate
+				// when it is absent.
+				//
+				// This migration originally assumed 0002's column was present and failed the whole
+				// run with `column "simple_name" does not exist` on a database whose ledger recorded
+				// 0002 as applied but whose `symbols` table had since been recreated without it. That
+				// took the two indexes above down with it: CONCURRENTLY runs outside a transaction,
+				// so a later statement failing does not undo earlier ones, but the ledger is not
+				// written either — leaving the operator with a migration that reports failure and
+				// half its work done.
+				//
+				// Skipping is correct rather than lenient: the index accelerates a lookup that
+				// already degrades gracefully, so its absence costs latency, not correctness. Adding
+				// the column here would rewrite a large table inside a migration whose stated job is
+				// index creation.
+				var hasSimpleName bool
+				if err := pool.QueryRow(ctx, `
+					SELECT EXISTS (
+						SELECT 1 FROM information_schema.columns
+						WHERE table_schema = current_schema()
+						  AND table_name = 'symbols'
+						  AND column_name = 'simple_name'
+					)`).Scan(&hasSimpleName); err != nil {
+					return fmt.Errorf("probe simple_name: %w", err)
+				}
+				if !hasSimpleName {
+					return nil
+				}
+				// 0003 created this on simple_name alone and noted it becomes
+				// (repo_id, simple_name) when the symbol graph is repo-scoped. It now is.
+				if _, err := pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_symbols_repo_simple_name
+					   ON symbols (repo_id, simple_name)`); err != nil {
+					return fmt.Errorf("repo-scoped simple_name index: %w", err)
+				}
+				return nil
+			},
+		},
+		{
+			ID:          "0008_simple_name_parameter_aware",
+			Description: "recreate generated simple_name to strip B25 parameter lists and generic markers",
+			Apply: func(ctx context.Context, pool *pgxpool.Pool) error {
+				// B25 parameterizes C# FQNames ("Ns.Type<T>#M(int,Outer.Inner)"). 0002's generated
+				// expression takes the segment after the LAST '.' or '#', which inside a parameter
+				// list yields garbage like "Inner)" — and a generated column's expression cannot be
+				// altered in place, so the column is dropped and recreated. Guarded on existence:
+				// the column is 0002's operator opt-in, and a database without it stays without it.
+				// The dependent indexes (0003's and 0007's) drop with the column and are recreated
+				// here; plain CREATE INDEX, not CONCURRENTLY, because ADD COLUMN ... STORED just
+				// rewrote the table anyway.
+				//
+				// Expression mirrored from metadata.BareFQName (the Go twin — change both or
+				// neither): strip "(...)" to end-of-string, strip "<...>" runs, then take the last
+				// [.#] segment.
+				var hasSimpleName bool
+				if err := pool.QueryRow(ctx, `
+					SELECT EXISTS (
+						SELECT 1 FROM information_schema.columns
+						WHERE table_schema = current_schema()
+						  AND table_name = 'symbols'
+						  AND column_name = 'simple_name'
+					)`).Scan(&hasSimpleName); err != nil {
+					return fmt.Errorf("probe simple_name: %w", err)
+				}
+				if !hasSimpleName {
+					return nil
+				}
+				stmts := []string{
+					`ALTER TABLE symbols DROP COLUMN simple_name`,
+					`ALTER TABLE symbols ADD COLUMN simple_name TEXT
+					   GENERATED ALWAYS AS (
+					     regexp_replace(
+					       regexp_replace(
+					         regexp_replace(fq_name, '\(.*$', ''),
+					         '<[^#]*', '', 'g'),
+					       '^.*[.#]', '')
+					   ) STORED`,
+					`CREATE INDEX IF NOT EXISTS idx_symbols_simple_name ON symbols (simple_name)`,
+					`CREATE INDEX IF NOT EXISTS idx_symbols_repo_simple_name ON symbols (repo_id, simple_name)`,
+				}
+				for _, q := range stmts {
+					if _, err := pool.Exec(ctx, q); err != nil {
+						return fmt.Errorf("recreate simple_name: %w", err)
+					}
+				}
+				return nil
+			},
+		},
 	}
 }

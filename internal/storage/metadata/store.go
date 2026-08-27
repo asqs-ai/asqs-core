@@ -47,6 +47,10 @@ type Store struct {
 	// pool is the handle db is backed by, or nil when a test injected a fake. It owns Close and
 	// exposes pool statistics; every query goes through db.
 	pool *pgxpool.Pool
+	// simpleName / trigram cache whether the migration-added lookup aids exist, so queries can use
+	// the indexed form when available and the original predicates otherwise.
+	simpleName simpleNameProbe
+	trigram    simpleNameProbe
 }
 
 // Config configures the metadata connection pool. Only ConnString is required.
@@ -242,12 +246,26 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, repoID, needle str
 	if needle == "" {
 		return nil, nil
 	}
+	// strpos(lower(fq_name), lower($1)) > 0 cannot use any index — idx_symbols_fq_name is a plain
+	// btree, useless for a substring search — so this is a sequential scan over every symbol, and
+	// it backs the interactive `?q=` graph API search.
+	//
+	// With pg_trgm present, ILIKE '%needle%' uses idx_symbols_fq_trgm, and ordering by
+	// similarity() is also a better answer than alphabetical for someone typing into a search box.
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
 		WHERE repo_id = $3 AND strpos(lower(fq_name), lower($1)) > 0
 		ORDER BY fq_name
 		LIMIT $2`
+	if s.hasTrigram(ctx) {
+		query = `
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols
+		WHERE repo_id = $3 AND fq_name ILIKE '%' || $1 || '%'
+		ORDER BY similarity(fq_name, $1) DESC, fq_name
+		LIMIT $2`
+	}
 	rows, err := s.db.Query(ctx, query, needle, limit, repoID)
 	if err != nil {
 		return nil, err
@@ -286,6 +304,14 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 	if limit > 100 {
 		limit = 100
 	}
+	// `fq_name LIKE '%.' || $1` is a leading-wildcard match, so it is a sequential scan over the
+	// whole symbols table — and this runs PER GAP, once per candidate type name (up to 8 domain
+	// models). On a 200k-symbol repo with 50 gaps that is up to 400 full scans inside the plan
+	// phase, which is also the phase running an 8-way errgroup, so they contend with each other.
+	//
+	// The generated simple_name column turns it into an indexed equality lookup. Semantics are
+	// equivalent for the kinds filtered here: type FQNames use '.' separators, so the final
+	// segment is exactly what the LIKE anchored on.
 	query := `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
@@ -294,6 +320,15 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`
+	if s.hasSimpleNameColumn(ctx) {
+		query = `
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols
+		WHERE repo_id = $3 AND simple_name = $1
+		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
+		ORDER BY length(fq_name), fq_name
+		LIMIT $2`
+	}
 	rows, err := s.db.Query(ctx, query, simpleName, limit, repoID)
 	if err != nil {
 		return nil, err

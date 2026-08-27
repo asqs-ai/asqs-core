@@ -307,7 +307,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP10 | Batched inserts, `COPY`, batched FQName resolution | B28 | CP09 | 2 d | `in review` |
 | CP11 | **Repo-scoped `symbols` / `edges` / `files`** | B23, R02 | CP07, CP09 | 4–5 d | `in review` |
 | CP12 | Unified graph traversal (recursive CTE) + degree columns | B22 | CP11 | 3 d | `in review` |
-| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP55)` |
+| CP13 | Stable symbol identity and churn signal | B26 | CP11, CP55 | 3–4 d | `blocked (CP11)` |
 | CP14 | Embedding input limits and embedding cache | B11 | CP07, CP08 | 2–3 d | `in review` |
 | CP15 | Fail closed on embedding-dimension mismatch | R03 | CP08 | 0.5 d | `in review` |
 | CP16 | **First-wave metrics writer + A/B report** | B14 (see §2.5-3) | CP09, CP18 | 2 d | `in review` |
@@ -391,7 +391,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP54 | C# per-project compilation | B24 | — | 4–5 d | `in review` |
-| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `ready` |
+| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `in review` |
 
 ### P12 — Framework-aware test bootstrap *(a whole upstream wave, previously unbundled — §2.5-6)*
 
@@ -1104,7 +1104,7 @@ cross-check after a full run.
 
 ### CP13 — Stable symbol identity and churn signal
 
-- **Status:** `blocked (CP55)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `blocked (CP11)` · **Effort:** 3–4 d · **Risk:** high
 
 **Goal.** Symbol ids that survive a reindex, so `chunks.symbol_id` is durable and per-symbol history
 is possible at all.
@@ -3622,13 +3622,59 @@ became fully qualified. Unresolved invocations are counted and audited (CP03).
 
 ### CP55 — C# parameterized FQNames
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 2–3 d · **Risk:** medium
 
 Overloads become distinct end to end; edges bind the exact overload; generic declarations carry `<T>`.
 Needs a **forced reindex** on the legacy format (automatic, detected), a migration for the simple-name
 column (CP07), and bare-name lookups served from `signature_json`.
 
 **Sequencing:** this must precede CP13 — see that bundle's note.
+
+#### Implementation record
+
+**The indexer half was already done, and the plan did not say so.** CP54 took `Program.cs` at its end
+state, which is *after* B25, so the C# indexer already emitted `Lib.Greeter#Hello(string)` and already
+stored `signature_json.bare_fq_name`. Verified live before writing any code. What CP55 actually had to
+build was the whole **read** side — the thing that makes those names usable — plus the upgrade path.
+
+**Four migrations, and why they were held back.** `0002`, `0003`, `0007` and `0008` were reserved for
+this bundle rather than shipped with CP07 because they are only meaningful once names carry parameters.
+They append to `MetadataMigrations()` after `0006`, and **ledger order is load-bearing**: `0008` DROPs
+and recreates `simple_name`, so it is only correct downstream of the `0002` that creates it. That
+invariant now has a test, because slice order is the kind of thing a merge reorders silently.
+
+`0008` is the one that matters. `0002`'s generated expression stripped everything before the last `.`
+or `#` — correct before B25, and wrong after it, because it yields `Hello(string)` for a name a caller
+searches for as `Hello`. The parameter-aware expression strips the parameter list and generic markers
+first. Both migrations are guarded on the column's existence: `simple_name` is `ADD COLUMN … GENERATED
+… STORED`, which rewrites the table on PG 12+, so it stays a deliberate `asqs-core migrate` action and
+never a restart side effect.
+
+**Both fast paths are conditional, and that is the point.** `symbol_lookup.go` brings two `sync.Once`
+probes; `ListSymbolsByFQSubstring` uses the trigram index when `pg_trgm` is present, and
+`ListSymbolsByTypeSimpleName` uses the indexed equality when the column exists. An unmigrated database
+keeps the original correct-but-sequential predicates. Verified live that the probes read `false` before
+migrating and `true` after, and that both paths return identical rows.
+
+**A live finding: the bare-name fallback was structurally dead.** `resolveSymbol`'s B25 fallback landed
+with CP42/CP43 as an optional type assertion on `r.Meta` — and until this bundle added
+`ListSymbolsByBareFQName`, *no concrete type satisfied it*. The assertion just failed, and `get_symbol`
+answered "no symbol" for every parameterless C# name a model quoted from prose, with no build error and
+no log line. This is copy-at-end-state working as designed (the consumer preceded its dependency), but
+it is invisible, so the satisfaction of both optional interfaces — `bareFQLookup` and
+`legacyCSharpFQCounter` — is now asserted at compile time in tests. Mutation-checked: renaming either
+method fails the guard.
+
+**Forced reindex.** `Run` consults `legacyCSharpFQCounter` before the existing `forceReindex` block and
+appends every not-already-queued file to the change set, auditing `index.csharp_fqname_upgrade` with
+the legacy count and the number of files forced. Mixed formats are the failure it prevents: incremental
+indexing would leave unchanged files on legacy names beside new-format ones, making overload gaps, edge
+binding and lookups inconsistent in ways that never surface as an error. `CountLegacyCSharpFQNames`
+counts only C# callables with a `#` member and no parameter list — verified live that a legacy row
+counts and a parameterized one does not.
+
+**Deferred:** no behavioural test of the reindex path. Core has no `MetadataWriter` mock and no `Run()`
+harness — the same gap CP58 hit — so the wiring is pinned by the interface guard instead.
 
 ---
 

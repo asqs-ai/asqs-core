@@ -88,6 +88,12 @@ type RunResult struct {
 
 // Run performs change detection, then incremental index: remove stale data, parse changed/added files,
 // write symbol table and dependency graph to metadata, chunk and sanitize, embed and store chunks.
+// legacyCSharpFQCounter is the optional metadata capability behind the B25 forced reindex; the
+// concrete metadata.Store implements it, mocks opt in to exercise the path.
+type legacyCSharpFQCounter interface {
+	CountLegacyCSharpFQNames(ctx context.Context, repoID string) (int64, error)
+}
+
 func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts RunOptions) (*RunResult, error) {
 	if meta == nil {
 		return nil, fmt.Errorf("indexer: MetadataWriter required")
@@ -208,6 +214,35 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			} else if chunks == 0 {
 				forceReindex = true
 				forceReason = "chunk_store_empty_for_repo"
+			}
+		}
+	}
+	// B25: parameterized C# FQNames are a BREAKING format change. Any stored callable still in the
+	// old parameterless form means this repository predates the format; incremental indexing would
+	// leave unchanged files with legacy names next to new-format ones, making overload gaps, edge
+	// binding and lookups silently inconsistent — so the whole repo reindexes, even when change
+	// detection found work of its own.
+	if lc, ok := meta.(legacyCSharpFQCounter); ok && !forceReindex {
+		if n, lerr := lc.CountLegacyCSharpFQNames(ctx, opts.RepoID); lerr == nil && n > 0 {
+			inSet := make(map[string]struct{}, len(changeSet.Added)+len(changeSet.Changed))
+			for _, fv := range changeSet.Added {
+				inSet[fv.Path] = struct{}{}
+			}
+			for _, fv := range changeSet.Changed {
+				inSet[fv.Path] = struct{}{}
+			}
+			missing := 0
+			for _, fv := range currentFiles {
+				if _, seen := inSet[fv.Path]; !seen {
+					changeSet.Changed = append(changeSet.Changed, fv)
+					missing++
+				}
+			}
+			if opts.Audit != nil {
+				opts.Audit.Log(ctx, "index.csharp_fqname_upgrade", map[string]interface{}{
+					"message":        fmt.Sprintf("%d C# symbol(s) carry pre-B25 parameterless FQNames; forcing a full reindex (%d file(s) added to the change set) so the stored graph is single-format.", n, missing),
+					"legacy_symbols": n, "files_forced": missing,
+				})
 			}
 		}
 	}
