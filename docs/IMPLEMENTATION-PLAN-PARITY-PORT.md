@@ -3115,6 +3115,60 @@ valid messages; every attempt is recorded with tool name, arguments size and out
   alone, on a tree without this bundle's changes); spun out as its own task.
 
 
+### A/B measurement — generation tool loop (2026-08-27)
+
+**Result: the default stays OFF.** The comparison did not justify a flip, and the reason is specific
+rather than a shrug.
+
+**Setup.** `asqs-java-test-2`, 11 files, 3 gaps, `qwen3-coder:30b-a3b-q8_0` on local Ollama, local
+sandbox, dedicated database. Two configs differing in exactly ONE line
+(`generation.policy.tools.enabled`), verified by diff; the fixture was reset to its committed state
+between arms.
+
+| | stable | compile OK first pass | test OK without fix | iterations | compile fixes | test fixes | prompt tokens | total tokens |
+|---|---|---|---|---|---|---|---|---|
+| tools OFF | false | false | false | 3 | 2 | 1 | 54,071 | 61,977 |
+| tools ON | false | false | false | 3 | 2 | 1 | 59,377 | 65,349 |
+
+**Every outcome column is identical. Tools cost ~5% more tokens and changed nothing** — because the
+model made **zero tool calls**. Not one `generate.tool_call` event across the run.
+
+**That is not the upstream defect returning, and the distinction took work to establish.** The
+mechanism is demonstrably live: CP41's Ollama probe detected native tool support; the mode resolved
+to `native` with structured output deferred to the final tool-free turn — CP41/CP44's fix for the
+exact grammar conflict that made upstream ship a tool-enabled fixer issuing zero calls; and the
+definitions reached the provider, which is what the +5,306 provider-reported prompt tokens are. The
+per-gap prompt hashes are byte-identical between arms, so the assembled context did not differ — the
+delta is the tool schemas and nothing else. The model was offered the tools, paid for them, and
+declined to use them.
+
+**What this does and does not establish.** It is one run per arm, one model, one small repository. It
+cannot settle a small difference, and it is not evidence that tool access does not help in general.
+It IS sufficient for the decision actually in front of us: a default may only change on evidence that
+it helps, there is none here, and there is a measured ~5% cost. **CP45 and CP46 stay `in review`
+(A/B outstanding)** rather than being marked done on an inconclusive result.
+
+**What a conclusive comparison needs:** a model that calls tools unprompted (the hosted providers do;
+`qwen3-coder` on this task did not), several repositories, and repeated runs per arm so LLM sampling
+variance can be separated from the toggle. Churn weight (CP13) is blocked behind the same instrument.
+
+**Three findings from the same runs, recorded because they are worth more than the comparison:**
+
+1. **`asqs-core migrate` failed on a fresh database** — the documented FIRST step of an install.
+   Fixed (`3087a99`); every schema must be created before any migration runs, since metadata's
+   repo-scoping migration reads `chunks`, which the embeddings schema owns.
+2. **Audit redaction was hashing counts.** `generate.prompt_budget` shipped
+   `prompt_tokens: {sha256, len: 4}` — the figure CP29's ground truth calibrates against, replaced by
+   a hash of its own digits. Fixed (`68f131e`).
+3. **CP03's deferred JSONL spot-check is CLOSED**, and CP13 is confirmed live: a real `commit_sha` in
+   the audit stream (the bug that cost upstream weeks), 82 `symbol_versions` rows, and one genuine
+   Java overload kept separate by `dup_ordinal`.
+
+**A fixture caveat worth keeping.** None of the `test-repos` fixtures carry a test framework, so the
+first attempt at this A/B produced 0/3 for a purely environmental reason — the model wrote correct
+tests against JUnit and Mockito that were not on the classpath. Bootstrap had to be enabled in BOTH
+arms for the comparison to measure anything. Any future A/B on these fixtures needs the same.
+
 ### CP45 — Core-plus-inventory context restructure
 
 - **Status:** `in review` (code complete; **the CP16 A/B remains outstanding** — see record) · **Effort:** 3 d · **Risk:** medium
