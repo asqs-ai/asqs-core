@@ -257,11 +257,42 @@ type AuditConfig struct {
 	DumpPrompts bool `yaml:"dump_prompts" env:"AUDIT_DUMP_PROMPTS"`
 }
 
+// DependencyDocsConfig configures local-only ingestion of documentation for the repository's DIRECT
+// dependencies — Maven sources-jars, NuGet XML documentation, node_modules .d.ts — so the model can
+// retrieve third-party signatures without a network call.
+//
+// No network and no subprocess: it reads artifacts that are already on disk. Gradle is NOT
+// supported; a Gradle project ingests nothing rather than half-working.
+//
+// Dependency chunks are stored under their own chunk type with its own retrieval budget, so a large
+// dependency corpus cannot crowd repository chunks out of a result — that is a structural guard, not
+// a tuned weight.
+type DependencyDocsConfig struct {
+	// Enabled turns dependency doc ingestion on. Default false: with it off, chunk counts are
+	// identical to before this existed. Env: INDEXER_DEPENDENCY_DOCS_ENABLED.
+	Enabled bool `yaml:"enabled" env:"INDEXER_DEPENDENCY_DOCS_ENABLED"`
+	// MaxChunksPerDependency caps one dependency's contribution. 0 = 80.
+	// Env: INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_PER_DEPENDENCY.
+	MaxChunksPerDependency int `yaml:"max_chunks_per_dependency" env:"INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_PER_DEPENDENCY"`
+	// MaxChunksTotal caps the whole ingestion. 0 = 400.
+	// Env: INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_TOTAL.
+	MaxChunksTotal int `yaml:"max_chunks_total" env:"INDEXER_DEPENDENCY_DOCS_MAX_CHUNKS_TOTAL"`
+	// MavenRepoDir overrides the local Maven repository root. Empty = ~/.m2/repository.
+	// Env: INDEXER_DEPENDENCY_DOCS_MAVEN_REPO_DIR.
+	MavenRepoDir string `yaml:"maven_repo_dir" env:"INDEXER_DEPENDENCY_DOCS_MAVEN_REPO_DIR"`
+	// NuGetPackagesDir overrides the NuGet global packages folder. Empty = NUGET_PACKAGES or
+	// ~/.nuget/packages. Env: INDEXER_DEPENDENCY_DOCS_NUGET_PACKAGES_DIR.
+	NuGetPackagesDir string `yaml:"nuget_packages_dir" env:"INDEXER_DEPENDENCY_DOCS_NUGET_PACKAGES_DIR"`
+}
+
 // IndexerConfig configures when the indexer runs (schedule and first start) and which language indexer to use.
 type IndexerConfig struct {
 	// Schedule is a cron expression for recurring runs (e.g. "0 1 * * *" = daily at 01:00).
 	// Empty disables scheduled runs.
 	Schedule string `yaml:"schedule" env:"INDEXER_SCHEDULE"`
+
+	// DependencyDocs configures local-only ingestion of documentation for DIRECT dependencies.
+	DependencyDocs DependencyDocsConfig `yaml:"dependency_docs"`
 
 	// RunOnFirstStart runs the indexer once at startup when there are no previous index runs for the repo.
 	RunOnFirstStart bool `yaml:"run_on_first_start" env:"INDEXER_RUN_ON_FIRST_START"`

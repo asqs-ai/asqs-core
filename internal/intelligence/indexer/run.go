@@ -36,6 +36,9 @@ type RunOptions struct {
 	EmbeddingProvider  string // e.g. "openai"
 	EmbeddingModel     string // e.g. "text-embedding-3-small"
 	EmbeddingDimension int    // 0 = infer from first vector length
+	// DependencyDocs enables local-only ingestion of direct-dependency documentation.
+	// Zero value = disabled.
+	DependencyDocs DependencyDocOptions
 	// Audit logs each step to the audit store (and optional file) for debugging and improvement. Optional.
 	Audit Auditor
 	// IndexablePaths when non-nil restricts indexing to these repo-relative paths (forward slashes).
@@ -728,6 +731,35 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 		opts.Audit.Log(ctx, "index.finished", finishPayload)
 	}
+	// Dependency documentation : local-only ingestion of docs for direct dependencies,
+	// after the core run has succeeded and before totals are counted. Best-effort — this is
+	// auxiliary context for retrieval, and a broken ~/.m2 layout must not fail an otherwise
+	// complete index run.
+	if opts.DependencyDocs.Enabled && emb != nil && opts.Embedder != nil {
+		ddStats, ddErr := ingestDependencyDocs(ctx, emb, opts, opts.DependencyDocs, chunkCfg)
+		if opts.Audit != nil {
+			payload := map[string]interface{}{
+				"message": fmt.Sprintf("Dependency docs: %d dependency(ies) scanned, %d ingested (%d chunks), %d without local artifact.",
+					ddStats.DepsScanned, ddStats.DepsIngested, ddStats.Chunks, ddStats.NoArtifact),
+				"run_id": runID, "deps_scanned": ddStats.DepsScanned, "deps_ingested": ddStats.DepsIngested,
+				"chunks": ddStats.Chunks, "no_artifact": ddStats.NoArtifact, "capped": ddStats.Capped,
+			}
+			if len(ddStats.IngestedCoordinates) > 0 {
+				payload["ingested_coordinates"] = ddStats.IngestedCoordinates
+			}
+			if len(ddStats.NoArtifactCoordinates) > 0 {
+				payload["no_artifact_coordinates"] = ddStats.NoArtifactCoordinates
+			}
+			if ddErr != nil {
+				payload["error"] = ddErr.Error()
+				payload["message"] = fmt.Sprintf("Dependency doc ingestion failed after %d chunk(s): %v. Run continues without dependency docs.", ddStats.Chunks, ddErr)
+				opts.Audit.LogError(ctx, "index.dependency_docs", payload)
+			} else {
+				opts.Audit.Log(ctx, "index.dependency_docs", payload)
+			}
+		}
+	}
+
 	// Best-effort post-run totals (A.7). Counting failures are non-fatal — we keep the
 	// otherwise-successful run result and report a zero total. Errors are surfaced via audit
 	// when an Auditor is wired so operators can investigate if the dashboards show 0 totals.

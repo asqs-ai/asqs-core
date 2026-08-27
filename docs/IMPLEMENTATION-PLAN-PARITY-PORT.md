@@ -374,7 +374,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `ready` |
-| CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `ready` |
+| CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `in review` |
 
 ### P9 — Evaluator and fix loop *(highest per-day value here — see §2.5-5)*
 
@@ -3005,7 +3005,7 @@ Results are nonce-framed so a search result cannot impersonate an instruction bl
 
 ### CP48 — Dependency doc indexing
 
-- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 5–6 d · **Risk:** medium
 
 The offline alternative to CP47: ingest API documentation that is already on disk — Maven
 sources-jars, NuGet XML documentation files, `node_modules` `.d.ts` — into the index so the model can
@@ -3022,6 +3022,36 @@ than leaving users to discover it.
 **Acceptance.** Indexing a Maven project with sources-jars present adds dependency chunks; retrieval
 for a repository symbol still returns repository chunks first, asserted on a fixture. With the
 feature off, chunk counts are identical to before.
+
+**Implementation record (2026-08-27).**
+
+- `dependency_docs.go` + `dependency_docs_resolve.go` ported (their only import is
+  `storage/embeddings`), with the Maven sources-jar, NuGet XML-documentation and `node_modules`
+  `.d.ts` resolvers. **No network, no subprocess** — every path reads artifacts already on disk.
+- **Wired inside `indexer.Run`, before the totals are counted**, so the dependency chunks it adds
+  are included in `ChunksTotal` rather than under-reported, and gated on
+  `indexer.dependency_docs.enabled` (default false). Failure is best-effort and audited as
+  `index.dependency_docs`: a broken `~/.m2` layout must not fail an otherwise complete index run.
+- **The dilution guard is structural, as the section requires** — dependency text lands under its
+  own `ChunkTypeDependencyDoc`, which `search_code` excludes unless asked for and which the
+  `get_symbol` miss ladder queries explicitly (both already in core from CP21 and CP43, so this
+  bundle is what finally puts content behind them).
+  `TestDependencyDocs_areStructurallySeparatedFromRepositoryChunks` pins that the type is distinct
+  from every repository type and that ingestion writes nothing untyped — a single untyped write
+  would put library text into the repository's own retrieval budget.
+- **Config:** `indexer.dependency_docs.{enabled,max_chunks_per_dependency,max_chunks_total,
+  maven_repo_dir,nuget_packages_dir}`. Upstream additionally carries `warm_caches`, which runs
+  sandboxed `mvn dependency:sources` / `npm install` / `dotnet restore` in its bootstrap phase;
+  core has no bootstrap phase yet (that is P12/CP58), and the key would be a dead letter, so it is
+  **not** added here. Gradle is unsupported upstream and here — a Gradle project ingests nothing
+  rather than half-working; said in the config comment rather than left to discovery.
+- **Not ported, named:** upstream's `TestRun_IngestsDependencyDocs` drives ingestion through
+  `indexer.Run` using its full 1 225-line run harness, whose mock writers are built on types core
+  does not carry (`metadata.SymbolVersion` among them). The ingestion itself keeps its direct
+  end-to-end test, and the Run wiring is pinned by an authored guard asserting the call is present,
+  gated on the option, and ordered before the totals block.
+- Full gate green; ten of upstream's eleven tests ported and passing, plus two authored.
+
 
 ---
 

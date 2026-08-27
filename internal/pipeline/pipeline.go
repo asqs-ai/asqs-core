@@ -225,6 +225,15 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		Audit:             audit,
 		IndexablePaths:    indexable,
 		ConfigRevisionID:  configRevisionID,
+		// Off by default: with it disabled the chunk counts are identical to before this existed.
+		// Reads only artifacts already on disk — no network, no subprocess.
+		DependencyDocs: indexer.DependencyDocOptions{
+			Enabled:                cfg.Indexer.DependencyDocs.Enabled,
+			MaxChunksPerDependency: cfg.Indexer.DependencyDocs.MaxChunksPerDependency,
+			MaxChunksTotal:         cfg.Indexer.DependencyDocs.MaxChunksTotal,
+			MavenRepoDir:           cfg.Indexer.DependencyDocs.MavenRepoDir,
+			NuGetPackagesDir:       cfg.Indexer.DependencyDocs.NuGetPackagesDir,
+		},
 	}); err != nil {
 		return sum, fmt.Errorf("index: %w", err)
 	}
