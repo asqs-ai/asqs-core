@@ -296,8 +296,9 @@ Not included (these live in the commercial layer):
   there is no audit reporting/export CLI.
 - **Governance/policy engine** — a `runner.policy:` block parses but is ignored. No coverage gate, no
   mutation-testing gate.
-- **Parallelism** — gaps are generated sequentially. `runner.gap_concurrency` and `llm.max_concurrent`
-  are not honoured. (The whole-repo overview is the one exception: it runs in parallel with generation.)
+- **Parallelism** — gaps are generated sequentially. `llm.max_concurrent` bounds concurrent LLM calls
+  across the run; there is no per-gap worker pool. (The whole-repo overview is the one exception: it
+  runs in parallel with generation.)
 - **Pre-generation seams** — no controlled source-seam edits or C# project-reference fixes before
   generation. (The evaluator's in-loop C# project-reference autofix _is_ included.)
 - **Per-step LLM providers** — one `llm.provider` + `llm.model` drives generation, docs, fixing, and

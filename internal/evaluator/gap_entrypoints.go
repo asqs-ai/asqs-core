@@ -16,7 +16,9 @@ import (
 // helpers use these fields to scope the operation to one gap's artifacts only — they do not run
 // the project-wide evaluation that legacy `RunEvaluation` performs.
 //
-// Per-gap evaluation contract (per docs/SESSIONS.md per-gap pipeline):
+// Per-gap evaluation contract. (This used to cite the agent-session engine's reference document,
+// which is enterprise-excluded and will never exist here, so the contract is stated below rather
+// than referenced.)
 //   - Compile: project-wide (shared), see RunSharedCompile.
 //   - Test: per gap (only the gap's tests).
 //   - Lint: per gap (only the gap's artifacts).

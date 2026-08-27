@@ -32,9 +32,6 @@ Precedence: explicit option > env (client-prefixed if set) > env (base prefix) >
 | `ASQS_LLM_OLLAMA_NUM_CTX` | Ollama only: positive int → `options.num_ctx` on POST `/api/chat` |
 | `ASQS_LOG_RESOLVED_LLM_ENDPOINTS` | `1` / `true`: log resolved Ollama chat + embed HTTP URLs when clients are built (debug) |
 | `ASQS_RUNNER_TYPE` | `docker` (default) or `local` |
-| `ASQS_RUNNER_DOCKER_ENDPOINT` | Docker API endpoint |
-| `ASQS_INDEXER_SCHEDULE` | Cron expression (e.g. `0 1 * * *` = daily at 01:00) |
-| `ASQS_INDEXER_RUN_ON_FIRST_START` | Run indexer once at startup when no previous run exists (`true`/`false`) |
 | `ASQS_AUDIT_FILE_PATH` | Optional file to append audit entries (one JSON line per step); empty = DB only |
 
 For a client `acme`, set `ASQS_CLIENT_ID=acme` and e.g. `ASQS_ACME_DATABASE_METADATA_URL=...` to override only that client’s database.

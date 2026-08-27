@@ -4,12 +4,15 @@ The indexer traverses the repo, detects changes, builds the AST/symbol table and
 
 ## Scheduling and first run
 
-Use **Scheduler** to run the indexer on a cron schedule and optionally once on first system start:
+**Not configurable in the open core, and not wired.** `Scheduler` in `schedule.go` is library code
+with no caller here: the CLI indexes once, when you run it, against the repository you name. The
+`indexer.schedule` and `indexer.run_on_first_start` keys that used to appear in this section were
+deleted in CP36 because nothing read them — a cron expression in a config file had no scheduler to
+reach. Drive recurring runs from your own cron job or CI schedule instead.
 
-- **Schedule**: cron expression (e.g. `0 1 * * *` = daily at 01:00). Configure via `indexer.schedule` or `ASQS_INDEXER_SCHEDULE`.
-- **Run on first start**: when `run_on_first_start` is true, the scheduler checks whether any previous index run exists for the repo (via `HasPreviousRun(ctx, repoID)`). If none, it runs the indexer once before starting the cron. Configure via `indexer.run_on_first_start` or `ASQS_INDEXER_RUN_ON_FIRST_START`.
-
-Example: create a scheduler with `SchedulerOptions{ Schedule: "0 1 * * *", RunOnFirstStart: true, RepoID: "org/repo", Run: runFunc, HasPreviousRun: func(ctx, repoID) (bool, error) { n, err := metaStore.CountIndexRuns(ctx, repoID); return n > 0, err } }`. Call `Start(ctx)` (e.g. in a goroutine); it runs once immediately if no previous run, then at 01:00 daily. Use `Stop()` to shut down.
+A caller that wants the type can still construct it directly:
+`SchedulerOptions{ Schedule: "0 1 * * *", RunOnFirstStart: true, RepoID: "org/repo", Run: runFunc, HasPreviousRun: … }`,
+then `Start(ctx)` / `Stop()`.
 
 ## Flow
 
@@ -58,7 +61,7 @@ Use `ParsedFileFromJSON(stdout, source)` to convert to `ParsedFile`; then run ch
 
 ## E2E-oriented symbols (Phase 1)
 
-Nest HTTP routes are indexed as **`API_ROUTE`** symbols with stable `fq_name` so **`ROUTE_TO_HANDLER`** edges persist in Postgres. The **minimal Java indexer** (`tools/java-indexer`) emits the same for **Spring Web** `@RestController` / mapping annotations. The **advanced Java JAR** (`JavaIndexer.java` + `advanced.go`) adds the same E2E-oriented entities as JS/TS where applicable: **`E2E_SPEC`**, Playwright-Java **`TEST_SELECTOR`** (`getByTestId`), and **`API_CLIENT_REQUEST`** + **`CALLS_API`** (WebClient `.uri`, RestTemplate URL strings). The **JS/TS indexer** adds **`PAGE_ROUTE`** for SPA routers, **`E2E_SPEC`**, HTTP client calls, etc. The **C# Roslyn indexer** (`tools/csharp-indexer`, when **`indexer.csharp_indexer_dll_path`** is set) emits **`API_ROUTE`** for ASP.NET attribute routes, **`API_CLIENT_REQUEST`** for **`HttpClient`** usage, and **`E2E_SPEC`** stubs for Playwright .NET / Selenium test files — same post-run **`TARGETS_API_ROUTE`** linking (`apiclient_route_link.go`). Chunk types `route`, `api_contract`, `e2e_pattern`, `page` are assigned in `chunk.go`. See **`docs/E2E-INDEXING.md`** at the repository root.
+Nest HTTP routes are indexed as **`API_ROUTE`** symbols with stable `fq_name` so **`ROUTE_TO_HANDLER`** edges persist in Postgres. The **minimal Java indexer** (`tools/java-indexer`) emits the same for **Spring Web** `@RestController` / mapping annotations. The **advanced Java JAR** (`JavaIndexer.java` + `advanced.go`) adds the same E2E-oriented entities as JS/TS where applicable: **`E2E_SPEC`**, Playwright-Java **`TEST_SELECTOR`** (`getByTestId`), and **`API_CLIENT_REQUEST`** + **`CALLS_API`** (WebClient `.uri`, RestTemplate URL strings). The **JS/TS indexer** adds **`PAGE_ROUTE`** for SPA routers, **`E2E_SPEC`**, HTTP client calls, etc. The **C# Roslyn indexer** (`tools/csharp-indexer`, when **`indexer.csharp_indexer_dll_path`** is set) emits **`API_ROUTE`** for ASP.NET attribute routes, **`API_CLIENT_REQUEST`** for **`HttpClient`** usage, and **`E2E_SPEC`** stubs for Playwright .NET / Selenium test files — same post-run **`TARGETS_API_ROUTE`** linking (`apiclient_route_link.go`). Chunk types `route`, `api_contract`, `e2e_pattern`, `page` are assigned in `chunk.go`.
 
 ## `TESTS_SOURCE` (test ↔ production trace)
 

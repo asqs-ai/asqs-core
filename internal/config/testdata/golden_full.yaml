@@ -1,0 +1,60 @@
+# Fixture for the golden resolved-config test. It is deliberately BROAD rather than realistic:
+# the point is to touch as many resolution paths as possible — defaults that survive, defaults that
+# get overridden, pointer-bool tri-states, nested blocks, list keys and the accessor-mediated VCS
+# provider selection — so that a later bundle changing any of them shows up as a diff.
+database:
+  metadata_url: postgres://user:pass@localhost:5432/meta?sslmode=disable
+  embeddings_url: postgres://user:pass@localhost:5432/emb?sslmode=disable
+  max_open_conns: 12
+
+llm:
+  provider: ollama
+  model: qwen3-coder
+  embedding_model: nomic-embed-text
+  max_concurrent: 3
+  temperature: 0.15
+
+indexer:
+  type: advanced
+  max_gaps: 25
+  max_gaps_e2e: 4
+  mono_repo_workspace: services/api
+  dependency_docs:
+    enabled: true
+    max_chunks_total: 400
+
+retrieval:
+  profile: java_unit
+  fusion: dense
+  max_context_tokens: 60000
+  failure_hint_file: .asqs/ci-build.log
+  persist_last_eval_failure: true
+
+generation:
+  tools_enabled: true
+  max_tool_turns: 5
+
+websearch:
+  enabled: false
+
+runner:
+  type: local
+  timeout: 45m
+  two_phase_test_generation: false
+  fix_loop_repeat_stop_threshold: 4
+
+vcs:
+  provider: gitlab
+  gitlab:
+    token: PLACEHOLDER-NOT-A-REAL-TOKEN
+    base_url: https://gitlab.example.com/api/v4
+    default_namespace: acme
+    default_project: widgets
+    ship:
+      enabled: true
+      branch: asqs-core
+      base_branch: main
+
+audit:
+  file_path: /var/log/asqs/audit.jsonl
+  dump_prompts: false

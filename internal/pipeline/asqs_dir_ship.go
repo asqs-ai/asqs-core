@@ -69,10 +69,6 @@ func ShipPreserveRelPaths(cfg *config.Config) []string {
 	return out
 }
 
-// defaultLastEvalFailureHintRelPath is where persist_last_eval_failure writes when
-// retrieval.failure_hint_file names no path of its own.
-const defaultLastEvalFailureHintRelPath = ".asqs/last-eval-failure.log"
-
 // RemoveRepoAsqsDirForShip deletes repoPath/.asqs before staging, restoring the preserved files.
 //
 // Called immediately before `git add .`: without it a ship commits .asqs/test-stack.json, which

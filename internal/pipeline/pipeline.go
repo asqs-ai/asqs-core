@@ -247,6 +247,19 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
 	planOpts.MaxGapsE2E = opts.MaxGapsE2E
 	planOpts.Audit = audit
+	// retrieval.failure_hint_file was reaching PlanOptions.FailureHintFile and stopping there —
+	// nothing ever opened the file, so FailureHint stayed empty and failure-localized retrieval was
+	// unreachable from configuration. Reading it here is what makes the key mean anything (CP36).
+	if rel := failureHintReadRelPath(cfg); rel != "" && strings.TrimSpace(planOpts.FailureHint) == "" {
+		if hint := loadFailureHintFromRepoFile(repoAbs, rel); hint != "" {
+			planOpts.FailureHint = hint
+			audit.Log(ctx, "plan.failure_hint_loaded", map[string]interface{}{
+				"message": fmt.Sprintf("Retrieval is localized by %s (%d bytes): planning weights chunks the last failure implicates.", rel, len(hint)),
+				"path":    rel,
+				"bytes":   len(hint),
+			})
+		}
+	}
 	// Detect the repository's unit-test naming convention once, from the indexed file list, and
 	// carry it to every item. The generator's built-in default is FooTest.java; plenty of
 	// repositories use FooTests.java, and on those every run wrote a sibling beside the file it
@@ -727,6 +740,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// The project is green when the eval passed outright, or stayed stable after discarding.
 	sum.ProjectStable = evalRes.Stable || evalRes.EarlyExitStableAfterDiscard
+
+	// Close the loop the read half above opens: this run's failing output becomes the next run's
+	// planning hint, so a repository that keeps failing the same way gets retrieval steered at the
+	// failure instead of starting cold. A green run REMOVES the file — a hint describing a failure
+	// that no longer exists is worse than none, since it localizes on code already fixed. Placed
+	// after the discard pass so a run that went green by discarding writes no hint (CP36).
+	persistLastEvalFailureHint(repoAbs, cfg, sum.ProjectStable, evalRes.StepResults)
 	if sum.ProjectStable {
 		sum.GapsStable = sum.GapsGenerated - sum.Discarded
 		for i := range sum.Outcomes {

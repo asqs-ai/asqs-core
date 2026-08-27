@@ -30,41 +30,52 @@ import (
 // field or delete it instead. If a field is read only from inside internal/config, name the
 // accessor in a comment rather than exempting it — the scan can see those now.
 //
-// KNOWN BLIND SPOT. The check matches identifiers, not types, so a field counts as read when any
-// package declares a field of the same name. It has missed two keys for exactly that reason:
-// runner.prefer_default_test_suffix (orchestrator.Config also has a PreferDefaultTestSuffix) and
-// general.git.ship.allow_partial (session.ShipDecision also has an AllowPartial). Both were
-// eventually caught by review, not by this test. Closing the gap needs go/types to resolve each
-// selector to its declaring type; until then, a config field whose name is duplicated elsewhere in
-// the tree is worth confirming by hand.
+// KNOWN BLIND SPOT, and CP36 measured how deep it goes. The check matches identifiers, not types,
+// so a field counts as read when ANY package declares a field of the same name. Three keys have now
+// slipped through for exactly that reason — runner.prefer_default_test_suffix (orchestrator.Config
+// also has a PreferDefaultTestSuffix), general.git.ship.allow_partial (session.ShipDecision also has
+// an AllowPartial), and retrieval.failure_hint_file, which reached PlanOptions.FailureHintFile and
+// stopped there because nothing opened the file. All three were caught by review, not by this test.
+//
+// Two cheap closures were tried at CP36 and BOTH fail; do not spend the afternoon rediscovering it:
+//
+//  1. "Flag fields whose name is declared elsewhere and confirm those by hand." 148 of 266 config
+//     fields are ambiguous that way. Ambiguity is the NORM here — config values legitimately mirror
+//     into each consumer's own options struct, which is how configuration flows through this
+//     codebase — so the list is noise, not a review queue.
+//  2. "Require the read to be a selector chain ending in <Parent>.<Field>." 108 of 266 fields fail
+//     it, because so many are read through an accessor (ActiveShip, EffectiveProjectIntel) or a
+//     bound sub-struct value, where the Config root is no longer in the expression.
+//
+// The gap really does need go/types to resolve each selector to its declaring type, which needs
+// golang.org/x/tools — not a dependency worth adding for a test. Until then this stays a smoke
+// alarm: it catches a field NOTHING anywhere mentions, and cannot catch a field shadowed by a
+// same-named field elsewhere. The golden resolved-config fixtures are the other half of the
+// defence, and they are type-blind by construction.
+// CP36 emptied the TRIAGE backlog. Thirteen entries were resolved by deciding each one, which was
+// the point of baselining them rather than deleting the check:
+//
+//   - llm.max_concurrent — WIRED by CP60 (BuildStepCompleters). Its note outlived its problem.
+//   - runner.disable_multi_turn_fixer — DELETED. It had zero readers UPSTREAM too, so no wave was
+//     ever going to bring one; the fixer-hardening bundles came and went without touching it.
+//   - runner.auto_seam_refactor_pre_generate, runner.scheduler_interval,
+//     runner.post_generate_static_check.* (5), indexer.mono_repo_extra_paths — DELETED. Every
+//     consumer is in an excluded package (orchestrator, workflow, session, upstream's own CLI), and
+//     no bundle in the port plan brings one. mono_repo_extra_paths is additionally DEPRECATED
+//     upstream in favour of mono dependency auto-expansion.
+//   - retrieval.persist_last_eval_failure — WIRED (internal/pipeline/failure_hint.go), together
+//     with a defect the old note asserted away: it claimed "the READ half is wired", and the read
+//     half was NOT. retrieval.failure_hint_file reached PlanOptions.FailureHintFile and stopped
+//     there — nothing opened the file. Another instance of the blind spot below.
+//
+// Only the credential seam remains, and it is structural rather than deferred: see its note.
 var exemptConfigFields = map[string]string{
-	// TRIAGE: llm.max_concurrent has zero readers because core's gap loop is sequential — the
-	// concurrency-limited completer that consumes it is upstream orchestrator machinery. CP60
-	// decides wire-or-delete alongside runner.gap_concurrency (D15).
-	// TRIAGE: the private-registry credential seam is compile-only in core (CP33 / §10.4); the
-	// runtime that reads endpoint/scope is on the enterprise side of the seam.
-	"PrivateRegistryCredential.Endpoint": "TRIAGE: compile-only credential seam (CP33)",
-	"PrivateRegistryCredential.Scope":    "TRIAGE: compile-only credential seam (CP33)",
-	// TRIAGE: consumed by the multi-turn fixer wave (CP50–CP53); the key predates its feature.
-	"RunnerConfig.DisableMultiTurnFixer": "TRIAGE: fixer-hardening wave (CP50–CP53) brings the reader",
-	// TRIAGE: pre-generation seam refactor is a later wave (P7); key shipped ahead of it.
-	"RunnerConfig.AutoSeamRefactorPreGenerate": "TRIAGE: seam-refactor bundle brings the reader",
-	// TRIAGE: the CLI pipeline is one-shot; the interval belongs to the serve-mode scheduler,
-	// which is enterprise-excluded. Candidate for deletion in CP38's re-key.
-	"RunnerConfig.SchedulerInterval": "TRIAGE: serve-mode scheduler excluded from core; CP38 candidate delete",
-	// TRIAGE: the post-generate static micro-gate (language lint before evaluation) is CP50's;
-	// the whole block waits for its feature.
-	"RunnerConfig.PostGenerateStaticCheck":        "TRIAGE: post-generate static gate arrives with CP50",
-	"PostGenerateStaticCheckConfig.FailStopsEval": "TRIAGE: post-generate static gate arrives with CP50",
-	"PostGenerateStaticCheckConfig.JavaCommand":   "TRIAGE: post-generate static gate arrives with CP50",
-	"PostGenerateStaticCheckConfig.NodeCommand":   "TRIAGE: post-generate static gate arrives with CP50",
-	"PostGenerateStaticCheckConfig.CSharpCommand": "TRIAGE: post-generate static gate arrives with CP50",
-	// TRIAGE: mono-repo extra scan roots; the scanner consuming them is part of the mono-repo
-	// workspace wave. mono_repo_workspace itself IS wired (buildPlanOptions).
-	"IndexerConfig.MonoRepoExtraPaths": "TRIAGE: mono-repo scan wave brings the reader",
-	// TRIAGE: the persist half of the failure-hint loop (write .asqs/last-eval-failure.log after
-	// evaluation) is the fix-loop wave's; the READ half (failure_hint_file) is wired.
-	"RetrievalConfig.PersistLastEvalFailure": "TRIAGE: fix-loop wave brings the writer (read half is wired)",
+	// The private-registry credential seam is compile-only in core (CP33 / §10.4). These two fields
+	// exist to hold the seam open so copied callers compile; the runtime that reads endpoint and
+	// scope is on the enterprise side. This is NOT a deferral — no core bundle will ever wire them,
+	// and deleting them would break the seam. It is the one shape of exemption that is legitimate.
+	"PrivateRegistryCredential.Endpoint": "structural: compile-only credential seam (CP33 / §10.4)",
+	"PrivateRegistryCredential.Scope":    "structural: compile-only credential seam (CP33 / §10.4)",
 }
 
 // TestEveryConfigFieldIsRead walks config.Config reflectively and asserts each field name is

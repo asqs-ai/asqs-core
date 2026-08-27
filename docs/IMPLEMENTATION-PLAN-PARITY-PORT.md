@@ -352,9 +352,9 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `ready` |
-| CP37 | Constants freeze | C2 | CP36 | 1–2 d | `blocked (CP36)` |
-| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `blocked (CP36, CP37)` |
+| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `in review` |
+| CP37 | Constants freeze | C2 | CP36 | 1–2 d | `ready` |
+| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `blocked (CP37)` |
 | CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `blocked (CP38)` |
 | CP40 | Rollout: README, deployment guide, examples, guards | C5, C7 | CP39 | 2 d | `blocked (CP39)` |
 
@@ -2457,7 +2457,7 @@ between the two products.**
 
 ### CP36 — Housekeeping: dead keys, lint upgrade, golden fixtures
 
-- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 2 d · **Risk:** low
 
 **Verified inert config in core today** (zero readers outside `internal/config`, checked by grep):
 
@@ -2487,16 +2487,72 @@ reference is repointed (CP56 creates `docs/DOCUMENTATION.md`) or it is deleted.
 **Acceptance.** The lint passes with an empty exemption list, or with each entry carrying a decision.
 Goldens are committed and CP37/CP38 diff against them.
 
+#### Implementation record
+
+**Deletions went as the table said**, plus their runtime: `indexer.schedule`, `run_on_first_start`,
+`repo_path`, `runner.gap_concurrency` (D15), and `vcs.<provider>.webhook` / `gating` across all four
+providers together with the three `Active*` accessors that read them — those accessors had **zero
+production callers**, which is exactly why the fields looked read. `copilot.*` was already gone
+(CP17). `internal/vcs/*/webhook*.go` stays: those parsers define their own types and never touched
+config's.
+
+**The TRIAGE backlog is empty, and emptying it meant deciding rather than deferring.** Thirteen
+entries: `llm.max_concurrent` was already **wired** by CP60 and its note had simply outlived it;
+`runner.disable_multi_turn_fixer` was **deleted** because it has zero readers *upstream* too, so no
+wave was ever going to bring one; `auto_seam_refactor_pre_generate`, `scheduler_interval`,
+`post_generate_static_check.*` and `mono_repo_extra_paths` were **deleted** because every consumer
+sits in an excluded package and no bundle in this plan brings one (`mono_repo_extra_paths` is also
+deprecated upstream). Two remain, re-labelled **structural** rather than TRIAGE: the private-registry
+credential seam fields exist to hold the seam open, and no core bundle will ever wire them.
+
+**A defect the exemption list asserted away.** Its note for `persist_last_eval_failure` read "the
+READ half (failure_hint_file) is wired". It was not. `retrieval.failure_hint_file` reached
+`PlanOptions.FailureHintFile` and **stopped there** — nothing ever opened the file, so `FailureHint`
+stayed empty and failure-localized retrieval was unreachable from configuration no matter what an
+operator set. A third victim of the lint's name-matching blind spot. Both halves are now real
+(`internal/pipeline/failure_hint.go`): planning reads the hint, and a failing run persists
+compile/test/e2e output for the next one, while a **green run deletes it** — a hint describing a
+failure that no longer exists localizes retrieval on code already fixed, which is worse than none.
+Ten tests, path safety through `pathsafe` on both halves.
+
+**The lint cannot be cheaply strengthened, and CP36 measured why so nobody re-derives it.** Two
+closures were tried: flagging fields whose name is declared elsewhere gives **148 of 266** — ambiguity
+is the norm, because config values legitimately mirror into each consumer's options struct; requiring
+a `<Parent>.<Field>` selector chain gives **108 of 266** false positives, because so much is read
+through accessors or a bound sub-struct. The gap genuinely needs `go/types`, hence
+`golang.org/x/tools`, which is not worth adding for a test. Both dead ends are recorded in the lint's
+own comment.
+
+**Goldens** are recorded at this boundary for two resolutions — required-keys-only and a broad
+fixture — as `internal/config/testdata/golden_*.json`, regenerated with `-update-golden`. They are
+the type-blind half of the inert-key defence: a key that stops being populated shows up here even
+where the lint is blind. Mutation-checked. That check immediately earned its keep by exposing **dead
+code**: `loader.go`'s `if c.Runner.Type == "" { … = "local" }` was unreachable, since CP35's
+`normaliseAndValidateRunnerType` already defaults and validates far earlier. Removed.
+
+**The doc sweep found more than the plan counted.** The plan said 19 references (`DOCUMENTATION.md`
+×16, `SESSIONS.md` ×3); a guard test found **a second layer** — nine upstream planning documents
+(`PLAN.md`, `CSHARP-PARITY.md`, `E2E-INDEXING.md`, `API-IMPLEMENTATION_PLAN.md`, and others) cited
+from ported code and READMEs as though they shipped here. All rewritten. The `SESSIONS.md` citations
+were rewritten rather than parked: that document describes the enterprise-excluded session engine and
+can never exist here. `DOCUMENTATION.md` is the single entry in the new guard's `pendingDocs` ledger,
+owned by CP56 — and the guard fails if CP56 creates the file without clearing the entry, so the
+ledger cannot decay into the exemption list this bundle spent its time deleting.
+
+**Not done: the VCS `Collapse`.** The table lists collapsing 13 keys × 4 providers, but the Tasks
+paragraph does not, and collapsing them is a schema change — CP38's job, not a v1 housekeeping
+bundle's. The webhook/gating half of that duplication is gone regardless.
+
 ### CP37 — Constants freeze
 
-- **Status:** `blocked (CP36)` · **Effort:** 1–2 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 1–2 d · **Risk:** low
 
 Settings that are tuning knobs nobody tunes become constants: section budgets, chunk sizing, web
 search cache limits. Each removal must show the golden resolved config unchanged.
 
 ### CP38 — v2 schema, strict loader, derived env, translation
 
-- **Status:** `blocked (CP36, CP37)` · **Effort:** 4–5 d · **Risk:** high
+- **Status:** `blocked (CP37)` · **Effort:** 4–5 d · **Risk:** high
 
 **Tasks**
 

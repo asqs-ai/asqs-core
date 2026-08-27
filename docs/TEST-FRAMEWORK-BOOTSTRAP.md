@@ -392,4 +392,5 @@ Requires network where applicable. **JS** test needs Node; **C#** host test need
 - **Java:** multi-module layouts and unusual POM structures may need manual fixes.
 - **C#:** **SDK-style** `.csproj` only; monorepo discovery picks a primary project (see **`internal/testbootstrap`**). **NuGet Central Package Management** (**`Directory.Packages.props`** on the path from the project to the repo root): bootstrap adds **`PackageVersion`** entries there and **versionless** **`PackageReference`** lines (avoids **NU1008**). For **Playwright .NET** in Docker with **net9+**, use a custom **`image_playwright_dotnet`** if bootstrap still reports **NETSDK1045** (see **[PLAYWRIGHT-DOTNET-DOCKER.md](./PLAYWRIGHT-DOTNET-DOCKER.md)**).
 
-See also **`docs/PLAN.md`** §4 for remaining bootstrap backlog.
+The remaining bootstrap backlog lived in an upstream planning document that was not carried into
+the open core; `docs/IMPLEMENTATION-PLAN-PARITY-PORT.md` (P12) is the record here.

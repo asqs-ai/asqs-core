@@ -33,4 +33,5 @@ Methods use **`Namespace.Type#Member`** so Go `indexer.Run` can synthesize **`co
 
 ## Docs
 
-See **[`docs/CSHARP-PARITY.md`](../../docs/CSHARP-PARITY.md)** and **[`docs/PLAN.md` — C# parity](../../docs/PLAN.md#c-first-class-parity-java-reference)**.
+C# parity with the Java reference indexer is tracked in `docs/IMPLEMENTATION-PLAN-PARITY-PORT.md`
+(CP54, CP55).

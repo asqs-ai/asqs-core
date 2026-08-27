@@ -1,6 +1,6 @@
 package config
 
-// GitLabVCSConfig configures GitLab (Cloud or self-managed) API, webhooks, gating, and ship.
+// GitLabVCSConfig configures GitLab (Cloud or self-managed) API access and ship.
 type GitLabVCSConfig struct {
 	// Token is a personal, project, or group access token with api scope.
 	Token string `yaml:"token" env:"GITLAB_TOKEN"`
@@ -11,16 +11,7 @@ type GitLabVCSConfig struct {
 	// DefaultProject is the project name (second segment of path under namespace).
 	DefaultProject string `yaml:"default_project" env:"GITLAB_DEFAULT_PROJECT"`
 
-	Webhook GitLabWebhookConfig `yaml:"webhook"`
-	Gating  GatingConfig        `yaml:"gating"`
-	Ship    ShipConfig          `yaml:"ship"`
-}
-
-// GitLabWebhookConfig configures the HTTP listener for GitLab Merge Request hooks.
-type GitLabWebhookConfig struct {
-	ListenAddress string `yaml:"listen_address" env:"GITLAB_WEBHOOK_LISTEN_ADDRESS"`
-	// Secret is the value GitLab sends in X-Gitlab-Token; empty skips verification.
-	Secret string `yaml:"secret" env:"GITLAB_WEBHOOK_SECRET"`
+	Ship ShipConfig `yaml:"ship"`
 }
 
 // BitbucketVCSConfig configures Bitbucket Cloud or Server API access.
@@ -33,15 +24,7 @@ type BitbucketVCSConfig struct {
 	// DefaultRepo is the repository slug.
 	DefaultRepo string `yaml:"default_repo" env:"BITBUCKET_DEFAULT_REPO"`
 
-	Webhook BitbucketWebhookConfig `yaml:"webhook"`
-	Gating  GatingConfig           `yaml:"gating"`
-	Ship    ShipConfig             `yaml:"ship"`
-}
-
-// BitbucketWebhookConfig configures the HTTP listener for Bitbucket pullrequest hooks.
-type BitbucketWebhookConfig struct {
-	ListenAddress string `yaml:"listen_address" env:"BITBUCKET_WEBHOOK_LISTEN_ADDRESS"`
-	Secret        string `yaml:"secret" env:"BITBUCKET_WEBHOOK_SECRET"`
+	Ship ShipConfig `yaml:"ship"`
 }
 
 // AzureDevOpsVCSConfig configures Azure DevOps (Repos) REST API.
@@ -57,13 +40,5 @@ type AzureDevOpsVCSConfig struct {
 	// Repository is the git repo name within the project.
 	Repository string `yaml:"repository" env:"AZURE_DEVOPS_REPOSITORY"`
 
-	Webhook AzureDevOpsWebhookConfig `yaml:"webhook"`
-	Gating  GatingConfig             `yaml:"gating"`
-	Ship    ShipConfig               `yaml:"ship"`
-}
-
-// AzureDevOpsWebhookConfig configures the HTTP listener for Azure DevOps git pull request service hooks.
-type AzureDevOpsWebhookConfig struct {
-	ListenAddress string `yaml:"listen_address" env:"AZURE_DEVOPS_WEBHOOK_LISTEN_ADDRESS"`
-	Secret        string `yaml:"secret" env:"AZURE_DEVOPS_WEBHOOK_SECRET"`
+	Ship ShipConfig `yaml:"ship"`
 }

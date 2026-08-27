@@ -10,7 +10,7 @@
 // # D3: never a repo wrapper
 //
 // Resolve returns "mvn" or "gradle", never "./mvnw", "./gradlew", "mvnw.cmd" or "gradlew.bat".
-// The decision (D3 in docs/IMPLEMENTATION-PLAN-RUNNER-UNIFICATION.md) is that both sandbox targets
+// The decision (D3 of the runner unification) is that both sandbox targets
 // use the PATH/image binary, and U3b extended it to the rest of the pipeline so that a single run
 // cannot bootstrap with the repository's pinned Maven and then evaluate with a different one.
 //

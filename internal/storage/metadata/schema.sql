@@ -165,7 +165,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_run_id ON audit_log (run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log (at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_step ON audit_log (step);
 
--- Control plane: versioned named configs (see docs/API-IMPLEMENTATION_PLAN.md)
+-- Control plane: versioned named configs. The control plane itself is enterprise-excluded; the
+-- table stays so a shared database is schema-compatible in both directions.
 CREATE TABLE IF NOT EXISTS configs (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL UNIQUE,
@@ -218,7 +219,8 @@ CREATE TABLE IF NOT EXISTS audit_exports (
 
 CREATE INDEX IF NOT EXISTS idx_audit_exports_pending ON audit_exports (created_at) WHERE status = 'pending';
 
--- Multi-tenant control plane: tenants → projects → runs (see docs/API-IMPLEMENTATION_PLAN.md §13).
+-- Multi-tenant control plane: tenants → projects → runs. Enterprise-excluded, kept for schema
+-- compatibility; nothing in the open core writes these tables.
 CREATE TABLE IF NOT EXISTS tenants (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name          TEXT NOT NULL,
@@ -269,10 +271,11 @@ CREATE INDEX IF NOT EXISTS idx_run_jobs_project ON run_jobs (project_id) WHERE p
 
 DROP TABLE IF EXISTS repos;
 
--- Agent-session engine (see docs/SESSIONS.md). Each qualitybot run produces one run_sessions row
--- and N gap_sessions rows (one per plan item). session_attempts logs tool invocations
--- session_feedback stores normalized structured observations emitted by normalizers.
--- Writes are best-effort from internal/session/engine. Failing to persist never aborts a run.
+-- Agent-session engine tables. The engine itself (internal/session/engine) and its reference doc
+-- are enterprise-excluded, so NOTHING IN THE OPEN CORE WRITES THESE TABLES; they are kept so a
+-- shared database stays schema-compatible in both directions. Each run would produce one
+-- run_sessions row and N gap_sessions rows (one per plan item); session_attempts logs tool
+-- invocations and session_feedback stores normalized observations from normalizers.
 CREATE TABLE IF NOT EXISTS run_sessions (
     id                  TEXT PRIMARY KEY,
     run_id              TEXT NOT NULL,

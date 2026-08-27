@@ -19,7 +19,7 @@ Integration smoke (Docker daemon + built JAR):
 go test -tags=integration ./tools/java-indexer/... -count=1 -run TestRunJARDocker_smoke
 ```
 
-See **`docs/PLAN-INDEXER-DOCKER.md`** (P0).
+Container execution of the indexers is covered by `docs/IMPLEMENTATION-PLAN-PARITY-PORT.md` (P5).
 
 ## Advanced JAR (`JavaIndexer.java`)
 

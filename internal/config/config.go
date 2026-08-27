@@ -289,17 +289,15 @@ type DependencyDocsConfig struct {
 	NuGetPackagesDir string `yaml:"nuget_packages_dir" env:"INDEXER_DEPENDENCY_DOCS_NUGET_PACKAGES_DIR"`
 }
 
-// IndexerConfig configures when the indexer runs (schedule and first start) and which language indexer to use.
+// IndexerConfig selects which language indexer to use and bounds what it scans.
+//
+// It used to carry schedule, run_on_first_start and repo_path as well. Those three described a
+// long-running serve mode that decided WHEN to index and WHICH checkout to index — a mode the open
+// core does not have. The CLI is invoked once, against the repository named on its command line, and
+// a cron expression in a file it reads had no scheduler to reach (CP36).
 type IndexerConfig struct {
-	// Schedule is a cron expression for recurring runs (e.g. "0 1 * * *" = daily at 01:00).
-	// Empty disables scheduled runs.
-	Schedule string `yaml:"schedule" env:"INDEXER_SCHEDULE"`
-
 	// DependencyDocs configures local-only ingestion of documentation for DIRECT dependencies.
 	DependencyDocs DependencyDocsConfig `yaml:"dependency_docs"`
-
-	// RunOnFirstStart runs the indexer once at startup when there are no previous index runs for the repo.
-	RunOnFirstStart bool `yaml:"run_on_first_start" env:"INDEXER_RUN_ON_FIRST_START"`
 
 	// Type selects the Java indexer: "minimal" (default, line-based Go) or "advanced" (JavaParser JAR, AST + symbol resolution).
 	Type string `yaml:"type" env:"INDEXER_TYPE"`
@@ -388,13 +386,8 @@ type IndexerConfig struct {
 	// MonoRepoTestWorkspace is an optional repo-relative directory (same path rules as mono_repo_workspace) where unit/E2E test framework bootstrap, generated test file paths, and evaluation working directory are rooted, while indexing, planning, gap filtering, and documentation/overview generation stay scoped to mono_repo_workspace.
 	// Requires mono_repo_workspace when set. The directory should contain a project root marker at that level. Empty = use mono_repo_workspace for tests and eval (legacy behavior). Env: INDEXER_MONO_REPO_TEST_WORKSPACE.
 	MonoRepoTestWorkspace string `yaml:"mono_repo_test_workspace" env:"INDEXER_MONO_REPO_TEST_WORKSPACE"`
-	// MonoRepoExtraPaths lists additional repo-relative directories to include in the indexer file scan when mono_repo_workspace is set (e.g. shared library "services/base" alongside "projects/upper"). Each extra directory must contain the same project root marker rule as mono_repo_workspace for the C# / JS·TS indexers to run there; results merge into the parsed map (git-root-relative keys). Gap listing and test-plan filtering still use mono_repo_workspace only. Requires mono_repo_workspace; paths use the same rules (no ".."). YAML list only.
-	MonoRepoExtraPaths []string `yaml:"mono_repo_extra_paths"`
 
-	// RepoPath is the local path to the repo when running via serve. When set, the scheduler indexes this path and runs the full workflow (plan, generate, evaluate) against it. Empty = headless (no local files; index/plan from existing DB only).
-	RepoPath string `yaml:"repo_path" env:"INDEXER_REPO_PATH"`
-
-	// Chunk configures embedding chunk boundaries, headers, optional secondary chunks, and small-symbol merge (see docs/PLAN.md §1 for optional follow-ups).
+	// Chunk configures embedding chunk boundaries, headers, optional secondary chunks, and small-symbol merge.
 	Chunk IndexerChunkYAML `yaml:"chunk"`
 }
 
@@ -441,12 +434,6 @@ type GitHubConfig struct {
 	DefaultOwner string `yaml:"default_owner" env:"GITHUB_DEFAULT_OWNER"`
 	DefaultRepo  string `yaml:"default_repo" env:"GITHUB_DEFAULT_REPO"`
 
-	// Webhook config for PR creation events (listen for pull_request webhook).
-	Webhook WebhookConfig `yaml:"webhook"`
-
-	// Gating rules for PR webhook: when to skip processing (draft, base branch, repo size, language, toolchain, failing tests).
-	Gating GatingConfig `yaml:"gating"`
-
 	// Ship: after a stable run with generated artifacts, commit and push to a stable branch and create/update a single PR (avoids duplicate PRs on recurring runs).
 	Ship ShipConfig `yaml:"ship"`
 }
@@ -461,32 +448,6 @@ type ShipConfig struct {
 	BaseBranch string `yaml:"base_branch" env:"VCS_SHIP_BASE_BRANCH"`
 	// DraftPR creates the PR as draft when true.
 	DraftPR bool `yaml:"draft_pr" env:"VCS_SHIP_DRAFT_PR"`
-}
-
-// WebhookConfig configures the GitHub webhook listener (PR creation).
-type WebhookConfig struct {
-	// ListenAddress is the HTTP listen address (e.g. ":8080"). Empty = webhook server not started.
-	ListenAddress string `yaml:"listen_address" env:"GITHUB_WEBHOOK_LISTEN_ADDRESS"`
-	// Secret is the GitHub webhook secret for X-Hub-Signature-256 verification. Empty = skip verification (not recommended in production).
-	Secret string `yaml:"secret" env:"GITHUB_WEBHOOK_SECRET"`
-}
-
-// GatingConfig configures PR gating rules (skip processing when conditions are met).
-type GatingConfig struct {
-	// AllowedBaseBranches: PR target must be one of these (e.g. ["main", "master"]). Empty = allow any.
-	AllowedBaseBranches []string `yaml:"allowed_base_branches"`
-	// RejectDraft: skip draft PRs when true.
-	RejectDraft bool `yaml:"reject_draft"`
-	// MaxRepoSizeKB: skip when repo size (from API) exceeds this; 0 = no limit.
-	MaxRepoSizeKB int `yaml:"max_repo_size_kb"`
-	// MaxIndexFiles: skip when estimated indexable file count exceeds this; 0 = no limit.
-	MaxIndexFiles int `yaml:"max_index_files"`
-	// SupportedLanguages: only process repos with primary language in this list (e.g. ["java", "csharp"]). Empty = allow all.
-	SupportedLanguages []string `yaml:"supported_languages"`
-	// RequireBuildToolchain: skip when no build file (pom.xml, build.gradle, .csproj) detected.
-	RequireBuildToolchain bool `yaml:"require_build_toolchain"`
-	// MaxFailingTests: skip when number of failing tests exceeds this; 0 = skip this gate.
-	MaxFailingTests int `yaml:"max_failing_tests"`
 }
 
 // WebSearchConfig configures the external documentation tools.
@@ -674,7 +635,7 @@ type RunnerConfig struct {
 	ImagePlaywrightJava string `yaml:"image_playwright_java" env:"RUNNER_IMAGE_PLAYWRIGHT_JAVA"`
 	// ImagePlaywrightDotnet is the Docker image for C# e2e_framework_bootstrap in ephemeral Docker and for the Docker E2E eval pass when E2EFramework is playwright-dotnet (default mcr.microsoft.com/playwright/dotnet; browsers + .NET SDK; plain sdk images lack matching browser bundles for Microsoft.Playwright).
 	ImagePlaywrightDotnet string `yaml:"image_playwright_dotnet" env:"RUNNER_IMAGE_PLAYWRIGHT_DOTNET"`
-	// ImageDotNet is the Docker image for .NET runs. Empty = mcr.microsoft.com/dotnet/sdk:10.0, or sdk:{major}.0 inferred from net{major}.* in repo-root csproj files (see docs/CSHARP-PARITY.md).
+	// ImageDotNet is the Docker image for .NET runs. Empty = mcr.microsoft.com/dotnet/sdk:10.0, or sdk:{major}.0 inferred from net{major}.* in repo-root csproj files.
 	ImageDotNet string `yaml:"image_dotnet" env:"RUNNER_IMAGE_DOTNET"`
 	// DotNetFallbackTargetFramework when set (e.g. net8.0): for dotnet restore/build/test/format argv, append /p:TargetFramework=<value> when the entry .csproj does not declare a non-empty concrete TargetFramework/TargetFrameworks (no file edits). Empty = disabled.
 	DotNetFallbackTargetFramework string `yaml:"dotnet_fallback_target_framework" env:"RUNNER_DOTNET_FALLBACK_TARGET_FRAMEWORK"`
@@ -759,8 +720,6 @@ type RunnerConfig struct {
 	E2ETestCommand string `yaml:"e2e_test_command" env:"RUNNER_E2E_TEST_COMMAND"`
 	// CompileOncePerEval when true: after compile succeeds once in an evaluation run, skip compile on later fix iterations (test/lint/coverage still run). Use when compile is slow and only needed once (e.g. npm ci).
 	CompileOncePerEval bool `yaml:"compile_once_per_eval" env:"RUNNER_COMPILE_ONCE_PER_EVAL"`
-	// DisableMultiTurnFixer when true, each LLM fix call uses a fresh system+user prompt only (no conversation carry-over within the same compile/test step). Default false = multi-turn repair enabled for llmfix.Fixer.
-	DisableMultiTurnFixer bool `yaml:"disable_multi_turn_fixer" env:"RUNNER_DISABLE_MULTI_TURN_FIXER"`
 	// DisableStructuredFixOutput when true, the LLM fixer does not request JSON-schema structured completions (OpenAI response_format json_schema); only prompt + parser + repair. Default false = try structured output first when the provider supports it (OpenAI client implements it; others ignore). Env: RUNNER_DISABLE_STRUCTURED_FIX_OUTPUT.
 	DisableStructuredFixOutput bool `yaml:"disable_structured_fix_output" env:"RUNNER_DISABLE_STRUCTURED_FIX_OUTPUT"`
 	// FixerDependencySignatureOnly (Phase 3 opt-in) when true, dependency/source files the fixer reads solely as *read-only context* (i.e. not in the writable artifact set, not listed in ArtifactDependencies[artifact], and not cited in the error output) are sliced to signatures only via internal/evaluator/fixslice: class/interface headers, public/protected method signatures, field declarations, and class-level doc-comments are kept while method bodies and private members are dropped. Artifacts, their declared ArtifactDependencies, and error-cited sources are always shipped in full. Default false = every file is shipped with bodies (existing behaviour). Env: RUNNER_FIXER_DEPENDENCY_SIGNATURE_ONLY.
@@ -776,9 +735,11 @@ type RunnerConfig struct {
 	// only for legacy callers that rely on always-default-suffix output.
 	// Env: RUNNER_PREFER_DEFAULT_TEST_SUFFIX.
 	PreferDefaultTestSuffix bool `yaml:"prefer_default_test_suffix" env:"RUNNER_PREFER_DEFAULT_TEST_SUFFIX"`
-	// Policy carries optional YAML-driven session.PolicyOverrides (B.3, see docs/SESSIONS.md
-	// "YAML override syntax"). Empty / omitted keys preserve Legacy defaults; unknown keys are
-	// rejected at YAML load time so a typo cannot silently disable a hook in production.
+	// Policy carries optional YAML-driven session.PolicyOverrides (B.3). Empty / omitted keys
+	// preserve Legacy defaults; unknown keys are rejected at YAML load time so a typo cannot
+	// silently disable a hook in production. (This cited the session engine's reference document for
+	// the override syntax; that engine is enterprise-excluded and its document will never exist in
+	// the open core, so the allow-lists below are the authority instead.)
 	//
 	// The supported keys are the unioned allow-lists exported by
 	// session.AllowedRunHookKeys() and session.AllowedGapHookKeys(); see
@@ -792,15 +753,6 @@ type RunnerConfig struct {
 	ProjectIntel ProjectIntelConfig `yaml:"project_intel"`
 	// TwoPhaseTestGeneration when true, unit-test gaps use two LLM completions: (1) compilable skeleton (imports, containers, mock stubs, placeholder bodies), (2) full tests conditioned on that skeleton. Skipped for E2E items, extend-existing mode, empty suggested path, or nil item. Each phase uses structured path→content JSON when DisableStructuredGenerateOutput is false and the provider supports it; otherwise both phases use free-form output. Default true when the key is omitted from YAML (see config.Load); set false in YAML or env to disable. Env: RUNNER_TWO_PHASE_TEST_GENERATION.
 	TwoPhaseTestGeneration bool `yaml:"two_phase_test_generation" env:"RUNNER_TWO_PHASE_TEST_GENERATION"`
-	// GapConcurrency is the worker count for the per-gap loop (Retrieve → Generate → Sandbox →
-	// Discard?). 0 or 1 = sequential; >1 enables concurrent gaps. We cap at 16 to keep LLM
-	// rate-limit exposure bounded; larger values are coerced down with a warning on stderr.
-	// Env: RUNNER_GAP_CONCURRENCY.
-	GapConcurrency int `yaml:"gap_concurrency" env:"RUNNER_GAP_CONCURRENCY"`
-	// AutoSeamRefactorPreGenerate enables a controlled pre-generation refactor pass for private/hard-wired targets.
-	// Current scope: C# storage seam, Java supplier seam, and C# missing cross-project ProjectReference insertion when retrieved dependencies resolve to another local .csproj.
-	// It applies minimal safe transforms before generation so tests stay behavioral and compile against real project wiring. Default false. Env: RUNNER_AUTO_SEAM_REFACTOR_PRE_GENERATE.
-	AutoSeamRefactorPreGenerate bool `yaml:"auto_seam_refactor_pre_generate" env:"RUNNER_AUTO_SEAM_REFACTOR_PRE_GENERATE"`
 
 	// RepeatedTestFailureThreshold stops the evaluation fix loop early when the same failing generated test fingerprint (from unit or E2E output) occurs this many times in a row. 0 = default 5; -1 = disabled (use full iteration budget only). If other generated tests are not among the failing paths, discards failing files and marks stable; otherwise discards failing files, marks unstable, and applies the same reschedule / human-in-the-loop behavior as max-iteration unstable when start_max_iteration / scheduler are configured.
 	RepeatedTestFailureThreshold int `yaml:"repeated_test_failure_threshold" env:"RUNNER_REPEATED_TEST_FAILURE_THRESHOLD"`
@@ -846,8 +798,6 @@ type RunnerConfig struct {
 	StartMaxIteration int `yaml:"start_max_iteration" env:"RUNNER_START_MAX_ITERATION"`
 	// MaxIteration is the ceiling for current_iteration; we never allow more than this many fix iterations per run. 0 = use default 10.
 	MaxIteration int `yaml:"max_iteration" env:"RUNNER_MAX_ITERATION"`
-	// SchedulerInterval is the duration to wait before re-running the pipeline when evaluation was unstable (e.g. "10m", "1h"). Used only when StartMaxIteration/MaxIteration are in use. Empty = no scheduled reruns.
-	SchedulerInterval string `yaml:"scheduler_interval" env:"RUNNER_SCHEDULER_INTERVAL"`
 	// HumanInTheLoopEmail is the address to notify when max_iteration is reached and evaluation is still unstable. Empty = do not send.
 	HumanInTheLoopEmail string `yaml:"human_in_the_loop_email" env:"RUNNER_HUMAN_IN_THE_LOOP_EMAIL"`
 	// SMTP* configure the human-in-the-loop email sender. SMTPHost and SMTPFrom are required to
@@ -858,9 +808,6 @@ type RunnerConfig struct {
 	SMTPUser     string `yaml:"smtp_user" env:"RUNNER_SMTP_USER"`
 	SMTPPassword string `yaml:"smtp_password" env:"RUNNER_SMTP_PASSWORD"`
 	SMTPFrom     string `yaml:"smtp_from" env:"RUNNER_SMTP_FROM"`
-
-	// PostGenerateStaticCheck runs fast static checks on written test files after format (when set) and before sandbox evaluation. See docs/DOCUMENTATION.md.
-	PostGenerateStaticCheck PostGenerateStaticCheckConfig `yaml:"post_generate_static_check"`
 
 	// TestFrameworkBootstrap optionally installs a default test stack when none is detected (Jest / JUnit / xUnit).
 	TestFrameworkBootstrap TestFrameworkBootstrapConfig `yaml:"test_framework_bootstrap"`
@@ -921,22 +868,6 @@ type PrivateRegistryCredential struct {
 	// `//<registry>:_authToken=<token>`. Ignored for nuget and maven entries (which always use
 	// username/password).
 	Token string `yaml:"token,omitempty"`
-}
-
-// PostGenerateStaticCheckConfig runs fast static checks on newly written test files after the post-generate write/format step (before full sandbox evaluation). See docs/DOCUMENTATION.md — Static micro-gate.
-type PostGenerateStaticCheckConfig struct {
-	// Enabled when true runs Java and/or JS/TS checks on written test paths when applicable. Env: RUNNER_POST_GENERATE_STATIC_CHECK_ENABLED.
-	Enabled bool `yaml:"enabled" env:"RUNNER_POST_GENERATE_STATIC_CHECK_ENABLED"`
-	// FailStopsEval when true: static gate failure skips Phase 4 (sandbox evaluation). Other post-generate errors (e.g. format) do not use this sentinel. Env: RUNNER_POST_GENERATE_STATIC_CHECK_FAIL_STOPS_EVAL.
-	FailStopsEval bool `yaml:"fail_stops_eval" env:"RUNNER_POST_GENERATE_STATIC_CHECK_FAIL_STOPS_EVAL"`
-	// Timeout for the whole static gate (e.g. 3m). Empty = 3m. Env: RUNNER_POST_GENERATE_STATIC_CHECK_TIMEOUT.
-	Timeout string `yaml:"timeout" env:"RUNNER_POST_GENERATE_STATIC_CHECK_TIMEOUT"`
-	// JavaCommand: optional sh -c at repo root; empty = Maven test-compile or Gradle compileTestJava from build_tool / auto-detect. Env: RUNNER_POST_GENERATE_STATIC_CHECK_JAVA_COMMAND.
-	JavaCommand string `yaml:"java_command" env:"RUNNER_POST_GENERATE_STATIC_CHECK_JAVA_COMMAND"`
-	// NodeCommand: optional sh -c for JS/TS; empty = eslint --fix then tsc --noEmit (if tsconfig/jsconfig) and eslint --max-warnings 0 on written files (when eslint config exists). Env: RUNNER_POST_GENERATE_STATIC_CHECK_NODE_COMMAND.
-	NodeCommand string `yaml:"node_command" env:"RUNNER_POST_GENERATE_STATIC_CHECK_NODE_COMMAND"`
-	// CSharpCommand: optional sh -c when written paths include .cs. Empty = dotnet build on nearest .csproj per written path, else root .sln/.slnx/.csproj. Env: RUNNER_POST_GENERATE_STATIC_CHECK_CSHARP_COMMAND.
-	CSharpCommand string `yaml:"csharp_command" env:"RUNNER_POST_GENERATE_STATIC_CHECK_CSHARP_COMMAND"`
 }
 
 // E2EFrameworkBootstrapConfig controls auto-setup of E2E runners when gaps are enabled and no E2E stack exists.

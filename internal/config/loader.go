@@ -302,19 +302,10 @@ func Validate(c *Config, mode string) error {
 	if c.Database.EmbeddingsDimension <= 0 {
 		c.Database.EmbeddingsDimension = 1536
 	}
-	if c.Runner.Type == "" {
-		c.Runner.Type = "local"
-	}
-	// gap_concurrency: 0/1 = sequential; larger values are capped at the bounded ceiling so a
-	// typo like "100" cannot surprise-flood an LLM provider rate limit in production. The
-	// coercion is silent because the CLI already echoes the resolved config on startup.
-	const gapConcurrencyCeiling = 16
-	if c.Runner.GapConcurrency < 0 {
-		c.Runner.GapConcurrency = 0
-	}
-	if c.Runner.GapConcurrency > gapConcurrencyCeiling {
-		c.Runner.GapConcurrency = gapConcurrencyCeiling
-	}
+	// runner.type is NOT defaulted here. normaliseAndValidateRunnerType already lowercased it,
+	// defaulted empty to "local" and rejected anything that is neither local nor docker — and it runs
+	// far earlier, so this branch was unreachable. CP35 added that validator and left the older
+	// default behind; the golden-config mutation check is what proved the leftover dead (CP36).
 	return nil
 }
 
