@@ -36,7 +36,7 @@ node dist/index.js --repo /path/to/repo [--jsonl-out /path/to/index.jsonl] [--ou
 ```
 
 - **--repo** (required): repository root.
-- **--jsonl-out** (optional): write JSONL **only** to this file (directories created); stdout stays free for anything else. Same records as default stdout mode. QualityBot can set **`indexer.jst_jsonl_out: temp`** so Go uses a temp file instead of a pipe (recommended if you hit parse errors on huge single-file payloads).
+- **--jsonl-out** (optional): write JSONL **only** to this file (directories created); stdout stays free for anything else. Same records as the default stdout mode. Go ALWAYS uses this route — `indexer.jst_jsonl_out` was frozen to `temp` in CP37 and is no longer a key — because a pipe can fail on a huge single-record payload.
 - **--output** (optional): directory for **Phase 1 artifacts** after indexing:
   - **`packages.jsonl`** — one JSON object per workspace package (paths, `moduleKind`, `packageRole`, `sourceRoots` / `testRoots`, split `dependencies` / `devDependencies`, scripts).
   - **`index-summary.json`** — repo metadata, all `tsconfig` hints (`extends`, **`extendsChain`** base→leaf, **`mergedCompilerOptions`** shallow merge, `references`), Angular projects from `angular.json`, per-package **source file lists** (filesystem), and `indexedFileCount` from the AST pass.

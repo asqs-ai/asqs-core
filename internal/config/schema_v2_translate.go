@@ -208,7 +208,6 @@ func translateSandbox(sb SandboxV2, c *Config) {
 	c.Runner.DockerBinary = sb.Docker.Binary
 	// INVERSION 2/8: sandbox.docker.offline_test.enabled → docker_disable_offline_test.
 	c.Runner.DockerDisableOfflineTest = !boolOr(sb.Docker.OfflineTest, true)
-	c.Runner.RequireDockerBootstrap = sb.Docker.RequireBootstrap
 
 	c.Runner.ImageJava = sb.Images.Java
 	c.Runner.ImageJavaMaven = sb.Images.JavaMaven
@@ -239,6 +238,7 @@ func translateSandbox(sb SandboxV2, c *Config) {
 }
 
 func translateBootstrap(s *SchemaV2, c *Config) {
+	c.Runner.RequireDockerBootstrap = s.Bootstrap.RequireDocker
 	c.Runner.TestFrameworkBootstrap.Enabled = s.Bootstrap.TestFramework.Enabled
 	c.Runner.TestFrameworkBootstrap.Mode = s.Bootstrap.TestFramework.Mode
 	c.Runner.TestFrameworkBootstrap.PinVersions = s.Bootstrap.TestFramework.PinVersions

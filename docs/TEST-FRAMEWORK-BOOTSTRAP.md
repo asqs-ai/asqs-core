@@ -12,7 +12,7 @@ Two things to know before enabling this:
 
 # Test framework auto-bootstrap
 
-When **`runner.test_framework_bootstrap.enabled`** is `true`, asqs-core can **detect** whether the target repo already has a test runner for the dominant stack. If not, it **patches the build** and **verifies** compilation:
+When **`bootstrap.test_framework.enabled`** is `true`, asqs-core can **detect** whether the target repo already has a test runner for the dominant stack. If not, it **patches the build** and **verifies** compilation:
 
 - **JavaScript / TypeScript** — **framework-aware**. Bootstrap detects **Angular**, **React** (with or without Vite), **NestJS**, **ESM Node** or plain, picks the runner that framework can actually use (**Jest** or **Vitest**), installs the matching stack — jsdom + Testing Library for React, `jest-preset-angular` for Angular, `@nestjs/testing` for Nest — then **runs** a smoke test to prove it. It no longer overwrites `scripts.test`. See [JS/TS detection](#javascript--typescript-1) and [JS/TS smoke tests](#jsts-smoke-tests).
 - **Java** — **framework-aware**. Bootstrap detects the application framework (**Spring Boot**, **Quarkus**, **Micronaut**, **Android**, or plain) from `pom.xml` / `build.gradle(.kts)` and installs the test stack that framework actually needs, then **compiles and runs** a smoke test to prove it. A Spring Boot module gets **`spring-boot-starter-test`**; a plain module gets **JUnit 5 + Mockito + AssertJ + Surefire**. See [Java detection](#java) and [Java smoke tests](#java-smoke-tests).
@@ -24,12 +24,11 @@ This runs **after** checkout and **before** the language indexer, so metadata an
 
 ```yaml
 bootstrap:
-  policy:
-    test_framework:
-      enabled: false          # set true to enable
-      mode: auto              # auto | jest | junit | xunit | off
-      pin_versions: true      # exact semver in package.json (JS/TS only)
-      allow_lockfile_change: true   # false → npm ci / frozen lockfile when lock exists (JS/TS only)
+  test_framework:
+    enabled: false # set true to enable
+    mode: auto # auto | jest | junit | xunit | off
+    pin_versions: true # exact versions in package.json (JS/TS only)
+    allow_lockfile_change: true # false → npm ci / frozen lockfile when a lock exists (JS/TS only)
 ```
 
 | Field | Meaning |
@@ -41,9 +40,11 @@ bootstrap:
 
 **pnpm:** Bootstrap runs `pnpm install` with **`--store-dir`** outside the repo (host: OS user cache `…/asqs-pnpm-store`; Docker: `/root/.local/share/pnpm/store`) so a project `.npmrc` that sets `store-dir=.pnpm-store` does not create thousands of files under the repo. If `.pnpm-store/` is not already ignored, bootstrap **appends** it to **`.gitignore`** (same for **E2E** bootstrap when the repo uses pnpm).
 
-**Environment:** `ASQS_BOOTSTRAP_POLICY_TEST_FRAMEWORK_ENABLED`, `ASQS_BOOTSTRAP_POLICY_TEST_FRAMEWORK_MODE`, etc. (see `internal/config/config.go`).
+**Environment:** every key has a derived variable — `ASQS_` plus the dotted path upper-cased — so
+these are `ASQS_BOOTSTRAP_TEST_FRAMEWORK_ENABLED`, `ASQS_BOOTSTRAP_TEST_FRAMEWORK_MODE`, and so on.
+See `docs/CONFIG-REFERENCE.md`.
 
-Subprocess timeouts for install/verify use **`runner.timeout`** (capped internally for the bootstrap phase; see `internal/testbootstrap/helpers.go`).
+Subprocess timeouts for install/verify use **`general.sandbox.timeout`** (capped internally for the bootstrap phase; see `internal/testbootstrap/helpers.go`).
 
 ## Detection (no-op when already set up)
 
@@ -322,12 +323,11 @@ Audit steps (under **Test framework bootstrap** in `qualitybot audit report`):
 | `test_bootstrap.install_failed` | JS install failed (error level). |
 | `test_bootstrap.verify_failed` | Verify step failed (error level). |
 | `test_bootstrap.apply_ok` | Success. |
-| `test_bootstrap.run_failed` | Top-level failure returned to workflow (error level). |
 | `test_bootstrap.detect_error` | Could not read/parse repo for detection. |
 
 ## E2E framework bootstrap (Playwright)
 
-When **`retrieval.max_gaps_e2e` > 0** and **`runner.e2e_framework_bootstrap.enabled`** is `true`, asqs-core runs **E2E detection** for the workflow language. **JS/TS:** runs **after** unit test bootstrap (when present) and **before** the JS/TS indexer:
+When **`indexer.policy.max_gaps_e2e` > 0** and **`bootstrap.e2e_framework.enabled`** is `true`, asqs-core runs **E2E detection** for the workflow language. **JS/TS:** runs **after** unit test bootstrap (when present) and **before** the JS/TS indexer:
 
 1. **Detect** Playwright/Cypress via config files, dependencies, and scripts (same signals as runtime `E2EFramework`).
 2. If nothing is detected and **`mode`** is `auto` or `playwright`, **merge** `@playwright/test` into `package.json`, add **`scripts.test:e2e`** (`playwright test`), write **`playwright.config.ts`** if missing, write **`e2e/smoke.spec.ts`** if missing (so **`playwright test --list`** finds at least one test), run **npm/pnpm/yarn install**, then **`npx playwright test --list`** as verify.
@@ -336,27 +336,27 @@ When **`retrieval.max_gaps_e2e` > 0** and **`runner.e2e_framework_bootstrap.enab
 
 **`mode: auto`:** installs **Playwright** (same as `playwright`) when no E2E stack is detected.
 
-**Java / C# (same `max_gaps_e2e` gate):** **`DetectE2E`** scans **`pom.xml`** / **`build.gradle(.kts)`** (Java) or root **`*.csproj`** (C#). If nothing is detected and **`mode`** is `auto` or `playwright`, **Java** adds **Playwright Java** (test scope) + JUnit/Surefire/Maven exec or Gradle task **`asqsPlaywrightInstall`**, writes **`src/test/java/com/asqs/e2e/AsqsPlaywrightSmokeE2E.java`**, resolves deps, runs **`playwright` CLI `install chromium --with-deps`**, then the smoke test. **When `runner.type`/execution use ephemeral Docker**, Java E2E bootstrap uses **`mcr.microsoft.com/playwright/java`** (see **`runner.docker_image_playwright_java`**) instead of **`maven:*` / `gradle:*`**, so Chromium and OS libraries match the Playwright version; bootstrap containers also use **`docker run --ipc=host`** (Playwright’s recommendation). On the **host** (local execution), **`install chromium --with-deps`** still applies. **C#** adds **Microsoft.Playwright** + xUnit test SDK references if missing, writes **`E2E/AsqsPlaywrightSmokeE2E.cs`**, **`dotnet build`**, **`playwright.sh` install chromium** (in Docker, **`playwright.sh`** under **`bin/`** is used; on Windows hosts **`playwright.ps1`** may be used), then **`dotnet test`** filtered to that class. **C# E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/dotnet`** (**`runner.docker_image_playwright_dotnet`**, default tag aligned with the **Microsoft.Playwright** NuGet pin in code), not the plain **`runner.docker_image_dotnet`** SDK image, so browser bundles match the package version; containers use **`--ipc=host`** like other Playwright images. **`mode: cypress`** is not applicable on JVM/.NET — bootstrap **falls back to Playwright** (audit **`e2e_bootstrap.mode_fallback`**). Unsupported languages still log **`e2e_bootstrap.skip_apply`**.
+**Java / C# (same `max_gaps_e2e` gate):** **`DetectE2E`** scans **`pom.xml`** / **`build.gradle(.kts)`** (Java) or root **`*.csproj`** (C#). If nothing is detected and **`mode`** is `auto` or `playwright`, **Java** adds **Playwright Java** (test scope) + JUnit/Surefire/Maven exec or Gradle task **`asqsPlaywrightInstall`**, writes **`src/test/java/com/asqs/e2e/AsqsPlaywrightSmokeE2E.java`**, resolves deps, runs **`playwright` CLI `install chromium --with-deps`**, then the smoke test. **When `general.sandbox.type`/execution use ephemeral Docker**, Java E2E bootstrap uses **`mcr.microsoft.com/playwright/java`** (see **`general.sandbox.images.playwright_java`**) instead of **`maven:*` / `gradle:*`**, so Chromium and OS libraries match the Playwright version; bootstrap containers also use **`docker run --ipc=host`** (Playwright’s recommendation). On the **host** (local execution), **`install chromium --with-deps`** still applies. **C#** adds **Microsoft.Playwright** + xUnit test SDK references if missing, writes **`E2E/AsqsPlaywrightSmokeE2E.cs`**, **`dotnet build`**, **`playwright.sh` install chromium** (in Docker, **`playwright.sh`** under **`bin/`** is used; on Windows hosts **`playwright.ps1`** may be used), then **`dotnet test`** filtered to that class. **C# E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/dotnet`** (**`general.sandbox.images.playwright_dotnet`**, default tag aligned with the **Microsoft.Playwright** NuGet pin in code), not the plain **`general.sandbox.images.dotnet`** SDK image, so browser bundles match the package version; containers use **`--ipc=host`** like other Playwright images. **`mode: cypress`** is not applicable on JVM/.NET — bootstrap **falls back to Playwright** (audit **`e2e_bootstrap.mode_fallback`**). Unsupported languages still log **`e2e_bootstrap.skip_apply`**.
 
 **Why `AsqsPlaywrightSmokeE2E.java` (and the C# counterpart)?** After adding Playwright dependencies, bootstrap must **prove** the toolchain works: JUnit can run, the Playwright driver loads, and **Chromium** is installed. A tiny test that launches headless Chromium and opens a **`data:`** HTML URL does that without your application or a server. It is only created when the file is missing; it is not meant to replace your real E2E tests—only to **verify install** and satisfy **`mvn test` / `gradle test`** during bootstrap. The Java smoke source is **`spring-javaformat:apply` output**, including **tab characters for indentation** (the Spring formatter rejects space-indented versions of the same file). If you still see an older copy in the repo, delete **`src/test/java/com/asqs/e2e/AsqsPlaywrightSmokeE2E.java`** once so bootstrap can recreate it, or run **`./mvnw spring-javaformat:apply -q`** on that path.
 
 ### Configuration
 
 ```yaml
+indexer:
+  policy:
+    max_gaps_e2e: 0 # > 0 enables the E2E plan branch and optional bootstrap
+    max_gaps_per_file_e2e: 0 # 0 = the built-in cap
+
 retrieval:
-  plan:
-    e2e:
-      max_gaps: 0          # > 0 enables E2E plan branch + optional bootstrap
-      max_gaps_per_file: 0 # 0 = default cap (2)
-  profile_e2e: ""          # empty → e2e_playwright for E2E plan retrieval
+  profile_e2e: "" # empty → e2e_playwright for E2E plan retrieval
 
 bootstrap:
-  policy:
-    e2e_framework:
-      enabled: false
-      mode: auto             # auto (= playwright apply) | playwright | cypress | off
-      pin_versions: true
-      allow_lockfile_change: true
+  e2e_framework:
+    enabled: false
+    mode: auto # auto (= playwright apply) | playwright | cypress | off
+    pin_versions: true
+    allow_lockfile_change: true
 ```
 
 ### Audit steps (`e2e_bootstrap.*`)
@@ -365,13 +365,13 @@ Grouped under **Test framework bootstrap** in `qualitybot audit report` (same se
 
 ## Requirements
 
-- **`runner.test_framework_bootstrap.execution`** / **`runner.e2e_framework_bootstrap.execution`:** **`auto`** (default) — when **`runner.type: docker`**, **TS/JS**, **Java**, and **C#** install/verify run in **`docker run --rm`** (**`internal/runner/jobrunner`**). **C# unit** bootstrap uses the **csharp-dotnet** eval image (**`runner.docker_image_dotnet`**). **`local`** — always host **`exec`**. **`docker`** — force Docker (fails if toolchain cannot be resolved).
-- **`runner.test_framework_bootstrap.require_docker`:** when **true**, a TS/JS, **Java**, or **C#** bootstrap that would **install on the host** (no ephemeral container) **fails fast** after detection shows work is needed. Use with **`runner.type: docker`** and/or **`execution: docker`**.
-- **JS/TS images:** **Unit** bootstrap (`runner.test_framework_bootstrap`) uses the same **Node**-based image as eval (**`runner.docker_image_node`** / **`runner.build_tool`** for npm vs pnpm vs yarn lockfiles). **E2E** bootstrap (`runner.e2e_framework_bootstrap`) uses **`mcr.microsoft.com/playwright`** (**`runner.docker_image_playwright`**, default tag pinned with **`@playwright/test`** in code) so browsers match the Playwright stack. **Docker evaluation:** the **unit** test pass still uses the **Node** profile; the **second (E2E) pass** for **Playwright/Cypress** uses **`runner.docker_image_playwright`** so browsers are available in the eval container.
-- **Java E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/java`** (**`runner.docker_image_playwright_java`**, default tag aligned with the Playwright Java pin in code), not **`image_java_maven` / `image_java_gradle`**, so the JDK/Maven image already includes matching Chromium and OS libraries. **Unit** bootstrap and **docker eval** for Java still use the Maven/Gradle profile images.
-- **C# E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/dotnet`** (**`runner.docker_image_playwright_dotnet`**, default tag aligned with **Microsoft.Playwright** in code). The default image includes **.NET SDK 8** only; repos targeting **net9.0** / **net10.0** should set **`runner.docker_image_playwright_dotnet`** to a **custom image** (see **[PLAYWRIGHT-DOTNET-DOCKER.md](./PLAYWRIGHT-DOTNET-DOCKER.md)** and **`docker/runner/playwright-dotnet-sdk10/Dockerfile`**). **C# unit** bootstrap in Docker uses **`runner.docker_image_dotnet`** (same as **csharp-dotnet** eval).
+- **`bootstrap.test_framework.execution`** / **`bootstrap.e2e_framework.execution`:** **`auto`** (default) — when **`general.sandbox.type: docker`**, **TS/JS**, **Java**, and **C#** install/verify run in **`docker run --rm`** (**`internal/runner/jobrunner`**). **C# unit** bootstrap uses the **csharp-dotnet** eval image (**`general.sandbox.images.dotnet`**). **`local`** — always host **`exec`**. **`docker`** — force Docker (fails if toolchain cannot be resolved).
+- **`bootstrap.require_docker`:** when **true**, a TS/JS, **Java**, or **C#** bootstrap that would **install on the host** (no ephemeral container) **fails fast** after detection shows work is needed. Use with **`general.sandbox.type: docker`** and/or a stage's **`execution: docker`**.
+- **JS/TS images:** **Unit** bootstrap (`bootstrap.test_framework`) uses the same **Node**-based image as eval (**`general.sandbox.images.node`** / **`general.build.build_tool`** for npm vs pnpm vs yarn lockfiles). **E2E** bootstrap (`bootstrap.e2e_framework`) uses **`mcr.microsoft.com/playwright`** (**`general.sandbox.images.playwright`**, default tag pinned with **`@playwright/test`** in code) so browsers match the Playwright stack. **Docker evaluation:** the **unit** test pass still uses the **Node** profile; the **second (E2E) pass** for **Playwright/Cypress** uses **`general.sandbox.images.playwright`** so browsers are available in the eval container.
+- **Java E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/java`** (**`general.sandbox.images.playwright_java`**, default tag aligned with the Playwright Java pin in code), not **`image_java_maven` / `image_java_gradle`**, so the JDK/Maven image already includes matching Chromium and OS libraries. **Unit** bootstrap and **docker eval** for Java still use the Maven/Gradle profile images.
+- **C# E2E bootstrap in Docker** uses **`mcr.microsoft.com/playwright/dotnet`** (**`general.sandbox.images.playwright_dotnet`**, default tag aligned with **Microsoft.Playwright** in code). The default image includes **.NET SDK 8** only; repos targeting **net9.0** / **net10.0** should set **`general.sandbox.images.playwright_dotnet`** to a **custom image** (see **[PLAYWRIGHT-DOTNET-DOCKER.md](./PLAYWRIGHT-DOTNET-DOCKER.md)** and **`docker/runner/playwright-dotnet-sdk10/Dockerfile`**). **C# unit** bootstrap in Docker uses **`general.sandbox.images.dotnet`** (same as **csharp-dotnet** eval).
 - **npm, pnpm, yarn in Docker:** for **pnpm** and **yarn**, install runs **`npm install -g corepack@latest`** then **`corepack enable`** before **`pnpm install` / `yarn install`** so the shims work and **Corepack’s signing keys match the registry** (avoids `Cannot find matching keyid` on older Node-bundled Corepack). **npm** installs only run **`corepack enable`** (best-effort). Lockfile detection unchanged (**`package-lock.json`**, **`pnpm-lock.yaml`**, **`yarn.lock`**).
-- When **`execution`** implies **local** (default **`runner.type: local`**): **JS/TS** need **Node** + **npm** (or yarn/pnpm); **Java** needs **Maven** or **Gradle** (or wrappers); **C#** needs **.NET SDK**.
+- When **`execution`** implies **local** (default **`general.sandbox.type: local`**): **JS/TS** need **Node** + **npm** (or yarn/pnpm); **Java** needs **Maven** or **Gradle** (or wrappers); **C#** needs **.NET SDK**.
 
 Network may be needed for first-time dependency resolution (`npm`, NuGet).
 

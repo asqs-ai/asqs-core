@@ -41,9 +41,11 @@ func dispatch(args []string) error {
 		return runMigrate(args[1:])
 	case "ab-report":
 		return runABReport(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	default:
 		printTopLevelUsage()
-		return fmt.Errorf("unknown command %q (supported: run, migrate, ab-report)", args[0])
+		return fmt.Errorf("unknown command %q (supported: run, migrate, ab-report, config)", args[0])
 	}
 }
 
@@ -51,7 +53,8 @@ func printTopLevelUsage() {
 	fmt.Fprintf(os.Stderr, "usage: asqs-core <command> [flags]\n\ncommands:\n"+
 		"  run        generate unit/E2E tests for a repo and evaluate them (see `asqs-core run` for flags)\n"+
 		"  migrate    apply one-shot schema/data migrations recorded in schema_migrations\n"+
-		"  ab-report  compare outcome metrics across config revisions (first-wave metrics per run)\n")
+		"  ab-report  compare outcome metrics across config revisions (first-wave metrics per run)\n"+
+		"  config     inspect the configuration schema (`config reference` renders the full key list)\n")
 }
 
 func runRun(args []string) error {

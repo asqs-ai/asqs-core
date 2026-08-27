@@ -253,9 +253,6 @@ type SandboxDockerV2 struct {
 	// caches. Inverts v1's runner.docker_disable_offline_test. Default true — an offline test phase
 	// is what makes a run reproducible.
 	OfflineTest *bool `yaml:"offline_test"`
-	// RequireBootstrap fails the run when the image's toolchain bootstrap did not complete, instead
-	// of proceeding to compile against a half-provisioned container.
-	RequireBootstrap bool `yaml:"require_bootstrap"`
 }
 
 // SandboxImagesV2 pins one container image per toolchain.
@@ -384,6 +381,10 @@ type WebSearchV2 struct {
 // BootstrapV2 prepares the repository's test tooling before generation, so the fix loop does not
 // spend its whole budget discovering that the repository could never have run a generated test.
 type BootstrapV2 struct {
+	// RequireDocker fails a bootstrap fast when it would install on the HOST rather than in an
+	// ephemeral container. It applies to both stages, which is why it sits here rather than on each:
+	// a deployment that wants host installs refused wants that for the whole step.
+	RequireDocker bool `yaml:"require_docker"`
 	// TestFramework installs and smoke-verifies the unit-test stack.
 	TestFramework FrameworkBootstrapV2 `yaml:"test_framework"`
 	// E2EFramework installs the end-to-end stack when E2E gaps are enabled.

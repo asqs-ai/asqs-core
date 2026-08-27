@@ -355,8 +355,8 @@ implementation record can be found; it is provenance, not instruction.
 | CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `in review` |
 | CP37 | Constants freeze | C2 | CP36 | 1–2 d | `in review` |
 | CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `in review` |
-| CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `ready` |
-| CP40 | Rollout: README, deployment guide, examples, guards | C5, C7 | CP39 | 2 d | `blocked (CP39)` |
+| CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `in review` |
+| CP40 | Rollout: README, deployment guide, examples, guards | C5, C7 | CP39 | 2 d | `in review` |
 
 ### P7 — Tool calling
 
@@ -2718,7 +2718,7 @@ enterprise product and are already written against upstream's v2.
 
 ### CP39 — Generated reference and regenerated templates
 
-- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 2 d · **Risk:** low
 
 1. `reference.go` + `reference_render.go`; `asqs-core config reference -o docs/CONFIG-REFERENCE.md`
    (the CP07 dispatch makes this a subcommand, not a fourth ad-hoc branch).
@@ -2730,9 +2730,41 @@ enterprise product and are already written against upstream's v2.
 5. **No explicit `null` in any shipped template.** Null and absent are equivalent to the loader, but
    null reads as a third state to an operator.
 
+#### Implementation record
+
+All five items done. `reference.go` + `reference_render.go` render the document from the schema
+structs, and `asqs-core config reference [-o FILE]` is a subcommand rather than a `go generate` step
+so the reference can be produced **from a shipped binary with no source tree** — the schema source is
+embedded, so an operator can ask the exact build they are running what keys it understands.
+
+Defaults come from a real `ApplyV2Defaults` pass over a zero schema, never a hand-written table, so
+the document cannot claim a default the loader does not apply. Doc comments come from parsing the
+embedded source, because reflection cannot see them and a reference without the explanation is just
+the struct again. Wrapper types inherit the sentence from the field one level up, so
+`retrieval.policy.abstention.enabled` reads as what it is rather than as nothing.
+
+**A defect the coverage test found immediately.** `BuildConfigReference` reused `walkV2Fields`, which
+skips maps and struct slices because they have no flat environment spelling — so
+`retrieval.profile_budgets` and `general.sandbox.registries.credentials` were missing from the
+*document* too. Two settable keys with nothing describing them. The walk is now split: the
+environment overlay still skips them, the documentation walk does not, and their Env column reads
+"— (YAML only)" rather than a plausible-looking variable an operator would set and get nothing from.
+**Upstream's reference has the same gap**, since it shares the single walker.
+
+**`env_only.go` is swept, not written.** The sweep found `ASQS_ALLOW_EMBEDDING_DIM_RESET` only after
+the regex was widened to the named-constant form — the variable that most needs documenting was the
+one someone had taken the trouble to name. Thirteen entries in three groups, because "set this",
+"the platform already sets this" and "this decides whether a test runs" ask different things of a
+reader.
+
+`config.example.yaml` is capped at 200 lines by a test. The cap is the mechanism, not a preference:
+upstream's template grew by accretion into a hand-maintained mirror and drifted about twenty fields
+while still being what operators copied. A file that cannot grow past the cap cannot take that job
+back.
+
 ### CP40 — Rollout: docs, deployment guide, guards
 
-- **Status:** `blocked (CP39)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 2 d · **Risk:** low
 
 Update `README.md` — its "Config keys that are CLI-driven here" section, the configure step, and the
 troubleshooting sections that quote keys.
@@ -2753,6 +2785,41 @@ learned this the hard way: hand-maintained lists of key spellings missed **124**
 | documented-YAML-blocks-parse | Every v2 YAML block in the markdown loads under the real strict decoder. Executable documentation. |
 | every-key-reaches-the-runtime | CP38's reachability test. |
 | no-nulls-in-templates | No explicit `null` in files operators copy. |
+
+#### Implementation record
+
+**All four guards ship, and all four were mutation-checked** — each was made to fail against a real
+drift and pass again on restore, because a guard nobody has seen fail is indistinguishable from one
+that cannot.
+
+The unresolvable-config-paths guard is derived from the schema and from the audit-event names the code
+emits, never a needle list. It found **21 stale documented paths** on its first run, most of them in
+`docs/TEST-FRAMEWORK-BOOTSTRAP.md`, which CP58 ported with upstream's v1 spellings. After CP38 those
+are not cosmetic: the loader is strict, so a reader copying one gets a failed run.
+
+Building it surfaced two things worth recording beyond the repointing:
+
+- **A key I filed in the wrong place in CP38.** The doc named `bootstrap.test_framework.require_docker`;
+  CP38 had translated `require_docker_bootstrap` into `general.sandbox.docker.require_bootstrap`. The
+  doc was right about the intent and CP38 was wrong about the home — it governs whether BOOTSTRAP may
+  install on the host, applies to both stages, and is now `bootstrap.require_docker`.
+- **A documented audit event nothing emits.** `test_bootstrap.run_failed` was in the event table and
+  is emitted nowhere; the sweep of real event names is what exposed it. Removed.
+
+Tuning the guard mattered as much as writing it. The first version reported database identifiers
+(`metadata.symbols`, `files.is_test`), other tools' config fields (`scripts.test`,
+`resolve.conditions`) and file names as unresolvable keys — a guard that cries wolf gets an exemption
+list, and an exemption list is the thing this was written to avoid. Historical mentions are allowed by
+a marker on the same line, so documentation can still say what a key used to be called.
+
+The documented-YAML-blocks guard runs every fenced block that looks like a v2 config through the real
+strict decoder. It caught both blocks in the bootstrap document using upstream's `bootstrap.policy.*`
+and `retrieval.plan.*` shapes, which core does not have.
+
+**Outstanding: D18's move of the OpenShift guide, still CP56's.** CP38 converted that guide's
+ConfigMap to v2 in place, so nothing it says is wrong — but the guards above walk `asqs-core` only,
+so a file in the parent working folder stays outside their reach. That is the whole reason D18 asked
+for the move, and it remains the one documented gap in this phase's coverage.
 
 ---
 

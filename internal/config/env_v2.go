@@ -67,10 +67,24 @@ func ApplyV2Env(s *SchemaV2, getenv func(string) string, clientID string) error 
 	})
 }
 
-// walkV2Fields visits every settable LEAF field of the v2 tree, reporting its dotted YAML path.
-// Structs are descended into; slices of structs are not, because a list of credentials has no
-// sensible single-variable spelling.
+// walkV2Fields visits every settable LEAF field of the v2 tree that has an environment spelling,
+// reporting its dotted YAML path. Structs are descended into; maps and slices of structs are not,
+// because a per-profile budget table and a list of credentials have no single-variable spelling.
 func walkV2Fields(v reflect.Value, prefix string, visit func(reflect.Value, string) error) error {
+	return walkV2FieldsOpt(v, prefix, false, visit)
+}
+
+// walkV2FieldsAll additionally visits the YAML-ONLY leaves — the map and the struct slice.
+//
+// The documentation walk must see them: they are settable keys, and omitting them from the generated
+// reference would leave two keys an operator can write with nothing describing them. Only the
+// environment overlay needs them skipped, and skipping them there is about the variable, not the key.
+// Sharing one walker between the two purposes is what hid them in the first place.
+func walkV2FieldsAll(v reflect.Value, prefix string, visit func(reflect.Value, string) error) error {
+	return walkV2FieldsOpt(v, prefix, true, visit)
+}
+
+func walkV2FieldsOpt(v reflect.Value, prefix string, includeYAMLOnly bool, visit func(reflect.Value, string) error) error {
 	t := v.Type()
 	for i := 0; i < t.NumField(); i++ {
 		fv, ft := v.Field(i), t.Field(i)
@@ -87,17 +101,20 @@ func walkV2Fields(v reflect.Value, prefix string, visit func(reflect.Value, stri
 		}
 		switch fv.Kind() {
 		case reflect.Struct:
-			if err := walkV2Fields(fv, path, visit); err != nil {
+			if err := walkV2FieldsOpt(fv, path, includeYAMLOnly, visit); err != nil {
 				return err
 			}
 			continue
 		case reflect.Map:
 			// profile_budgets is the only map, and a per-profile budget table has no flat env
-			// spelling. YAML is its only home; the reflection test below knows that.
-			continue
+			// spelling. YAML is its only home.
+			if !includeYAMLOnly {
+				continue
+			}
 		case reflect.Slice:
-			if fv.Type().Elem().Kind() == reflect.Struct {
-				continue // e.g. registry credentials
+			// A list of structs — registry credentials — has no single-variable spelling either.
+			if fv.Type().Elem().Kind() == reflect.Struct && !includeYAMLOnly {
+				continue
 			}
 		}
 		if err := visit(fv, path); err != nil {

@@ -152,7 +152,7 @@ Flags: `--lang` (auto-detected if omitted), `--max-gaps`, `--max-gaps-e2e`, `--d
 | Source                                              | `max-gaps` | `max-gaps-e2e` |
 | --------------------------------------------------- | ---------- | -------------- |
 | `--max-gaps` / `--max-gaps-e2e` on the command line | wins       | wins           |
-| `indexer.policy.max_gaps` / `indexer.max_gaps_e2e`         | then this  | then this      |
+| `indexer.policy.max_gaps` / `indexer.policy.max_gaps_e2e`         | then this  | then this      |
 | built-in default                                    | `10`       | `0` (skip E2E) |
 
 The config keys also accept the `ASQS_INDEXER_MAX_GAPS` and `ASQS_INDEXER_MAX_GAPS_E2E` environment
@@ -316,9 +316,30 @@ Not included (these live in the commercial layer):
 
 ### Config keys that are CLI-driven here
 
-Shipping is enabled by `--ship`, not by `vcs.<provider>.ship.enabled`. The rest of that block _is_
-read: `branch` and `base_branch` supply the defaults for `--ship-branch` / `--base-branch`, and
-`draft_pr` opens the PR as a draft (GitHub; ignored for Azure DevOps).
+Shipping is enabled by `--ship`, not by `general.git.ship.enabled`. The rest of that block _is_ read:
+`branch` and `base_branch` supply the defaults for `--ship-branch` / `--base-branch`, and `draft_pr`
+opens the PR as a draft (GitHub; ignored for Azure DevOps).
+
+Gap caps work the other way round: `--max-gaps` / `--max-gaps-e2e` override
+`indexer.policy.max_gaps` / `max_gaps_e2e` when passed, and the config values apply otherwise.
+
+### Where the full key list lives
+
+[`docs/CONFIG-REFERENCE.md`](./docs/CONFIG-REFERENCE.md) is generated from the schema and lists every
+key with its type, effective default and environment variable. Regenerate it after a schema change:
+
+```bash
+go run ./cmd/asqs-core config reference -o docs/CONFIG-REFERENCE.md
+```
+
+A test fails when the checked-in copy goes stale, so the document cannot quietly stop describing the
+code. `config.example.yaml` is deliberately much shorter — it is a starting point, not an inventory.
+
+Two properties are worth knowing before you edit a config:
+
+- **Unknown keys fail the load** and name their own path. A typo is an error, not a silent no-op.
+- **Every key has an environment variable**, derived rather than tagged: `ASQS_` plus the dotted path
+  upper-cased, with a leading `general.` dropped. `general.llm.model` is `ASQS_LLM_MODEL`.
 
 ## License
 

@@ -18,7 +18,7 @@ impossible to switch off from the environment.
 ## Unknown keys are an error
 
 Decoding is strict. A misspelled or misplaced key fails the load and names its own path. This is
-deliberate: the previous lenient parser accepted `retrieval.max_similair_tests` with no error, no
+deliberate: the previous lenient parser accepted a misspelled `max_similair_tests` with no error, no
 warning and no effect, which is the same invisible-no-op failure the schema restructure existed to
 remove, except self-inflicted.
 
