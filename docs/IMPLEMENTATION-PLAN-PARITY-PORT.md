@@ -381,10 +381,10 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
-| CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `ready` |
-| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `blocked (CP50)` |
-| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `blocked (CP50)` |
-| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `blocked (CP49, CP50, CP52)` |
+| CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
+| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `ready` |
+| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `ready` |
+| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `blocked (CP52)` |
 
 ### P10 — Language indexers
 
@@ -3062,7 +3062,7 @@ a real fixture asserted on by name. Do not let a `**/bin/` ignore rule near it.
 
 ### CP50 — Fix-loop convergence core
 
-- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high
+- **Status:** `in review` · **Effort:** 4–5 d · **Risk:** high
 
 Four fixes that together are the difference between a loop that converges and one that burns its
 budget:
@@ -3110,9 +3110,69 @@ code lives in `workflow.go` and the files CP50/CP52/CP53 port wholesale.
 carries the prior attempt; a coverage-deleting fix is rejected; an inherited failure is classified as
 inherited and does not consume the budget.
 
+**Implementation record (2026-08-27).**
+
+- **Item 1 — narrowing basis.** Core's narrowing rebuilt the writable set by iterating
+  `opts.ArtifactPaths`, which silently undid adoption: the write gate already permitted an adopted
+  path while `FixRequest.ArtifactPaths` never told the model it could touch it, so the model never
+  returned it. The intersection basis is now `writableArtifacts` — the run's own artifacts PLUS
+  adopted failures — and the audit reports the true pre-narrowing set as `artifact_paths_all` with
+  the generated set alongside it as `artifact_paths_generated` (the count in the message was
+  repointed too, or it would have understated what narrowing started from).
+- **Item 2 — per-round memory.** `fix_attempt_memory.go` ported with its test; `FixLoopState` gained
+  `attempts` and `lastFileDiagnostics`; `FixRequest.PriorAttempts` is filled from
+  `priorAttempts(loopState)` and rendered into the fix prompt ahead of the error log, so the model
+  reads what it already tried before it reads the failure again. **Every return from applyLLMFix
+  now leaves a record**: the write loop banks applied changes and per-path skip reasons, and the two
+  early returns (an unusable reply, an empty response) bank a round-failure note — those sit far
+  above the recorder, so the round would otherwise be erased from the memory the next prompt is
+  built from.
+- **Item 3 — coverage gate.** `fix_coverage_gate.go` ported with its test and wired ahead of the
+  existing low-value check, so a deletion-shaped fix is refused before anything reaches disk.
+  `EvalOptions.AllowFixCoverageReduction` is the escape hatch, off by default, and every use of it
+  emits `evaluator.fix_coverage_regression_allowed`. The unused-import residue check rides along as
+  a report, not a block — a textual scan cannot see reflective or fully-qualified uses.
+- **Item 4 — baseline classification.** `baseline.go` re-homed from upstream's `internal/workflow`
+  into `internal/evaluator` (core has no workflow package) and re-signed to take
+  `(SandboxRunner, EvalOptions)` instead of the orchestrator's `Config`/`WorkflowInput`. The
+  pipeline captures it with one pre-generation compile — after the plan is built, before a single
+  artifact is written, which is the ordering that makes "inherited" mean anything — and feeds
+  `EvalOptions.BaselineFailingPaths`. Adoption then takes those paths on **evidence** rather than a
+  regex over the round's diagnostic, bounded exactly as upstream bounds it: test-shaped, on disk,
+  and **still named by the current diagnostic** — a file that was broken before and is not in this
+  error output is not this round's problem. Audited as `evaluator.fix_baseline_adopted` and
+  `evaluator.baseline_compile`. `FailureSignature` came along as its prerequisite.
+- **Ride-along files.** `lang_paths.go`, `fix_file_progress.go` and `fix_primary_progress.go` ported
+  with their tests, plus `errout/signature.go` (`SignatureNormalize`) as a prerequisite. Their
+  **reporting** call sites are live here — `evaluator.fix_file_no_progress` (which of the previous
+  round's writes achieved nothing, computed before the request so the finding reaches this round's
+  prompt) and `evaluator.fix_primary_site_untouched`. The **enforcement** those feed — the
+  untouched-site streak that forces scope onto the blamed file and can terminally stop the loop —
+  is CP52's, exactly as this section's table says.
+- **Excluded, with reason:** the rerun progress gate. `EvaluateBaselineProgress` and
+  `BaselineProgress` ARE ported (the measurement is evaluator-domain and feeds the audit), but the
+  gate that consumes them lives in `internal/session/policy_baseline.go` — the session engine,
+  outside core's seam. Core's pipeline runs once and schedules nothing, so item 4's "gating any
+  rerun on actual progress" has no landing site here; this is exactly the case §2.5-5(b) predicts.
+  Upstream's `TestRerunProgressGate` and `TestBaselineSummary` are trimmed with that note in-file.
+- **Deferred, with reason:** two ported tests exercise the targeted-edit response contract
+  (`FixResponse.Edits` — CP51) and `applyLLMFix`'s skip-reason return (CP52's breaker refactor), so
+  they return with those bundles; noted in `fix_primary_progress_test.go`.
+- **Not taken:** upstream also narrows on **compile** steps and defers narrowing on a test step's
+  first attempt. Neither is named by this bundle's four items — they change which rounds narrow at
+  all, not what narrowing is computed from — so they stay with whichever bundle owns them.
+- **Acceptance.** The section requires a test per item that fails before the change, and **all four
+  were mutation-checked**: reverting the narrowing basis, the round recorder, the coverage gate and
+  baseline adoption each makes exactly its own test fail. Item 2's headline case is covered by
+  upstream's own ported test, so the authored file covers the half core's wiring adds — the early
+  returns — plus both halves of item 4 (an implicated baseline failure is adopted; an unimplicated
+  one is not).
+- Full gate green.
+
+
 ### CP51 — Extend-merge and artifact identity
 
-- **Status:** `blocked (CP50)` · **Effort:** 5–6 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** high
 
 1. **Import union on every extend-existing merge**, Java **and** C#. Hoist top-level imports; model
    import *kind* rather than a static/global boolean; handle the C# anchor chain, alias collisions and
@@ -3130,7 +3190,7 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
 
 ### CP52 — Fix-loop breakers and audit honesty
 
-- **Status:** `blocked (CP50)` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
 
 1. Extract `checkFixLoopBreakers` and the three thresholds (`repeatStopThreshold`,
    `recurrenceStopThreshold`, `noProgressStopThreshold`) from `applyLLMFix`, which is currently one
@@ -3146,7 +3206,7 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
 
 ### CP53 — Fixer robustness batches
 
-- **Status:** `blocked (CP49, CP50, CP52)` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `blocked (CP52)` · **Effort:** 3–4 d · **Risk:** medium
 - **Provenance:** upstream `8640c59` (§2.6) — re-diff before implementing; upstream keeps moving.
 
 1. **Accept flat `{"edits":[…]}` arrays.** Models emit them; the parser rejected them and the round

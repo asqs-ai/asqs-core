@@ -1,6 +1,11 @@
 package evaluator
 
-import "context"
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // Minimal test doubles for the evaluator package. asqs-core does not carry the full asqs-go
 // workflow_test.go harness, so the fix-loop tests (RC1–RC3) bring their own. Kept in sync with the
@@ -120,3 +125,15 @@ func (s *stubSandboxRunner) Mutation(ctx context.Context, repoPath, lang string,
 }
 
 var _ SandboxRunner = (*stubSandboxRunner)(nil)
+
+// writeRepoFile writes a repo-relative file, creating parent directories.
+func writeRepoFile(t *testing.T, repo, rel, content string) {
+	t.Helper()
+	full := filepath.Join(repo, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

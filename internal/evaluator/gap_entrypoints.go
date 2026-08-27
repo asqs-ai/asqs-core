@@ -2,7 +2,10 @@ package evaluator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/errout"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -52,6 +55,15 @@ type FinalEvalResult struct {
 	// FailingOutput is the (truncated) error output of the failing step, ready to feed into
 	// RunRunFixerOnce. Empty for Stable=true.
 	FailingOutput string
+}
+
+// FailureSignature hashes a failing step together with a position-insensitive form of its output.
+func FailureSignature(lang string, step SandboxStep, output string) string {
+	if strings.TrimSpace(output) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(string(step) + "\x00" + errout.SignatureNormalize(lang, output)))
+	return hex.EncodeToString(sum[:])
 }
 
 // RunSharedCompile invokes the compile step at run scope. It is a thin alias over RunCompile

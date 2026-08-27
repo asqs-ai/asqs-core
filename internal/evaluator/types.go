@@ -110,6 +110,15 @@ type FixRequest struct {
 	TestCommand string
 	// Manifests are dependency manifest files (e.g. package.json, pom.xml) so the LLM only suggests imports/packages that exist in the project. Key = repo-relative path (e.g. "package.json"); value = file content.
 	Manifests map[string]string
+	// PriorAttempts is the compacted record of fixer rounds already completed for this step in this
+	// run: what actually landed on disk, what was skipped and why, and the failure signature that
+	// came back afterwards. Empty on the first round.
+	//
+	// It exists because llmfix's raw multi-turn history cannot survive a real fix prompt: retention
+	// drops message pairs above a 64k budget and one prompt in the motivating upstream run was
+	// 141-147k runes, so every round was stateless and rounds 3 and 4 produced byte-identical
+	// output.
+	PriorAttempts []FixAttemptRecord
 	// FixAttempt is the current fix attempt (1-based). When > 1, the LLM can try a different strategy. 0 = unknown.
 	FixAttempt int
 	// MaxFixAttempt is the max fix attempts for this step (e.g. 3). 0 = unknown.

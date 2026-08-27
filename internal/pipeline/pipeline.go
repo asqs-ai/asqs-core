@@ -419,6 +419,39 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		}()
 	}
 
+	// Baseline: was the tree already red BEFORE this run generated anything?
+	//
+	// Without this, a repository that could not compile at minute zero spends the entire fix budget
+	// on failures the run did not cause, and the audit attributes every one of them to the run.
+	// Ordering is the whole point: after the plan is built and before a single artifact is written,
+	// so nothing this run produces can be counted as inherited.
+	baseline := evaluator.CaptureBaselineFailures(ctx, sandbox, evaluator.EvalOptions{
+		RepoPath:       repoAbs,
+		Lang:           lang,
+		BuildTool:      cfg.Runner.BuildTool,
+		CompileCommand: cfg.Runner.CompileCommand,
+	})
+	switch {
+	case !baseline.Captured:
+		// Deliberately silent: an uncaptured baseline must never read as "the tree was clean".
+	case baseline.Clean:
+		audit.Log(ctx, "evaluator.baseline_compile", map[string]interface{}{
+			"message": "Baseline compiled before generation: every failure from here on was introduced by this run.",
+			"clean":   true,
+		})
+	default:
+		fmt.Fprintf(os.Stderr, "asqs-core: baseline did not compile before generation: %d file(s) were already failing\n", len(baseline.Paths))
+		audit.Log(ctx, "evaluator.baseline_compile", map[string]interface{}{
+			"message": fmt.Sprintf(
+				"Baseline did NOT compile before generation: %d file(s) were already failing. Repairing them is in scope; they are not regressions introduced by this run.",
+				len(baseline.Paths)),
+			"clean":             false,
+			"failing_paths":     baseline.Paths,
+			"failure_signature": baseline.Signature,
+			"summary":           baseline.Summary,
+		})
+	}
+
 	// Phase 1 — generate + write every gap's test (no per-gap evaluation). Collect the unique
 	// artifact paths so the whole project is compiled/tested exactly once below.
 	var artifactPaths []string
@@ -545,6 +578,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		MaxFixIterations: maxFix,
 		ArtifactPaths:    artifactPaths,
 		Fixer:            fixer,
+		// The fixer may now repair inherited breakage on evidence rather than on a regex guess
+		// over each round's diagnostic.
+		BaselineFailingPaths: append([]string(nil), baseline.Paths...),
 		// Keep the evaluator's view of the flag in step with the Fixer's, or the audit payload
 		// (structured_user_message_config / _forced) contradicts what the fixer actually did.
 		FixerStructuredUserMessage: cfg.Runner.FixerStructuredUserMessage,

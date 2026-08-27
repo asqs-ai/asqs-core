@@ -113,6 +113,17 @@ type EvalOptions struct {
 	// Default false = every file keeps its full body (existing behaviour). Runner flag:
 	// `runner.fixer_dependency_signature_only`; env RUNNER_FIXER_DEPENDENCY_SIGNATURE_ONLY.
 	FixerDependencySignatureOnly bool
+	// BaselineFailingPaths are repo-relative test files that were ALREADY failing before this run
+	// generated anything, captured by one pre-generation compile. They are adopted into the fixer's
+	// writable set as a known input rather than being re-derived from each round's diagnostic by
+	// regex, which is what the derived-path fallback below has to do without them.
+	BaselineFailingPaths []string
+	// AllowFixCoverageReduction (escape hatch, default false) lets a fixer write through even when
+	// it reduces the number of test methods in a file. Off by default because the observed failure
+	// mode was the fixer "repairing" a compile error by deleting the tests and the round being
+	// recorded as a success. Set it only for a repo where a test genuinely has to go, and expect
+	// evaluator.fix_coverage_regression_allowed in the audit every time it is used.
+	AllowFixCoverageReduction bool
 	// FixerStructuredUserMessage (Phase 3 opt-in) when true, the fixer emits its user message as
 	// tagged `<error>` / `<file role=… writable=…>` XML-like blocks instead of the legacy
 	// `--- path ---` layout, giving the model explicit section boundaries. Default false keeps
@@ -1204,6 +1215,16 @@ type FixLoopState struct {
 	bestMagnitude    int
 	magnitudeKnown   bool
 	noProgressStreak int
+	// attempts is the compacted memory of rounds already completed for this step. It lives here
+	// rather than in the Fixer because llmfix's conversation retention cannot hold a real fix
+	// prompt (141-147k runes against a 64k budget upstream measured), so raw multi-turn history is
+	// wiped after every round. FixLoopState is already scoped to exactly (step, loop) and threaded
+	// through every applyLLMFix call site, which is the scope this memory needs.
+	attempts []FixAttemptRecord
+	// lastFileDiagnostics is the per-file diagnostic fingerprint of the failure the PREVIOUS round
+	// was handed, so the next round can tell which of that round's writes moved nothing. See
+	// FileDiagnostics.
+	lastFileDiagnostics map[string]string
 }
 
 // FixLoopRepeatStopThreshold is the number of consecutive applyLLMFix calls sharing the same
@@ -1352,12 +1373,53 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 		}
 	}
+	// Baseline failures are adopted on EVIDENCE rather than on a regex over the current diagnostic:
+	// one pre-generation compile already established these files were broken before the run started,
+	// so repairing them is in scope and they must be writable for the model to return them.
+	//
+	// Same bounds as the derived paths above, plus one more: only a baseline failure the CURRENT
+	// diagnostic still implicates is adopted. A file that was broken before and is not in this
+	// error output is not this round's problem, and widening scope to it would spend the budget on
+	// something nothing is asking about. Applies to every step — a compile round is exactly where
+	// inherited breakage surfaces.
+	if len(opts.BaselineFailingPaths) > 0 && strings.TrimSpace(errorOutput) != "" {
+		seen := make(map[string]bool, len(pathsToRead))
+		for _, p := range pathsToRead {
+			seen[normalizePathForFix(p)] = true
+		}
+		for _, p := range opts.BaselineFailingPaths {
+			rel := normalizePathForFix(strings.TrimSpace(p))
+			if rel == "" || seen[rel] || !pathLooksLikeTestArtifact(rel, opts.Lang) {
+				continue
+			}
+			if !strings.Contains(errorOutput, filepath.Base(rel)) {
+				continue
+			}
+			if st, err := os.Stat(filepath.Join(opts.RepoPath, filepath.FromSlash(rel))); err != nil || st.IsDir() {
+				continue
+			}
+			seen[rel] = true
+			pathsToRead = append(pathsToRead, rel)
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_baseline_adopted", map[string]interface{}{
+					"message": fmt.Sprintf("Adopted %s into the fixer's writable set: it was already failing before this run generated anything, and this round's diagnostic still names it.", rel),
+					"path":    rel,
+					"step":    step,
+				})
+			}
+		}
+	}
 	if len(pathsToRead) == 0 {
 		return false, nil
 	}
 	// Repeat-failure circuit-breaker. Compute the signature now that errorOutput is sanitised and
 	// pathsToRead is finalised (includes any FailingTestCandidatePaths additions for test steps).
 	// We check BEFORE reading files / calling the LLM so a truly stuck loop wastes no further work.
+	//
+	// The signature is computed once at function scope: the breaker below consumes it, and so does
+	// the per-round memory recorded at every exit, which must name the failure this round was
+	// handed rather than recomputing a possibly different one later.
+	roundSignature := fixLoopSignature(step, pathsToRead, errorOutput)
 	if loopState != nil {
 		// Sticky breaker: once tripped, subsequent calls are immediate no-ops regardless of whether
 		// the outer loop honoured the counter bump (defensive against reentrancy / tests).
@@ -1365,7 +1427,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			*attemptCounter = maxAttempts
 			return false, nil
 		}
-		sig := fixLoopSignature(step, pathsToRead, errorOutput)
+		sig := roundSignature
 		mag := fixLoopErrorMagnitude(errorOutput)
 		if loopState.seen == nil {
 			loopState.seen = make(map[string]int)
@@ -1731,7 +1793,26 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	}
 	scopeNarrowed := false
 	var scopedAuditPaths []string
-	if (step == StepTest || step == StepTestE2E) && len(opts.ArtifactPaths) > 0 && strings.TrimSpace(errorOutput) != "" {
+	// preNarrowAuditPaths is the writable candidate set BEFORE narrowing, recorded for audit.
+	// `artifact_paths_all` used to report opts.ArtifactPaths, which understates the set once
+	// adoption is in play — the adopted paths appeared in no field near the narrowing decision,
+	// which is what makes a multi-round stall unreadable after the fact.
+	preNarrowAuditPaths := append([]string(nil), writableArtifacts...)
+	// The intersection basis is `writableArtifacts` as computed above — this run's own artifacts
+	// PLUS the failing test files adopted from the diagnostic — and NOT `opts.ArtifactPaths`.
+	// Iterating opts.ArtifactPaths here silently undid adoption: the block above adds the adopted
+	// paths so they become writable, and this one then rebuilt the writable set from the run's own
+	// artifacts alone. The cost upstream measured was a run whose first compile error named a file
+	// left behind by a previous run, in all six rounds, while the fixer rewrote healthy files: the
+	// write gate already permitted that path, but FixRequest.ArtifactPaths never told the model it
+	// could touch it, so the model never returned it. Narrowing must be able to shrink the writable
+	// set, never to remove a file the run deliberately took ownership of.
+	//
+	// Widening the basis cannot make production source writable: pathsToRead only ever gains
+	// FailingTestCandidatePaths matches, which require an on-disk test-shaped path under RepoPath.
+	// Dependency and source files reach the prompt through opts.ArtifactDependencies, never
+	// pathsToRead.
+	if (step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
 		cited := errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath))
 		if len(cited) > 0 {
 			citedSet := make(map[string]bool, len(cited))
@@ -1740,11 +1821,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 			// Scoped set must also dedupe: if opts.ArtifactPaths arrived with dups AND the
 			// error cited the same path, we'd otherwise carry the dup through.
-			scoped := make([]string, 0, len(opts.ArtifactPaths))
-			scopedSeen := make(map[string]bool, len(opts.ArtifactPaths))
+			scoped := make([]string, 0, len(writableArtifacts))
+			scopedSeen := make(map[string]bool, len(writableArtifacts))
 			uniqueArtifactCount := 0
-			seenArtifact := make(map[string]bool, len(opts.ArtifactPaths))
-			for _, a := range opts.ArtifactPaths {
+			seenArtifact := make(map[string]bool, len(writableArtifacts))
+			for _, a := range writableArtifacts {
 				key := normalizePathForFix(a)
 				if !seenArtifact[key] {
 					seenArtifact[key] = true
@@ -1786,9 +1867,10 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	sort.Strings(droppedArtifactCtxPaths)
 	if scopeNarrowed && audit != nil {
 		audit.Log(ctx, "evaluator.fix_scope_narrowed", map[string]interface{}{
-			"message":                        fmt.Sprintf("Narrowed writable-artifact scope for step %s from %d to %d path(s) based on error output (dropped %d artifact-context entr(ies), %d runes).", step, len(opts.ArtifactPaths), len(scopedAuditPaths), len(droppedArtifactCtxPaths), droppedArtifactCtxRunes),
+			"message":                        fmt.Sprintf("Narrowed writable-artifact scope for step %s from %d to %d path(s) based on error output (dropped %d artifact-context entr(ies), %d runes).", step, len(preNarrowAuditPaths), len(scopedAuditPaths), len(droppedArtifactCtxPaths), droppedArtifactCtxRunes),
 			"step":                           step,
-			"artifact_paths_all":             append([]string(nil), opts.ArtifactPaths...),
+			"artifact_paths_all":             preNarrowAuditPaths,
+			"artifact_paths_generated":       append([]string(nil), opts.ArtifactPaths...),
 			"artifact_paths_scoped":          scopedAuditPaths,
 			"reason":                         "error_cited_subset",
 			"error_output_sanitized":         errorOutputSanitized,
@@ -1858,6 +1940,37 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		}
 	}
 
+	// Which of the PREVIOUS round's writes achieved nothing.
+	//
+	// Computed here, before the request is built, so the finding reaches this round's prompt rather
+	// than only the audit. It compares per-file diagnostics across the two failures and consults
+	// the paths that actually landed on disk last round, which is what recordFixAttempt stores.
+	if loopState != nil {
+		nowDiagnostics := FileDiagnostics(errorOutput)
+		if n := len(loopState.attempts); n > 0 {
+			prev := loopState.attempts[n-1]
+			written := make([]string, 0, len(prev.Changes))
+			for p := range prev.Changes {
+				written = append(written, p)
+			}
+			sort.Strings(written)
+			if stalled := stalledFiles(loopState.lastFileDiagnostics, nowDiagnostics, written); len(stalled) > 0 {
+				noteFileNoProgress(loopState, stalled)
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_file_no_progress", map[string]interface{}{
+						"message": fmt.Sprintf(
+							"Previous round wrote %d file(s) whose diagnostics came back identical: %s. The edits landed but changed nothing the compiler can see; this round's prompt says so per file.",
+							len(stalled), strings.Join(stalled, ", ")),
+						"step":    step,
+						"paths":   stalled,
+						"attempt": currentAttempt,
+					})
+				}
+			}
+		}
+		loopState.lastFileDiagnostics = nowDiagnostics
+	}
+
 	attempt := currentAttempt
 	req := FixRequest{
 		Step:                      step,
@@ -1872,6 +1985,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		CompileCommand:            opts.CompileCommand,
 		TestCommand:               testCommandForFixStep(opts, step),
 		Manifests:                 manifests,
+		PriorAttempts:             priorAttempts(loopState),
 		FixAttempt:                attempt,
 		MaxFixAttempt:             maxAttempts,
 		InfrastructureFailureKind: strings.TrimSpace(infrastructureFailureKind),
@@ -1971,6 +2085,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"error":   err.Error(), "context_dump": contextDump, "context_dump_length": len(contextDump),
 			})
 		}
+		// Bank the round before returning. This return sits far above recordFixAttempt, so the
+		// round would otherwise be erased from the memory the NEXT prompt is built from — and an
+		// unusable reply is exactly what the model needs to be told it produced.
+		recordFixRoundFailure(loopState, currentAttempt-1, roundSignature,
+			"Your reply could not be used at all (the response was not valid output for this contract). Return the required JSON shape, and keep the reply small enough to finish — prefer targeted edits over whole files.")
 		return false, nil
 	}
 	if len(resp.Files) == 0 {
@@ -1980,6 +2099,8 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"step":    step,
 			})
 		}
+		recordFixRoundFailure(loopState, currentAttempt-1, roundSignature,
+			"Your reply contained no file to apply. Return the required JSON shape with at least one file.")
 		return false, nil
 	}
 	// Basename remap targets **generated artifacts only** (not dependency/source paths in pathsToRead),
@@ -1996,7 +2117,15 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		base := filepath.Base(norm)
 		artifactBaseToPaths[base] = append(artifactBaseToPaths[base], norm)
 	}
+	// The site the first diagnostic blames, and whether this round acted on it. Reported here;
+	// the streak that ENFORCES scope onto the blamed file arrives with CP52's breakers.
+	primarySite := ParsePrimaryFailureSite(errorOutput)
+	primarySiteKnown, primarySiteTouched := false, false
 	pathsUpdated := make([]string, 0, len(resp.Files))
+	// Per-round memory: what actually landed, and what was refused and why. Both feed
+	// recordFixAttempt below so the NEXT round's prompt can say "you already tried this".
+	appliedChanges := make(map[string]string, len(resp.Files))
+	skippedPaths := make(map[string]string, len(resp.Files))
 	for rel, content := range resp.Files {
 		relClean := normalizePathForFix(rel)
 		// If LLM returned a path not in pathsToRead, try to match by base name to a **generated** artifact only.
@@ -2030,6 +2159,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"step":    step,
 				})
 			}
+			skippedPaths[relClean] = "not a writable artifact path in this round's scope"
 			continue
 		}
 		if strings.TrimSpace(content) == "" {
@@ -2040,6 +2170,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"step":    step,
 				})
 			}
+			skippedPaths[relClean] = "returned empty content, which would erase the file"
 			continue
 		}
 		// Absolute gate: never accept a test file that has no test methods — even if the previous on-disk body
@@ -2055,6 +2186,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
 		}
 		// Absolute structural gate: reject files with obvious syntactic garbage (markdown fences
@@ -2074,7 +2206,43 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
+		}
+		// Refuse a "fix" that makes the compiler happy by removing the tests. The system prompt
+		// already forbids it; this is the check that makes the instruction binding.
+		if reason := coverageRegressionReason(relClean, files[relClean], content); reason != "" {
+			if !opts.AllowFixCoverageReduction {
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_rejected_coverage_regression", map[string]interface{}{
+						"message": fmt.Sprintf("LLM fix rejected for %s: %s. Deleting tests to satisfy the compiler makes the round worse than doing nothing; the file on disk is unchanged.", relClean, reason),
+						"path":    relClean,
+						"step":    step,
+						"reason":  reason,
+					})
+				}
+				skippedPaths[relClean] = "would delete tests"
+				continue
+			}
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_coverage_regression_allowed", map[string]interface{}{
+					"message": fmt.Sprintf("LLM fix for %s reduces test coverage (%s) but the coverage-reduction escape hatch is set, so it was applied.", relClean, reason),
+					"path":    relClean,
+					"step":    step,
+					"reason":  reason,
+				})
+			}
+		}
+		// Unused-import residue is the visible signature of a deletion-shaped fix. Reported, not
+		// blocked: a simple textual scan cannot see fully-qualified or reflective uses, so blocking
+		// would reject correct fixes.
+		if reason := unusedImportResidueReason(relClean, files[relClean], content); reason != "" && audit != nil {
+			audit.Log(ctx, "evaluator.fix_unused_import_residue", map[string]interface{}{
+				"message": fmt.Sprintf("LLM fix for %s %s. Often means the fix removed the code that used them.", relClean, reason),
+				"path":    relClean,
+				"step":    step,
+				"reason":  reason,
+			})
 		}
 		if reason := introducedLowValueFixReason(relClean, files[relClean], content); reason != "" {
 			if audit != nil {
@@ -2085,6 +2253,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
 		}
 		full := filepath.Join(opts.RepoPath, relForWrite)
@@ -2095,6 +2264,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"path":    full, "error": err.Error(),
 				})
 			}
+			skippedPaths[relClean] = "could not create its directory on disk"
 			continue
 		}
 		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
@@ -2104,6 +2274,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"path":    relForWrite, "error": err.Error(),
 				})
 			}
+			skippedPaths[relClean] = "could not be written to disk"
 			continue
 		}
 		if audit != nil {
@@ -2112,7 +2283,23 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"path":    relClean, "step": step,
 			})
 		}
+		if touched, known := TouchedPrimarySite(primarySite, relClean, files[relClean], content); known {
+			primarySiteKnown = true
+			primarySiteTouched = primarySiteTouched || touched
+		}
 		pathsUpdated = append(pathsUpdated, relClean)
+		appliedChanges[relClean] = summarizeAppliedChange(files[relClean], content)
+	}
+	if primarySite.OK && primarySiteKnown && !primarySiteTouched && len(pathsUpdated) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_primary_site_untouched", map[string]interface{}{
+			"message": fmt.Sprintf(
+				"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely.",
+				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line),
+			"step":         step,
+			"primary_path": primarySite.Path,
+			"primary_line": primarySite.Line,
+			"paths":        pathsUpdated,
+		})
 	}
 	if audit != nil && len(pathsUpdated) > 0 {
 		audit.Log(ctx, "evaluator.fix_response", map[string]interface{}{
@@ -2141,6 +2328,10 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			audit.Log(ctx, "evaluator.format_after_fix", map[string]interface{}{"message": "Format applied after LLM fix."})
 		}
 	}
+	// Bank the round before returning, on BOTH paths. A round that wrote nothing is exactly the
+	// round the next prompt most needs to know about — it is what stops the model re-sending a
+	// refused change — so the skip reasons are recorded even though nothing landed.
+	recordFixAttempt(loopState, currentAttempt-1, roundSignature, appliedChanges, skippedPaths)
 	if len(pathsUpdated) == 0 {
 		return false, nil
 	}

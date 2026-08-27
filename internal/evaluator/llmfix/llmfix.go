@@ -730,6 +730,12 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
 			}
 		}
 	}
+	// Prior attempts BEFORE the error log: the model should know what it already tried before it
+	// reads the failure again, or it re-derives the same answer it derived last time.
+	if blk := evaluator.RenderFixAttemptMemory(req.PriorAttempts); blk != "" {
+		b.WriteString(blk)
+		b.WriteString("\n")
+	}
 	// --- Error log (gist when truncated); surface primary error first when possible ---
 	b.WriteString("=== ERROR LOG (gist when truncated) ===\n")
 	if primary := primaryErrorLine(req.ErrorOutput); primary != "" {
