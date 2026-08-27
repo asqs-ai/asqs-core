@@ -140,6 +140,44 @@ func NewChatCompleter(cfg *config.Config) (model.ChatCompleter, error) {
 	return NewChatCompleterForStep(cfg, "")
 }
 
+// BuildStepCompleters builds the per-step chat completers (base/default, doc, generation, fixer)
+// and wraps every one with a SINGLE shared concurrency limiter sized by cfg.LLM.MaxConcurrent
+// (default model.DefaultLLMMaxConcurrent). Sharing one limiter across the steps yields a global
+// in-flight LLM-request cap, so parallelizing the test/doc/overview/fixer workstreams can never
+// exceed the provider's safe concurrency. Each step falls back to the base completer when its
+// provider is unset (matching prior call-site behaviour); per-step construction errors are
+// swallowed (base is used). err is non-nil only when the base/default completer failed to build
+// (callers may log it; generation is then skipped). Returns all-nil when cfg.LLM.Provider is empty.
+func BuildStepCompleters(cfg *config.Config) (base, doc, gen, fixer model.ChatCompleter, lim *model.LLMLimiter, err error) {
+	if cfg == nil || strings.TrimSpace(cfg.LLM.Provider) == "" {
+		return nil, nil, nil, nil, nil, nil
+	}
+	lim = model.NewLLMLimiter(cfg.LLM.MaxConcurrent)
+	base, err = NewChatCompleter(cfg)
+	doc, _ = NewChatCompleterForStep(cfg, StepDoc)
+	if doc == nil {
+		doc = base
+	}
+	gen, _ = NewChatCompleterForStep(cfg, StepGeneration)
+	if gen == nil {
+		gen = base
+	}
+	fixer, _ = NewChatCompleterForStep(cfg, StepFixer)
+	if fixer == nil {
+		fixer = base
+	}
+	// Upstream probes Ollama tool support here, BEFORE wrapping, while the concrete client is
+	// still reachable (a model's tool support is a property of its chat template and changes
+	// between tags). That probe arrives with CP41; until then the Ollama client's conservative
+	// ToolCalling=false declaration stands.
+
+	base = model.NewConcurrencyLimitedCompleter(base, lim)
+	doc = model.NewConcurrencyLimitedCompleter(doc, lim)
+	gen = model.NewConcurrencyLimitedCompleter(gen, lim)
+	fixer = model.NewConcurrencyLimitedCompleter(fixer, lim)
+	return base, doc, gen, fixer, lim, err
+}
+
 // NewEmbedder returns an Embedder for the configured provider.
 // When EmbeddingProvider is set (e.g. openai while Provider is anthropic), that provider and its key are used so you can use Anthropic for chat and OpenAI for embeddings. Returns (nil, nil) when both Provider and EmbeddingProvider are empty.
 // Every provider is wrapped so its vectors are L2-normalized before they reach the store — see

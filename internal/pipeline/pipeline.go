@@ -118,7 +118,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 
 	// --- LLM clients --------------------------------------------------------------------
-	chat, err := llm.NewChatCompleter(cfg)
+	// All step completers share ONE concurrency limiter (llm.max_concurrent, default
+	// model.DefaultLLMMaxConcurrent) so the overview goroutine plus per-symbol generation can
+	// never exceed the provider's safe in-flight cap. The per-gap loop itself stays sequential —
+	// the global limiter is the concurrency control (upstream deleted runner.gap_concurrency).
+	_, docChat, genChat, fixerChat, _, err := llm.BuildStepCompleters(cfg)
 	if err != nil {
 		return sum, fmt.Errorf("llm chat client: %w", err)
 	}
@@ -259,7 +263,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			Lang:              lang,
 			CurrentFiles:      files,
 			ConfigFingerprint: piCfg.ConfigFingerprintHash(),
-			LLM:               chat,
+			LLM:               genChat,
 			Opts: projectintel.Options{
 				Enabled:             true,
 				MaxTotalRunes:       piCfg.EffectiveMaxTotalRunes(),
@@ -299,15 +303,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
 	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).
 	runUsage := &model.UsageAccumulator{}
-	trackedChat := model.NewUsageTrackingChatCompleter(chat, runUsage)
+	trackedGen := model.NewUsageTrackingChatCompleter(genChat, runUsage)
+	trackedFixer := model.NewUsageTrackingChatCompleter(fixerChat, runUsage)
 	gen := &generator.LLMGenerator{
-		LLM:                    trackedChat,
+		LLM:                    trackedGen,
 		ContractRules:          &rules,
 		TwoPhaseTestGeneration: cfg.Runner.TwoPhaseTestGeneration,
 		RepoPath:               repoAbs,
 		Audit:                  audit,
 	}
-	fixer := &llmfix.Fixer{LLM: trackedChat, Audit: audit}
+	fixer := &llmfix.Fixer{LLM: trackedFixer, Audit: audit}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
@@ -339,7 +344,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var docGen *generator.LLMDocGenerator
 	var docFmt retrieval.FormatOptions
 	if opts.GenerateDocs {
-		docGen = &generator.LLMDocGenerator{LLM: chat}
+		docGen = &generator.LLMDocGenerator{LLM: docChat}
 		docFmt = retrieval.DefaultFormatOptions()
 		docFmt.DocGeneration = true
 	}
@@ -353,7 +358,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var overviewErr error
 	if opts.GenerateDocs && !cfg.Indexer.DisableOverviewDocGeneration {
 		og := &overview.LLMOverviewDocGenerator{
-			LLM:                     chat,
+			LLM:                     genChat,
 			Path:                    strings.TrimSpace(cfg.Indexer.OverviewDocPath),
 			MaxCompletionTokensFull: cfg.Indexer.OverviewMaxCompletionTokens,
 			FullRewrite:             cfg.Indexer.OverviewFullRewrite,

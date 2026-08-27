@@ -5,42 +5,63 @@ import (
 	"testing"
 )
 
-type wrapDeclaringCompleter struct{ caps Capabilities }
+type declaresTools struct{}
 
-func (d wrapDeclaringCompleter) Complete(context.Context, []Message, CompleteOptions) (*CompleteResult, error) {
+func (declaresTools) Complete(context.Context, []Message, CompleteOptions) (*CompleteResult, error) {
 	return &CompleteResult{}, nil
 }
-func (d wrapDeclaringCompleter) Capabilities() Capabilities { return d.caps }
+func (declaresTools) Capabilities() Capabilities { return Capabilities{ToolCalling: true} }
 
-type wrapPlainCompleter struct{}
+type declaresNothing struct{}
 
-func (wrapPlainCompleter) Complete(context.Context, []Message, CompleteOptions) (*CompleteResult, error) {
+func (declaresNothing) Complete(context.Context, []Message, CompleteOptions) (*CompleteResult, error) {
 	return &CompleteResult{}, nil
 }
 
-// A wrapper must forward its inner completer's declaration: losing it would make every wrapped
-// provider read as "unknown" and re-enable the degradations the declaration exists to prevent.
+// Wrappers must forward Capabilities, or every provider looks undeclared to callers that gate on it.
+//
+// This is not cosmetic. Completers reach the generator through the concurrency limiter and the usage
+// tracker, so a wrapper that swallows Capabilities() makes DeclaredCapabilitiesOf report "undeclared"
+// for OpenAI and Anthropic too — and the tool-mode resolver would then put every provider on the
+// prompted fallback, never the native path, with nothing failing to show it.
 func TestWrappers_forwardCapabilities(t *testing.T) {
-	inner := wrapDeclaringCompleter{caps: Capabilities{StructuredOutput: true, UsageReporting: true}}
-	wrapped := NewUsageTrackingChatCompleter(inner, &UsageAccumulator{})
-	caps, declared := DeclaredCapabilitiesOf(wrapped)
-	if !declared {
-		t.Fatal("usage wrapper dropped the inner declaration")
-	}
-	if !caps.StructuredOutput || !caps.UsageReporting {
-		t.Fatalf("forwarded capabilities wrong: %+v", caps)
+	inner := declaresTools{}
+	for _, tc := range []struct {
+		name    string
+		wrapped ChatCompleter
+	}{
+		{"concurrency limiter", NewConcurrencyLimitedCompleter(inner, NewLLMLimiter(4))},
+		{"usage tracker", NewUsageTrackingChatCompleter(inner, &UsageAccumulator{})},
+		{"both, limiter outermost", NewConcurrencyLimitedCompleter(NewUsageTrackingChatCompleter(inner, &UsageAccumulator{}), NewLLMLimiter(4))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			caps, declared := DeclaredCapabilitiesOf(tc.wrapped)
+			if !declared {
+				t.Fatal("wrapper hides the provider's declaration; every provider looks undeclared")
+			}
+			if !caps.ToolCalling {
+				t.Errorf("capabilities not forwarded: %+v", caps)
+			}
+		})
 	}
 }
 
-// The inverse matters just as much: a wrapper must NOT manufacture a declaration for an inner
-// completer that never made one — "undeclared" means unknown, not incapable, and fabricating the
-// zero value would flip that to "declared incapable".
+// The inverse must hold too: wrapping a provider that declares NOTHING must not make it look like it
+// declared all-false. "Undeclared" and "declared incapable" resolve to different tiers — prompted
+// versus one-shot — so conflating them silently removes tool access from unknown providers.
 func TestWrappers_doNotFabricateADeclaration(t *testing.T) {
-	wrapped := NewUsageTrackingChatCompleter(wrapPlainCompleter{}, &UsageAccumulator{})
-	if _, declared := DeclaredCapabilitiesOf(wrapped); declared {
-		t.Fatal("usage wrapper fabricated a capability declaration for an undeclared inner completer")
+	inner := declaresNothing{}
+	for _, tc := range []struct {
+		name    string
+		wrapped ChatCompleter
+	}{
+		{"concurrency limiter", NewConcurrencyLimitedCompleter(inner, NewLLMLimiter(4))},
+		{"usage tracker", NewUsageTrackingChatCompleter(inner, &UsageAccumulator{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, declared := DeclaredCapabilitiesOf(tc.wrapped); declared {
+				t.Error("wrapper claims a declaration the provider never made")
+			}
+		})
 	}
 }
-
-// The concurrency-limiter wrapper's forwarding tests return with the bundle that brings
-// NewConcurrencyLimitedCompleter/NewLLMLimiter (the llm.max_concurrent machinery, CP60's call).

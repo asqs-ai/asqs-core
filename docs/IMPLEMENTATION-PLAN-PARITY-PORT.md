@@ -335,7 +335,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP27 | Anthropic block messages *(no prompt caching)* | B12 | CP25 | 1–2 d | `in review` |
 | CP28 | Token budget and prompt accounting | B07 | CP06, CP17 | 3–4 d | `in review` |
 | CP29 | `prompt_tokens` end to end | R07 | CP26 | 0.5 d | `in review` |
-| CP60 | LLM concurrency limiter — wires two inert core keys | (unbundled upstream) | CP26 | 1–2 d | `blocked (CP26)` |
+| CP60 | LLM concurrency limiter — wires two inert core keys | (unbundled upstream) | CP26 | 1–2 d | `in review` |
 
 ### P5 — Runner unification *(land `CP30` alone and green before moving any behaviour)*
 
@@ -2028,7 +2028,7 @@ CP28's calibration has a ground truth and CP16's `llm_total_tokens` is real rath
 
 ### CP60 — LLM concurrency limiter
 
-- **Status:** `blocked (CP26)` · **Effort:** 1–2 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 1–2 d · **Risk:** low
 - **Provenance:** `internal/intelligence/model/concurrency_limiter.go`, upstream since `cce7afc`
   (2026-06-16) — **older than core's own tracking point** and part of no upstream bundle.
 
@@ -2057,6 +2057,45 @@ a single local Ollama process.
 **Acceptance.** With `llm.max_concurrent: 1`, two concurrent generation paths never overlap in
 flight, asserted by a counting completer. The limiter-wrapped completer reports the same
 capabilities as the one it wraps. CP17's inert-field lint stops exempting `LLM.MaxConcurrent`.
+
+**Implementation record (2026-08-27).**
+
+- **Limiter (task 1)** — `internal/intelligence/model/concurrency_limiter.go` and its test file
+  copied verbatim (`LLMLimiter`, `NewLLMLimiter`, `ResolveLLMMaxConcurrent`,
+  `NewConcurrencyLimitedCompleter`, `DefaultLLMMaxConcurrent = 8`; acquire is
+  cancellation-correct — a caller cancelled while waiting for a slot never reaches the LLM).
+  Core-authored addition in the same test file: `TestLLMLimiter_isSharedAcrossCompleters` pins the
+  acceptance sentence directly — two *different* completers wrapped with the *same* limiter never
+  overlap in flight at `max_concurrent: 1` (upstream's cap test only wraps one completer).
+- **One shared limiter (task 2)** — `llm.BuildStepCompleters` ported to `internal/llm/client.go`
+  at the upstream end state **minus `probeOllamaToolSupport`** (that probe belongs to CP41 and
+  needs the concrete client before wrapping; flip note left at the call point). This gives
+  `NewChatCompleterForStep` its first production caller, so the per-step
+  doc/generation/fixer provider keys stop being dead letters — behaviour-preserving for every
+  existing config (each step falls back to base when unset).
+- **Pipeline** — `pipeline.go` switches from one `NewChatCompleter` to `BuildStepCompleters`,
+  assigning per upstream's workflow: generation → gen, fixer → fixer, per-symbol docs → doc,
+  overview → gen, project-intel → gen. The CP16 usage scope is preserved exactly: the run
+  accumulator wraps gen and fixer only (now as two wrappers over one accumulator, since the
+  steps may be different providers). The overview goroutine — previously an uncapped concurrent
+  LLM caller alongside the gap loop — is now bounded by the shared limiter.
+- **Capabilities (task 3)** — the deferred limiter-wrapper tests noted in
+  `wrapper_capabilities_test.go` since CP26 are restored by replacing the file with upstream's
+  table-driven version (limiter / usage tracker / both stacked; forward-never-fabricate both
+  ways). `step_completers_test.go` additionally asserts through the REAL provider chain that all
+  four returned completers still declare capabilities and that `lim.Cap()` follows
+  `llm.max_concurrent`, plus the all-nil empty-provider contract.
+- **Sequential loop (task 4)** — untouched: the per-gap loop remains
+  `for _, item := range plan.Items`; the comment at the completer build site names the global
+  limiter as the concurrency control and upstream's deletion of `runner.gap_concurrency` (D15;
+  core's key is removed by CP36).
+- **Lint** — `"LLMConfig.MaxConcurrent"` exemption deleted from `config_field_usage_test.go`;
+  the lint now sees the reader in `BuildStepCompleters`. `runner.gap_concurrency` stays
+  TRIAGE-baselined for CP36's deletion.
+- **Verification** — full gate green; live pipeline/metadata suite green against
+  `asqs_scratch` (scratch residue from earlier sessions' ab-report/config-revision tests swept:
+  46 runs + 12 configs deleted).
+
 
 ---
 

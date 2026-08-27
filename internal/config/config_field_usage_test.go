@@ -41,7 +41,6 @@ var exemptConfigFields = map[string]string{
 	// TRIAGE: llm.max_concurrent has zero readers because core's gap loop is sequential — the
 	// concurrency-limited completer that consumes it is upstream orchestrator machinery. CP60
 	// decides wire-or-delete alongside runner.gap_concurrency (D15).
-	"LLMConfig.MaxConcurrent": "TRIAGE: sequential gap loop; CP60 decides with gap_concurrency",
 	// TRIAGE: the private-registry credential seam is compile-only in core (CP33 / §10.4); the
 	// runtime that reads endpoint/scope is on the enterprise side of the seam.
 	"PrivateRegistryCredential.Endpoint": "TRIAGE: compile-only credential seam (CP33)",
