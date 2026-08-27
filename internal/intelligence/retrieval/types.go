@@ -90,6 +90,17 @@ type RetrievalContext struct {
 	// Used to steer generation toward missing branches instead of duplicating covered happy paths.
 	ExistingTestCoverage *ExistingTestCoverageHint
 
+	// TestSuffixConvention is the repository's detected UNIT-test naming suffix ("Test"/"Tests" for
+	// Java and C#, ".test."/".spec." for JS/TS), or empty when no convention was detected. It rides
+	// on the context because the generator resolves the default path per item and has no view of
+	// the repository's file list.
+	//
+	// Without it the built-in default (FooTest.java) disagrees with a *Tests repository on every
+	// run, so each run writes a sibling beside the file it should have extended — and once both
+	// exist the redirect picks on sort order, where "Test.java" precedes "Tests.java", so the
+	// tool's own leftover shadows the repository's real suite permanently.
+	TestSuffixConvention string
+
 	// ExistingTestPaths is the sorted list of on-disk test files that already cover the target
 	// symbol's source file (repo-relative). Populated from PlanOptions.ExistingTestPathsBySource.
 	// Downstream the generator prefers the first entry over SuggestedTestPath so a repo using

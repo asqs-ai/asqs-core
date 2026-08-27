@@ -116,6 +116,11 @@ type PlanOptions struct {
 	// when the default is XTest.java, or x.spec.ts in a jest repo). Empty / nil keeps legacy
 	// behaviour (always emit SuggestedTestPath).
 	ExistingTestPathsBySource map[string][]string
+	// TestSuffixConvention is the repository's detected unit-test naming convention as a bare token
+	// ("Test"/"Tests", ".test."/".spec."), or empty when undetected. Detected once per run by the
+	// caller (generator.DetectTestSuffixConvention) and copied onto every item's RetrievalContext,
+	// because the generator resolves each item's default path with no view of the repo's file list.
+	TestSuffixConvention string
 	// FailureHint is optional stderr/test output passed to every Retrieve (e.g. prior run or WorkflowInput). See applyFailureLocalizedRetrieval.
 	FailureHint string
 	// FailureHintFile is an optional repo-relative path the orchestrator reads when FailureHint is empty (see config retrieval.failure_hint_file).
@@ -1160,6 +1165,7 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 			sort.Strings(cleaned)
 			r.item.Context.ExistingTestPaths = cleaned
 		}
+		r.item.Context.TestSuffixConvention = opts.TestSuffixConvention
 		if opts.Audit != nil {
 			prof := string(profileForRetrieve)
 			payload := retrievalContextAuditSummary(r.item.Context, prof)

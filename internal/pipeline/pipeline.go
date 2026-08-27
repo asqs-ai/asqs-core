@@ -19,6 +19,7 @@ import (
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
+	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
@@ -231,6 +232,17 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
 	planOpts.MaxGapsE2E = opts.MaxGapsE2E
 	planOpts.Audit = audit
+	// Detect the repository's unit-test naming convention once, from the indexed file list, and
+	// carry it to every item. The generator's built-in default is FooTest.java; plenty of
+	// repositories use FooTests.java, and on those every run wrote a sibling beside the file it
+	// should have extended — after which the redirect picks on sort order ("Test.java" precedes
+	// "Tests.java"), so the tool's own leftover shadows the real suite permanently. ASQS-authored
+	// files are excluded from the vote, or the tool would eventually vote its own mistake into the
+	// house style.
+	if conv := generator.DetectTestSuffixConvention(files, lang, genmanifest.LoadSet(repoAbs)); conv.Detected() {
+		planOpts.TestSuffixConvention = conv.Suffix
+		fmt.Fprintf(os.Stderr, "asqs-core: %s\n", conv.Describe())
+	}
 	plan, err := retrieval.CreateTestPlan(ctx, meta, meta, emb, planOpts)
 	if err != nil {
 		return sum, fmt.Errorf("plan: %w", err)

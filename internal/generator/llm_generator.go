@@ -11,6 +11,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator/contract"
+	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/intelligence/tools"
@@ -606,15 +607,15 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 		} else {
 			dir = filepath.Join("src", "test", "java", dir)
 		}
-		return filepath.Join(dir, name+"Test"+ext)
+		return applyUnitSuffixConvention(filepath.ToSlash(filepath.Join(dir, name+"Test"+ext)), lang, conventionForItem(item))
 	}
 	// C#: sibling *Tests.cs, or under a root-level dedicated tests/ tree when repoPath is set.
 	if lang == "csharp" {
-		return layout.SuggestedCSharpUnitTestPath(f, repoPath)
+		return applyUnitSuffixConvention(layout.SuggestedCSharpUnitTestPath(f, repoPath), lang, conventionForItem(item))
 	}
 	// JS/TS: .test. / .spec. naming; optional dedicated tests/ tree when repoPath is set (see layout).
 	if lang == "javascript" || lang == "typescript" {
-		return layout.SuggestedJSTSUnitTestPath(f, repoPath, testFramework)
+		return applyUnitSuffixConvention(layout.SuggestedJSTSUnitTestPath(f, repoPath, testFramework), lang, conventionForItem(item))
 	}
 	// Default: same dir, Test suffix
 	dir := filepath.Dir(f)
@@ -642,7 +643,15 @@ func ExistingOrSuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2
 	if item.Gap != nil && item.Gap.Symbol != nil {
 		lang = strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Lang))
 	}
-	chosen := pickCanonicalExistingTestPath(item.Context.ExistingTestPaths, lang)
+	// Layer gate BEFORE canonical selection. ExistingTestPaths is keyed on the SOURCE file, which
+	// the unit and e2e plan layers share, so without this an e2e gap redirects into the unit suite
+	// (and vice versa) — silently discarding the path its own suggester produced. Falling through
+	// to defaultPath here is the desired outcome: that IS the layer's suggested path.
+	candidates, _ := existingTestPathsForItem(item)
+	if len(candidates) == 0 {
+		return defaultPath, false, defaultPath
+	}
+	chosen := pickCanonicalExistingTestPath(candidates, lang)
 	if chosen == "" {
 		return defaultPath, false, defaultPath
 	}
@@ -692,4 +701,124 @@ func pickCanonicalExistingTestPath(paths []string, lang string) string {
 		return canonical
 	}
 	return paths[0]
+}
+
+// rankExistingTestPaths returns the candidate a plan item should extend.
+//
+// This used to be "first path under the canonical test tree, else paths[0]", with the list sorted
+// lexicographically by buildExistingTestIndex. That tie-break is the second half of the duplicate
+// artifact bug: when a SUT has both FooTest.java (left by an earlier ASQS run) and FooTests.java
+// (the repository's real suite), BOTH sit under src/test/java, so the canonical check matched both
+// and paths[0] decided — and '.' (0x2E) sorts before 's' (0x73), so the leftover always won. The
+// repository's own suite was never extended again.
+//
+// The order below is a total order, most significant first. Layer is absent deliberately: callers
+// filter by layer before reaching here (see existingTestPathsForItem), and re-deciding it at two
+// levels is how the two got out of step in the first place.
+//
+//  1. under the language-canonical test tree
+//  2. matches the repository's detected naming convention
+//  3. human-authored in preference to ASQS-authored
+//  4. more existing test methods — a real suite outranks a stub
+//  5. lexicographic, purely so the result is deterministic
+func rankExistingTestPaths(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set) string {
+	return rankExistingTestPathsInRepo(paths, lang, conv, generated, "")
+}
+
+// RankExistingTestPaths is the exported form of rankExistingTestPathsInRepo, for callers outside
+// this package that must pick the same survivor this package would pick — notably duplicate-artifact
+// reconciliation, which decides which of two colliding files to keep. Sharing the ranking is the
+// point: a reconciler that chose differently would delete the file generation is about to extend.
+func RankExistingTestPaths(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set, repoRoot string) string {
+	return rankExistingTestPathsInRepo(paths, lang, conv, generated, repoRoot)
+}
+
+// rankExistingTestPathsInRepo is rankExistingTestPaths with repoRoot available, which enables the
+// test-method-count signal. repoRoot may be empty, in which case that signal is skipped.
+func rankExistingTestPathsInRepo(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set, repoRoot string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	cands := make([]existingTestCandidate, 0, len(paths))
+	for _, p := range paths {
+		cands = append(cands, existingTestCandidate{
+			path:      p,
+			canonical: underCanonicalTestTree(p, lang),
+			matchesC:  conv.Detected() && unitTestSuffixOf(genmanifest.Normalize(p), lang) == conv.Suffix,
+			// Unknown provenance counts as human-authored: refusing to rank a file we have no
+			// record of would penalise every repository ASQS has never written to.
+			human:   !generated.Has(p),
+			methods: countTestMethods(repoRoot, p, lang),
+		})
+	}
+	best := 0
+	for i := 1; i < len(cands); i++ {
+		if betterExistingTestCandidate(cands[i], cands[best]) {
+			best = i
+		}
+	}
+	return cands[best].path
+}
+
+type existingTestCandidate struct {
+	path      string
+	canonical bool
+	matchesC  bool
+	human     bool
+	methods   int
+}
+
+// betterExistingTestCandidate reports whether a beats b under the documented total order.
+func betterExistingTestCandidate(a, b existingTestCandidate) bool {
+	if a.canonical != b.canonical {
+		return a.canonical
+	}
+	if a.matchesC != b.matchesC {
+		return a.matchesC
+	}
+	if a.human != b.human {
+		return a.human
+	}
+	if a.methods != b.methods {
+		return a.methods > b.methods
+	}
+	return a.path < b.path
+}
+
+// countTestMethods returns how many test methods rel declares, or 0 when it cannot be read. Used
+// only as a late tie-break, so an unreadable file degrades to "no signal" rather than an error.
+func countTestMethods(repoRoot, rel, lang string) int {
+	if strings.TrimSpace(repoRoot) == "" {
+		return 0
+	}
+	b, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(genmanifest.Normalize(rel))))
+	if err != nil {
+		return 0
+	}
+	body := string(b)
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "java":
+		return strings.Count(body, "@Test")
+	case "csharp", "cs":
+		return strings.Count(body, "[Fact]") + strings.Count(body, "[Theory]") + strings.Count(body, "[Test]")
+	case "javascript", "typescript", "js", "ts":
+		return strings.Count(body, "it(") + strings.Count(body, "test(")
+	}
+	return 0
+}
+
+// underCanonicalTestTree reports whether p sits in the language's conventional test root.
+func underCanonicalTestTree(p, lang string) bool {
+	switch lang {
+	case "java":
+		return strings.Contains(filepath.ToSlash(p), "src/test/java/")
+	case "javascript", "typescript", "js", "ts", "csharp", "cs":
+		first := strings.SplitN(filepath.ToSlash(p), "/", 2)[0]
+		for _, root := range layout.DedicatedRootDirCandidates {
+			if strings.EqualFold(first, root) {
+				return true
+			}
+		}
+	}
+	return false
 }

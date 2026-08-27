@@ -382,7 +382,7 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
-| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `ready` |
+| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `partial` (items 2 + 3a done; 1, 3b, 4 open) |
 | CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `in review` |
 | CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `ready` |
 
@@ -3172,7 +3172,7 @@ inherited and does not consume the budget.
 
 ### CP51 — Extend-merge and artifact identity
 
-- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** high
+- **Status:** `partial` — items 2 and the convention half of 3 are `in review`; items 1, 4 and the rest of 3 remain **open** · **Effort:** 5–6 d (≈2 d spent) · **Risk:** high
 
 1. **Import union on every extend-existing merge**, Java **and** C#. Hoist top-level imports; model
    import *kind* rather than a static/global boolean; handle the C# anchor chain, alias collisions and
@@ -3187,6 +3187,58 @@ inherited and does not consume the budget.
 
 **Adaptation.** Upstream runs the reconciliation between index and plan inside its orchestration
 package; in core that seam is `internal/pipeline/pipeline.go` between the index and plan blocks.
+
+**Progress record (2026-08-27) — PARTIAL, this bundle is not finished.**
+
+**Landed (items 2 and 3a):**
+
+- **Item 2 — one test artifact, one layer.** `test_path_layer.go` ported with its tests and the
+  layer gate wired into `ExistingOrSuggestedTestPath`, ahead of canonical selection.
+  `RetrievalContext.ExistingTestPaths` is keyed on the SOURCE file, which the unit and e2e plan
+  layers share, so without the gate an e2e gap redirects into the unit suite — silently discarding
+  the path its own suggester produced — and a unit gap into the e2e suite. Falling through to the
+  default is the desired outcome there: that IS the layer's suggested path.
+- **Item 3a — convention detection and the convention-driven default.** `testconvention.go`
+  ported; `RetrievalContext.TestSuffixConvention` + `PlanOptions.TestSuffixConvention` added; the
+  pipeline detects the convention once per run from the indexed file list (ASQS-authored files
+  excluded from the vote via `genmanifest`, or the tool eventually votes its own mistake into the
+  house style) and the plan copies it onto every item; all three default-path sites now apply it.
+  Candidate **ranking** came along too (`RankExistingTestPaths` + `betterExistingTestCandidate`,
+  canonical tree → convention match → human-authored → test-method count → path), exported for the
+  reconciler that item 4 will bring, since a reconciler that ranked differently would delete the
+  file generation is about to extend.
+- Both are wired end to end with live consumers — no dead code — and pinned by the ported tests
+  plus two authored ones (the convention reaches the default path; the vote excludes generated
+  files).
+
+**Open, and what each needs:**
+
+- **Item 1 (import union on extend-existing merge)** and **item 4 (reconcile duplicates on disk)**
+  both require an extend-existing WRITE PATH, which core does not have at all: the pipeline writes
+  artifacts with a plain `writeArtifact`, and while `ExtendExistingTestContextPrefix` and its two
+  consumers exist in the generator, **nothing ever prepends it** — the whole extend path is dead
+  here. Landing them means porting upstream's `postgenerate_write.go` extend branch
+  (`hoistTopLevelImports`, `classifyExtendPayload`, `unwrapCompilationUnit`,
+  `insertInsideClassBody`, `csharpInsertIndexBeforeTestClassClose`) plus `import_union.go` (491
+  lines) and `duplicate_artifacts.go`, and rewiring the gap loop onto it. Upstream's
+  `WriteCoordinator` is mostly per-gap concurrency and backups, which core's sequential loop does
+  not need, so the adapted surface is smaller than upstream's 1 800 lines — but this is still the
+  bulk of the bundle.
+- **Item 3b (provenance manifest wiring)** — `internal/genmanifest` exists in core from CP06 and is
+  now READ (the convention vote and the ranking both consult it), but nothing ever calls
+  `genmanifest.Record`, so the manifest is always empty and both consumers degrade to
+  "unknown provenance = human-authored". That degradation is deliberate and safe, but the manifest
+  only starts paying for itself once the write path records what it wrote — which is item 1's work.
+
+**Correction to this section, verified in both trees.** `PlanOptions.ExistingTestPathsBySource` —
+the field the plan's own comment names as the source of `ExistingTestPaths` — is **populated by
+nobody, in either tree**. So the "extend, never duplicate" behaviour does not flow from it, and
+core's `pickCanonicalExistingTestPath` chain has been inert since it was written. Item 3's real
+mechanism is the convention (a new artifact's default path collides with the existing file *by
+construction*, and the collision resolves to extend), which is why the convention half is worth
+landing before the write path. Populating that map is not on any bundle's task list and should not
+be invented here.
+
 
 ### CP52 — Fix-loop breakers and audit honesty
 
