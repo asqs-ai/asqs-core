@@ -26,6 +26,9 @@ type Client struct {
 	endpoint    string
 	model       string
 	chatOptions map[string]any // JSON "options" object for POST /api/chat; nil if unset
+	// toolCalling is the cached result of ProbeToolSupport. False until probed: an unprobed client
+	// falls back to prompted tools rather than sending definitions a template will ignore.
+	toolCalling bool
 }
 
 type chatRequest struct {
@@ -39,20 +42,53 @@ type chatRequest struct {
 	// here.
 	Format  json.RawMessage `json:"format,omitempty"`
 	Options map[string]any  `json:"options,omitempty"`
+	Tools   []ollamaTool    `json:"tools,omitempty"`
+}
+
+// ollamaTool mirrors Ollama's tool definition, which follows the OpenAI function shape: the schema
+// field is `parameters` here, unlike Anthropic's `input_schema`.
+type ollamaTool struct {
+	Type     string             `json:"type"` // always "function"
+	Function ollamaToolFunction `json:"function"`
+}
+
+type ollamaToolFunction struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+// ollamaToolCall is a call on the wire. Arguments is a DECODED JSON OBJECT here — the opposite of
+// OpenAI, which sends a JSON string. Both are normalized into model.ToolCall.Args so one tool
+// handler works against either provider.
+type ollamaToolCall struct {
+	Function struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"function"`
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls is set on assistant messages being replayed. Ollama has a "tool" role for results,
+	// like OpenAI, but identifies them by NAME rather than by a call id — the API has no
+	// tool_call_id field.
+	ToolCalls []ollamaToolCall `json:"tool_calls,omitempty"`
+	// ToolName names which tool a "tool" role message answers.
+	ToolName string `json:"tool_name,omitempty"`
 }
 
 type chatResponse struct {
 	Message struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
+		Role      string           `json:"role"`
+		Content   string           `json:"content"`
+		ToolCalls []ollamaToolCall `json:"tool_calls"`
 	} `json:"message"`
 	Done bool `json:"done"`
-	// DoneReason is "stop" for a natural finish, "length" when the output cap was hit.
+	// DoneReason is "stop" when the model finished and "length" when it hit num_predict. Note that
+	// Ollama silently drops the oldest messages when the prompt exceeds num_ctx and does NOT report
+	// that here — see llm.ollama_num_ctx.
 	DoneReason string `json:"done_reason"`
 	// EvalCount is the number of completion tokens the server generated.
 	EvalCount int `json:"eval_count"`
@@ -108,13 +144,38 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, chatModel string)
 // and Temperature to options.temperature; Structured is sent as the native `format` grammar (see
 // Capabilities).
 func (c *Client) Complete(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
+	// Ollama matches tool results to calls by NAME, not by id: there is no tool_call_id field on
+	// this API. Track the name each call id was issued under so a RoleTool message — which carries
+	// only the id, because that is what OpenAI and Anthropic need — can be given its tool_name.
+	nameByCallID := map[string]string{}
+	for _, m := range messages {
+		for _, tc := range m.ToolCalls {
+			if tc.ID != "" {
+				nameByCallID[tc.ID] = tc.Name
+			}
+		}
+	}
+
 	msgs := make([]chatMessage, 0, len(messages))
 	for _, m := range messages {
 		role := strings.TrimSpace(m.Role)
 		if role == "" {
 			role = "user"
 		}
-		msgs = append(msgs, chatMessage{Role: role, Content: m.Content})
+		cm := chatMessage{Role: role, Content: m.Content}
+		if role == model.RoleTool {
+			cm.ToolName = nameByCallID[strings.TrimSpace(m.ToolCallID)]
+		}
+		for _, tc := range m.ToolCalls {
+			var oc ollamaToolCall
+			oc.Function.Name = tc.Name
+			oc.Function.Arguments = tc.Args
+			if len(strings.TrimSpace(string(oc.Function.Arguments))) == 0 {
+				oc.Function.Arguments = json.RawMessage(`{}`)
+			}
+			cm.ToolCalls = append(cm.ToolCalls, oc)
+		}
+		msgs = append(msgs, cm)
 	}
 	// Per-request options are merged over the client defaults (which carry num_ctx) so a caller's
 	// MaxTokens/Temperature are not lost and the client's own settings are not mutated.
@@ -139,6 +200,50 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		Stream:   false,
 		Format:   structuredFormat(opts.Structured),
 		Options:  opt,
+	}
+	if len(opts.Tools) > 0 {
+		// num_ctx is a hard prerequisite for tool use, not a tuning knob.
+		//
+		// Ollama defaults to a small context window and silently DROPS THE OLDEST MESSAGES past it
+		// — no error, no done_reason, nothing in the response to detect it from. A tool loop grows
+		// the message stack fast: task, tool calls, tool results, repeat. With the default window
+		// the model loses the original task description partway through and then answers
+		// confidently about something else. Refusing here converts a silent wrong answer into a
+		// startup-time configuration error.
+		if _, ok := opt["num_ctx"]; !ok {
+			return nil, fmt.Errorf("ollama: llm.ollama_num_ctx must be set when tools are enabled: " +
+				"Ollama silently drops the oldest messages past the context window, and a tool loop " +
+				"overflows a default window quickly — the model then loses the original task with no error")
+		}
+		payload.Tools = make([]ollamaTool, 0, len(opts.Tools))
+		for _, t := range opts.Tools {
+			name := strings.TrimSpace(t.Name)
+			if name == "" {
+				return nil, fmt.Errorf("ollama: tool definition with empty name")
+			}
+			schema := json.RawMessage(`{"type":"object"}`)
+			if t.Schema != nil {
+				raw, err := t.Schema.MarshalJSON()
+				if err != nil {
+					return nil, fmt.Errorf("ollama: tool %s schema: %w", name, err)
+				}
+				schema = raw
+			}
+			payload.Tools = append(payload.Tools, ollamaTool{
+				Type: "function",
+				Function: ollamaToolFunction{
+					Name:        name,
+					Description: strings.TrimSpace(t.Description),
+					Parameters:  schema,
+				},
+			})
+		}
+		// Ollama's /api/chat has no tool_choice field; the model decides. Callers that need forcing
+		// must use a provider that supports it, so say so rather than silently ignoring the option.
+		if tc := strings.TrimSpace(opts.ToolChoice); tc != "" && tc != model.ToolChoiceAuto {
+			return nil, fmt.Errorf("ollama: tool_choice %q is not supported by /api/chat (only the "+
+				"model-decides default); use %q or a provider that implements forcing", tc, model.ToolChoiceAuto)
+		}
 	}
 	var body bytes.Buffer
 	if err := json.NewEncoder(&body).Encode(&payload); err != nil {
@@ -205,6 +310,22 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		// wants it, and a plain-text contract cannot survive it. See model.StripReasoningBlock.
 		content, thought := model.StripReasoningBlock(out.Message.Content)
 		res := &model.CompleteResult{Content: content, StopReason: stopReason, ReasoningRunes: thought}
+		// `arguments` arrives as a decoded JSON object here, where OpenAI sends a JSON string.
+		// Normalizing both through the same helper is what lets one tool handler serve either.
+		//
+		// Ollama returns no call id, so one is synthesized from the position. Callers match results
+		// back by id, and the outbound path translates that id to the tool_name this API expects.
+		for i, tc := range out.Message.ToolCalls {
+			args, err := model.NormalizeToolArgs("ollama", tc.Function.Name, i, string(tc.Function.Arguments))
+			if err != nil {
+				return nil, err
+			}
+			res.ToolCalls = append(res.ToolCalls, model.ToolCall{
+				ID:   fmt.Sprintf("ollama_%d", i),
+				Name: tc.Function.Name,
+				Args: args,
+			})
+		}
 		if w := promptOverflowWarning(out.PromptEvalCount, opt); w != "" {
 			res.Warnings = append(res.Warnings, w)
 			log.Printf("[asqs] llm ollama: %s", w)
@@ -292,7 +413,13 @@ func intOption(v any) (int, bool) {
 	}
 }
 
-// structuredFormat renders CompleteOptions.Structured as Ollama's native `format` value.
+// structuredFormat renders CompleteOptions.Structured as Ollama's `format` value, or nil when the
+// caller asked for free-form text or supplied a schema that will not marshal.
+//
+// A schema that fails to marshal degrades to an unconstrained request rather than failing the call.
+// The caller always has the prose instruction and a defensive parser behind this — the fixer's
+// whole-file contract is stated in the system prompt regardless — so an unconstrained completion is
+// the old behaviour, while a returned error would cost the round outright.
 func structuredFormat(s *model.StructuredJSONSchema) json.RawMessage {
 	if s == nil || s.Schema == nil {
 		return nil
@@ -322,16 +449,15 @@ func (c *Client) Capabilities() model.Capabilities {
 		MaxTokens:        true,
 		UsageReporting:   true,
 		PromptCaching:    false,
-		// ToolCalling flips to the /api/show probe's answer when the tool-calling wave (CP41)
-		// lands; until then no tools are ever sent, so false is simply true.
-		ToolCalling: false,
+		ToolCalling:      c.toolCalling,
 		// `format` is a grammar constraint over the whole generation: with it set, the model
 		// cannot emit tool-call syntax at all. Measured upstream (qwen3-coder:30b, 2026-08-18):
 		// the same lookup-requiring prompt called get_symbol on every trial without format and on
 		// none with it. Tool loops must defer Structured to the final tool-free turn.
 		StructuredWithTools: false,
-		// /api/chat has no tool_choice field, so a final turn cannot keep tools while forbidding
-		// calls — it must drop the tools field and say "no more lookups" in the message text.
+		// /api/chat has no tool_choice field (Complete rejects a forcing value when tools are
+		// declared), so a final turn cannot keep tools while forbidding calls — it must drop the
+		// tools field and say "no more lookups" in the message text.
 		ToolChoiceNoneWithTools: false,
 	}
 }

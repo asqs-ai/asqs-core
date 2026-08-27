@@ -40,6 +40,9 @@ type Config struct {
 	// Retrieval configures symbol-aware context when building the test plan (graph expansion + similar chunks).
 	Retrieval RetrievalConfig `yaml:"retrieval"`
 
+	// Generation configures the tool-calling generation loop.
+	Generation GenerationConfig `yaml:"generation"`
+
 	// Audit holds audit log settings (run-scoped step logging for debugging and improvement).
 	Audit AuditConfig `yaml:"audit"`
 }
@@ -519,6 +522,19 @@ type LLMConfig struct {
 
 	// MaxConcurrent is the max concurrent requests to the API. 0 = default (e.g. 5).
 	MaxConcurrent int `yaml:"max_concurrent" env:"LLM_MAX_CONCURRENT"`
+}
+
+// GenerationConfig configures tool-calling during test generation.
+//
+// Upstream's edition additionally bounds the tool loop (max turns, calls per turn/run, result
+// characters); those keys arrive with the loop itself (CP44), and the prompted-JSON fallback
+// switch with the mode resolver (CP42) — a key without its reader would be a dead letter.
+type GenerationConfig struct {
+	// ToolsEnabled turns tool calling on. False is the previous one-shot behaviour, byte-identical
+	// on the wire. Today this gates the startup Ollama tool-support probe (see
+	// llm.BuildStepCompleters); the generation loop that actually sends tools arrives with CP44.
+	// Env: GENERATION_TOOLS_ENABLED.
+	ToolsEnabled bool `yaml:"tools_enabled" env:"GENERATION_TOOLS_ENABLED"`
 }
 
 // RunnerConfig configures the test/CI runner (e.g. Docker).

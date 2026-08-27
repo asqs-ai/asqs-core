@@ -73,11 +73,28 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, modelOverride str
 
 // request body for POST /v1/messages
 type messagesRequest struct {
-	Model       string         `json:"model"`
-	MaxTokens   int            `json:"max_tokens"`
-	System      []systemBlock  `json:"system,omitempty"`
-	Messages    []anthropicMsg `json:"messages"`
-	Temperature *float32       `json:"temperature,omitempty"`
+	Model       string          `json:"model"`
+	MaxTokens   int             `json:"max_tokens"`
+	System      []systemBlock   `json:"system,omitempty"`
+	Messages    []anthropicMsg  `json:"messages"`
+	Temperature *float32        `json:"temperature,omitempty"`
+	Tools       []anthropicTool `json:"tools,omitempty"`
+	ToolChoice  *toolChoice     `json:"tool_choice,omitempty"`
+}
+
+// anthropicTool is one tool definition. The schema field is `input_schema` here, not `parameters`
+// as on OpenAI.
+type anthropicTool struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	InputSchema json.RawMessage `json:"input_schema"`
+}
+
+// toolChoice mirrors Anthropic's object form. Note "any" is this API's word for "you must call
+// something", where OpenAI says "required".
+type toolChoice struct {
+	Type string `json:"type"`           // "auto" | "any" | "tool" | "none"
+	Name string `json:"name,omitempty"` // set only when Type == "tool"
 }
 
 // systemBlock is one block of the system prompt. Upstream's edition carries an optional
@@ -96,7 +113,6 @@ type anthropicMsg struct {
 // contentBlock is a block in a message body. Anthropic models tool calls as content blocks rather
 // than as a separate message role: an assistant turn carries `tool_use` blocks, and the results come
 // back as `tool_result` blocks inside the NEXT USER message — there is no "tool" role on this API.
-// The tool halves go on the wire when the tool-calling wave (CP41) starts populating them.
 type contentBlock struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
@@ -141,7 +157,7 @@ func (b contentBlock) MarshalJSON() ([]byte, error) {
 }
 
 // isToolResultOnly reports whether a message body consists solely of tool_result blocks, which is
-// how the merge target for parallel tool results is recognized once tool calling lands.
+// how the merge target for parallel tool results is recognized.
 func isToolResultOnly(blocks []contentBlock) bool {
 	if len(blocks) == 0 {
 		return false
@@ -172,7 +188,6 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 	var apiMessages []anthropicMsg
 	for _, m := range messages {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
-		content := []contentBlock{{Type: "text", Text: m.Content}}
 		if role == "system" {
 			if system != "" {
 				system += "\n\n"
@@ -180,12 +195,41 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 			system += m.Content
 			continue
 		}
-		if role == "" || role == "user" {
-			role = "user"
-		} else if role == "assistant" {
+
+		// A tool result is a `tool_result` block in a USER message, not its own role.
+		//
+		// Anthropic additionally requires every result for one assistant turn to sit in a SINGLE
+		// user message: when the model makes three parallel calls, three separate user messages are
+		// rejected. So consecutive RoleTool messages are merged into the message already being
+		// built rather than appended one by one.
+		if role == model.RoleTool {
+			block := contentBlock{Type: "tool_result", ToolUseID: strings.TrimSpace(m.ToolCallID), Content: m.Content}
+			if n := len(apiMessages); n > 0 && apiMessages[n-1].Role == "user" && isToolResultOnly(apiMessages[n-1].Content) {
+				apiMessages[n-1].Content = append(apiMessages[n-1].Content, block)
+				continue
+			}
+			apiMessages = append(apiMessages, anthropicMsg{Role: "user", Content: []contentBlock{block}})
+			continue
+		}
+
+		if role == "assistant" {
 			role = "assistant"
 		} else {
 			role = "user"
+		}
+
+		var content []contentBlock
+		// An assistant turn that called tools may carry no text at all; emitting an empty text block
+		// alongside tool_use is rejected, so only add one when there is something to say.
+		if m.Content != "" || len(m.ToolCalls) == 0 {
+			content = append(content, contentBlock{Type: "text", Text: m.Content})
+		}
+		for _, tc := range m.ToolCalls {
+			input := tc.Args
+			if len(strings.TrimSpace(string(input))) == 0 {
+				input = json.RawMessage(`{}`)
+			}
+			content = append(content, contentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})
 		}
 		apiMessages = append(apiMessages, anthropicMsg{Role: role, Content: content})
 	}
@@ -210,6 +254,43 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 			t = 1
 		}
 		body.Temperature = &t
+	}
+	// Tools are appended AFTER the system blocks in the cacheable prefix order Anthropic uses
+	// (tools, then system, then messages); stable per run, so they sit ahead of the system prompt.
+	if len(opts.Tools) > 0 {
+		body.Tools = make([]anthropicTool, 0, len(opts.Tools))
+		for _, t := range opts.Tools {
+			name := strings.TrimSpace(t.Name)
+			if name == "" {
+				return nil, fmt.Errorf("anthropic: tool definition with empty name")
+			}
+			schema := json.RawMessage(`{"type":"object"}`)
+			if t.Schema != nil {
+				raw, err := t.Schema.MarshalJSON()
+				if err != nil {
+					return nil, fmt.Errorf("anthropic: tool %s schema: %w", name, err)
+				}
+				schema = raw
+			}
+			body.Tools = append(body.Tools, anthropicTool{
+				Name:        name,
+				Description: strings.TrimSpace(t.Description),
+				InputSchema: schema,
+			})
+		}
+		switch tc := strings.TrimSpace(opts.ToolChoice); tc {
+		case "":
+			// provider default
+		case model.ToolChoiceAuto:
+			body.ToolChoice = &toolChoice{Type: "auto"}
+		case model.ToolChoiceNone:
+			body.ToolChoice = &toolChoice{Type: "none"}
+		case model.ToolChoiceRequired:
+			// Anthropic spells "you must call something" as "any".
+			body.ToolChoice = &toolChoice{Type: "any"}
+		default:
+			body.ToolChoice = &toolChoice{Type: "tool", Name: tc}
+		}
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -241,9 +322,19 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		return nil, fmt.Errorf("anthropic: decode response: %w", err)
 	}
 	var text string
-	for _, b := range out.Content {
-		if b.Type == "text" {
+	var toolCalls []model.ToolCall
+	for i, b := range out.Content {
+		switch b.Type {
+		case "text":
 			text += b.Text
+		case "tool_use":
+			// `input` arrives as a decoded JSON object here, not as the JSON *string* OpenAI sends.
+			// Normalizing both through the same helper is what lets callers treat Args identically.
+			args, err := model.NormalizeToolArgs("anthropic", b.Name, i, string(b.Input))
+			if err != nil {
+				return nil, err
+			}
+			toolCalls = append(toolCalls, model.ToolCall{ID: b.ID, Name: b.Name, Args: args})
 		}
 	}
 	stopReason := strings.ToLower(strings.TrimSpace(out.StopReason))
@@ -265,7 +356,7 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 	// Extended thinking arrives as its own content block and never reaches `text`; this covers a
 	// model that emits an inline <think> preamble anyway. See model.StripReasoningBlock.
 	text, thought := model.StripReasoningBlock(text)
-	result := &model.CompleteResult{Content: text, StopReason: stopReason, ReasoningRunes: thought}
+	result := &model.CompleteResult{Content: text, StopReason: stopReason, ToolCalls: toolCalls, ReasoningRunes: thought}
 	if out.Usage != nil {
 		result.Usage = &model.Usage{
 			PromptTokens:     out.Usage.InputTokens,
@@ -277,6 +368,13 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 }
 
 // Capabilities implements model.CapabilityReporter.
+//
+// StructuredOutput is false and that is load-bearing: LLMGenerator sets opts.Structured AND appends
+// a JSON-shape system suffix, and IsStructuredOutputAPIError never fires here because no error is
+// returned — the path works only because the model tends to follow the prose instruction and
+// ParsePathContentMap is forgiving. Declaring false makes callers degrade explicitly instead of
+// depending on model compliance where a schema was requested. (Anthropic does support structured
+// output via tool use; this client does not implement it.)
 func (c *Client) Capabilities() model.Capabilities {
 	return model.Capabilities{
 		StructuredOutput: false,
@@ -286,14 +384,14 @@ func (c *Client) Capabilities() model.Capabilities {
 		// Upstream declares PromptCaching true; core's client carries none of the cache_control
 		// machinery (excluded by the enterprise seam), so declaring support would be a lie here.
 		PromptCaching: false,
-		// The tool fields flip with the tool-calling wave (CP41). Their eventual values: ToolCalling
-		// true, StructuredWithTools false (StructuredOutput is false above, so the pair stays
-		// coherent), ToolChoiceNoneWithTools true — and on this provider that last one is REQUIRED
-		// for a forced final turn: a history carrying tool_use/tool_result blocks is rejected by
-		// the Messages API unless the request still declares tools.
-		ToolCalling:             false,
-		StructuredWithTools:     false,
-		ToolChoiceNoneWithTools: false,
+		ToolCalling:   true,
+		// StructuredOutput is false above, so this can never matter; false keeps the pair coherent.
+		StructuredWithTools: false,
+		// tool_choice {"type": "none"} is supported and REQUIRED for a forced final turn here: a
+		// history carrying tool_use/tool_result blocks is rejected by the Messages API unless the
+		// request still declares tools, so "withhold the tools field" is not an option on this
+		// provider.
+		ToolChoiceNoneWithTools: true,
 	}
 }
 

@@ -166,10 +166,14 @@ func BuildStepCompleters(cfg *config.Config) (base, doc, gen, fixer model.ChatCo
 	if fixer == nil {
 		fixer = base
 	}
-	// Upstream probes Ollama tool support here, BEFORE wrapping, while the concrete client is
-	// still reachable (a model's tool support is a property of its chat template and changes
-	// between tags). That probe arrives with CP41; until then the Ollama client's conservative
-	// ToolCalling=false declaration stands.
+	// Ollama tool support is probed BEFORE wrapping, while the concrete client is still reachable.
+	//
+	// Self-hosted open models are a first-class deployment here, and their tool support is a
+	// property of the model's chat template rather than of the server or the family — it changes
+	// between tags. Probing is the only way to know; without it the client conservatively reports
+	// no tool calling and every Ollama run falls to the prompted tier, which is one lookup per turn
+	// instead of parallel native calls.
+	probeOllamaToolSupport(cfg, base, doc, gen, fixer)
 
 	base = model.NewConcurrencyLimitedCompleter(base, lim)
 	doc = model.NewConcurrencyLimitedCompleter(doc, lim)

@@ -127,9 +127,20 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 			Role:    role,
 			Content: sanitizeChatMessageContent(m.Content),
 		}
-		// hasToolCalls is false until tool calling lands (the assistant-with-tool-calls exemption
-		// inside contentOrPlaceholder is inert until then).
-		om.Content = contentOrPlaceholder(om.Content, om.Role, false)
+		// A tool result must carry the id of the call it answers, or the API rejects the turn.
+		om.ToolCallID = strings.TrimSpace(m.ToolCallID)
+		for _, tc := range m.ToolCalls {
+			args := string(tc.Args)
+			if strings.TrimSpace(args) == "" {
+				args = "{}"
+			}
+			om.ToolCalls = append(om.ToolCalls, openai.ToolCall{
+				ID:       tc.ID,
+				Type:     openai.ToolTypeFunction,
+				Function: openai.FunctionCall{Name: tc.Name, Arguments: args},
+			})
+		}
+		om.Content = contentOrPlaceholder(om.Content, om.Role, len(om.ToolCalls) > 0)
 		msgs = append(msgs, om)
 	}
 
@@ -163,6 +174,37 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 				Schema:      s.Schema,
 				Strict:      s.Strict,
 			},
+		}
+	}
+	// Tool fields are only set when tools are actually requested, so a request built without them
+	// marshals exactly as it did before tools existed (omitempty on Tools/ToolChoice).
+	if len(opts.Tools) > 0 {
+		req.Tools = make([]openai.Tool, 0, len(opts.Tools))
+		for _, t := range opts.Tools {
+			name := strings.TrimSpace(t.Name)
+			if name == "" {
+				return nil, fmt.Errorf("openai chat: tool definition with empty name")
+			}
+			req.Tools = append(req.Tools, openai.Tool{
+				Type: openai.ToolTypeFunction,
+				Function: &openai.FunctionDefinition{
+					Name:        name,
+					Description: strings.TrimSpace(t.Description),
+					Parameters:  t.Schema,
+				},
+			})
+		}
+		if tc := strings.TrimSpace(opts.ToolChoice); tc != "" {
+			switch tc {
+			case model.ToolChoiceAuto, model.ToolChoiceNone, model.ToolChoiceRequired:
+				req.ToolChoice = tc
+			default:
+				// Any other value names a specific tool to force.
+				req.ToolChoice = openai.ToolChoice{
+					Type:     openai.ToolTypeFunction,
+					Function: openai.ToolFunction{Name: tc},
+				}
+			}
 		}
 	}
 
@@ -215,6 +257,18 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		Content:        content,
 		StopReason:     stopReason,
 		ReasoningRunes: thought,
+	}
+	// OpenAI sends `arguments` as a JSON string; normalize so callers unmarshal Args directly.
+	for i, tc := range choice.Message.ToolCalls {
+		args, err := model.NormalizeToolArgs("openai", tc.Function.Name, i, tc.Function.Arguments)
+		if err != nil {
+			return nil, err
+		}
+		out.ToolCalls = append(out.ToolCalls, model.ToolCall{
+			ID:   tc.ID,
+			Name: tc.Function.Name,
+			Args: args,
+		})
 	}
 	if resp.Usage.TotalTokens != 0 {
 		out.Usage = &model.Usage{
@@ -406,8 +460,9 @@ func modelFixesSamplingParams(name string) bool {
 }
 
 // Capabilities implements model.CapabilityReporter. OpenAI/Azure acts on every CompleteOptions
-// field this client sends; reasoning models fix their sampling parameters, so Temperature is
-// declared only where it actually reaches the wire.
+// field today except Temperature on a reasoning model, which pins it (see
+// modelFixesSamplingParams). Prompt caching is automatic for prefixes over the provider's
+// threshold and needs no directive, so it is declared true without a cache_control equivalent.
 func (c *Client) Capabilities() model.Capabilities {
 	return model.Capabilities{
 		StructuredOutput: true,
@@ -415,12 +470,11 @@ func (c *Client) Capabilities() model.Capabilities {
 		MaxTokens:        true,
 		UsageReporting:   true,
 		PromptCaching:    true,
-		// The three tool fields flip with the tool-calling wave (CP41), which brings the request
-		// plumbing; until then no tools are ever sent and false is simply true. Their eventual
-		// values here are true/true/true — response_format and tools are separate request fields
-		// the API composes, and tool_choice "none" is legal alongside tools.
-		ToolCalling:             false,
-		StructuredWithTools:     false,
-		ToolChoiceNoneWithTools: false,
+		ToolCalling:      true,
+		// response_format and tools are separate request fields; the API composes them.
+		StructuredWithTools: true,
+		// tool_choice "none" is legal alongside tools; the API keeps the declarations (and the
+		// cacheable prefix) while forbidding calls.
+		ToolChoiceNoneWithTools: true,
 	}
 }

@@ -362,10 +362,10 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `blocked (CP25–CP27)` |
-| CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `blocked (CP06, CP41)` |
-| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `blocked (CP41)` |
-| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP03, CP42, CP43)` |
+| CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `in review` |
+| CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `ready` |
+| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `ready` |
+| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP42, CP43)` |
 | CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `blocked (CP44, CP16)` |
 | CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP44, CP50)` |
 
@@ -2580,7 +2580,7 @@ fix port, and it should be treated as one.
 
 ### CP41 — Tool contract and provider support
 
-- **Status:** `blocked (CP25, CP26, CP27)` · **Effort:** 4–5 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 4–5 d · **Risk:** medium
 
 **Tasks**
 
@@ -2604,16 +2604,71 @@ fix port, and it should be treated as one.
 **Acceptance.** A recorded-transport test per provider: definitions serialise, a parallel two-call
 turn round-trips, malformed arguments produce `ToolCallArgsError` rather than a silent passthrough.
 
+**Implementation record (2026-08-27).**
+
+- **Contract (tasks 1–2)** — `model/types.go` gained the upstream tool surface verbatim: role
+  constants (`RoleSystem/User/Assistant/Tool`), `Message.{ToolCalls,ToolCallID}`,
+  `ToolDefinition`, `ToolCall` (Args as `json.RawMessage` per task 2), the three `ToolChoice`
+  constants, `ToolCallArgsError` (+`Unwrap`), `NormalizeToolArgs` (empty/`null` → `{}`,
+  everything else `json.Compact`-ed or an attributable error), `CompleteOptions.{Tools,ToolChoice}`,
+  `CompleteResult.ToolCalls`. `tools_test.go` ported whole. The prompt-truncation warning comment
+  now names tool definitions among what a front truncation destroys, per upstream.
+- **OpenAI** — request: Tools/ToolChoice built only when tools are requested (byte-identical
+  otherwise, pinned by `TestComplete_nonToolRequestIsByteIdenticalToPreToolBehaviour`); named
+  tool-choice as the object form; messages carry `ToolCallID` and replayed `ToolCalls`;
+  `contentOrPlaceholder`'s third argument goes live. Response: `arguments` (a JSON *string* on
+  this API) normalized via `NormalizeToolArgs`. Capabilities flipped true/true/true.
+  `empty_content_test.go` replaced with upstream's full file — the two deferred wire-level cases
+  (empty tool content keeps a string `content`; assistant tool-call turn keeps its legal absent
+  content) are restored.
+- **Anthropic** — `anthropicTool` (`input_schema`) + `toolChoice` object (`required` → `"any"`);
+  the conversion loop now emits `tool_result` blocks inside USER messages with consecutive
+  results MERGED into one message (`isToolResultOnly` live — three parallel results in three
+  user messages is rejected by the API), and assistant turns carry `tool_use` blocks with the
+  empty-text suppression; response `tool_use` blocks parse through the same normalizer (`input`
+  is a decoded object here). Capabilities: ToolCalling true, ToolChoiceNoneWithTools true
+  (REQUIRED on this provider — a tool-bearing history must keep declaring tools),
+  StructuredWithTools false. **Seam adaptation:** upstream's
+  `TestComplete_toolsDoNotDisturbPromptCaching` pins the cache_control breakpoint surviving
+  tools; core has no cache machinery, so the adapted
+  `TestComplete_toolsDoNotDisturbSystemBlocks` pins what still exists — system blocks intact and
+  still zero `cache_control` bytes on a tool-carrying request.
+- **Ollama (tasks 4–5)** — tools in the OpenAI function shape (`parameters`); results matched by
+  NAME (no tool_call_id on this API): the client tracks `nameByCallID` outbound and synthesizes
+  `ollama_<i>` ids inbound; **refuses tools when `num_ctx` is unconfigured** (silent
+  oldest-message dropping, task 5) and **rejects forcing tool_choice** (/api/chat has none);
+  `StructuredWithTools: false` per task 4 (the `format` grammar excludes tool-call syntax —
+  upstream measured zero calls with it set); `ToolCalling` now reports the probe's answer.
+  `probe.go` ported verbatim (`ProbeToolSupport` via POST /api/show `capabilities`, plus the
+  `SetToolCalling/ChatEndpoint/ModelID/HTTPClient` accessors).
+- **Probe wiring (task 3)** — `llm/ollama_tool_probe.go` + test ported;
+  `probeOllamaToolSupport(cfg, base, doc, gen, fixer)` now runs inside `BuildStepCompleters`
+  before wrapping (CP60's flip note resolved): per-(endpoint, model) verdict cache, tolerant of
+  unreachable servers, gated on the new `generation.tools_enabled` key. That key is the ONLY
+  GenerationConfig field added — the loop caps belong to CP44 and the prompted-tools switch to
+  CP42; adding them now would recreate the dead-key class the CP17 lint exists to kill (the lint
+  passes with the probe as the key's reader). Upstream's `EffectiveProviderForStep` is NOT taken
+  — its caller (provider-aware fixer grammar skipping) is not in core yet; it travels with that
+  caller's bundle.
+- **Verification** — full gate green; recorded-transport suites green for all three providers;
+  **live against the developer's local Ollama**: `ProbeToolSupport` returned tools=true for
+  qwen3-coder:30b-a3b-q8_0 and deepseek-r1:32b, false-with-reason for nomic-embed-text and a
+  404 model; a real two-turn round trip on qwen3-coder made exactly one `get_symbol` call
+  (`id=ollama_0`, compacted `{"fq_name":…}` args), the num_ctx refusal fired without
+  `ollama_num_ctx`, and the RoleTool follow-up produced a grounded final answer (transient
+  probes deleted).
+
+
 ### CP42 — Prompted-JSON fallback and mode resolution
 
-- **Status:** `blocked (CP41)` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low
 
 A three-tier `ResolveMode`: native tools → prompted-JSON tools → no tools. The extractor is
 `internal/jsonx` (CP06), shared rather than duplicated. Copilot registration is **excluded**.
 
 ### CP43 — Read-only retrieval tool suite
 
-- **Status:** `blocked (CP41, CP12)` · **Effort:** 4 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 4 d · **Risk:** medium
 
 Five tools in a new `internal/intelligence/tools`: symbol lookup, chunk/similar search, file read,
 `expand_symbol`, and the inventory. Path containment comes from `internal/pathsafe` (CP06), shared
@@ -2628,7 +2683,7 @@ root is refused, with the traversal attempt counted (CP03).
 
 ### CP44 — Bounded generation tool loop, budgets, attempt audit
 
-- **Status:** `blocked (CP42, CP43, CP03)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `blocked (CP42, CP43)` · **Effort:** 3–4 d · **Risk:** high
 
 `internal/intelligence/tools/loop.go` + `config.go`, wired into `internal/generator/llm_generator.go`.
 Caps on turns per run, calls per turn, calls per run, and result characters per run.
