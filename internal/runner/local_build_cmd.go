@@ -52,8 +52,8 @@ func localBuildCmd(dir string, argv []string) (*exec.Cmd, error) {
 // either, because configuring one would not change what runs.
 func requireLocalToolchain(bin string) error {
 	if _, err := exec.LookPath(bin); err != nil {
-		return fmt.Errorf("runner.type is \"local\" but %q is not on PATH (%v). Install it on this host "+
-			"or set runner.type to docker", bin, err)
+		return fmt.Errorf("general.sandbox.type is \"local\" but %q is not on PATH (%v). Install it on this host "+
+			"or set general.sandbox.type to docker", bin, err)
 	}
 	return nil
 }

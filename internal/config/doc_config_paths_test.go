@@ -55,8 +55,19 @@ func TestNoUnresolvableConfigPathsInDocs(t *testing.T) {
 		if rel == "docs/CONFIG-REFERENCE.md" {
 			continue
 		}
+		// A markdown table whose HEADER carries a historical marker — a migration table's "| v1 | v2 |"
+		// — is historical for all its rows. Requiring the marker on every row would either bloat the
+		// table or push someone to exempt the whole file, and a migration table naming old keys is
+		// exactly the documentation a reader upgrading needs.
+		inHistoricalTable := false
 		for i, line := range strings.Split(string(b), "\n") {
-			if hasHistoricalMarker(line) {
+			trimmed := strings.TrimSpace(line)
+			if !strings.HasPrefix(trimmed, "|") {
+				inHistoricalTable = false
+			} else if !inHistoricalTable && hasHistoricalMarker(line) {
+				inHistoricalTable = true
+			}
+			if inHistoricalTable || hasHistoricalMarker(line) {
 				continue
 			}
 			for _, m := range reDocConfigPath.FindAllStringSubmatch(line, -1) {

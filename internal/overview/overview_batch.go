@@ -23,7 +23,7 @@ const defaultOverviewMaxFilesPerSlice = 400
 // triggers further file-list splitting or truncation so each LLM request stays bounded.
 const defaultOverviewMaxIndexRunesPerSlice = 120_000
 
-const overviewSliceIndexTruncatedTrailer = "... [truncated: this overview slice index exceeded indexer.overview_max_index_runes_per_slice; raise that value, lower overview_max_files_per_slice, or set overview_max_index_runes_per_slice to -1 to disable (may risk EOF on very large slices)]"
+const overviewSliceIndexTruncatedTrailer = "... [truncated: this overview slice index exceeded generation.docs.overview.max_index_runes_per_slice; raise that value, lower overview_max_files_per_slice, or set overview_max_index_runes_per_slice to -1 to disable (may risk EOF on very large slices)]"
 
 // OverviewLLMStats summarizes batched overview generation (metadata → LLM).
 type OverviewLLMStats struct {

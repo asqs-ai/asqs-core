@@ -404,7 +404,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP56 | README, behaviour docs, release notes, operator actions | — | everything | 3 d | `ready` |
+| CP56 | README, behaviour docs, release notes, operator actions | — | everything | 3 d | `in review` |
 
 ### Critical path and parallelism
 
@@ -4217,7 +4217,7 @@ against the filesystem after cleanup rather than against `git status`.
 
 ### CP56 — README, behaviour docs, release notes
 
-- **Status:** `ready` · **Effort:** 3 d
+- **Status:** `in review` · **Effort:** 3 d
 
 1. `README.md`: the pipeline diagram gains the tool loop and the two knowledge sources; the config
    step points at the generated reference; the "Limitations" and "Not included" sections are
@@ -4236,6 +4236,46 @@ against the filesystem after cleanup rather than against `git status`.
    wrapper→binary may break pinned builds (CP32); an unrecognised `runner.type` now fails instead of
    silently passing (CP35); **config files are v2-only and are not shared with the enterprise
    product** (P6); **test-framework bootstrap exists and is off by default** (P12).
+
+#### Implementation record
+
+All five items done. **The port is complete: 60 of 60 bundles.**
+
+**`docs/DOCUMENTATION.md` written**, covering the fix loop, retrieval profiles, the runner plan, the
+tool loop and the bootstrap contract, plus every section the sources actually cite. It resolves all
+sixteen dangling `DOCUMENTATION.md` references and closes CP36's `pendingDocs` ledger — which failed
+the build the moment the file appeared, exactly as CP39 designed it to.
+
+**A stale section found while checking the anchors.** `internal/intelligence/retrieval/README.md`
+documented an offline IR evaluation harness — `qualitybot retrieval-eval`, an `ireval/` package, nDCG
+on a labelled suite. **None of it exists in core**; it was inherited prose describing upstream. Rather
+than document a harness core does not have, the section now says so and points at what core actually
+measures with (`ab-report` over `first_wave_metrics`). A new guard, `TestCitedDocAnchorsResolve`,
+checks that every `docs/X.md#anchor` citation lands on a real heading — a dangling anchor is worse
+than a dangling file, because the link opens and the reader simply cannot find what they were sent for.
+
+**D18 discharged.** The OpenShift guide is now `docs/OPENSHIFT-DEPLOYMENT.md`, inside the repository
+and inside the guards' reach — and the guards immediately earned the move, finding **nine stale config
+paths** in it that no test could see while it lived in the parent folder. That is precisely the gap
+D18 was raised to close.
+
+**The README's "Limitations" list was substantially wrong, and verified rather than trusted.** Five of
+its entries no longer held: per-step LLM providers, mono-repo workspace scoping, the retrieval block,
+private-registry credentials and the Copilot block (deleted outright in CP17). Each claim was checked
+against the code before being kept, corrected or removed.
+
+**A sweep the plan did not ask for, and should have.** Release-note item 5 required naming the v2
+migration, which meant checking the operator-facing strings an upgrader would actually meet — and
+**about twenty of them still named v1 paths**, in `errclass` remediation text, runner preflight
+warnings, NuGet credential diagnostics and CLI flag help. CP38 repointed validation messages; it did
+not reach these. The most delicate was `(runner.timeout)`, which `internal/runner` EMITS and
+`errclass` MATCHES ON: the plan explicitly warned those must move together, and they did, in one edit
+with the three tests that pin them.
+
+**A guard relaxation, narrowly.** A migration table legitimately names v1 keys in every row, so the
+unresolvable-paths guard now treats a markdown table whose HEADER carries a historical marker as
+historical throughout. Mutation-checked in both directions: a stale key in prose, or in an unmarked
+table, still fails.
 
 ---
 

@@ -105,9 +105,9 @@ func (s *Sandbox) warnLocalE2EBrowsersMissing(lang, e2eFramework string) {
 		}
 		fmt.Fprintf(os.Stderr,
 			"[asqs-eval] E2E preflight: %s browsers are not installed for this user (%s is empty or absent), "+
-				"and runner.type is local so there is no image to supply them.\n"+
-				"  Enable runner.e2e_framework_bootstrap.enabled to have ASQS install them, install them by hand for the "+
-				"account ASQS runs as, or set runner.type to docker.\n"+
+				"and general.sandbox.type is local so there is no image to supply them.\n"+
+				"  Enable bootstrap.e2e_framework.enabled to have ASQS install them, install them by hand for the "+
+				"account ASQS runs as, or set general.sandbox.type to docker.\n"+
 				"  Continuing: a repository that drives the system browser (Playwright `channel`) does not need this cache.\n",
 			tool, where)
 	})

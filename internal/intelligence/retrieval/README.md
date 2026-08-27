@@ -71,6 +71,14 @@ When **`PlanOptions.Audit`** is set, **`CreateTestPlan`** logs:
 
 **MetaReader** must implement **`GetEdgesTo`** (inbound edges); **`metadata.Store`** does.
 
-## IR evaluation harness (offline)
+## Measuring retrieval quality
 
-**`qualitybot retrieval-eval -golden suite.yaml`** runs **MRR**, **nDCG@k**, **P@k**, **R@k** on **chunk UUIDs** using either the production **similar-reference** pipeline (**`SimilarReferenceRankedChunks`**) or a single **dense Search**. See **`ireval/`** and **[DOCUMENTATION.md — Retrieval IR evaluation harness](../../docs/DOCUMENTATION.md#retrieval-ir-evaluation-harness)**.
+There is **no offline IR harness in the open core** — no `ireval` package and no `retrieval-eval`
+subcommand. This section used to describe one, which was inherited prose rather than a description of
+this repository.
+
+What core measures instead is the OUTCOME: `asqs-core ab-report` compares `first_wave_metrics` across
+config revisions, so a retrieval change is judged by whether the tests it produced compiled and
+passed. That is a coarser instrument than nDCG on a labelled suite and a slower one, but it needs no
+golden set to maintain, and it answers the question a retrieval change is actually made to answer.
+See [DOCUMENTATION.md — First-wave quality metrics](../../docs/DOCUMENTATION.md#first-wave-quality-metrics).

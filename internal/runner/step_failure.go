@@ -27,7 +27,7 @@ import (
 //
 // A step can fail before writing a single byte: on a host the binary is not on PATH or a build
 // wrapper has no execute bit; under Docker the CLI itself failed to start or the JobSpec was
-// rejected. On both, the step may have hit runner.timeout. The run error is then the only
+// rejected. On both, the step may have hit general.sandbox.timeout. The run error is then the only
 // diagnostic that exists, so it becomes both Summary and Output. Without this the step reported a
 // bare "compile failed" / "tests failed" with an empty Output — and because
 // evaluator.compileErrorTouchesArtifactScope treats empty output as in-scope, the LLM fixer was
@@ -40,12 +40,12 @@ import (
 // signatures across iterations still see a stable string.
 // dockerJobRunError is sandboxStepFailure's counterpart for the error-returning Docker paths (the
 // format step), which have no StepResult to fill. Same defect, same fix: without naming the
-// deadline, a container killed at runner.timeout surfaced as `exit -1` — or, where the caller
+// deadline, a container killed at general.sandbox.timeout surfaced as `exit -1` — or, where the caller
 // checked ExitCode first, as an ordinary non-zero exit.
 func dockerJobRunError(what string, runErr error, out string, timeout time.Duration) error {
 	switch {
 	case errors.Is(runErr, context.DeadlineExceeded):
-		return fmt.Errorf("%s: step timed out after %s (runner.timeout)\n%s", what, timeout, out)
+		return fmt.Errorf("%s: step timed out after %s (general.sandbox.timeout)\n%s", what, timeout, out)
 	case errors.Is(runErr, context.Canceled):
 		return fmt.Errorf("%s: cancelled before it completed\n%s", what, out)
 	default:
@@ -58,7 +58,7 @@ func sandboxStepFailure(step evaluator.SandboxStep, out string, runErr error, ti
 	hasOutput := strings.TrimSpace(out) != ""
 	switch {
 	case errors.Is(runErr, context.DeadlineExceeded):
-		note := fmt.Sprintf("%s step timed out after %s (runner.timeout)", step, timeout)
+		note := fmt.Sprintf("%s step timed out after %s (general.sandbox.timeout)", step, timeout)
 		if hasOutput {
 			summary = note + "\n" + summary
 		} else {

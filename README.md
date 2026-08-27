@@ -177,6 +177,9 @@ via `generation.docs.overview.path`, `generation.docs.overview.max_files_per_sli
 
 ## How it works
 
+Behaviour is documented in [docs/DOCUMENTATION.md](./docs/DOCUMENTATION.md) — what each phase does and
+why it works that way. This section is the summary.
+
 - **Indexing** runs language-native parsers (Java AST, C# Roslyn, TypeScript) that emit symbols,
   typed edges, and source chunks; chunks are embedded into pgvector. On subsequent runs, it performs
   **small incremental updates**, only re-indexing changed or added files to keep execution times fast.
@@ -190,8 +193,22 @@ via `generation.docs.overview.path`, `generation.docs.overview.max_files_per_sli
   Results are cached in `.asqs/project-intel-cache.json`, keyed by a file/config fingerprint, so repeat
   runs skip the work.
 - **Generation** uses a provider-agnostic LLM with embedded per-language skill-packs and contracts.
-  This includes first-level support for self-hosted open-source models (such as Llama, Codestral, and Qwen),
+  This includes first-level support for self-hosted open-source models (such as Llama and Qwen),
   ensuring no source code leaves your local environment for ultimate data security and cost reduction.
+  Optionally the generator can **query the index while writing** — look up a symbol, read a file
+  range, search code, walk the call graph — instead of working only from the context assembled up
+  front. Off by default (`generation.policy.tools.enabled`); see
+  [DOCUMENTATION.md — The tool loop](./docs/DOCUMENTATION.md#the-tool-loop).
+- **Two knowledge sources** supplement the repository's own code. **Dependency documentation** ingests
+  docs for direct dependencies — Maven sources jars, NuGet XML, `node_modules` type declarations — so
+  the model reads a third-party API instead of guessing it; local only, nothing reaches the network.
+  **Web search** gives the tool loop bounded access to external documentation, and is the one
+  component that sends data out of the process: off by default, host allow-list failing closed, an
+  offline replay mode, and deny tokens derived from the repository's own identity. Both are described
+  under [Knowledge sources](./docs/DOCUMENTATION.md#knowledge-sources).
+- **Test framework bootstrap** (optional, off by default) detects a repository with no usable test
+  stack, installs one, and smoke-verifies that it runs — then hands generation an authoritative
+  allow-list of importable libraries. See [TEST-FRAMEWORK-BOOTSTRAP.md](./docs/TEST-FRAMEWORK-BOOTSTRAP.md).
 - **Evaluation** generates every gap's test first, then compiles + runs the **whole project once**
   in a local or Docker sandbox (not per gap — one compile per fix iteration, not N). The LLM fixer
   repairs failures over a bounded loop (`fixer.iterations.start`); tests that repeatedly fail are
@@ -296,23 +313,21 @@ Not included (these live in the commercial layer):
   there is no audit reporting/export CLI.
 - **Governance/policy engine** — not present, and no longer parses: the `runner.policy:` block went
   with the v1 schema. No coverage gate, no mutation-testing gate.
-- **Parallelism** — gaps are generated sequentially. `general.llm.max_concurrent` bounds concurrent LLM calls
-  across the run; there is no per-gap worker pool. (The whole-repo overview is the one exception: it
-  runs in parallel with generation.)
-- **Pre-generation seams** — no controlled source-seam edits or C# project-reference fixes before
-  generation. (The evaluator's in-loop C# project-reference autofix _is_ included.)
-- **Per-step LLM providers** — one `general.llm.provider` + `general.llm.model` drives generation, docs, fixing, and
-  embeddings. Per-step overrides are not wired.
-- **Mono-repo scoping** — `general.build.workspace.path` and related keys are ignored; asqs-core indexes
-  from the repo root and picks a single primary language by file count.
-- **Retrieval tuning** — the `retrieval:` config block is not read. Profiles, per-profile budgets,
-  MMR lambda, context compaction, and retrieval **abstention** all run at their built-in defaults
-  (abstention is off, so low-confidence gaps are still generated).
-- **Post-generate static micro-gate** — a post-generate static gate is ignored; generated files
-  go straight to the sandbox after formatting.
-- **Private registries** — no Maven `settings.xml` / npm `.npmrc` / NuGet credential injection into the
-  Docker sandbox.
-- **GitHub Copilot SDK** — the `copilot:` config block parses but no code consumes it.
+- **Parallelism** — gaps are generated sequentially. `general.llm.max_concurrent` bounds concurrent
+  LLM calls across the run; there is no per-gap worker pool. (The whole-repo overview is the one
+  exception: it runs in parallel with generation.)
+- **Pre-generation seams** — no controlled source-seam edits before generation. (The evaluator's
+  in-loop C# project-reference autofix _is_ included.)
+- **Post-generate static micro-gate** — no language lint between writing a test and evaluating it;
+  generated files go straight to the sandbox after formatting.
+- **Offline retrieval evaluation** — no labelled IR suite and no nDCG harness. Retrieval changes are
+  judged by outcome through `asqs-core ab-report`; see
+  [First-wave quality metrics](./docs/DOCUMENTATION.md#first-wave-quality-metrics).
+
+Several things this list used to disclaim **are now included**: per-step LLM provider overrides,
+mono-repo workspace scoping, the retrieval block (profiles, per-profile budgets, fusion, context
+compaction and abstention are all read), private-registry credential injection for the sandbox, and
+the generation tool loop with its two knowledge sources.
 
 ### Config keys that are CLI-driven here
 
@@ -322,6 +337,12 @@ opens the PR as a draft (GitHub; ignored for Azure DevOps).
 
 Gap caps work the other way round: `--max-gaps` / `--max-gaps-e2e` override
 `indexer.policy.max_gaps` / `max_gaps_e2e` when passed, and the config values apply otherwise.
+
+### Upgrading
+
+Configuration is **schema v2** and the loader is strict — a pre-v2 file fails the load and says which
+sections moved. [docs/RELEASE-NOTES.md](./docs/RELEASE-NOTES.md) has the key-by-key migration table
+and the three things to do before your first run on this version.
 
 ### Where the full key list lives
 

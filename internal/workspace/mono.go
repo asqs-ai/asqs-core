@@ -15,7 +15,7 @@ import (
 )
 
 // NormalizeMonoRepoWorkspace validates and returns a repo-relative path using forward slashes, no leading/trailing slashes, no ".." segments.
-// Empty input returns ("", nil). Use for indexer.mono_repo_workspace config.
+// Empty input returns ("", nil). Use for general.build.workspace.path config.
 func NormalizeMonoRepoWorkspace(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -122,7 +122,7 @@ func ResolveMonoScanRoots(gitRootAbs, primaryNorm string, rawExtras []string) ([
 		}
 	}
 	if len(normExtras) > 0 && primaryNorm == "" {
-		return nil, fmt.Errorf("mono_repo_extra_paths requires indexer.mono_repo_workspace to be set (extra paths only apply together with a primary workspace)")
+		return nil, fmt.Errorf("mono_repo_extra_paths requires general.build.workspace.path to be set (extra paths only apply together with a primary workspace)")
 	}
 	if primaryNorm == "" {
 		return nil, nil

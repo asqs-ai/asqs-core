@@ -169,7 +169,7 @@ func TestRequireLocalToolchain_MissingBuildToolNamesTheConfigKeys(t *testing.T) 
 	if err == nil {
 		t.Fatal("expected an error when mvn is not on PATH")
 	}
-	for _, want := range []string{`"mvn" is not on PATH`, "runner.type"} {
+	for _, want := range []string{`"mvn" is not on PATH`, "general.sandbox.type"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing %q", err, want)
 		}

@@ -78,7 +78,7 @@ func reportNuGetRestoreFailure(ctx context.Context, opts EvalOptions, errorOutpu
 // generic env-var hints) and, when the failing feed is recognised as an Azure DevOps Artifacts feed
 // (pkgs.dev.azure.com or *.pkgs.visualstudio.com), points at the PAT-based path that is already wired
 // through to docker eval + bootstrap containers via VSS_NUGET_EXTERNAL_FEED_ENDPOINTS. For any other
-// private feed it points at the unified runner.private_registry_credentials path (cross-ecosystem, also
+// private feed it points at the unified general.sandbox.registries.credentials path (cross-ecosystem, also
 // covers Maven/npm) so non-Azure feeds (Artifactory, ProGet, BaGet, MyGet) can be authenticated without
 // code changes.
 func nuGetRestoreRemediation(failingFeedURLs []string) []string {
@@ -100,7 +100,7 @@ func nuGetRestoreRemediation(failingFeedURLs []string) []string {
 				break
 			}
 		}
-		line := "Provide an Azure DevOps PAT with Packaging (Read): set `vcs.azure_devops.token` (or env `ASQS_AZURE_DEVOPS_TOKEN`) AND list every failing feed's v3 index URL under `runner.azure_devops_nuget_feed_endpoints`"
+		line := "Provide an Azure DevOps PAT with Packaging (Read): set `general.git.azure_devops.token` (or env `ASQS_AZURE_DEVOPS_TOKEN`) AND list every failing feed's v3 index URL under `general.sandbox.registries.azure_devops_nuget_feed_endpoints`"
 		if sample != "" {
 			line += " (e.g. `- \"" + sample + "\"`)"
 		}
@@ -108,7 +108,7 @@ func nuGetRestoreRemediation(failingFeedURLs []string) []string {
 		out = append(out, line)
 	}
 	out = append(out,
-		"For non-Azure-DevOps private feeds, set `runner.private_registry_credentials` with a `- {type: nuget, endpoint, username, password}` entry; ASQS merges these into the same `VSS_NUGET_EXTERNAL_FEED_ENDPOINTS` envelope read by dotnet's Artifacts Credential Provider (works for Artifactory / ProGet / BaGet / MyGet / any HTTPS NuGet source). The same unified list also configures Maven (settings.xml) and npm (.npmrc) with `type: maven` / `type: npm` entries.",
+		"For non-Azure-DevOps private feeds, set `general.sandbox.registries.credentials` with a `- {type: nuget, endpoint, username, password}` entry; ASQS merges these into the same `VSS_NUGET_EXTERNAL_FEED_ENDPOINTS` envelope read by dotnet's Artifacts Credential Provider (works for Artifactory / ProGet / BaGet / MyGet / any HTTPS NuGet source). The same unified list also configures Maven (settings.xml) and npm (.npmrc) with `type: maven` / `type: npm` entries.",
 		"Alternatively, vendor the required packages into a public or reachable internal feed and remove the private source from `NuGet.config` — this is the only option when credentials cannot be supplied.",
 		"Until restore succeeds for every transitively referenced project, CS0234/CS0246 on consumers are symptoms of the restore failure and cannot be repaired by edits to tests or source — the LLM fixer is deliberately skipped in this case to avoid degrading generated tests.",
 	)

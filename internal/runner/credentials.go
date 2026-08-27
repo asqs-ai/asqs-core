@@ -12,7 +12,7 @@ import (
 
 // Private-registry credentials on the local target (CP33; compile-only in the open core — no credential is ever materialised, see config/private_registry_compat.go).
 //
-// runner.private_registry_credentials and runner.azure_devops_nuget_feed_endpoints were read only
+// general.sandbox.registries.credentials and general.sandbox.registries.azure_devops_nuget_feed_endpoints were read only
 // by the Docker eval path: the generated settings.xml and .npmrc became container mounts and the
 // NuGet envelope became a `-e`. Under runner.type: local all of it was inert, and the only signal
 // was a startup warning. For a deployment behind a private Artifactory or Nexus that was the
@@ -121,12 +121,12 @@ func (s *Sandbox) warnLocalNuGetCredentialProviderMissing() {
 	}
 	s.runState().nugetPluginWarnOnce.Do(func() {
 		fmt.Fprintf(os.Stderr,
-			"config: a NuGet credential envelope is configured (runner.azure_devops_nuget_feed_endpoints "+
-				"or a private_registry_credentials entry of type nuget) but the Azure Artifacts credential "+
+			"config: a NuGet credential envelope is configured (general.sandbox.registries.azure_devops_nuget_feed_endpoints "+
+				"or a general.sandbox.registries.credentials entry of type nuget) but the Azure Artifacts credential "+
 				"provider is not installed for this user, so `dotnet restore` will ignore it and fail against "+
 				"a private feed with NU1301.\n"+
 				"  Install it with:\n"+
 				"    sh -c \"$(curl -fsSL https://aka.ms/install-artifacts-credprovider.sh)\"\n"+
-				"  Or set runner.type to docker, which installs the plugin into the container itself.\n")
+				"  Or set general.sandbox.type to docker, which installs the plugin into the container itself.\n")
 	})
 }

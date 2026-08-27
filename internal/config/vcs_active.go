@@ -44,7 +44,7 @@ func CloneURLIsAzureDevOpsHTTPS(raw string) bool {
 }
 
 // CloneAuthTokenForURL returns the PAT/token to use for HTTPS git to this remote.
-// When remoteURL is Azure DevOps and vcs.azure_devops.token is set (YAML or ASQS_AZURE_DEVOPS_TOKEN after MergeEnvFromOS),
+// When remoteURL is Azure DevOps and general.git.azure_devops.token is set (YAML or ASQS_AZURE_DEVOPS_TOKEN after MergeEnvFromOS),
 // that value is used even if vcs.provider is github — so API/scheduled runs can clone Azure project repos without switching the whole config provider.
 func (c *Config) CloneAuthTokenForURL(remoteURL string) string {
 	if c == nil {

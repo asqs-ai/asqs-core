@@ -65,4 +65,4 @@ Nest HTTP routes are indexed as **`API_ROUTE`** symbols with stable `fq_name` so
 
 ## `TESTS_SOURCE` (test ↔ production trace)
 
-After **`TARGETS_API_ROUTE`** linking, **`metadata.Store.MaterializeTestsSourceEdges`** rebuilds **`TESTS_SOURCE`** edges (test caller → production callee): derived from **calls/imports** across **`files.is_test`**, plus **JUnit-style** test class names (**`FooTest` / `FooTests` / `FooIT` → `Foo`**). **`ListGaps`** uses them for **deprioritization** and **reason** text. See **[DOCUMENTATION.md — Tests ↔ source trace edges](../../docs/DOCUMENTATION.md#tests-source-edges)**.
+After **`TARGETS_API_ROUTE`** linking, **`metadata.Store.MaterializeTestsSourceEdges`** rebuilds **`TESTS_SOURCE`** edges (test caller → production callee): derived from **calls/imports** across **`files.is_test`**, plus **JUnit-style** test class names (**`FooTest` / `FooTests` / `FooIT` → `Foo`**). **`ListGaps`** uses them for **deprioritization** and **reason** text. See **[DOCUMENTATION.md — Tests ↔ source trace edges](../../docs/DOCUMENTATION.md#tests_source-edges)**.

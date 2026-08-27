@@ -197,8 +197,8 @@ func kindHostExecution(lower string) string {
 	if strings.Contains(lower, "fork/exec ") && strings.Contains(lower, "permission denied") {
 		return KindToolchainNotExecutable
 	}
-	// runner.sandboxStepFailure: "<step> step timed out after 30m0s (runner.timeout)"
-	if strings.Contains(lower, "step timed out after ") && strings.Contains(lower, "(runner.timeout)") {
+	// runner.sandboxStepFailure: "<step> step timed out after 30m0s (general.sandbox.timeout)"
+	if strings.Contains(lower, "step timed out after ") && strings.Contains(lower, "(general.sandbox.timeout)") {
 		return KindStepTimeout
 	}
 	// Playwright and Cypress reporting that their browsers are absent. Every marker below is

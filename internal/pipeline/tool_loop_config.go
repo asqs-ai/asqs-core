@@ -382,7 +382,7 @@ func resolveFixerStructuredOutput(ctx context.Context, cfg *config.Config, audit
 		log(true, false, "no_configuration", "no configuration")
 		return true, false
 	case cfg.Runner.DisableStructuredFixOutput:
-		log(true, false, "config_off", "runner.disable_structured_fix_output is set")
+		log(true, false, "config_off", "fixer.policy.structured_output.enabled is false")
 		return true, false
 	case provider == "ollama":
 		log(false, true, "ollama_grammar_risk", "on, but Ollama enforces the schema as a grammar: replies bias toward whole-file reproduction")

@@ -384,7 +384,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 					failingFeeds := sortedSet(failingNuGetFeedURLs(compileRes.Output))
 					if audit != nil {
 						audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
-							"message":           "LLM compile fix rejected: compile failure is a NuGet restore symptom (NU1301/NU1101/NU1102/NU1103/NU1403/NU5036). Code-level edits cannot repair authentication or feed-reachability issues — fix credentials (vcs.azure_devops.token / runner.azure_devops_nuget_feed_endpoints / runner.private_registry_credentials) and re-run.",
+							"message":           "LLM compile fix rejected: compile failure is a NuGet restore symptom (NU1301/NU1101/NU1102/NU1103/NU1403/NU5036). Code-level edits cannot repair authentication or feed-reachability issues — fix credentials (general.git.azure_devops.token / general.sandbox.registries.azure_devops_nuget_feed_endpoints / general.sandbox.registries.credentials) and re-run.",
 							"step":              StepCompile,
 							"reason":            "nuget_restore_failure",
 							"failing_feed_urls": failingFeeds,

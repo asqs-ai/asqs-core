@@ -980,7 +980,7 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 	switch lang {
 	case "javascript", "typescript":
 		if strings.TrimSpace(cfg.Indexer.JSTIndexerPath) == "" {
-			return nil, nil, fmt.Errorf("indexer.jst_indexer_path is not set (build tools/js-ts-indexer and point config at dist/index.js)")
+			return nil, nil, fmt.Errorf("indexer.jsts.indexer_path is not set (build tools/js-ts-indexer and point config at dist/index.js)")
 		}
 		parsed, _, err := jstindexer.RunIndexer(ctx, repoAbs, cfg.Indexer.JSTIndexerPath, jstindexerRunConfig(cfg, 0))
 		if err != nil {
@@ -991,7 +991,7 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 	case "csharp":
 		dll := strings.TrimSpace(cfg.Indexer.CSharpIndexerDllPath)
 		if dll == "" {
-			return nil, nil, fmt.Errorf("indexer.csharp_indexer_dll_path is not set (dotnet publish tools/csharp-indexer)")
+			return nil, nil, fmt.Errorf("indexer.csharp.indexer_dll_path is not set (dotnet publish tools/csharp-indexer)")
 		}
 		parsed, err := csharpindexer.Run(ctx, repoAbs, dll, csharpindexerRunConfig(cfg, 0))
 		if err != nil {

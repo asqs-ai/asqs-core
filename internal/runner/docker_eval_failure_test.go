@@ -29,7 +29,7 @@ func fakeDockerSandbox(t *testing.T, timeout, script string) (*Sandbox, string) 
 	return &Sandbox{Type: "docker", Timeout: timeout, DockerBinary: bin}, repo
 }
 
-// The bug this bundle fixes: a container killed at runner.timeout used to be reported as
+// The bug this bundle fixes: a container killed at general.sandbox.timeout used to be reported as
 // {OK: false, Summary: "failed", Output: ""} — no mention of the deadline, and an empty Output
 // that sends the fixer off to repair code that was fine.
 func TestDockerTest_timeoutIsNamedInTheSummary(t *testing.T) {
@@ -40,7 +40,7 @@ func TestDockerTest_timeoutIsNamedInTheSummary(t *testing.T) {
 	if res.OK {
 		t.Fatal("a timed-out step must not report OK")
 	}
-	if !strings.Contains(res.Summary, "step timed out after 150ms (runner.timeout)") {
+	if !strings.Contains(res.Summary, "step timed out after 150ms (general.sandbox.timeout)") {
 		t.Fatalf("summary does not name the timeout: %q", res.Summary)
 	}
 	if strings.TrimSpace(res.Output) == "" {
@@ -78,7 +78,7 @@ func TestDockerCompile_timeoutIsNamedInTheSummary(t *testing.T) {
 	if res.OK {
 		t.Fatal("a timed-out compile must not report OK")
 	}
-	if !strings.Contains(res.Summary, "compile step timed out after 150ms (runner.timeout)") {
+	if !strings.Contains(res.Summary, "compile step timed out after 150ms (general.sandbox.timeout)") {
 		t.Fatalf("summary does not name the timeout: %q", res.Summary)
 	}
 }

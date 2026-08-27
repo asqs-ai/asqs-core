@@ -58,8 +58,8 @@ func parseRunFlags(args []string, out io.Writer) (*runFlags, error) {
 	configPath := fs.String("config", "", "path to config YAML (database, llm, indexer, runner, vcs)")
 	repoFlag := fs.String("repo", "", "repo path or git URL (may also be passed as a trailing argument)")
 	lang := fs.String("lang", "", "language override: java|csharp|typescript|javascript (default: autodetect)")
-	maxGaps := fs.Int("max-gaps", defaultMaxGaps, "max unit gaps to generate (default: indexer.max_gaps, else 10)")
-	maxGapsE2E := fs.Int("max-gaps-e2e", defaultMaxGapsE2E, "max E2E gaps to generate, 0 = skip E2E (default: indexer.max_gaps_e2e, else 0)")
+	maxGaps := fs.Int("max-gaps", defaultMaxGaps, "max unit gaps to generate (default: indexer.policy.max_gaps, else 10)")
+	maxGapsE2E := fs.Int("max-gaps-e2e", defaultMaxGapsE2E, "max E2E gaps to generate, 0 = skip E2E (default: indexer.policy.max_gaps_e2e, else 0)")
 	docs := fs.Bool("docs", false, "also generate per-symbol documentation (inserted above declarations)")
 	sandbox := fs.String("sandbox", "", "sandbox type override: local|docker")
 	ship := fs.Bool("ship", false, "after a stable run, commit+push a branch and open/update a PR/MR")
@@ -126,7 +126,7 @@ func resolveAuditLogPath(flagSet bool, flagVal, cfgVal string) (string, string) 
 }
 
 // resolveMaxGaps picks the effective unit-gap cap. Precedence: an explicitly passed --max-gaps,
-// then indexer.max_gaps from the config file (or ASQS_INDEXER_MAX_GAPS, which config.Load has
+// then indexer.policy.max_gaps from the config file (or ASQS_INDEXER_MAX_GAPS, which config.Load has
 // already folded into cfgVal), then the built-in default.
 //
 // A non-positive value is treated as "not configured" and falls through to the next source: a run
@@ -139,7 +139,7 @@ func resolveMaxGaps(flagSet bool, flagVal, cfgVal int) (int, string, error) {
 		return 0, "", fmt.Errorf("--max-gaps must be >= 0, got %d", flagVal)
 	}
 	if cfgVal < 0 {
-		return 0, "", fmt.Errorf("indexer.max_gaps must be >= 0, got %d", cfgVal)
+		return 0, "", fmt.Errorf("indexer.policy.max_gaps must be >= 0, got %d", cfgVal)
 	}
 	if flagSet && flagVal > 0 {
 		return flagVal, gapSourceFlag, nil
@@ -151,7 +151,7 @@ func resolveMaxGaps(flagSet bool, flagVal, cfgVal int) (int, string, error) {
 }
 
 // resolveMaxGapsE2E picks the effective E2E-gap cap. Precedence: an explicitly passed
-// --max-gaps-e2e, then indexer.max_gaps_e2e (or ASQS_INDEXER_MAX_GAPS_E2E), then 0.
+// --max-gaps-e2e, then indexer.policy.max_gaps_e2e (or ASQS_INDEXER_MAX_GAPS_E2E), then 0.
 //
 // Unlike the unit cap, 0 is MEANINGFUL here: it means "skip the E2E plan branch entirely". So an
 // explicit `--max-gaps-e2e 0` wins over a non-zero config value — that is how a user turns E2E off
@@ -161,7 +161,7 @@ func resolveMaxGapsE2E(flagSet bool, flagVal, cfgVal int) (int, string, error) {
 		return 0, "", fmt.Errorf("--max-gaps-e2e must be >= 0, got %d", flagVal)
 	}
 	if cfgVal < 0 {
-		return 0, "", fmt.Errorf("indexer.max_gaps_e2e must be >= 0, got %d", cfgVal)
+		return 0, "", fmt.Errorf("indexer.policy.max_gaps_e2e must be >= 0, got %d", cfgVal)
 	}
 	if flagSet {
 		return flagVal, gapSourceFlag, nil

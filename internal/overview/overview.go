@@ -297,7 +297,7 @@ func emptyFileDependencyGraphExplanation(workflowLang string) string {
 		"An empty graph is common when callees are unresolved, calls stay within one file, or dependencies point only at external or standard-library code."
 	switch l {
 	case "java":
-		return base + " For Java **call** edges, use the **advanced** indexer (`indexer.type: advanced` + `indexer.advanced_jar_path`); cross-file arcs still require symbols to resolve."
+		return base + " For Java **call** edges, use the **advanced** indexer (`indexer.type: advanced` + `indexer.java.jar_path`); cross-file arcs still require symbols to resolve."
 	case "javascript", "typescript", "js", "ts":
 		return base + " For JavaScript/TypeScript, in-repo arcs come from resolved **imports** and **calls** to symbols in indexed project files; unresolved specifiers and third-party modules usually do not add file pairs here."
 	case "csharp", "cs":

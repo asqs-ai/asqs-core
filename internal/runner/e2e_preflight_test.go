@@ -76,7 +76,7 @@ func TestWarnLocalE2EBrowsersMissing(t *testing.T) {
 	sb := &Sandbox{Type: "local"}
 
 	out := captureStderr(t, func() { sb.warnLocalE2EBrowsersMissing("typescript", "playwright") })
-	for _, want := range []string{"E2E preflight", "playwright browsers are not installed", "runner.e2e_framework_bootstrap.enabled", "runner.type to docker"} {
+	for _, want := range []string{"E2E preflight", "playwright browsers are not installed", "bootstrap.e2e_framework.enabled", "general.sandbox.type to docker"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("warning %q missing %q", out, want)
 		}

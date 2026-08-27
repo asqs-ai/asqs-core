@@ -16,9 +16,11 @@ import (
 // The agent-session engine's reference document is deliberately NOT here. That engine is
 // enterprise-excluded, so its document can never exist in the open core; the three citations of it
 // were rewritten in CP36 rather than parked.
-var pendingDocs = map[string]string{
-	"docs/DOCUMENTATION.md": "CP56 creates core's behaviour reference; these citations predate it",
-}
+// EMPTY, and that is the point. CP36 opened this ledger with one entry — docs/DOCUMENTATION.md,
+// owed by CP56 — and CP56 wrote the document, so the debt is paid and the guard now covers those
+// citations like any other. An entry here is a promise; keeping one after its document exists would
+// turn the ledger back into the exemption list it was built to replace.
+var pendingDocs = map[string]string{}
 
 // reDocRef finds docs/<NAME>.md paths cited anywhere in sources.
 //

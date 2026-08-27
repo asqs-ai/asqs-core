@@ -83,7 +83,7 @@ func (c *Config) ShipEnsureOpenPullRequest(ctx context.Context, httpsRemoteURL, 
 		return fmt.Sprintf("bitbucket PR #%d", pr.ID), true, nil
 
 	case vcs.ProviderAzureDevOps:
-		return "", false, fmt.Errorf("azure devops: set ASQS_AZURE_DEVOPS_TOKEN (or vcs.azure_devops.token) and use an Azure Repos HTTPS URL as the project clone URL for ship")
+		return "", false, fmt.Errorf("azure devops: set ASQS_AZURE_DEVOPS_TOKEN (or general.git.azure_devops.token) and use an Azure Repos HTTPS URL as the project clone URL for ship")
 
 	default:
 		gh := c.GitHubClient()

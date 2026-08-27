@@ -150,7 +150,7 @@ func TestWarnLocalNuGetCredentialProviderMissing(t *testing.T) {
 
 	out := captureStderr(t, func() { sb.warnLocalNuGetCredentialProviderMissing() })
 
-	for _, want := range []string{"credential provider is not installed", "NU1301", "install-artifacts-credprovider", "runner.type to docker"} {
+	for _, want := range []string{"credential provider is not installed", "NU1301", "install-artifacts-credprovider", "general.sandbox.type to docker"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("warning %q missing %q", out, want)
 		}
