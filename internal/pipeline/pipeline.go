@@ -532,10 +532,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// Terminal DB state: status + stable/iterations, plus the first-wave metrics that make this
 	// run comparable in `asqs-core ab-report`. On an evaluation error the metrics stay NULL.
-	_, _, llmTotal := runUsage.Totals()
 	stable := sum.ProjectStable
 	iters := evalRes.Iterations
-	completeRun(ctx, meta, runID, &stable, &iters, evalFirstWaveMetricsForDB(&evalRes, eerr, llmTotal))
+	completeRun(ctx, meta, runID, &stable, &iters, evalFirstWaveMetricsForDB(&evalRes, eerr, runUsage))
 	return sum, nil
 }
 

@@ -334,7 +334,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP26 | Provider capability contract and Ollama parity | B08, R08 | CP25 | 2 d | `in review` |
 | CP27 | Anthropic block messages *(no prompt caching)* | B12 | CP25 | 1–2 d | `in review` |
 | CP28 | Token budget and prompt accounting | B07 | CP06, CP17 | 3–4 d | `in review` |
-| CP29 | `prompt_tokens` end to end | R07 | CP26 | 0.5 d | `blocked (CP26)` |
+| CP29 | `prompt_tokens` end to end | R07 | CP26 | 0.5 d | `in review` |
 | CP60 | LLM concurrency limiter — wires two inert core keys | (unbundled upstream) | CP26 | 1–2 d | `blocked (CP26)` |
 
 ### P5 — Runner unification *(land `CP30` alone and green before moving any behaviour)*
@@ -1992,10 +1992,39 @@ method survives at any budget. The calibration delta is recorded per completion.
 
 ### CP29 — `prompt_tokens` end to end
 
-- **Status:** `blocked (CP26)` · **Effort:** 0.5 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 0.5 d · **Risk:** low
 
 Thread the provider's reported `prompt_tokens` through `usage_accumulator.go` into the run summary so
 CP28's calibration has a ground truth and CP16's `llm_total_tokens` is real rather than estimated.
+
+**Implementation record (2026-08-27).**
+
+- **Provenance status** — upstream **R07 is `ready`, not implemented**: asqs-go's
+  `FirstWaveRunMetrics` has no `prompt_tokens` field at the baseline. This bundle implements
+  R07's spec fresh in core's shapes. R07's own "asqs-core port: No — control-plane table" note
+  predates core's CP16 decision to port the whole measurement loop and is overridden by this
+  plan's existence; recorded here so nobody re-litigates it against the upstream doc.
+- **Schema** — `metadata.FirstWaveRunMetrics.PromptTokens *int64` (`json:"prompt_tokens,omitempty"`),
+  placed beside `LlmTotalTokens`. Pointer per R07's own review focus (which flags the spec'd
+  plain `int64 + omitempty` as conflating "reported zero" with "not reported"), matching how
+  `TokensToStable` already distinguishes the two. Additive — `ab-report`'s JSONB casts keep
+  working unchanged.
+- **Threading** — core has no `EvalPhaseResult`/`applyFirstWaveEvalMetrics` intermediary
+  (R07 tasks 2–3 are upstream-shaped), so `evalFirstWaveMetricsForDB` now takes the
+  `*model.UsageAccumulator` itself and destructures `Totals()` in one place: total with the
+  read-site `tot <= 0 → p+c` fallback (previously core discarded prompt/completion with
+  `_, _, llmTotal`), prompt share kept, `PromptTokens` set only when `p > 0`. Nil accumulator =
+  untracked = both keys absent.
+- **Enterprise exclusions** — R07 tasks 4–5 (`openapi.yaml`, `docs/API.md`) not applicable: core
+  has no serve mode/API surface, hence no `TestFirstWaveRunMetrics_specMatchesGoStruct` drift
+  guard either.
+- **Tests** — `first_wave_metrics_test.go` rewritten to seed real accumulators (`usageOf`
+  helper); R07's acceptance pinned: `PromptTokens` is the accumulator's **prompt** total (1000),
+  not the combined 1234, and untracked usage omits the key. Live
+  `run_metrics_prompt_tokens_live_test.go`: `SetIndexRunFirstWaveMetrics` → stored JSONB
+  contains `"prompt_tokens": 4321` → `GetIndexRunFirstWaveMetrics` returns the pointer value →
+  a metrics row without usage omits the key entirely.
+- **Verification** — full gate green; live round-trip green against `asqs_scratch`.
 
 ### CP60 — LLM concurrency limiter
 

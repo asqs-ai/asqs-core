@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
@@ -19,9 +20,20 @@ import (
 // snake_case JSON keys (the struct tags are the wire format — stored as JSONB verbatim). Stability
 // here is what the pipeline reports to the operator (green outright, or green after discarding
 // repeatedly-failing files), so the metric and the console never disagree about the same run.
-func evalFirstWaveMetricsForDB(eval *evaluator.EvalWorkflowResult, evalErr error, llmTotalTokens int64) *metadata.FirstWaveRunMetrics {
+func evalFirstWaveMetricsForDB(eval *evaluator.EvalWorkflowResult, evalErr error, usage *model.UsageAccumulator) *metadata.FirstWaveRunMetrics {
 	if eval == nil || evalErr != nil {
 		return nil
+	}
+	// Destructure the accumulator here, in one place: total with the belt-and-braces fallback
+	// (per-call Add already sums prompt+completion when a provider omits total_tokens), and the
+	// prompt share on its own — previously computed and thrown away.
+	var promptTokens, llmTotalTokens int64
+	if usage != nil {
+		p, c, tot := usage.Totals()
+		if tot <= 0 {
+			tot = p + c
+		}
+		promptTokens, llmTotalTokens = p, tot
 	}
 	stable := eval.Stable || eval.EarlyExitStableAfterDiscard
 	m := &metadata.FirstWaveRunMetrics{
@@ -32,6 +44,9 @@ func evalFirstWaveMetricsForDB(eval *evaluator.EvalWorkflowResult, evalErr error
 		CompileFixCount:        eval.CompileFixCount,
 		TestFixCount:           eval.TestFixCount,
 		LlmTotalTokens:         llmTotalTokens,
+	}
+	if promptTokens > 0 {
+		m.PromptTokens = &promptTokens
 	}
 	if stable && llmTotalTokens > 0 {
 		ts := llmTotalTokens

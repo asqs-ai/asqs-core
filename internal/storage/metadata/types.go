@@ -85,12 +85,17 @@ type ListAuditOptions struct {
 // FirstWaveRunMetrics is stored in index_runs.first_wave_metrics (JSONB) when evaluation completes successfully.
 // Query remotely with SQL, e.g. first_wave_metrics->>'test_ok_without_fix' = 'true'.
 type FirstWaveRunMetrics struct {
-	CompileOKAfterGenerate bool   `json:"compile_ok_after_generate"`
-	TestOKWithoutFix       bool   `json:"test_ok_without_fix"`
-	EvalStable             bool   `json:"eval_stable"`
-	EvalIterations         int    `json:"eval_iterations"`
-	CompileFixCount        int    `json:"compile_fix_count"`
-	TestFixCount           int    `json:"test_fix_count"`
-	LlmTotalTokens         int64  `json:"llm_total_tokens"`
-	TokensToStable         *int64 `json:"tokens_to_stable,omitempty"`
+	CompileOKAfterGenerate bool  `json:"compile_ok_after_generate"`
+	TestOKWithoutFix       bool  `json:"test_ok_without_fix"`
+	EvalStable             bool  `json:"eval_stable"`
+	EvalIterations         int   `json:"eval_iterations"`
+	CompileFixCount        int   `json:"compile_fix_count"`
+	TestFixCount           int   `json:"test_fix_count"`
+	LlmTotalTokens         int64 `json:"llm_total_tokens"`
+	// PromptTokens is the prompt-side share of LlmTotalTokens as the provider reported it — the
+	// ground truth the context-budget calibration (CP28's counter) is measured against. Pointer,
+	// like TokensToStable: absent means the provider reported no usage, which must stay
+	// distinguishable from a genuine zero.
+	PromptTokens   *int64 `json:"prompt_tokens,omitempty"`
+	TokensToStable *int64 `json:"tokens_to_stable,omitempty"`
 }
