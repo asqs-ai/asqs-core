@@ -397,8 +397,8 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP58 | Detection, per-language profiles, smoke verification, goal runners | `21d25de` + `6e693f4` | CP06, CP32, CP33 | 8–10 d | `ready` |
-| CP59 | The bootstrap → generation contract (`.asqs/test-stack.json`) | `21d25de`, `8640c59` | CP58 | 3–4 d | `blocked (CP58)` |
+| CP58 | Detection, per-language profiles, smoke verification, goal runners | `21d25de` + `6e693f4` | CP06, CP32, CP33 | 8–10 d | `in review` |
+| CP59 | The bootstrap → generation contract (`.asqs/test-stack.json`) | `21d25de`, `8640c59` | CP58 | 3–4 d | `ready` (task 2 landed with CP58 — see its record) |
 
 ### P11 — Documentation and release
 
@@ -3656,7 +3656,7 @@ the thing P6 exists to avoid.
 
 ### CP58 — Detection, profiles, smoke verification, goal runners
 
-- **Status:** `ready` · **Effort:** 8–10 d · **Risk:** high
+- **Status:** `in review` · **Effort:** 8–10 d · **Risk:** high
 
 **Scope: 15 of the wave's 17 new files.** The other two — `contract_profiles.go` and
 `contract_writer.go` — belong to CP59, which owns the contract they write. (By commit provenance the
@@ -3727,9 +3727,56 @@ it. Today that list is empty. It will not stay empty by itself.
 the session-engine references, keep the detection matrices and the "smoke tests are instruments"
 rationale.
 
+**Implementation record (2026-08-27).**
+
+- All 15 named files ported, plus the `testdata/*.template` smoke sources and the Playwright smoke
+  embed. Their only cross-package needs were `config`, `javaproj`, `layout` and `runner`, all of
+  which core has; `orchestrator.Auditor` became core's own local `testbootstrap.Auditor`, which
+  exists precisely so this package never pulls in the enterprise orchestrator.
+- **Rewritten existing files** taken at end state: `versions.go`, `detect.go`, `detect_unit.go`,
+  `csharp_csproj.go`, `csharp_test_project.go`, `csharp_cpm.go`, `java_gradle.go`, `java_maven.go`,
+  `jest_config.go`, `package_json.go`, `run.go`, `run_java.go`, `run_csharp.go`, and — not on the
+  section's list but required — `repo_manifest_discovery.go`, whose 15 diverged lines carry the
+  nested-manifest search a ported test proves is needed (a monorepo with no root `package.json`
+  failed detection without it).
+- **`jest_config.go` narrowed, not deleted** — the section's own correction held: the rendering
+  helpers moved to `js_config.go` while the package-manager and lockfile helpers stayed.
+  **`run_jest.go` IS deleted**, superseded by `run_javascript.go`; core's copy was the only thing
+  still defining `isJSLang`.
+- **The section's 15/17 file split does not hold, and this is the correction.** It assigns
+  `contract_profiles.go` and `contract_writer.go` to CP59 — but `run.go`, `run_java.go`,
+  `run_csharp.go` and `run_javascript.go` at end state all call into them (`javaContract`,
+  `csharpContract`, `writeTestStackContract`, `writeSkipContract`, `smokeFromRun`,
+  `verifiedSuffix`). Stubbing four files' worth of call sites would be invasive divergence to undo
+  later, so **both files landed here** — CP59's task 2. CP59 keeps its substance: the contract's
+  semantics, `project_config_teststack.go` into the generator, and the `.asqs` pre-ship cleanup,
+  none of which this bundle touches. Its row is flipped to `ready` with the overlap noted.
+- **Version pins verified, not assumed.** The section claims `VersionTSJest` is the only changed
+  value and that the four E2E pins are byte-identical between trees. Checked all five by hand:
+  `VersionPlaywrightTest`, `DefaultPlaywrightDockerImage`, `VersionCypress` and
+  `VersionPlaywrightJava` are identical; `VersionTSJest` moves `29.2.5` → `29.4.12`, whose only
+  consumer is the flag-gated unit path.
+- **The flag-off obligation, discharged with a non-empty list.** The section says "today that list
+  is empty; it will not stay empty by itself" — and it did not stay empty. One change is reachable
+  with `runner.test_framework_bootstrap.enabled` off: `e2e_bootstrap_csharp.go` (gated separately,
+  at `pipeline.go:190`) now calls `applyCSharpTestPackages(..., csharpRunnerOnlyProfile(CSharpTestXunit))`
+  where it called `applyCSharpXUnit`, because the latter no longer exists. **Verified
+  behaviour-preserving rather than release-noted:** `csharpBaseTestPackages(CSharpTestXunit)`
+  returns exactly `Microsoft.NET.Test.Sdk` + `xunit` + `xunit.runner.visualstudio`, which is the
+  set upstream's own comment records `applyCSharpXUnit` as having added. No other path this bundle
+  touched is reachable with the flag off.
+- **Docs ported and adapted** as required: `docs/TEST-FRAMEWORK-BOOTSTRAP.md`, with every upstream
+  config spelling rewritten to core's v1 keys (`bootstrap.policy.*` → `runner.*_bootstrap.*`,
+  `general.sandbox.docker.images.*` → `runner.docker_image_*`, `general.sandbox.timeout` →
+  `runner.timeout`, `retrieval.plan.e2e.max_gaps` → `retrieval.max_gaps_e2e`) — verified zero
+  upstream spellings remain — and a header stating the two things to know before enabling it: it is
+  off by default, and a complete-looking stack that cannot run a test fails the run deliberately.
+- Full gate green, live suite included; the whole ported bootstrap suite passes.
+
+
 ### CP59 — The bootstrap → generation contract
 
-- **Status:** `blocked (CP58)` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `ready` — task 2 (`contract_profiles.go` + `contract_writer.go`) landed with CP58, which could not compile without it · **Effort:** 3–4 d · **Risk:** medium
 
 A successful (or skipped-because-complete) bootstrap writes **`.asqs/test-stack.json`** — an
 authoritative allow-list of importable test libraries, read by the generation prompt builder so the
