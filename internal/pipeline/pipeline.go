@@ -331,6 +331,14 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		auditToolMode(ctx, audit, loop.Mode,
 			appendStructuredDeferralNote(reason, trackedGen, !cfg.Runner.DisableStructuredGenerateOutput))
 	}
+	// With tools in play the prompt carries a high-precision core plus an INVENTORY of what can be
+	// fetched, rather than every dependency body inline.
+	//
+	// The gate is the RESOLVED loop mode, not the config flag: a run that asked for tools but fell
+	// back to one-shot — an incapable provider, no registry — must still get the inlined bodies,
+	// because nothing can fetch what an inventory merely names. Getting this backwards produces a
+	// context that promises lookups nobody can perform.
+	formatOpts.ToolsAvailable = generatorHasTools(gen)
 	fixer := &llmfix.Fixer{LLM: trackedFixer, Audit: audit}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)

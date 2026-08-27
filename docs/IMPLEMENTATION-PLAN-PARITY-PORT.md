@@ -366,7 +366,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `in review` |
 | CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `in review` |
 | CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `in review` |
-| CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `ready` |
+| CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `in review` (A/B outstanding) |
 | CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP50)` |
 
 ### P8 — External knowledge
@@ -2820,13 +2820,66 @@ valid messages; every attempt is recorded with tool name, arguments size and out
 
 ### CP45 — Core-plus-inventory context restructure
 
-- **Status:** `ready` · **Effort:** 3 d · **Risk:** medium
+- **Status:** `in review` (code complete; **the CP16 A/B remains outstanding** — see record) · **Effort:** 3 d · **Risk:** medium
 
 When tools are enabled, the prompt carries a **core** context plus an **inventory** of what the model
 can fetch (`retrieval/available_context.go`), instead of everything inline.
 
 **This is a ranking/context change and cannot go `done` without a CP16 comparison.** Ships behind a
 setting defaulting to today's behaviour.
+
+**Implementation record (2026-08-27).**
+
+- **Renderer** — `available_context.go` and its test ported verbatim. `writeAvailableContext` lists
+  each dependency with the identity `get_symbol` resolves on (FQ name, edge type, depth, location)
+  and no body; entries without an FQ name are **dropped**, because listing something the tools
+  cannot fetch teaches the model to distrust the whole inventory. Similar-test COUNTS are reported
+  with the tool call to act on them, never bodies.
+- **Gate** — `FormatOptions.ToolsAvailable` switches `BuildLLMContext` between the two shapes: the
+  inventory when tools are live, the previous inline-everything rendering otherwise. Both branches
+  are explicit (`opts.ToolsAvailable` / `!opts.ToolsAvailable`) so neither can be reached by
+  accident.
+- **Chunk-miss member fallback** — `memberSummaryForType` plus `symbolVisibility` /
+  `symbolSignatureText` ported into `retrieve.go`, and both call sites wired: a domain model or a
+  dependency whose chunk did not resolve now carries index-derived member rows instead of appearing
+  as a bare type name, which is an invitation to invent an API. This fills
+  `SymbolChunk.Members`, added dormant in CP28 — `memberListBlock` has rendered and budgeted it
+  since then, so only the population was missing. `member_summary_test.go` ported and passes
+  unmodified (its `TestMemberListBlock_rendersExhaustiveWording` now exercises a live field).
+- **Wiring** — `generatorHasTools` in the pipeline sets `formatOpts.ToolsAvailable` once, from the
+  **resolved loop mode** rather than the config flag. That direction is load-bearing: a run that
+  asked for tools and fell back to one-shot must keep the inlined bodies, because nothing can fetch
+  what an inventory merely names. Pinned by `TestGeneratorHasTools_followsTheResolvedMode` across
+  all six shapes.
+- **Ships behind a setting defaulting to today's behaviour**, as required: the switch is
+  `generation.tools_enabled`, which defaults false → one-shot → inline bodies. No second key was
+  added; a separate toggle would let the two decisions disagree, and the resolved-mode gate is what
+  keeps the context shape and the tool availability consistent.
+  `TestToolsAvailable_defaultConfigLeavesTheContextUnchanged` pins that a default config renders
+  the pre-bundle shape.
+- **Not taken:** `DocFormatOptions` / `doc_retrieve.go`, which sit next to this code upstream — the
+  seam list (§ excluded files) already rules the narrowed doc-context preset out of the whole port,
+  and core's doc pass deliberately renders the full context.
+- **Measured live** (local Ollama + scratch Postgres): on a target with one dependency the
+  inventory rendering was **859 bytes against 2764 inline — 69% smaller** — with the dependency
+  named and its body absent, exactly the arithmetic the restructure is built on. The loop still
+  functions with the inventory in place: a direct run made three audited lookups
+  (`get_symbol`, `expand_symbol`×2), **including with `Structured` set**, which independently
+  confirms CP44's structured-deferral reaches the wire (the schema is withheld on tool turns, so
+  tool syntax can be emitted, then re-applied on the final turn).
+- **Observation for the A/B, recorded rather than glossed:** given the inventory row already
+  carries `file:line-line`, this model sometimes judged it had enough and made **no** lookup for a
+  small fixture dependency. Whether that is good economy or a quality loss is precisely what the
+  outstanding comparison must answer — it is not decidable by a unit test, which is why this
+  bundle stays `in review`.
+- **A/B obligation.** Per this section and rule 10 this cannot go `done` without a CP16
+  comparison: run the same repository with `generation.tools_enabled` off and on, and compare
+  `first_wave_metrics` (`test_ok_without_fix`, `compile_ok_after_generate`, `llm_total_tokens`,
+  `prompt_tokens`) through `asqs-core ab-report`. The instrument exists (CP16) and the prompt-token
+  ground truth exists (CP29); only the runs are missing. Upstream's own B21 row carries the same
+  open follow-up.
+- Full gate green.
+
 
 ### CP46 — Fixer tool access
 

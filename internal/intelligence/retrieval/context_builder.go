@@ -39,6 +39,15 @@ type FormatOptions struct {
 	UseStructuredTestJSON bool
 	// ContextCompact is populated from config (retrieval.context_compact) by the orchestrator. When Enabled (default on when enabled key omitted in YAML), the workflow compacts each item's RetrievalContext once before parallel test/doc generation.
 	ContextCompact ContextCompactOptions
+	// ToolsAvailable switches the context to a high-precision core plus an INVENTORY: dependencies
+	// are listed with enough identity to fetch them, and their bodies are left for the model to
+	// request via get_symbol.
+	//
+	// The arithmetic is the point. A symbol table row costs roughly 15 tokens; a symbol body costs
+	// 300-1500. Listing 40 and fetching 4 is dramatically cheaper than inlining 15 and hoping the
+	// right ones were chosen. Over-retrieval is currently the only defence against missing context,
+	// and it is what exhausts the budget.
+	ToolsAvailable bool
 	// MaxContextTokens caps the whole rendered context. 0 = unbounded (previous behaviour).
 	// The pipeline resolves it from the model window minus the output reservation and a safety
 	// margin, further capped by retrieval.max_context_tokens.
@@ -255,7 +264,12 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 	}
 
 	// --- Dependency graph: callees with edge types + code ---
-	if opts.IncludeDependencies && len(rc.Dependencies) > 0 {
+	// --- Available context: an inventory the model can fetch from (tools enabled) ---
+	if opts.ToolsAvailable && opts.IncludeDependencies && len(rc.Dependencies) > 0 {
+		b.WriteString(writeAvailableContext(rc, opts))
+	}
+
+	if !opts.ToolsAvailable && opts.IncludeDependencies && len(rc.Dependencies) > 0 {
 		b.WriteString(opts.SectionPrefix)
 		b.WriteString("Dependency graph (symbols used by the target method)\n\n")
 		for _, dep := range rc.Dependencies {
@@ -536,8 +550,7 @@ func budgetCounter(b *tokens.Budget) tokens.Counter {
 // memberListBlock renders the index-derived member list used when no source chunk resolved for a
 // type. The wording is deliberately absolute ("the only members that exist"): a soft phrasing
 // leaves the model free to assume the list is a sample and invent the member it expected to find,
-// which is the exact failure this block exists to prevent. (Members stays empty until the
-// chunk-miss fallback lands with CP45.)
+// which is the exact failure this block exists to prevent.
 //
 // Spends from the same section budget as chunkBlock so the list participates in clamping instead
 // of silently pushing other sections out.

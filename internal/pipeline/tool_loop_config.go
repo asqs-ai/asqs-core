@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/tools"
 	"github.com/asqs/asqs-core/internal/storage/embeddings"
@@ -122,4 +123,17 @@ func appendStructuredDeferralNote(reason string, cc model.ChatCompleter, structu
 		return note
 	}
 	return reason + "; " + note
+}
+
+// generatorHasTools reports whether the configured generator will actually offer tools this run.
+//
+// It checks the RESOLVED loop mode, not the config flag. A run where the provider fell back to
+// one-shot — tools disabled, or no registry bound — must keep the inlined dependency bodies, since
+// there is no way for the model to fetch what an inventory would merely name. Getting this wrong in
+// that direction produces a context that promises lookups nobody can perform.
+func generatorHasTools(g *generator.LLMGenerator) bool {
+	if g == nil || g.Tools == nil {
+		return false
+	}
+	return g.ToolLoop.Mode == tools.ModeNative || g.ToolLoop.Mode == tools.ModePrompted
 }

@@ -109,7 +109,13 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 		}
 		seen[s.ID] = true
 		c := chunkForSymbol(ctx, chunks, s.ID, req.RepoID)
-		out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
+		sc := &SymbolChunk{Symbol: s, Chunk: c}
+		if c == nil {
+			// No chunk resolved: without a member list the model sees only a type name and
+			// invents members for it. Derive them from the index instead.
+			sc.Members = memberSummaryForType(ctx, meta, req.RepoID, s, maxMembersPerType)
+		}
+		out.DomainModels = append(out.DomainModels, sc)
 	}
 	// Same-file types first (cheap, certain).
 	fileSyms, _ := meta.ListSymbolsByFile(ctx, req.RepoID, targetSym.File)
@@ -256,8 +262,14 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 		if c != nil {
 			annotateChunkGroupProvenance([]*embeddings.Chunk{c}, "dependency", "graph dependency expansion")
 		}
+		sc := SymbolChunk{Symbol: callee, Chunk: c}
+		if c == nil {
+			// Same chunk-miss fallback as domain models: a dependency shown as a bare name is an
+			// invitation to invent its API.
+			sc.Members = memberSummaryForType(ctx, meta, req.RepoID, callee, maxMembersPerType)
+		}
 		out = append(out, &DependencyEdge{
-			SymbolChunk: SymbolChunk{Symbol: callee, Chunk: c},
+			SymbolChunk: sc,
 			EdgeType:    label,
 			Depth:       ge.depth,
 			GraphPath:   ge.path,
@@ -1074,4 +1086,107 @@ func referencedTypeNames(ctx context.Context, meta MetaReader, repoID string, ta
 		add(typeNamesFromCodeBody(methodChunk.Content))
 	}
 	return out
+}
+
+// maxMembersPerType bounds the member list derived for a type whose chunk did not resolve. Twelve
+// keeps a typical service or entity (OrderService, OwnerRepository) whole while bounding a
+// god-class.
+const maxMembersPerType = 12
+
+// memberSummaryForType returns compact one-line member rows for typeSym, derived from persisted
+// symbols in the same file whose line range is enclosed by typeSym.
+//
+// This is the fallback for a chunk-lookup miss. chunkForSymbol resolves by exact SymbolID with
+// Limit 1, so a type whose chunk was split, merged, or never attributed shows up in the prompt as a
+// name with no members at all — and a model asked to write a test against a name will invent
+// plausible members for it. Reuses the same line-range containment walk as
+// fieldTypeNamesForContainer, and the same ListSymbolsByFile reader, so no new interface method and
+// no reindex are needed.
+func memberSummaryForType(ctx context.Context, meta MetaReader, repoID string, typeSym *metadata.Symbol, max int) []string {
+	if meta == nil || typeSym == nil {
+		return nil
+	}
+	if max <= 0 {
+		max = maxMembersPerType
+	}
+	syms, _ := meta.ListSymbolsByFile(ctx, repoID, typeSym.File)
+	type row struct {
+		line int
+		text string
+	}
+	var rows []row
+	for _, s := range syms {
+		if s == nil || s.ID == typeSym.ID {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(s.Kind)) {
+		case "method", "constructor", "field", "property":
+		default:
+			continue
+		}
+		if s.StartLine < typeSym.StartLine || (typeSym.EndLine > 0 && s.EndLine > typeSym.EndLine) {
+			continue
+		}
+		if symbolVisibility(s) == "private" {
+			continue
+		}
+		text := strings.TrimSpace(symbolSignatureText(s))
+		if text == "" {
+			text = strings.TrimSpace(s.FQName)
+		}
+		if text == "" {
+			continue
+		}
+		rows = append(rows, row{line: s.StartLine, text: text})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].line < rows[j].line })
+	out := make([]string, 0, len(rows))
+	seen := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if seen[r.text] {
+			continue
+		}
+		seen[r.text] = true
+		out = append(out, r.text)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// symbolVisibility reads the visibility field out of signature_json ("" when absent).
+func symbolVisibility(sym *metadata.Symbol) string {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Visibility string `json:"visibility"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Visibility))
+}
+
+// symbolSignatureText prefers the indexed signature, falling back to the type token for fields.
+func symbolSignatureText(sym *metadata.Symbol) string {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Signature string `json:"signature"`
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
+		return ""
+	}
+	if s := strings.TrimSpace(parsed.Signature); s != "" {
+		return s
+	}
+	if t := strings.TrimSpace(parsed.Type); t != "" && strings.TrimSpace(parsed.Name) != "" {
+		return t + " " + strings.TrimSpace(parsed.Name)
+	}
+	return strings.TrimSpace(parsed.Name)
 }
