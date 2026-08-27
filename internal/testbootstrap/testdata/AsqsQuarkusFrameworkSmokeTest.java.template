@@ -1,0 +1,27 @@
+package com.asqs.bootstrap;
+
+import org.junit.jupiter.api.Test;
+
+import io.quarkus.test.junit.QuarkusTest;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * ASQS test_framework_bootstrap framework smoke test (Quarkus).
+ *
+ * <p>
+ * @QuarkusTest starts the application before the test body runs, so reaching the
+ * assertion at all is what proves generated @QuarkusTest classes can work in this module.
+ *
+ * <p>
+ * Safe to delete.
+ */
+@QuarkusTest
+class AsqsFrameworkSmokeTest {
+
+	@Test
+	void applicationStarts() {
+		assertThat(Boolean.TRUE).isTrue();
+	}
+
+}

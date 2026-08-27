@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/layout"
 )
 
 // Report is the outcome of Detect.
@@ -181,43 +183,70 @@ func jsTestScriptFramework(packageJSON string) string {
 	return ""
 }
 
+// detectJava reports whether the module already carries the COMPLETE test stack its framework needs.
+//
+// The previous rule was a substring search: any pom mentioning "junit" or "surefire" counted as
+// equipped. That is how a Spring Boot module with bare junit-jupiter passed detection, skipped
+// bootstrap, and then produced twelve generated artifacts that could not compile because Mockito,
+// AssertJ and org.springframework.boot.test were all absent. The question asked here is instead
+// "which of the coordinates THIS framework requires are missing", so a partially equipped module is
+// a bootstrap trigger rather than a skip.
 func detectJava(dir string) (Report, error) {
-	jbf, err := primaryJavaBuildFile(dir)
+	prof, jbf, err := resolveJavaTestProfile(dir)
 	if err != nil {
 		return Report{}, err
 	}
 	if jbf.Abs == "" {
 		return Report{HasFramework: true, Reason: "no pom.xml or build.gradle under repo; skip java bootstrap"}, nil
 	}
-	switch jbf.Kind {
-	case javaBuildMaven:
-		b, err := os.ReadFile(jbf.Abs)
-		if err != nil {
-			return Report{}, err
-		}
-		s := strings.ToLower(string(b))
-		if strings.Contains(s, "junit") || strings.Contains(s, "surefire") || strings.Contains(s, "failsafe") ||
-			strings.Contains(s, "testng") {
-			return Report{HasFramework: true, Framework: "junit", Reason: "pom.xml contains junit/surefire/failsafe/testng"}, nil
-		}
-		return Report{HasFramework: false, Reason: "pom.xml without obvious test plugins/deps"}, nil
-	case javaBuildGradleGroovy, javaBuildGradleKotlin:
-		name := filepath.Base(jbf.Abs)
-		b, err := os.ReadFile(jbf.Abs)
-		if err != nil {
-			return Report{}, err
-		}
-		s := strings.ToLower(string(b))
-		if strings.Contains(s, "junit") || strings.Contains(s, "testimplementation") ||
-			strings.Contains(s, "testcompileonly") || strings.Contains(s, "testruntimeonly") {
-			return Report{HasFramework: true, Framework: "junit", Reason: name + " mentions junit or test* dependencies"}, nil
-		}
-		return Report{HasFramework: false, Reason: name + " without obvious junit test deps"}, nil
-	default:
-		return Report{HasFramework: true, Reason: "no Java build file; skip java bootstrap"}, nil
+	if prof.Declined {
+		return Report{HasFramework: true, Framework: string(prof.Framework), Reason: prof.DeclinedReason}, nil
 	}
+
+	b, err := os.ReadFile(jbf.Abs)
+	if err != nil {
+		return Report{}, err
+	}
+	src := string(b)
+	name := filepath.Base(jbf.Abs)
+	isMaven := jbf.Kind == javaBuildMaven
+
+	missing := prof.missingDeps(src, isMaven)
+	// Gradle defaults to the JUnit 4 runner: without useJUnitPlatform() a JUnit 5 suite compiles and
+	// then executes zero tests, which every downstream step reads as "the tests passed".
+	needsPlatformWiring := !isMaven && !strings.Contains(src, "useJUnitPlatform")
+
+	if len(missing) == 0 && !needsPlatformWiring {
+		return Report{
+			HasFramework: true,
+			Framework:    prof.Stack,
+			Reason: fmt.Sprintf("%s already carries the full %s (%s) test stack: %s",
+				name, prof.Framework, prof.Stack, strings.Join(describeJavaDeps(prof.Deps), ", ")),
+		}, nil
+	}
+
+	var reason strings.Builder
+	fmt.Fprintf(&reason, "%s is a %s module", name, prof.Framework)
+	if len(missing) > 0 {
+		fmt.Fprintf(&reason, " missing %s", strings.Join(describeJavaDeps(missing), ", "))
+	}
+	if needsPlatformWiring {
+		if len(missing) > 0 {
+			reason.WriteString(" and")
+		}
+		reason.WriteString(" missing useJUnitPlatform() (Gradle would run zero JUnit 5 tests)")
+	}
+	return Report{HasFramework: false, Framework: prof.Stack, Reason: reason.String()}, nil
 }
 
+// detectCSharp reports whether the solution already carries the COMPLETE test stack its framework
+// needs.
+//
+// The previous rule was "does the primary .csproj reference Microsoft.NET.Test.Sdk / xunit / nunit /
+// mstest". A test project with a bare xUnit reference satisfied it, so bootstrap skipped — and every
+// generated test using Moq, FluentAssertions or WebApplicationFactory then failed to compile against
+// a .csproj the fix loop is not allowed to write. This asks which of the coordinates the detected
+// framework requires are actually missing.
 func detectCSharp(dir string) (Report, error) {
 	csproj, err := primaryCsprojAbs(dir)
 	if err != nil {
@@ -226,13 +255,52 @@ func detectCSharp(dir string) (Report, error) {
 	if csproj == "" {
 		return Report{HasFramework: true, Reason: "no SDK-style .csproj under repo; skip csharp bootstrap"}, nil
 	}
-	b, err := os.ReadFile(csproj)
+
+	prof, err := resolveCSharpTestProfile(dir, "")
 	if err != nil {
 		return Report{}, err
 	}
-	base := filepath.Base(csproj)
-	if csprojHasDotNetTestFrameworkContent(string(b)) {
-		return Report{HasFramework: true, Framework: "dotnet-test", Reason: base + " contains test SDK/framework"}, nil
+	if prof.Declined {
+		return Report{HasFramework: true, Framework: string(prof.Framework), Reason: prof.DeclinedReason}, nil
 	}
-	return Report{HasFramework: false, Reason: base + " without xunit/nunit/mstest/test.sdk"}, nil
+
+	// No dedicated unit test project yet: bootstrap creates one with the full stack.
+	testDirRel := layout.DetectCSharpUnitTestProjectDir(dir)
+	if testDirRel == "" {
+		if prod, _, derr := splitCSharpProdAndTestCsprojs(dir); derr == nil && len(prod) > 0 {
+			return Report{
+				HasFramework: false,
+				Framework:    prof.Stack,
+				Reason: fmt.Sprintf("%s solution with no unit test project; one will be created with %s",
+					prof.Framework, strings.Join(describeCSharpPackages(prof.Packages), ", ")),
+			}, nil
+		}
+	}
+
+	target := csproj
+	if testDirRel != "" {
+		if tp := firstCsprojInDir(filepath.Join(dir, filepath.FromSlash(testDirRel))); tp != "" {
+			target = tp
+		}
+	}
+	b, err := os.ReadFile(target)
+	if err != nil {
+		return Report{}, err
+	}
+	base := filepath.Base(target)
+	missing := prof.missingPackages(string(b))
+	if len(missing) == 0 {
+		return Report{
+			HasFramework: true,
+			Framework:    prof.Stack,
+			Reason: fmt.Sprintf("%s already carries the full %s (%s) test stack: %s",
+				base, prof.Framework, prof.Stack, strings.Join(describeCSharpPackages(prof.Packages), ", ")),
+		}, nil
+	}
+	return Report{
+		HasFramework: false,
+		Framework:    prof.Stack,
+		Reason: fmt.Sprintf("%s is a %s solution missing %s",
+			base, prof.Framework, strings.Join(describeCSharpPackages(missing), ", ")),
+	}, nil
 }

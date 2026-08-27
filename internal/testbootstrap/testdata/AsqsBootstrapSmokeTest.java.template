@@ -1,0 +1,34 @@
+package com.asqs.bootstrap;
+
+import java.util.function.Supplier;
+
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * ASQS test_framework_bootstrap smoke test.
+ *
+ * <p>
+ * Proves the three libraries generated tests reach for — JUnit 5, Mockito and AssertJ —
+ * resolve, compile AND execute in this module. Bootstrap fails when this test does, and
+ * that is the point: a missing test dependency is repaired in the build manifest, and the
+ * fix loop is never allowed to write build manifests.
+ *
+ * <p>
+ * Safe to delete.
+ */
+class AsqsBootstrapSmokeTest {
+
+	@Test
+	void junitMockitoAndAssertJAreOnTheTestClasspath() {
+		@SuppressWarnings("unchecked")
+		final Supplier<String> supplier = mock(Supplier.class);
+		when(supplier.get()).thenReturn("asqs");
+
+		assertThat(supplier.get()).isEqualTo("asqs");
+	}
+
+}

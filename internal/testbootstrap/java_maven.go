@@ -14,6 +14,21 @@ const mavenJUnitDep = `
       <scope>test</scope>
     </dependency>`
 
+// renderMavenDep emits a test-scoped <dependency>. A dep with no Version is rendered without a
+// <version> element so the framework's parent POM or BOM supplies it.
+func renderMavenDep(d javaDep) string {
+	var b strings.Builder
+	b.WriteString("\n    <dependency>")
+	b.WriteString("\n      <groupId>" + d.GroupID + "</groupId>")
+	b.WriteString("\n      <artifactId>" + d.ArtifactID + "</artifactId>")
+	if d.Version != "" {
+		b.WriteString("\n      <version>" + d.Version + "</version>")
+	}
+	b.WriteString("\n      <scope>test</scope>")
+	b.WriteString("\n    </dependency>")
+	return b.String()
+}
+
 const mavenSurefirePlugin = `
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -21,39 +36,57 @@ const mavenSurefirePlugin = `
         <version>` + VersionMavenSurefirePlugin + `</version>
       </plugin>`
 
-// applyMavenJUnit merges junit-jupiter and maven-surefire-plugin into pom.xml when missing.
-func applyMavenJUnit(pomPath string) (changed bool, err error) {
+// applyMavenTestDeps merges the profile's required test dependencies (and Surefire, where the
+// profile asks for it) into pom.xml.
+//
+// This replaced a hardcoded junit-jupiter insert. The old behaviour patched every Java project
+// identically, so a Spring Boot module got bare JUnit and every generated test that touched
+// @SpringBootTest, Mockito or AssertJ failed to compile against a manifest the fix loop may not
+// write. What goes in now is decided by javaTestProfile, from the framework actually detected.
+func applyMavenTestDeps(pomPath string, prof javaTestProfile) (changed bool, added []javaDep, err error) {
 	b, err := os.ReadFile(pomPath)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	s := string(b)
 	orig := s
 
-	needDep := !strings.Contains(s, "junit-jupiter")
-	needPlugin := !strings.Contains(s, "maven-surefire-plugin")
-
-	if !needDep && !needPlugin {
-		return false, nil
-	}
-
-	if needDep {
-		s, err = insertMavenJUnitDependency(s)
+	for _, d := range prof.missingDeps(s, true) {
+		s, err = insertMavenDependency(s, d)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
+		added = append(added, d)
 	}
-	if needPlugin {
+
+	if prof.NeedsSurefirePlugin && !strings.Contains(s, "maven-surefire-plugin") {
 		s, err = insertMavenSurefirePlugin(s)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
 	}
 
 	if s == orig {
-		return false, nil
+		return false, nil, nil
 	}
-	return true, atomicWrite(pomPath, []byte(s))
+	return true, added, atomicWrite(pomPath, []byte(s))
+}
+
+// insertMavenDependency places one rendered dependency inside <dependencies>, creating the section
+// when the POM has none.
+func insertMavenDependency(pom string, d javaDep) (string, error) {
+	const open = "<dependencies>"
+	const closeTag = "</dependencies>"
+	block := renderMavenDep(d)
+	start := strings.Index(pom, open)
+	if start < 0 {
+		return insertBeforeClosingProject(pom, "  <dependencies>"+block+"\n  </dependencies>\n\n"), nil
+	}
+	afterOpen := start + len(open)
+	if closeIdx := strings.Index(pom[afterOpen:], closeTag); closeIdx < 0 {
+		return "", fmt.Errorf("pom.xml: unclosed <dependencies>")
+	}
+	return pom[:afterOpen] + block + "\n" + pom[afterOpen:], nil
 }
 
 func insertMavenJUnitDependency(pom string) (string, error) {

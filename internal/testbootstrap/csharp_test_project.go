@@ -129,17 +129,14 @@ func projectReferencesRel(testDir string, prodCsprojs []string) []string {
 	return out
 }
 
-func renderCSharpTestProject(tfm string, useCPM bool, projRefs []string, withPlaywright bool) string {
-	pkgLines := []string{csharpPkgTestSDK, csharpPkgXunit, csharpPkgRunner}
-	if useCPM {
-		pkgLines = []string{csharpPkgTestSDKCPM, csharpPkgXunitCPM, csharpPkgRunnerCPM}
-	}
-	if withPlaywright {
-		if useCPM {
-			pkgLines = append(pkgLines, csharpPkgPlaywrightCPM)
-		} else {
-			pkgLines = append(pkgLines, csharpPkgPlaywright)
-		}
+// renderCSharpTestProject writes a test project carrying the profile's full package set.
+//
+// It previously emitted a fixed xUnit + Test.Sdk + runner list, which is why a freshly created test
+// project for an ASP.NET Core solution could not compile a single generated integration test.
+func renderCSharpTestProject(tfm string, useCPM bool, projRefs []string, pkgs []csharpPkg) string {
+	pkgLines := make([]string, 0, len(pkgs))
+	for _, pkg := range pkgs {
+		pkgLines = append(pkgLines, renderCSharpPackageRef(pkg, useCPM))
 	}
 	var refs strings.Builder
 	for _, r := range projRefs {
@@ -172,6 +169,9 @@ type dedicatedProjectSpec struct {
 	nameSuffix     string                      // ".Tests" or ".E2E"
 	detectRoot     func(repoAbs string) string // existing root dir for this kind (DetectDedicatedRoot / DetectE2ERoot)
 	withPlaywright bool
+	// packages is the test stack the project is created with. Empty falls back to a plain xUnit
+	// runner set, which is what the E2E path wants.
+	packages []csharpPkg
 }
 
 // writeDedicatedCSharpTestProject creates a single test project under its root (existing dir, else the
@@ -199,39 +199,49 @@ func writeDedicatedCSharpTestProject(repo, gitRoot string, prodCsprojs []string,
 
 	// Central Package Management: when a Directory.Packages.props governs versions, the project must
 	// not pin Version on PackageReference; merge PackageVersion entries into the props instead.
+	pkgs := spec.packages
+	if len(pkgs) == 0 {
+		pkgs = csharpBaseTestPackages(CSharpTestXunit)
+	}
+	if spec.withPlaywright {
+		pkgs = append(append([]csharpPkg(nil), pkgs...), csharpPkg{ID: "Microsoft.Playwright", Version: VersionMicrosoftPlaywrightNuGet})
+	}
+
 	ceiling := centralPackageManagementSearchCeiling(repo, gitRoot, testProjAbs)
 	propsPath := findCentralPackageProps(ceiling, testDir)
 	useCPM := propsPath != ""
 	if useCPM {
-		cpmPkgs := map[string]string{
-			"Microsoft.NET.Test.Sdk":    VersionDotNetTestSDK,
-			"xunit":                     VersionXunit,
-			"xunit.runner.visualstudio": VersionXunitRunnerVS,
-		}
-		if spec.withPlaywright {
-			cpmPkgs["Microsoft.Playwright"] = VersionMicrosoftPlaywrightNuGet
-		}
-		if propsChanged, e := ensureCentralPackageVersions(propsPath, cpmPkgs); e != nil {
+		if propsChanged, e := ensureCentralPackageVersions(propsPath, cpmVersionMap(pkgs)); e != nil {
 			return "", nil, fmt.Errorf("Directory.Packages.props: %w", e)
 		} else if propsChanged {
 			changed = append(changed, propsPath)
 		}
 	}
 
-	content := renderCSharpTestProject(tfm, useCPM, projectReferencesRel(testDir, prodCsprojs), spec.withPlaywright)
+	content := renderCSharpTestProject(tfm, useCPM, projectReferencesRel(testDir, prodCsprojs), pkgs)
 	if err := atomicWrite(testProjAbs, []byte(content)); err != nil {
 		return "", nil, err
 	}
 	changed = append(changed, testProjAbs)
+
+	// A production project whose directory contains testDir would otherwise compile every generated
+	// test itself, without any test packages on its classpath.
+	excluded, err := excludeTestRootFromProductionProjects(testDir, prodCsprojs)
+	if err != nil {
+		return "", nil, err
+	}
+	changed = append(changed, excluded...)
 	return testProjAbs, dedupeAbsPaths(changed), nil
 }
 
-// createDedicatedCSharpTestProject creates a dedicated xUnit UNIT test project under the tests/ root.
-func createDedicatedCSharpTestProject(repo, gitRoot string, prodCsprojs []string, fallbackTFM string) (testProjAbs string, changed []string, err error) {
+// createDedicatedCSharpTestProject creates a dedicated UNIT test project under the tests/ root,
+// carrying the profile's complete package set.
+func createDedicatedCSharpTestProject(repo, gitRoot string, prodCsprojs []string, fallbackTFM string, prof csharpTestProfile) (testProjAbs string, changed []string, err error) {
 	return writeDedicatedCSharpTestProject(repo, gitRoot, prodCsprojs, fallbackTFM, dedicatedProjectSpec{
 		rootDefault: "tests",
 		nameSuffix:  ".Tests",
 		detectRoot:  layout.DetectDedicatedRoot,
+		packages:    prof.Packages,
 	})
 }
 

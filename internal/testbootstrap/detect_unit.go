@@ -2,6 +2,7 @@ package testbootstrap
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,11 +25,24 @@ func DetectUnit(repoPath, lang string) (Report, error) {
 	}
 }
 
+// detectUnitJS reports whether the package already carries the COMPLETE stack its framework needs.
+//
+// Two changes from the previous rule:
+//
+//   - it resolves the package the way bootstrap does (walking to a nested package.json when the repo
+//     root has none) instead of stat-ing the repo root and erroring out. A monorepo without a root
+//     package.json used to fail the whole bootstrap with "no such file or directory";
+//   - "jest is in devDependencies" is no longer sufficient. A React package with plain Jest has no
+//     jsdom environment and no Testing Library, so every generated component test fails on
+//     `document is not defined` — a failure that lives in package.json and the runner config, neither
+//     of which the fix loop may write.
 func detectUnitJS(dir string) (Report, error) {
-	pkgPath := filepath.Join(dir, "package.json")
-	if _, err := os.Stat(pkgPath); err != nil {
+	pkgDir, err := resolveJSPackageDirForBootstrap(dir)
+	if err != nil {
 		return Report{}, err
 	}
+	dir = pkgDir
+	pkgPath := filepath.Join(dir, "package.json")
 	data, err := os.ReadFile(pkgPath)
 	if err != nil {
 		return Report{}, err
@@ -46,13 +60,42 @@ func detectUnitJS(dir string) (Report, error) {
 			return Report{HasFramework: true, Framework: guessFrameworkFromConfig(name), Reason: "found " + name}, nil
 		}
 	}
-	if dep := jsUnitDepFramework(raw); dep != "" {
-		return Report{HasFramework: true, Framework: dep, Reason: "devDependency " + dep}, nil
+	// A runner is present. Ask the framework-aware question: is the stack COMPLETE?
+	runnerName := jsUnitDepFramework(raw)
+	if runnerName == "" {
+		runnerName = jsUnitTestScriptFramework(raw)
 	}
-	if fw := jsUnitTestScriptFramework(raw); fw != "" {
-		return Report{HasFramework: true, Framework: fw, Reason: "scripts.test references " + fw}, nil
+
+	det, derr := detectJSFramework(dir, "")
+	if derr != nil {
+		if runnerName != "" {
+			return Report{HasFramework: true, Framework: runnerName, Reason: "devDependency " + runnerName}, nil
+		}
+		return Report{HasFramework: false, Reason: "no unit test runner deps, scripts, or config found"}, nil
 	}
-	return Report{HasFramework: false, Reason: "no unit test runner deps, scripts, or config found"}, nil
+	prof := buildJSTestProfile(det)
+	if prof.Declined {
+		return Report{HasFramework: true, Framework: string(prof.Framework), Reason: prof.DeclinedReason}, nil
+	}
+	pkg, perr := readJSPackageJSON(dir)
+	if perr != nil {
+		return Report{}, perr
+	}
+	missing := prof.missingDeps(pkg)
+	if len(missing) == 0 && runnerName != "" {
+		return Report{
+			HasFramework: true,
+			Framework:    prof.Stack,
+			Reason: fmt.Sprintf("package.json already carries the full %s (%s) stack: %s",
+				prof.Framework, prof.Stack, strings.Join(describeJSDeps(prof.Deps), ", ")),
+		}, nil
+	}
+	if runnerName == "" && len(missing) == len(prof.Deps) {
+		return Report{HasFramework: false, Framework: prof.Stack, Reason: fmt.Sprintf(
+			"%s package with no unit test runner; %s will be installed", prof.Framework, strings.Join(describeJSDeps(prof.Deps), ", "))}, nil
+	}
+	return Report{HasFramework: false, Framework: prof.Stack, Reason: fmt.Sprintf(
+		"%s package missing %s", prof.Framework, strings.Join(describeJSDeps(missing), ", "))}, nil
 }
 
 func jsUnitDepFramework(packageJSON string) string {
