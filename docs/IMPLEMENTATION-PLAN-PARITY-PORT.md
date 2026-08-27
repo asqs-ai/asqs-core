@@ -367,7 +367,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `in review` |
 | CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `in review` |
 | CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `in review` (A/B outstanding) |
-| CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP50)` |
+| CP46 | Fixer tool access | B30 | CP44 | 3–5 d | `in review` (A/B outstanding) |
 
 ### P8 — External knowledge
 
@@ -381,7 +381,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `blocked (CP06, CP32)` |
-| CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `blocked (CP03)` |
+| CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `ready` |
 | CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `blocked (CP06, CP50)` |
 | CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `blocked (CP03, CP50)` |
 | CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `blocked (CP49, CP50, CP52)` |
@@ -2883,7 +2883,7 @@ setting defaulting to today's behaviour.
 
 ### CP46 — Fixer tool access
 
-- **Status:** `blocked (CP50)` · **Effort:** 3–5 d · **Risk:** medium
+- **Status:** `in review` (code complete; **enabling it is a CP16-measured decision** — see record) · **Effort:** 3–5 d · **Risk:** medium
 
 Tool access inside the fix loop: `completeToolAware`, `resolvedToolMode`, `MultiTurnEffectiveForStep`,
 attempt and cap-hit auditing in `internal/evaluator/llmfix`.
@@ -2893,6 +2893,77 @@ that carries the streak and discard logic. Fixer tool access lands on the *full*
 
 **Acceptance.** A tools-enabled fix round makes tool calls (the upstream failure was zero calls — a
 test must be able to detect that). Ships off by default; enabling it is a CP16-measured decision.
+
+**Implementation record (2026-08-27).**
+
+- **Dependency correction, verified.** This row listed `CP50`, but the plan's own dependency graph
+  (§ "Longest chain") shows `CP44 ── CP45/CP46/CP47` with no CP50 edge, and the code agrees:
+  `internal/evaluator/llmfix` contains **zero** references to CP50's convergence work
+  (`FixLoopState`, write-scope narrowing, the coverage gate, baseline classification) — all of
+  which live in `internal/evaluator`, a different package. The edge was ordering preference, not a
+  code dependency, so this landed on CP44 alone. (`CP50`'s own row was also stale — it read
+  `blocked (CP03)` while CP03 has been `in review` since an earlier session; flipped to `ready`.)
+- **Fixer** — `Tools` / `ToolLoop` fields, `resolvedToolMode`, `completeToolAware` and the
+  `fix.tool_call` / `fix.tool_cap` audit hooks ported into a new `fix_tools.go`. Both completion
+  paths (`completeWithRetry`, `completeWithRetryBuilder`) now route through `completeToolAware`,
+  and **one `RunBudget` is created per `Fix` call** and shared by every attempt below it: the
+  structured→unstructured fallbacks and transient retries re-ask the same question, so their
+  lookups draw from one allowance. A new `Fix` call is a different question and gets a fresh
+  budget. `fixToolsSystemNote` is appended only when tools resolve on — the fixer has no inventory
+  to carry that signal, unlike the generator. `tools_mode` joins `FixRequestAuditMetadata`.
+- **Pipeline** — `fixerToolLoopFromConfig` (its own gate, its own tighter turn default of 3),
+  `buildFixerTools` over a shared `buildToolRegistry`, and `auditFixerToolMode` under `fix.tool_mode`
+  via a shared `auditToolModeFor`. Config gains `generation.fixer_tools_enabled` and
+  `generation.fixer_max_tool_turns`.
+- **Deferred to CP50, with reason:** `MultiTurnEffectiveForStep`. It refines the audit's
+  `multi_turn_effective` key — which core does not emit at all (`FixRequestAuditMetadata` reports
+  only `multi_turn`), and whose correction is CP50's own item 2 ("`multi_turn_effective` must
+  report reality, not intent"). Porting the step-scoped refinement alone would add a method with
+  no caller and an `evaluator.FixMultiTurnIntrospector` interface with no consumer.
+- **Defect found and fixed — the two gates were not actually independent.** `generation.fixer_tools_enabled`
+  documents itself as independent of `tools_enabled`, but the Ollama tool-support probe was gated on
+  `tools_enabled` alone (upstream is the same). Enabling fixer tools by themselves therefore never
+  probed, the client kept its conservative `ToolCalling: false`, and the fix loop resolved to
+  one-shot claiming "provider does not support native tool calling" — a false capability claim,
+  unattributable to its real cause. **Caught by the live run**, which resolved `one_shot` on a model
+  whose template does support tools. The probe now arms on either gate, pinned by
+  `TestProbeOllamaToolSupport_fixerGateAlsoArmsTheProbe`.
+- **Crash fixed in CP43's registry, surfaced by this bundle's live run.** `Registry.Invoke`
+  dispatched on the tool name without re-checking the dependency each tool needs, while
+  `Definitions()` correctly omits unusable tools. The name is **model-chosen** and the fixer's
+  system note lists the whole suite in prose, so a registry built without a chunk store was asked
+  for `search_code`, reached `SearchLexical` on a nil store, and **panicked the process**. Dispatch
+  now refuses an unavailable tool with an error the loop hands back to the model ("do not call it
+  again"), mirroring the unknown-tool path; pinned by
+  `TestInvoke_unadvertisedToolIsRefusedNotCrashed`. Upstream has the same hole, latent because its
+  registry always receives a chunk store.
+- **Two more inert keys wired** (the same field-name collision that hid
+  `runner.disable_structured_generate_output` from CP17's lint):
+  `runner.disable_structured_fix_output` and `runner.fixer_structured_user_message` were never
+  passed to the `Fixer`. Neither changes default behaviour; the first had to be right here because
+  the fixer's tool-mode audit reports on the schema it decides. The evaluator's matching
+  `FixerStructuredUserMessage` option is set from the same key so the audit cannot contradict the
+  fixer. **`runner.disable_multi_turn_fixer` deliberately NOT wired** — its default would flip
+  `MultiTurnRepair` on, a behaviour change owned by the fixer-hardening wave; it stays
+  TRIAGE-exempt.
+- **Acceptance.** The plan asks for a test that can DETECT the upstream failure of zero tool calls:
+  `TestCompleteToolAware_makesAndAuditsToolCalls` asserts a tools-enabled round calls twice and
+  audits both, and it is **mutation-checked** (forcing the one-shot branch fails it). The control
+  arm is pinned too — `TestCompleteToolAware_withoutToolsSendsNoToolFields` asserts no tool fields
+  reach the wire in all three no-tools shapes, which is what makes a fix-quality A/B trustworthy.
+  Ships off by default: `TestFixerToolLoopFromConfig_defaultsToOneShot`, and the independence of
+  the two gates is pinned by `_isIndependentOfGeneration`.
+- **Live** (local Ollama + scratch Postgres): a real `Fix` round on a `cannot find symbol` compile
+  error resolved `native`, audited `fix.tool_mode`, and made **two lookups** —
+  `get_symbol("com.acme.OrderRepository")` (the symbol named in the error) then `read_file_range`
+  on the file it found — before returning a fix. Transient test deleted, scratch rows swept.
+- **A/B obligation.** Per this section, enabling fixer tools is a CP16-measured decision, so the
+  status stays qualified: compare `first_wave_metrics` with `generation.fixer_tools_enabled` off
+  and on (`compile_fix_count`, `test_fix_count`, `eval_iterations`, `llm_total_tokens`) through
+  `asqs-core ab-report`. The `tools_mode` field added here is what lets that split be made by
+  capability rather than by config intent.
+- Full gate green.
+
 
 ---
 
@@ -2991,7 +3062,7 @@ a real fixture asserted on by name. Do not let a `**/bin/` ignore rule near it.
 
 ### CP50 — Fix-loop convergence core
 
-- **Status:** `blocked (CP03)` · **Effort:** 4–5 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high
 
 Four fixes that together are the difference between a loop that converges and one that burns its
 budget:

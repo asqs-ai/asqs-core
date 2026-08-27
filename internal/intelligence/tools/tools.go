@@ -179,20 +179,47 @@ func (r *Registry) Definitions() []model.ToolDefinition {
 // a failed tool call is worth reporting to the model, retrying, or aborting on. Rendering "error:
 // ..." as a successful result would let a typo look like a finding.
 func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage) (string, error) {
+	// Dispatch re-checks the dependency each tool needs, mirroring Definitions.
+	//
+	// Advertising and dispatch are NOT the same gate. The tool name comes from the model, and a
+	// model can name a tool that was never advertised: the fixer's system prompt lists the whole
+	// suite in prose, so a registry built without a chunk store still gets asked for search_code.
+	// Dispatching that reached `r.Chunks.SearchLexical` on a nil store and crashed the process —
+	// observed live. An unavailable tool must answer with an error the loop can hand back to the
+	// model, exactly like an unknown one.
 	switch strings.TrimSpace(name) {
 	case ToolGetSymbol:
+		if r.Meta == nil {
+			return "", errToolUnavailable(ToolGetSymbol, "the symbol index")
+		}
 		return r.getSymbol(ctx, args)
 	case ToolExpandSymbol:
+		if r.Meta == nil {
+			return "", errToolUnavailable(ToolExpandSymbol, "the symbol index")
+		}
 		return r.expandSymbol(ctx, args)
 	case ToolSearchCode:
+		if r.Chunks == nil {
+			return "", errToolUnavailable(ToolSearchCode, "the chunk index")
+		}
 		return r.searchCode(ctx, args)
 	case ToolFindTestsFor:
+		if r.Meta == nil {
+			return "", errToolUnavailable(ToolFindTestsFor, "the symbol index")
+		}
 		return r.findTestsFor(ctx, args)
 	case ToolReadFileRange:
 		return r.readFileRange(args)
 	default:
 		return "", fmt.Errorf("tools: unknown tool %q", name)
 	}
+}
+
+// errToolUnavailable phrases a missing dependency as something the model can act on: it says the
+// tool is unavailable this run, so the model stops asking, rather than reading as a transient
+// failure worth retrying.
+func errToolUnavailable(tool, needs string) error {
+	return fmt.Errorf("tools: %s is not available in this run (%s is not configured); do not call it again", tool, needs)
 }
 
 func decodeArgs(args json.RawMessage, dst any) error {

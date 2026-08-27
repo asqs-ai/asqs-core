@@ -339,7 +339,28 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// because nothing can fetch what an inventory merely names. Getting this backwards produces a
 	// context that promises lookups nobody can perform.
 	formatOpts.ToolsAvailable = generatorHasTools(gen)
-	fixer := &llmfix.Fixer{LLM: trackedFixer, Audit: audit}
+	fixer := &llmfix.Fixer{
+		LLM:   trackedFixer,
+		Audit: audit,
+		// Two more documented keys the pipeline never passed on, so setting them did nothing —
+		// the same field-name collision that hid runner.disable_structured_generate_output from
+		// the inert-field lint (Fixer declares identically named fields). Neither changes default
+		// behaviour; they just make the keys work. disable_structured_fix_output in particular has
+		// to be right here, because the tool-mode audit below reports on the schema it decides.
+		// runner.disable_multi_turn_fixer is deliberately NOT wired: its default would flip
+		// MultiTurnRepair on, which is a behaviour change owned by the fixer-hardening wave.
+		DisableStructuredFixOutput: cfg.Runner.DisableStructuredFixOutput,
+		StructuredUserMessage:      cfg.Runner.FixerStructuredUserMessage,
+	}
+	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
+	// toggled independently so a fix-quality comparison can move one without the other.
+	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs); reg != nil {
+		loop, reason := fixerToolLoopFromConfig(cfg, trackedFixer)
+		fixer.Tools = reg
+		fixer.ToolLoop = loop
+		auditFixerToolMode(ctx, audit, loop.Mode,
+			appendStructuredDeferralNote(reason, trackedFixer, !cfg.Runner.DisableStructuredFixOutput))
+	}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
@@ -519,14 +540,17 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// with a single fix loop across all generated files.
 	fmt.Fprintf(os.Stderr, "asqs-core: evaluating %d generated test file(s) (whole-project compile + test)…\n", len(artifactPaths))
 	evalRes, eerr := evaluator.RunEvaluation(ctx, sandbox, evaluator.EvalOptions{
-		RepoPath:           repoAbs,
-		Lang:               lang,
-		MaxFixIterations:   maxFix,
-		ArtifactPaths:      artifactPaths,
-		Fixer:              fixer,
-		RunE2ETestPass:     anyE2E,
-		CompileOncePerEval: true,
-		FormatAfterFix:     formatAfterFixHook,
+		RepoPath:         repoAbs,
+		Lang:             lang,
+		MaxFixIterations: maxFix,
+		ArtifactPaths:    artifactPaths,
+		Fixer:            fixer,
+		// Keep the evaluator's view of the flag in step with the Fixer's, or the audit payload
+		// (structured_user_message_config / _forced) contradicts what the fixer actually did.
+		FixerStructuredUserMessage: cfg.Runner.FixerStructuredUserMessage,
+		RunE2ETestPass:             anyE2E,
+		CompileOncePerEval:         true,
+		FormatAfterFix:             formatAfterFixHook,
 	}, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)

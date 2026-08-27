@@ -449,3 +449,34 @@ func TestTools_areRepoScoped(t *testing.T) {
 		}
 	}
 }
+
+// Advertising and dispatch are separate gates, and dispatch is the one that faces the model.
+//
+// The tool NAME is model-chosen: the fixer's system prompt lists the whole suite in prose, so a
+// registry built without a chunk store is still asked for search_code. Before this guard that call
+// reached SearchLexical on a nil store and crashed the process — observed on a live fixer round.
+// An unavailable tool must answer with an error the loop can hand back, exactly like an unknown one.
+func TestInvoke_unadvertisedToolIsRefusedNotCrashed(t *testing.T) {
+	ctx := context.Background()
+
+	noChunks := &Registry{Meta: &fakeMeta{}, RepoID: "r"}
+	for _, d := range noChunks.Definitions() {
+		if d.Name == ToolSearchCode {
+			t.Fatal("search_code must not be advertised without a chunk store")
+		}
+	}
+	out, err := noChunks.Invoke(ctx, ToolSearchCode, json.RawMessage(`{"query":"anything"}`))
+	if err == nil {
+		t.Fatalf("search_code without a chunk store returned %q instead of an error", out)
+	}
+	if !strings.Contains(err.Error(), "not available") {
+		t.Errorf("the error should tell the model the tool is unavailable: %v", err)
+	}
+
+	noMeta := &Registry{Chunks: &fakeChunks{}, RepoID: "r"}
+	for _, name := range []string{ToolGetSymbol, ToolExpandSymbol, ToolFindTestsFor} {
+		if _, err := noMeta.Invoke(ctx, name, json.RawMessage(`{"fq_name":"a.B"}`)); err == nil {
+			t.Errorf("%s without a symbol index must be refused", name)
+		}
+	}
+}

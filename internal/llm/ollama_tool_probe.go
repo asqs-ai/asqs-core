@@ -28,7 +28,14 @@ const ollamaToolProbeTimeout = 5 * time.Second
 // HTTP call. Failures are logged and tolerated — an unreachable probe means "no native tools", and
 // the prompted tier still gives the model index access.
 func probeOllamaToolSupport(cfg *config.Config, completers ...model.ChatCompleter) {
-	if cfg == nil || !cfg.Generation.ToolsEnabled {
+	// EITHER loop's gate arms the probe. Upstream checks only generation.tools_enabled, which
+	// silently breaks the independence generation.fixer_tools_enabled documents: on Ollama, a run
+	// that enables fixer tools alone never probes, the client keeps its conservative
+	// ToolCalling=false, and the fixer resolves to one-shot with "provider does not support native
+	// tool calling" — a capability claim that is false, and unattributable to the real cause.
+	// Verified live before this guard: fixer_tools_enabled alone resolved one_shot on a model whose
+	// template does support tools.
+	if cfg == nil || (!cfg.Generation.ToolsEnabled && !cfg.Generation.FixerToolsEnabled) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ollamaToolProbeTimeout)
@@ -71,7 +78,7 @@ func warnMissingNumCtx(cfg *config.Config, modelID string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr,
-		"ollama: llm.ollama_num_ctx is unset and generation tools are enabled — tool calls on %s "+
+		"ollama: llm.ollama_num_ctx is unset and tools are enabled — tool calls on %s "+
 			"will be refused. Set it (e.g. 32768); Ollama silently truncates past the window and a "+
 			"tool loop overflows a default one quickly.\n", modelID)
 }

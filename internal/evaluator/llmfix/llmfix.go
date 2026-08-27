@@ -17,6 +17,7 @@ import (
 	"github.com/asqs/asqs-core/internal/evaluator"
 	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
+	"github.com/asqs/asqs-core/internal/intelligence/tools"
 )
 
 // Fixer uses the LLM to produce fixed file content when compile or test fails.
@@ -42,6 +43,11 @@ type Fixer struct {
 	// keeps the legacy layout. Older / weaker models may handle tagged blocks worse; the flag is
 	// meant for providers that follow structural cues more reliably (e.g. GPT-4-class models).
 	StructuredUserMessage bool
+	// Tools optionally gives the model read-only access to the index while fixing. Nil is the
+	// one-shot path: the model gets the error log and the artifact, and one turn.
+	Tools tools.ToolInvoker
+	// ToolLoop bounds that access. Its zero Mode means one-shot regardless of Tools.
+	ToolLoop tools.LoopOptions
 
 	mu               sync.Mutex
 	convRepoPath     string
@@ -59,6 +65,9 @@ func (f *Fixer) FixRequestAuditMetadata() map[string]any {
 		"multi_turn":                  f.MultiTurnRepair,
 		"structured_output_requested": !f.DisableStructuredFixOutput,
 		"structured_user_message":     f.StructuredUserMessage,
+		// tools_mode records what the model could actually DO on this request, so a fix-quality
+		// A/B can split runs by capability rather than by config intent.
+		"tools_mode": string(f.resolvedToolMode()),
 	}
 }
 
@@ -148,6 +157,16 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		system = defaultFixPrompt
 	}
 	system = augmentFixSystemPrompt(system, req)
+	if f.resolvedToolMode() != tools.ModeOneShot {
+		system += fixToolsSystemNote
+	}
+	// One tool budget for this Fix call, shared by every completion attempt below. The structured→
+	// unstructured fallbacks and transient retries re-ask the SAME question, so their lookups draw
+	// from one allowance rather than starting fresh — the same invariant the generator holds per
+	// gap. A fresh budget per attempt would let a flapping provider multiply index load by the
+	// retry count. Each new Fix call (a new fix attempt with new errors) IS a different question
+	// and gets a fresh budget.
+	toolBudget := &tools.RunBudget{}
 
 	structuredOn := !f.DisableStructuredFixOutput
 	// useStructuredUser resolves the tagged-<error>/<file> user-message layout: it's on when the
@@ -184,15 +203,15 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 	}
 	completeMain := func() (content string, sentUser string, err error) {
 		opts := f.fixCompleteOpts(structuredOn, req)
-		result, sentUser, err := f.completeWithRetryBuilder(ctx, buildMainUser, opts)
+		result, sentUser, err := f.completeWithRetryBuilder(ctx, buildMainUser, opts, toolBudget)
 		if err != nil && structuredOn && isStructuredOutputAPIError(err) {
 			structuredOn = false
-			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req))
+			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req), toolBudget)
 		}
 		// Large json_schema bodies + long JS/TS logs occasionally yield mid-stream EOF from the API or proxies.
 		if err != nil && structuredOn && isTransientNetworkError(err) {
 			structuredOn = false
-			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req))
+			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req), toolBudget)
 		}
 		if err != nil {
 			return "", "", err
@@ -234,9 +253,9 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		model.Message{Role: "user", Content: repairFixJSONUserMessage},
 	)
 	repairOpts := f.fixCompleteOpts(structuredOn, req)
-	repairResult, err2 := f.completeWithRetry(ctx, repairMsgs, repairOpts)
+	repairResult, err2 := f.completeWithRetry(ctx, repairMsgs, repairOpts, toolBudget)
 	if err2 != nil && structuredOn && (isStructuredOutputAPIError(err2) || isTransientNetworkError(err2)) {
-		repairResult, err2 = f.completeWithRetry(ctx, repairMsgs, f.fixCompleteOpts(false, req))
+		repairResult, err2 = f.completeWithRetry(ctx, repairMsgs, f.fixCompleteOpts(false, req), toolBudget)
 	}
 	if err2 != nil {
 		f.convMsgs = savedConv
@@ -292,7 +311,7 @@ func sleepFixerOuterRetry(ctx context.Context, attempt int) error {
 	}
 }
 
-func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
+func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, error) {
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = 8192
 	}
@@ -302,7 +321,7 @@ func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message,
 	var result *model.CompleteResult
 	var err error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err = f.LLM.Complete(ctx, messages, opts)
+		result, err = f.completeToolAware(ctx, messages, opts, budget)
 		if err == nil {
 			f.auditFixCompletionWarnings(ctx, result)
 			return result, nil
@@ -419,7 +438,7 @@ func (f *Fixer) auditFixCompletionWarnings(ctx context.Context, res *model.Compl
 
 // completeWithRetryBuilder calls Complete; on transient errors it bumps retryLevel, rebuilds messages
 // (tighter prompt budgets via build), sleeps with jitter, and retries. Returns the user string from the last build attempt.
-func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLevel int) ([]model.Message, string), opts model.CompleteOptions) (*model.CompleteResult, string, error) {
+func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLevel int) ([]model.Message, string), opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, string, error) {
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = 8192
 	}
@@ -432,7 +451,7 @@ func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLe
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		msgs, u := build(retryLevel)
 		sentUser = u
-		result, err = f.LLM.Complete(ctx, msgs, opts)
+		result, err = f.completeToolAware(ctx, msgs, opts, budget)
 		if err == nil {
 			f.auditFixCompletionWarnings(ctx, result)
 			// A front-truncated prompt SUCCEEDED as far as the provider is concerned, but the

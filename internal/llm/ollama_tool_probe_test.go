@@ -125,6 +125,26 @@ func TestProbeOllamaToolSupport_skippedWhenToolsDisabled(t *testing.T) {
 	}
 }
 
+// The fixer's gate arms the probe on its own. Without this, enabling fixer tools alone leaves the
+// Ollama client at its conservative ToolCalling=false and the fix loop resolves to one-shot with
+// "provider does not support native tool calling" — a false capability claim, and the independence
+// that generation.fixer_tools_enabled documents would only hold on providers that need no probe.
+func TestProbeOllamaToolSupport_fixerGateAlsoArmsTheProbe(t *testing.T) {
+	probes := 0
+	srv := ollamaProbeServer(t, []string{"tools"}, &probes)
+	c := ollamaClient(t, srv.URL)
+
+	cfg := &config.Config{}
+	cfg.Generation.FixerToolsEnabled = true
+	probeOllamaToolSupport(cfg, c)
+	if probes != 1 {
+		t.Fatalf("probed %d time(s) with only fixer tools enabled, want 1", probes)
+	}
+	if caps, declared := model.DeclaredCapabilitiesOf(c); !declared || !caps.ToolCalling {
+		t.Fatalf("probe result not applied: declared=%v caps=%+v", declared, caps)
+	}
+}
+
 // Non-Ollama completers must be ignored rather than mishandled.
 func TestProbeOllamaToolSupport_ignoresOtherProviders(t *testing.T) {
 	cfg := &config.Config{}

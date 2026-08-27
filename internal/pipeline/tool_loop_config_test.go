@@ -84,3 +84,51 @@ func TestToolLoopFromConfig_nilConfigIsOneShot(t *testing.T) {
 		t.Errorf("nil config must be one-shot with a reason: %q / %q", opts.Mode, reason)
 	}
 }
+
+// The fixer's gate is independent of generation's: a fix-quality A/B has to move one without the
+// other, so tools_enabled must not turn the fixer's loop on.
+func TestFixerToolLoopFromConfig_isIndependentOfGeneration(t *testing.T) {
+	cc := &capsCompleter{caps: &model.Capabilities{ToolCalling: true}}
+
+	genOnly := &config.Config{}
+	genOnly.Generation.ToolsEnabled = true
+	if opts, _ := fixerToolLoopFromConfig(genOnly, cc); opts.Mode != tools.ModeOneShot {
+		t.Fatalf("fixer mode = %q with only generation enabled; the two gates must be independent", opts.Mode)
+	}
+
+	fixOnly := &config.Config{}
+	fixOnly.Generation.FixerToolsEnabled = true
+	opts, reason := fixerToolLoopFromConfig(fixOnly, cc)
+	if opts.Mode != tools.ModeNative {
+		t.Fatalf("mode = %q (%s), want native", opts.Mode, reason)
+	}
+	// The fixer's turn default is deliberately tighter than generation's: each extra turn
+	// multiplies across fix attempts, not just gaps.
+	if opts.MaxTurns != DefaultFixerMaxToolTurns {
+		t.Fatalf("MaxTurns = %d, want the fixer default %d", opts.MaxTurns, DefaultFixerMaxToolTurns)
+	}
+	if DefaultFixerMaxToolTurns >= tools.DefaultMaxToolTurns {
+		t.Fatalf("the fixer default (%d) must be tighter than generation's (%d)", DefaultFixerMaxToolTurns, tools.DefaultMaxToolTurns)
+	}
+
+	explicit := &config.Config{}
+	explicit.Generation.FixerToolsEnabled = true
+	explicit.Generation.FixerMaxToolTurns = 7
+	if opts, _ := fixerToolLoopFromConfig(explicit, cc); opts.MaxTurns != 7 {
+		t.Fatalf("MaxTurns = %d, want the configured 7", opts.MaxTurns)
+	}
+}
+
+// Ships off by default, like generation's.
+func TestFixerToolLoopFromConfig_defaultsToOneShot(t *testing.T) {
+	opts, reason := fixerToolLoopFromConfig(&config.Config{}, &capsCompleter{caps: &model.Capabilities{ToolCalling: true}})
+	if opts.Mode != tools.ModeOneShot {
+		t.Fatalf("mode = %q, want one_shot by default", opts.Mode)
+	}
+	if reason == "" {
+		t.Error("a downgrade must carry a reason for the audit")
+	}
+	if buildFixerTools(&config.Config{}, nil, nil, nil, "r", "java", "/tmp") != nil {
+		t.Error("a default config must build no fixer registry")
+	}
+}

@@ -529,9 +529,6 @@ type LLMConfig struct {
 // The defaults are deliberately small. Every extra turn is a round trip paid per gap, so an
 // unbounded loop is a cost and latency hazard rather than merely a slow one — and against a local
 // Ollama, the single-process case this project targets, it is also a queue.
-//
-// The fixer's own gates (fixer_tools_enabled, fixer_max_tool_turns) arrive with the bundle that
-// gives the fix loop tool access (CP46) — a key without its reader would be a dead letter.
 type GenerationConfig struct {
 	// ToolsEnabled turns the loop on. False is the previous one-shot behaviour, byte-identical on
 	// the wire. Env: GENERATION_TOOLS_ENABLED.
@@ -554,6 +551,18 @@ type GenerationConfig struct {
 	// and the loop stops requesting tools. 0 = tools.DefaultMaxToolResultChars (24000).
 	// Env: GENERATION_MAX_TOOL_RESULT_CHARS.
 	MaxToolResultChars int `yaml:"max_tool_result_chars" env:"GENERATION_MAX_TOOL_RESULT_CHARS"`
+
+	// FixerToolsEnabled gives the FIXER the same read-only tool suite during compile/test repair.
+	// Independent of tools_enabled deliberately: a fix-quality A/B needs to toggle fixer tools
+	// while generation stays fixed, and vice versa. False is the previous one-shot fixer,
+	// byte-identical on the wire. Env: GENERATION_FIXER_TOOLS_ENABLED.
+	FixerToolsEnabled bool `yaml:"fixer_tools_enabled" env:"GENERATION_FIXER_TOOLS_ENABLED"`
+	// FixerMaxToolTurns caps the fixer's model→tool→model round trips. 0 =
+	// DefaultFixerMaxToolTurns (3) — smaller than generation's 4 because a fix attempt starts from
+	// a narrower question (one error log against one artifact) and runs inside the evaluator's
+	// iteration budget, so each extra turn multiplies across fix attempts, not just gaps.
+	// Env: GENERATION_FIXER_MAX_TOOL_TURNS.
+	FixerMaxToolTurns int `yaml:"fixer_max_tool_turns" env:"GENERATION_FIXER_MAX_TOOL_TURNS"`
 }
 
 // RunnerConfig configures the test/CI runner (e.g. Docker).
