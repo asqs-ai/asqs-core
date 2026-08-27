@@ -352,7 +352,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `blocked (CP35, CP59)` |
+| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `blocked (CP59)` |
 | CP37 | Constants freeze | C2 | CP36 | 1–2 d | `blocked (CP36)` |
 | CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `blocked (CP36, CP37)` |
 | CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `blocked (CP38)` |
@@ -374,16 +374,16 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `ready` |
-| CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `blocked (CP43, CP11)` |
+| CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `ready` |
 
 ### P9 — Evaluator and fix loop *(highest per-day value here — see §2.5-5)*
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `blocked (CP06, CP32)` |
+| CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `ready` |
-| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `blocked (CP06, CP50)` |
-| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `blocked (CP03, CP50)` |
+| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `blocked (CP50)` |
+| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `blocked (CP50)` |
 | CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `blocked (CP49, CP50, CP52)` |
 
 ### P10 — Language indexers
@@ -391,13 +391,13 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP54 | C# per-project compilation | B24 | — | 4–5 d | `ready` |
-| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `blocked (CP54, CP07)` |
+| CP55 | C# parameterized FQNames | B25 | CP54, CP07 | 2–3 d | `blocked (CP54)` |
 
 ### P12 — Framework-aware test bootstrap *(a whole upstream wave, previously unbundled — §2.5-6)*
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP58 | Detection, per-language profiles, smoke verification, goal runners | `21d25de` + `6e693f4` | CP06, CP32, CP33 | 8–10 d | `blocked (CP06, CP32, CP33)` |
+| CP58 | Detection, per-language profiles, smoke verification, goal runners | `21d25de` + `6e693f4` | CP06, CP32, CP33 | 8–10 d | `ready` |
 | CP59 | The bootstrap → generation contract (`.asqs/test-stack.json`) | `21d25de`, `8640c59` | CP58 | 3–4 d | `blocked (CP58)` |
 
 ### P11 — Documentation and release
@@ -3005,7 +3005,7 @@ Results are nonce-framed so a search result cannot impersonate an instruction bl
 
 ### CP48 — Dependency doc indexing
 
-- **Status:** `blocked (CP43, CP11)` · **Effort:** 5–6 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** medium
 
 The offline alternative to CP47: ingest API documentation that is already on disk — Maven
 sources-jars, NuGet XML documentation files, `node_modules` `.d.ts` — into the index so the model can
@@ -3033,7 +3033,7 @@ improvement here is live on every core run.
 
 ### CP49 — `internal/evaluator/apisurface` (and the generator-file merge)
 
-- **Status:** `blocked (CP06, CP32)` · **Effort:** 5–6 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** medium
 
 **The semantic wall.** The fixer is asked to repair a compile error against a type it cannot see —
 it invents members, and the next round invents different ones. This package extracts the **real** API
@@ -3112,7 +3112,7 @@ inherited and does not consume the budget.
 
 ### CP51 — Extend-merge and artifact identity
 
-- **Status:** `blocked (CP06, CP50)` · **Effort:** 5–6 d · **Risk:** high
+- **Status:** `blocked (CP50)` · **Effort:** 5–6 d · **Risk:** high
 
 1. **Import union on every extend-existing merge**, Java **and** C#. Hoist top-level imports; model
    import *kind* rather than a static/global boolean; handle the C# anchor chain, alias collisions and
@@ -3130,7 +3130,7 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
 
 ### CP52 — Fix-loop breakers and audit honesty
 
-- **Status:** `blocked (CP03, CP50)` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `blocked (CP50)` · **Effort:** 2–3 d · **Risk:** medium
 
 1. Extract `checkFixLoopBreakers` and the three thresholds (`repeatStopThreshold`,
    `recurrenceStopThreshold`, `noProgressStopThreshold`) from `applyLLMFix`, which is currently one
@@ -3197,7 +3197,7 @@ became fully qualified. Unresolved invocations are counted and audited (CP03).
 
 ### CP55 — C# parameterized FQNames
 
-- **Status:** `blocked (CP54, CP07)` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `blocked (CP54)` · **Effort:** 2–3 d · **Risk:** medium
 
 Overloads become distinct end to end; edges bind the exact overload; generic declarations carry `<T>`.
 Needs a **forced reindex** on the legacy format (automatic, detected), a migration for the simple-name
@@ -3231,7 +3231,7 @@ the thing P6 exists to avoid.
 
 ### CP58 — Detection, profiles, smoke verification, goal runners
 
-- **Status:** `blocked (CP06, CP32, CP33)` · **Effort:** 8–10 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 8–10 d · **Risk:** high
 
 **Scope: 15 of the wave's 17 new files.** The other two — `contract_profiles.go` and
 `contract_writer.go` — belong to CP59, which owns the contract they write. (By commit provenance the
