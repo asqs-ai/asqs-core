@@ -363,9 +363,9 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `in review` |
-| CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `ready` |
-| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `ready` |
-| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP42, CP43)` |
+| CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `in review` |
+| CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `in review` |
+| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `ready` |
 | CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `blocked (CP44, CP16)` |
 | CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP44, CP50)` |
 
@@ -373,7 +373,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `blocked (CP43, CP44)` |
+| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `blocked (CP44)` |
 | CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `blocked (CP43, CP11)` |
 
 ### P9 — Evaluator and fix loop *(highest per-day value here — see §2.5-5)*
@@ -2661,14 +2661,35 @@ turn round-trips, malformed arguments produce `ToolCallArgsError` rather than a 
 
 ### CP42 — Prompted-JSON fallback and mode resolution
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** low
+- **Status:** `in review` · **Effort:** 2–3 d · **Risk:** low
 
 A three-tier `ResolveMode`: native tools → prompted-JSON tools → no tools. The extractor is
 `internal/jsonx` (CP06), shared rather than duplicated. Copilot registration is **excluded**.
 
+**Implementation record (2026-08-27).**
+
+- `prompted.go` ported verbatim (imports re-based): the three-tier `ResolveMode` with its
+  downgrade reasons (undeclared ≠ incapable — an undeclared provider gets prompted mode, because
+  prompted mode works on anything that follows instructions), `PromptedInstructions` (one call
+  per turn — the model has no call ids to correlate parallel results), and `ParsePromptedCall`
+  (scans EVERY object in the reply via the shared `jsonx.ExtractObjectFrom` per this section's
+  extractor note; accepts the OpenAI-trained `"name"` spelling; unknown tools and malformed
+  arguments yield (nil, false), never a dispatched hallucination). `prompted_test.go` whole.
+- **Scope boundary, recorded:** `ResolveMode`'s only production caller upstream is
+  `tools/config.go` (CP44's loop-config resolution), and `PromptedInstructions` /
+  `ParsePromptedCall` are called only from `loop.go` (CP44). So this bundle lands the mechanism;
+  the wiring — and therefore the `generation.prompted_tools_enabled` key, whose only reader is
+  that wiring — arrives with CP44, same dead-key discipline as CP41's GenerationConfig decision.
+- **Copilot registration excluded** resolves to: nothing to exclude in this file. The Copilot
+  linkage upstream is `llm/copilot/retrieval_tools.go` (the SDK adapter over the CP43 Registry)
+  plus the workflow session paths — all inside the enterprise seam core already carries (the
+  copilot block was deleted in CP17).
+- Full gate green.
+
+
 ### CP43 — Read-only retrieval tool suite
 
-- **Status:** `ready` · **Effort:** 4 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 4 d · **Risk:** medium
 
 Five tools in a new `internal/intelligence/tools`: symbol lookup, chunk/similar search, file read,
 `expand_symbol`, and the inventory. Path containment comes from `internal/pathsafe` (CP06), shared
@@ -2681,9 +2702,38 @@ with the fixer's shell allow-list.
 **Acceptance.** Every tool is read-only — a test asserts no handler writes. A path outside the repo
 root is refused, with the traversal attempt counted (CP03).
 
+**Implementation record (2026-08-27).**
+
+- New `internal/intelligence/tools`: `tools.go` (Registry, `MetaReader`/`ChunkReader` seams,
+  `ToolInvoker`, definitions with omit-when-unusable, dispatch, the `capped`/`truncateN`/
+  `LastResultTruncated` truncation machinery CP44's attempt flag reads) and `handlers.go` (the
+  five tools: `get_symbol`, `expand_symbol`, `search_code`, `find_tests_for`, `read_file_range`),
+  both at upstream end state minus two strips, each marked in-file: the websearch fields/tools/
+  miss-rung (**CP47** — `missFollowUpHint(false)` is "" so the miss message is byte-identical)
+  and the `ThirdPartySurface` classpath rung (**CP49**). The **section's correction stands
+  verified**: `expand_symbol` calls `metadata.ExpandGraph` (CP12) — no `graphquery` anywhere.
+- Came along at end state, in scope: the **B55 read side** (`dependencyDocForSymbol` — answers a
+  get_symbol miss from ingested dependency docs; core has the `ChunkTypeDependencyDoc` +
+  `MetadataContains` plumbing since CP21, and the rung simply finds nothing until ingestion
+  lands) with `dependency_doc_test.go`; the **B25 read side** (`bareFQLookup` optional-interface
+  fallback in `resolveSymbol` — core's store implements `ListSymbolsByBareFQName` only with
+  CP55, so the assertion stays dormant in production while the ported test drives it through a
+  fake); and the `search_code` **per-result budget share** (`shareBudget` max-min fair /
+  `fitWithin` rune-safe marker-inclusive trim) with `search_code_budget_test.go`.
+- **Acceptance.** Read-only: ported traversal + symlink-escape refusal tests pass, and the
+  core-authored `TestPackage_handlersNeverWriteOrExec` scans the package's production sources for
+  write/exec identifiers — upstream states the boundary in the package doc but has no such
+  guard; this section's acceptance asks for one, so it was authored. Refusal **counting**: the
+  refusal error becomes `Attempt.Err` in the loop's `OnAttempt` hook feeding the CP03 audit sink
+  — that half of the acceptance lands with CP44 (verified upstream has no separate traversal
+  counter in this package).
+- No production caller yet by design: the Registry's consumers upstream are the loop
+  (CP44), the fixer tools (CP50-era), and enterprise session/copilot paths. Full gate green.
+
+
 ### CP44 — Bounded generation tool loop, budgets, attempt audit
 
-- **Status:** `blocked (CP42, CP43)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** high
 
 `internal/intelligence/tools/loop.go` + `config.go`, wired into `internal/generator/llm_generator.go`.
 Caps on turns per run, calls per turn, calls per run, and result characters per run.
