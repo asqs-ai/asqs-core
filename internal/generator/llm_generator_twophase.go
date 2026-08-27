@@ -221,6 +221,12 @@ func (g *LLMGenerator) generateFromConversation(ctx context.Context, messages []
 
 func (g *LLMGenerator) generateTwoPhase(ctx context.Context, item *retrieval.TestPlanItem, contextStr string, isE2E bool, itemLang, suggestedPath string, useStructured bool) (content string, path string, err error) {
 	sys1 := g.buildGeneratorSystem(item, isE2E, itemLang, genModePhase1)
+	// Both knowledge blocks belong on BOTH phases, and neither was here: the framework API surface
+	// was dropped when this path was ported, so a gap that took the two-phase route was generated
+	// against a prompt missing everything api_surface.go contributes — while the single-pass route
+	// got it. Phase 1 needs them most of all, since phase 1 is where imports are written.
+	sys1 += g.pregenerateAPISurface(ctx, itemLang, isE2E)
+	sys1 += g.testStackSystemBlock()
 	if useStructured {
 		sys1 += structuredTestJSONSystemSuffix(suggestedPath)
 	}
@@ -249,6 +255,8 @@ func (g *LLMGenerator) generateTwoPhase(ctx context.Context, item *retrieval.Tes
 	}
 
 	sys2 := g.buildGeneratorSystem(item, isE2E, itemLang, genModePhase2)
+	sys2 += g.pregenerateAPISurface(ctx, itemLang, isE2E)
+	sys2 += g.testStackSystemBlock()
 	if useStructured {
 		sys2 += structuredTestJSONSystemSuffix(suggestedPath)
 	}

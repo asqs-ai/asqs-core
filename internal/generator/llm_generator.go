@@ -136,6 +136,11 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	// where a small model weights it most heavily. Only the framework block belongs here: it is
 	// stable per (language, layer, framework), which is what makes caching it sound.
 	system += g.pregenerateAPISurface(ctx, itemLang, isE2E)
+	// The bootstrap contract, when one exists, is the most reliable statement available about what
+	// is on the test classpath, so it outranks anything the model infers from build files. Absent
+	// (bootstrap disabled — the default — or the repository already had its tooling) it renders
+	// nothing and the prompt is byte-identical to what it was before this existed.
+	system += g.testStackSystemBlock()
 	if useStructured {
 		system += structuredTestJSONSystemSuffix(suggestedPath)
 	}

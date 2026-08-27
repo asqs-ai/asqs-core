@@ -244,6 +244,11 @@ func shipRun(ctx context.Context, cfg *config.Config, gitRepo *repo.Repo, origin
 			}
 		}
 	}
+	// `.asqs/` holds both run scratch and caches meant to outlive the run, and `Add(".")` cannot
+	// tell them apart. Clear it first, keeping only the paths that are supposed to reach the next
+	// run through this repository's clone — chiefly the project-intel cache, which core already
+	// commits today and which this must not silently stop committing.
+	pipeline.RemoveRepoAsqsDirForShip(gitRepo.Path, cfg)
 	if err := gitRepo.Add("."); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}

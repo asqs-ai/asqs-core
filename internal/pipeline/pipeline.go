@@ -340,6 +340,15 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		fmt.Fprintf(os.Stderr, "asqs-core: no API-surface provider for %s; the fixer gets no member-signature block\n", lang)
 	}
 
+	// The bootstrap contract's two halves have different authors: bootstrap states what it
+	// installed, running its toolchain in an ephemeral container, while the API-surface provider
+	// resolves this project's real compile classpath on the host. Only the second can tell Spring
+	// Boot 3 from Spring Boot 4, so it is filled in here — once per run, before the per-gap
+	// generation fan-out reads the contract, and BEFORE the audit so the audited payload is the one
+	// generation will actually see. Both calls are no-ops without a contract, which is the default.
+	generator.ResolveTestStackCanonicalImports(ctx, audit, apiSurface, repoAbs, lang)
+	generator.AuditTestStackContract(ctx, audit, repoAbs)
+
 	rules := contract.ByLang(lang)
 	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
 	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).

@@ -352,7 +352,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `blocked (CP59)` |
+| CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `ready` |
 | CP37 | Constants freeze | C2 | CP36 | 1–2 d | `blocked (CP36)` |
 | CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `blocked (CP36, CP37)` |
 | CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `blocked (CP38)` |
@@ -398,7 +398,7 @@ implementation record can be found; it is provenance, not instruction.
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
 | CP58 | Detection, per-language profiles, smoke verification, goal runners | `21d25de` + `6e693f4` | CP06, CP32, CP33 | 8–10 d | `in review` |
-| CP59 | The bootstrap → generation contract (`.asqs/test-stack.json`) | `21d25de`, `8640c59` | CP58 | 3–4 d | `ready` (task 2 landed with CP58 — see its record) |
+| CP59 | The bootstrap → generation contract (`.asqs/test-stack.json`) | `21d25de`, `8640c59` | CP58 | 3–4 d | `in review` |
 
 ### P11 — Documentation and release
 
@@ -2457,7 +2457,7 @@ between the two products.**
 
 ### CP36 — Housekeeping: dead keys, lint upgrade, golden fixtures
 
-- **Status:** `blocked (CP35)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
 
 **Verified inert config in core today** (zero readers outside `internal/config`, checked by grep):
 
@@ -3822,7 +3822,7 @@ rationale.
 
 ### CP59 — The bootstrap → generation contract
 
-- **Status:** `ready` — task 2 (`contract_profiles.go` + `contract_writer.go`) landed with CP58, which could not compile without it · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `in review` — task 2 (`contract_profiles.go` + `contract_writer.go`) landed with CP58, which could not compile without it · **Effort:** 3–4 d · **Risk:** medium
 
 A successful (or skipped-because-complete) bootstrap writes **`.asqs/test-stack.json`** — an
 authoritative allow-list of importable test libraries, read by the generation prompt builder so the
@@ -3867,6 +3867,52 @@ With one, a library outside the allow-list is not offered to the model. **A ship
 `.asqs/` path except the preserved caches**, asserted per-path — including a regression test that
 `project-intel-cache.json` is still staged, since that is existing behaviour this bundle could
 silently break. A preserve entry containing `..` is refused.
+
+#### Implementation record
+
+Tasks 1 and 2 needed no work: `internal/teststack/contract.go` is byte-identical to upstream's and
+the two contract files landed with CP58 as the status line said.
+
+**Task 3 — the prompt block.** `project_config_teststack.go` becomes
+`internal/generator/test_stack_contract.go`. The port is faithful; the placement is not, because core
+has no `project_config.go` to hang it off. Upstream inserts it into a per-item project-config
+section; core appends it to the **system message**, next to `pregenerateAPISurface`, for that block's
+own stated reason — the contract is fixed for the whole run, so repeating it per gap would vary
+nothing and cost tokens on every call. It goes in before `structuredTestJSONSystemSuffix` so the
+output-format instruction stays last, where a small model weights it most.
+
+Two upstream helpers were renamed to avoid collisions in core's larger `generator` package:
+`sortedKeys` → `sortedImportKeys`, `nonEmpty` → `nonEmptyContractField`.
+
+**A live defect found and fixed: core's two-phase generation was dropping prompt blocks.** Upstream's
+`generateTwoPhase` appends `pregenerateAPISurface` to both `sys1` and `sys2`; core's does neither, and
+has not since the path was ported. Any gap taking the two-phase route was generated against a prompt
+missing everything `api_surface.go` contributes — while single-pass gaps got it, with nothing in the
+audit to distinguish them. Phase 1 is where imports are written, so this is precisely the phase that
+needed it. Both blocks now go on both phases, and a test drives `Generate` through each route and
+asserts the contract reaches every system message. Mutation-checked: removing the `sys1` line fails it.
+Fixing this is arguably CP49's territory (§2.2 gives it `api_surface.go`), but leaving a known
+prompt-assembly hole while editing the two lines above it was not defensible.
+
+**Task 4 — the pre-ship cleanup.** `internal/pipeline/asqs_dir_ship.go`, called at
+`cmd/asqs-core/main.go` immediately before `gitRepo.Add(".")`. Upstream's version carries its own
+containment check (`pathUnderRepoRoot`, `failureHintRelPathLooksSafe`); core uses
+`pathsafe.ContainedRelPath` instead, which is what that package exists for — a second copy of a
+containment check is a second chance to get it subtly wrong. Containment is checked **twice**, when
+the preserve list is built and again at the restore site, because those are separate entry points and
+only the second one writes files; a test drives the restore site directly with `../victim.txt` to
+prove it.
+
+The preserve list is derived from config, not hardcoded: project-intel cache when project intel and
+its cache are both on, the web-search cache when `websearch.enabled`, and the failure hint on either
+trigger (persistence set, or an explicit path). `retrieval.failure_hint_file` is operator-controlled,
+so it is the one entry where the containment check can actually bite — everything else is a constant
+under `.asqs/`.
+
+**Deferred:** no end-to-end ship test. Core has no harness that runs a real ship against a temp git
+repository, so the cleanup is tested directly and its call site is a single line at
+`cmd/asqs-core/main.go`. The plan's "stages no `.asqs/` path except the preserved caches" is asserted
+against the filesystem after cleanup rather than against `git status`.
 
 ---
 
