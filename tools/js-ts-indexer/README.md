@@ -11,7 +11,7 @@ npm install
 npm run build
 ```
 
-**Docker indexing (QualityBot):** With **`indexer.execution: docker`**, Go runs `node dist/index.js` inside **`node:20-bookworm`** (or **`indexer.docker_node_image`**). The whole **`tools/js-ts-indexer`** tree (including **`node_modules`**) is mounted read-only at **`/indexer`**; the repo at **`/workspace`**; JSONL is written to a host temp file mounted at **`/out/asqs-jst-index.jsonl`**. Heap size: **`indexer.docker_node_heap_mb`** (default 4096). Shared flags: **`docker_cli`**, **`docker_memory`**, **`docker_cpus`**, **`docker_network`**.
+**Docker indexing (QualityBot):** With **`indexer.execution: docker`**, Go runs `node dist/index.js` inside **`node:20-bookworm`** (or **`indexer.docker.node_image`**). The whole **`tools/js-ts-indexer`** tree (including **`node_modules`**) is mounted read-only at **`/indexer`**; the repo at **`/workspace`**; JSONL is written to a host temp file mounted at **`/out/asqs-jst-index.jsonl`**. Heap size: **`indexer.docker.node_heap_mb`** (default 4096). Shared: **`indexer.docker.cli`**, **`indexer.docker.memory`**. CPU limits and the container network are constants (CP37).
 
 Integration smoke:
 

@@ -9,17 +9,17 @@ import (
 // running and meeting a broken environment. No edit to a generated test can repair any of them.
 const (
 	// KindToolchainMissing: the build tool is not on the service account's PATH.
-	// runner.type: local only — a container image always supplies its own toolchain.
+	// general.sandbox.type: local only — a container image always supplies its own toolchain.
 	KindToolchainMissing = "toolchain_missing"
 	// KindToolchainNotExecutable: a build wrapper exists but could not be executed.
-	// runner.type: local only, for the same reason.
+	// general.sandbox.type: local only, for the same reason.
 	KindToolchainNotExecutable = "toolchain_not_executable"
 	// KindBrowsersMissing: an E2E runner could not find its browsers (or their OS dependencies).
 	// Occurs under BOTH runner types: on a host when e2e_framework_bootstrap has not installed
 	// them, and under Docker when the Playwright image override did not apply. No edit to a
 	// generated test can install a browser.
 	KindBrowsersMissing = "browsers_missing"
-	// KindStepTimeout: the step was killed at runner.timeout. Occurs under BOTH runner types —
+	// KindStepTimeout: the step was killed at general.sandbox.timeout. Occurs under BOTH runner types —
 	// the Docker path used to discard its deadline error, so a timed-out container surfaced as an
 	// ordinary test failure and matched nothing here (runner.sandboxStepFailure fixed that).
 	KindStepTimeout = "step_timeout"
@@ -173,13 +173,13 @@ func IsHostExecutionKind(kind string) bool {
 func Remediation(kind string) string {
 	switch strings.TrimSpace(kind) {
 	case KindToolchainMissing:
-		return "Install the build toolchain on the host running ASQS and make it available on the service account's PATH, or switch runner.type to docker. (Repository build wrappers are no longer invoked, so shipping a ./mvnw does not help.)"
+		return "Install the build toolchain on the host running ASQS and make it available on the service account's PATH, or switch general.sandbox.type to docker. (Repository build wrappers are no longer invoked, so shipping a ./mvnw does not help.)"
 	case KindToolchainNotExecutable:
-		return "The build tool could not be executed. Check that the binary on PATH is executable by the account ASQS runs as, or switch runner.type to docker."
+		return "The build tool could not be executed. Check that the binary on PATH is executable by the account ASQS runs as, or switch general.sandbox.type to docker."
 	case KindBrowsersMissing:
-		return "The E2E runner has no browsers. Enable runner.e2e_framework_bootstrap.enabled so ASQS installs them (it runs `playwright install` for you), install them by hand for the account ASQS runs as, or switch runner.type to docker, whose Playwright image ships them."
+		return "The E2E runner has no browsers. Enable bootstrap.e2e_framework.enabled so ASQS installs them (it runs `playwright install` for you), install them by hand for the account ASQS runs as, or switch general.sandbox.type to docker, whose Playwright image ships them."
 	case KindStepTimeout:
-		return "The step was killed at runner.timeout. Raise it, warm the dependency cache before the run, or narrow the build with runner.compile_command / test_command."
+		return "The step was killed at general.sandbox.timeout. Raise it, warm the dependency cache before the run, or narrow the build with general.build.compile_command / test_command."
 	}
 	return ""
 }
@@ -214,7 +214,7 @@ func kindHostExecution(lower string) string {
 		return KindBrowsersMissing
 	}
 	// runner.requireLocalToolchain, raised before the process is spawned.
-	if strings.Contains(lower, "is not on path") && strings.Contains(lower, "runner.type") {
+	if strings.Contains(lower, "is not on path") && strings.Contains(lower, "sandbox.type") {
 		return KindToolchainMissing
 	}
 	return ""

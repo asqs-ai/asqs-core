@@ -18,13 +18,15 @@ From the **`asqs-go`** repo root you can use **`make publish-csharp-indexer`** (
 dotnet tools/csharp-indexer/publish/CSharpIndexer.dll /path/to/repo
 ```
 
-## Config (QualityBot)
+## Config
 
 ```yaml
 indexer:
-  csharp_indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
-  execution: local   # or docker
-  docker_dotnet_indexer_image: "mcr.microsoft.com/dotnet/sdk:10.0"
+  execution: local # or docker
+  csharp:
+    indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
+  docker:
+    dotnet_indexer_image: "mcr.microsoft.com/dotnet/sdk:10.0"
 ```
 
 ## Method FQ names

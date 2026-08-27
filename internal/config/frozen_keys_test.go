@@ -60,14 +60,16 @@ var frozenKeys = map[string]string{
 	"fingerprint_mode":      "FingerprintMode",
 }
 
-// frozenGlobalBudgets are frozen keys whose leaf NAME survives on RetrievalProfileBudget, which is
-// still live. They are checked in the template direction only — the struct direction cannot tell the
-// deleted global from the surviving per-profile field.
-var frozenGlobalBudgets = []string{"max_similar_tests", "max_dependency_chunks", "max_fixtures"}
-
-// frozenCachePaths are frozen keys whose leaf name is shared by two blocks (project_intel and
-// websearch both had cache_path). Same limitation, same treatment.
-var frozenCachePaths = []string{"cache_path"}
+// The three global retrieval budgets and cache_path are NOT checked in the template direction, and
+// under v2 they cannot be. `max_similar_tests`, `max_dependency_chunks` and `max_fixtures` are live
+// leaf keys of retrieval.profile_budgets — the per-profile override that survived the freeze — so a
+// line-oriented search for those names matches valid configuration. `cache_path` has no v2 spelling
+// at all.
+//
+// Nothing is lost by dropping them: CP38 made the loader STRICT, so a genuinely frozen key in a
+// template now fails the load and names its own path. The template check below is no longer the only
+// thing standing between a stale key and silence — it is a clearer message, and a way to check files
+// the loader is never pointed at.
 
 // A frozen key must not come back as a struct field on Config.
 //
@@ -97,18 +99,16 @@ func TestFrozenKeysAreNotStructFieldsAgain(t *testing.T) {
 
 // A frozen key must not appear in a shipped YAML template.
 //
-// Until the strict v2 loader lands (CP38), unknown keys parse LENIENTLY — so a leftover frozen key
-// in a template is silently ignored, and the file goes on telling an operator that setting it does
-// something. That is the failure this direction exists to prevent, and it is why CP37 removed the
-// lines rather than leaving them as harmless-looking text.
+// CP37 wrote this when unknown keys parsed leniently and a leftover frozen key was silently ignored,
+// leaving a file that told an operator setting it did something. CP38's strict loader closed that
+// hole — such a key now fails the load outright — so this check survives for the better message and
+// for YAML the loader is never pointed at.
 func TestFrozenKeysAbsentFromShippedYAML(t *testing.T) {
 	root := repoRootFromConfigPkg(t)
 	var all []string
 	for k := range frozenKeys {
 		all = append(all, k)
 	}
-	all = append(all, frozenGlobalBudgets...)
-	all = append(all, frozenCachePaths...)
 
 	files := []string{filepath.Join(root, "config.example.yaml")}
 	testdata, err := filepath.Glob(filepath.Join(root, "internal", "config", "testdata", "*.yaml"))

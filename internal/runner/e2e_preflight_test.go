@@ -34,7 +34,7 @@ func TestErrclass_missingBrowsersClassifyAsExecutionFailure(t *testing.T) {
 			if !errclass.IsHostExecutionKind(got) {
 				t.Error("missing browsers must count as an execution kind so the fix loop stops")
 			}
-			if r := errclass.Remediation(got); !strings.Contains(r, "runner.e2e_framework_bootstrap.enabled") {
+			if r := errclass.Remediation(got); !strings.Contains(r, "bootstrap.e2e_framework.enabled") {
 				t.Errorf("remediation %q should name the config key that fixes it", r)
 			}
 		})

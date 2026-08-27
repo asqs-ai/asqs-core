@@ -4,7 +4,7 @@
   "Database": {
     "MetadataURL": "postgres://user:pass@localhost:5432/meta?sslmode=disable",
     "EmbeddingsURL": "postgres://user:pass@localhost:5432/emb?sslmode=disable",
-    "EmbeddingsDimension": 1536,
+    "EmbeddingsDimension": 768,
     "MaxOpenConns": 12
   },
   "VCS": {
@@ -60,8 +60,8 @@
     }
   },
   "LLM": {
-    "DisableEmbeddingCache": false,
-    "EmbeddingCacheRetentionDays": 0,
+    "DisableEmbeddingCache": true,
+    "EmbeddingCacheRetentionDays": 14,
     "Provider": "ollama",
     "APIKey": "",
     "APIKeyFromEnv": "",
@@ -84,10 +84,10 @@
     "EmbeddingModel": "nomic-embed-text",
     "EmbeddingFallback": "",
     "BaseURL": "",
-    "HTTPTimeout": "",
+    "HTTPTimeout": "10m",
     "HTTPDisableKeepAlives": false,
     "HTTPResponseHeaderTimeout": "",
-    "OllamaNumCtx": 0,
+    "OllamaNumCtx": 32768,
     "MaxConcurrent": 3
   },
   "Runner": {
@@ -102,14 +102,14 @@
     "ImagePlaywrightDotnet": "",
     "ImageDotNet": "",
     "DotNetFallbackTargetFramework": "",
-    "EvalProfile": "",
+    "EvalProfile": "java-maven",
     "DockerBinary": "",
-    "JobMemory": "",
-    "JobCPUs": 0,
+    "JobMemory": "4g",
+    "JobCPUs": 2,
     "JobPidsLimit": 0,
     "JobNetworkRestore": "",
     "JobNetworkTest": "",
-    "DockerDisableOfflineTest": false,
+    "DockerDisableOfflineTest": true,
     "JobReadonlyRootfs": false,
     "CacheMavenHost": "",
     "CacheGradleHost": "",
@@ -122,29 +122,28 @@
     "RequireDockerBootstrap": false,
     "FormatCommand": "",
     "FormatOnlyAdded": false,
-    "BuildTool": "",
+    "BuildTool": "mvn",
     "CompileCommand": "",
     "TestCommand": "",
     "UnitTestCommand": "",
     "E2ETestCommand": "",
     "CompileOncePerEval": false,
-    "DisableStructuredFixOutput": false,
+    "DisableStructuredFixOutput": true,
     "FixerDependencySignatureOnly": false,
     "FixerStructuredUserMessage": false,
-    "DisableStructuredGenerateOutput": false,
+    "DisableStructuredGenerateOutput": true,
     "PreferDefaultTestSuffix": false,
-    "Policy": null,
     "ProjectIntel": {
-      "Enabled": null,
+      "Enabled": true,
       "UseEmbeddingsRank": false,
       "ExtraDocGlobs": null,
       "ExtraSkillGlobs": null
     },
-    "TwoPhaseTestGeneration": false,
+    "TwoPhaseTestGeneration": true,
     "RepeatedTestFailureThreshold": 0,
     "AbortOnUnrecoverableEnvCompileFailure": false,
     "SkipFixerOnInfrastructureFailure": false,
-    "DisableErrorLogLLMSummary": false,
+    "DisableErrorLogLLMSummary": true,
     "ReconcileDuplicateTestArtifacts": false,
     "FixContextRunesMax": 0,
     "FixBackoff": "",
@@ -160,8 +159,8 @@
     "SMTPPassword": "",
     "SMTPFrom": "",
     "TestFrameworkBootstrap": {
-      "Enabled": false,
-      "Mode": "",
+      "Enabled": true,
+      "Mode": "apply",
       "PinVersions": false,
       "AllowLockfileChange": false,
       "Execution": ""
@@ -210,16 +209,22 @@
     "ProfileE2E": "",
     "FailureHintFile": ".asqs/ci-build.log",
     "PersistLastEvalFailure": true,
-    "DisableHybridModuleFilter": false,
+    "DisableHybridModuleFilter": true,
     "DependencyMaxDepth": 0,
     "Fusion": "dense",
     "MaxContextTokens": 60000,
-    "ProfileBudgets": null,
-    "AbstentionDisabled": false,
+    "ProfileBudgets": {
+      "http_api": {
+        "MaxSimilarTests": 8,
+        "MaxDependencyChunks": 20,
+        "MaxFixtures": 0
+      }
+    },
+    "AbstentionDisabled": true,
     "MinSimilarTestsForGeneration": 0,
     "MinSimilarityCosine": 0,
     "ContextCompact": {
-      "Enabled": null
+      "Enabled": true
     }
   },
   "Generation": {

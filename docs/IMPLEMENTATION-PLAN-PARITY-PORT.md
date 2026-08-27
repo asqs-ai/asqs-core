@@ -354,8 +354,8 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP36 | Housekeeping: dead keys, lint upgrade, **golden fixtures recorded** | C1 | CP35, **CP59** | 2 d | `in review` |
 | CP37 | Constants freeze | C2 | CP36 | 1–2 d | `in review` |
-| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `ready` |
-| CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `blocked (CP38)` |
+| CP38 | v2 schema, strict loader, derived env, translation | C3 | CP36, CP37 | 4–5 d | `in review` |
+| CP39 | Generated reference and regenerated templates | C4 | CP38 | 2 d | `ready` |
 | CP40 | Rollout: README, deployment guide, examples, guards | C5, C7 | CP39 | 2 d | `blocked (CP39)` |
 
 ### P7 — Tool calling
@@ -2615,7 +2615,7 @@ of any frozen variable.
 
 ### CP38 — v2 schema, strict loader, derived env, translation
 
-- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** high
+- **Status:** `in review` · **Effort:** 4–5 d · **Risk:** high
 
 **Tasks**
 
@@ -2651,9 +2651,74 @@ own stated limitation (it catches keys the translator drops; it does **not** cat
 reads — that is CP17's lint's job). An upstream template fed to core fails naming the first
 enterprise-only key. The CP36 goldens resolve identically.
 
+#### Implementation record
+
+**All seven tasks done. This is the breaking change: `Load` reads v2 only.** 208 v1 leaf keys become
+a schema organised by pipeline step, and a v1 file now fails with a message naming every section that
+moved rather than being partially understood.
+
+**The VCS collapse is the headline.** 34 keys across four near-identical `vcs.<provider>` blocks
+become nine under `general.git`. The runtime keeps its four-block shape, because `ActiveVCSToken`,
+`ActiveShip` and `ActiveDefaultOwnerRepo` select among them — so the translator writes the single v2
+block into whichever block the active provider names. Writing it into **all four** would be simpler
+and wrong: `CloneAuthTokenForURL` falls back across providers by URL, so a token meant for GitHub
+would start authenticating Bitbucket clones. A test asserts the token reaches the active provider and
+leaks into none of the others. Azure keeps a second token deliberately: a repository can live on
+dev.azure.com while the run's provider is something else.
+
+**Eight inversions**, each enumerated in the translator and pinned in both directions — a translator
+that hard-coded either constant would pass a one-directional test. They are the one-line silent-bug
+surface of the whole restructure: a missing `!` flips a feature for every deployment without changing
+a visible key.
+
+**Env names are derived, and that killed a defect class rather than moving one.** Every `env:` tag is
+gone from the runtime struct. v1's tag-driven walker handled string, int and bool and silently
+skipped the rest, so documented float and slice variables did nothing at all; the derived layer
+handles every kind the schema uses and **errors** on one it does not, so a field of a new type cannot
+ship as an inert variable. Client scoping (`ASQS_<ID>_<KEY>` beats `ASQS_<KEY>`) has its own test,
+being exactly the layering that vanishes silently in a rewrite.
+
+**The ordering invariant has a test that would actually fail.** YAML → env → defaults → translate.
+Defaults before env would materialise `true` for every default-true toggle, leaving the overlay
+unable to tell "operator set false" from "unset variable" — a default-true feature would become
+impossible to switch off from the environment. The test turns one off and checks it lands.
+
+**A defect found and fixed while mapping the schema.** v1 required BOTH `indexer.type: advanced` AND
+a jar path; a deployment that had built the JAR and configured its path but never set the type
+silently got line-based indexing — full AST and symbol resolution replaced by heuristics, with
+nothing in the run to say so (`pipeline.go:1004`). v2 has `indexer.java.mode: auto`, where a
+configured path is sufficient and an explicit `minimal` still wins. Upstream reached the same
+conclusion independently; adopting it here is one of the few places core and upstream converge.
+
+**Dead code removed with the v1 loader:** `applyEnv`/`applyEnvStruct`/`isTruthy`, the
+`MergeEnvFromOS` → `PrepareConfigForWorkflowRun` → `ValidateStoredRevisionYAML` chain (API-server
+helpers with no core callers, all parsing v1 shapes), `yaml_parse.go`, and `runner.policy` with its
+inert `PolicyConfig` placeholder — v2 gives project intel exactly one home, so there was no second
+spelling left to validate.
+
+**Validation and remediation messages were repointed.** They named v1 paths an operator would now be
+told do not parse — `vcs.github.token`, `runner.type`, `indexer.mono_repo_workspace` — which is worse
+than no message. `errclass`'s remediation strings had the same problem and are fixed with them.
+
+**Goldens** were rewritten as v2 fixtures exercising all eight inversions, the provider merge and
+every move; the resolved values were checked field by field rather than re-recorded on faith.
+
+**CORRECTION to record: core's v2 is NOT a subset of upstream's.** They share section names and most
+paths, but gap caps live at `indexer.policy.max_gaps` here and `retrieval.plan.max_gaps` upstream,
+`indexer.java` differs, and each tree has keys the other lacks. Neither file can be fed to the other
+engine, which is what the upstream-template rejection test asserts.
+
+**Outstanding, and it belongs to CP56.** D18 says the OpenShift guide must move into `asqs-core/docs/`
+before this cutover or with it. The move did not happen here — it is a file operation in the parent
+working folder, and CP56 item 4 owns it. What CP38 could not leave broken it fixed in place: the
+guide's ConfigMap is now v2. The consequence of the deferral is unchanged from what the plan predicts
+— the doc-reference guard still cannot reach a file outside this repository — but nothing is wrong
+today. `DEPLOYMENT-GUIDE.md` and `AWS-DEPLOYMENT-RUNBOOK.md` were left alone: they document the
+enterprise product and are already written against upstream's v2.
+
 ### CP39 — Generated reference and regenerated templates
 
-- **Status:** `blocked (CP38)` · **Effort:** 2 d · **Risk:** low
+- **Status:** `ready` · **Effort:** 2 d · **Risk:** low
 
 1. `reference.go` + `reference_render.go`; `asqs-core config reference -o docs/CONFIG-REFERENCE.md`
    (the CP07 dispatch makes this a subcommand, not a fourth ad-hoc branch).

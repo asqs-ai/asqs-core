@@ -1,98 +1,125 @@
-# asqs-core example configuration. Copy to config.yaml and edit.
-# Only the keys below are needed for a single `asqs-core run`.
+# asqs-core example configuration (schema v2). Copy to config.yaml and edit.
+#
+# Only the keys below are needed for a single `asqs-core run`. The full surface is larger; every key
+# is documented in the generated reference rather than here, because an exhaustive template stops
+# being a starting point.
+#
+# Two rules make this file predictable:
+#   * every toggle is positive — `enabled: false`, never `disable_something: true`;
+#   * unknown keys FAIL the load and name their own path, so a typo cannot be silently ignored.
+#
+# Every key also has an environment variable, derived from its path: ASQS_ plus the dotted path
+# upper-cased, with a leading `general.` dropped. general.database.metadata_url is
+# ASQS_DATABASE_METADATA_URL; generation.policy.tools.max_turns is
+# ASQS_GENERATION_POLICY_TOOLS_MAX_TURNS.
+schema_version: 2
 
-database:
-  # PostgreSQL + pgvector (see `docker compose up -d`).
-  metadata_url: "postgres://asqs:asqs@localhost:5432/asqs?sslmode=disable"
-  embeddings_url: "" # empty = reuse metadata_url
-  embeddings_dimension: 1536
+general:
+  database:
+    # PostgreSQL + pgvector (see `docker compose up -d`).
+    metadata_url: "postgres://asqs:asqs@localhost:5432/asqs?sslmode=disable"
+    embeddings_url: "" # empty = reuse metadata_url
 
-llm:
-  # One provider drives every step (generation, fixer, docs, embeddings).
-  provider: openai # openai | anthropic | azure_openai | ollama
-  # Provide the key here directly, OR name an env var in api_key_from_env. The direct api_key is
-  # used unless api_key_from_env points at a variable that is actually set. (Ollama needs no key.)
-  api_key: "" # e.g. "sk-..."
-  api_key_from_env: "" # e.g. OPENAI_API_KEY (leave empty to use api_key above)
-  model: "gpt-4o"
-  embedding_provider: "" # empty = use `provider`
-  embedding_model: "text-embedding-3-small"
-  base_url: "" # e.g. http://127.0.0.1:11434 for a local Ollama (no key needed)
+  llm:
+    # One provider drives every step; each step may override it in its own section.
+    provider: openai # openai | anthropic | azure_openai | ollama
+    model: "gpt-4o"
+    # Provide the key directly, OR name an environment variable in api_key_from_env, which wins when
+    # both are set. There is no ${VAR} interpolation: a literal "${MY_KEY}" is sent verbatim.
+    api_key: "" # e.g. "sk-..."
+    api_key_from_env: "" # e.g. OPENAI_API_KEY
+    base_url: "" # e.g. http://127.0.0.1:11434 for a local Ollama (no key needed)
+    embeddings:
+      model: "text-embedding-3-small"
+      dimension: 1536 # must match the model's output width
 
-indexer:
-  type: advanced # advanced = Java JAR parser; minimal = Go heuristics
-  execution: local # local | docker (docker = no host JDK/Node/.NET needed)
-  advanced_jar_path: "tools/java-indexer/target/java-indexer-0.1.0.jar"
-  jst_indexer_path: "tools/js-ts-indexer/dist/index.js"
-  csharp_indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
-  # Gap caps. The --max-gaps / --max-gaps-e2e CLI flags override these when passed; otherwise these
-  # values apply, and only if both are absent do the built-ins (10 unit / 0 E2E) kick in.
-  max_gaps: 20 # cap unit/doc gaps per run
-  max_gaps_e2e: 5 # cap E2E gaps per run (0 = skip E2E entirely)
+  build:
+    # Empty detects from the repository. Set these only when detection is wrong.
+    toolchain: "" # java-maven | java-gradle | typescript | csharp
+    build_tool: "" # mvn | gradle
+    format_command: "" # e.g. "prettier --write ." — empty means C# gets `dotnet format`, others none
 
-runner:
-  type: local # local | docker
-  timeout: "15m"
-  start_max_iteration:
-    10 # whole-project fix-loop budget: max LLM fixer iterations for the
-    # SINGLE compile+test evaluation run over ALL generated tests (not
-    # per gap). Raise it for large batches. Tests still failing after
-    # this budget are discarded so the rest of the project stays green.
-  human_in_the_loop_email: "" # Possible values: empty; or RFC5322 email address
-  # Actual sending requires human_in_the_loop_email AND smtp_host AND smtp_from to be set;
-  # otherwise the notification is a no-op. smtp_port 0 = default 587.
-  # When smtp_user is set, PLAIN auth (with STARTTLS when offered) is used.
-  smtp_host: "" # Possible values: empty; or SMTP server hostname (e.g. smtp.example.com)
-  smtp_port: 0 # Possible values: 0 (default 587); or positive int
-  smtp_user: "" # Possible values: empty (no auth); or SMTP username
-  smtp_password: "" # Possible values: empty; or SMTP password (prefer env RUNNER_SMTP_PASSWORD)
-  smtp_from: "" # Possible values: empty; or RFC5322 from address (e.g. asqs-bot@example.com)
-  # Formatter applied to generated tests (post-generate and after each LLM fix) so they pass the
-  # repo's style gates. Empty = skip, EXCEPT C# which defaults to `dotnet format`. Examples:
-  # "mvn spring-javaformat:apply -q" (Java/Spring), "google-java-format -i" (per-file), "prettier --write .".
-  format_command: "" # empty = C# → "dotnet format"; other langs → no formatting
-  format_only_added: false # true = format only the written files (dotnet format --include / per-file); false = whole repo
-  # Docker sandbox images (used when type: docker; empty = built-in defaults):
-  image_java_maven: "" # default: maven:3.9-eclipse-temurin-21
-  image_java_gradle: "" # default: gradle:8.11-jdk21
-  image_node: "" # default: node:20-bookworm
-  image_dotnet: "mcr.microsoft.com/dotnet/sdk:10.0"
-  image_playwright: "" # JS/TS E2E browsers
-  image_playwright_java: "" # Java E2E browsers
-  image_playwright_dotnet: "" # .NET E2E browsers
-  # IMPORTANT (Docker sandbox): compile/test run OFFLINE by default (job_network_test: none) for
-  # reproducibility, so dependencies must already be cached. If a Docker build fails to fetch deps
-  # ("Temporary failure in name resolution"), do ONE of: (a) mount your host package cache below;
-  # (b) set docker_disable_offline_test: true to download live; or (c) use runner.type: local.
-  cache_maven_host: "" # host ~/.m2  → /root/.m2 in the container (empty = no mount)
-  cache_gradle_host: "" # host ~/.gradle
-  cache_npm_host: "" # host ~/.npm
-  cache_nuget_host: "" # host ~/.nuget/packages
-  docker_disable_offline_test: false # true = allow network during compile/test (download deps live)
-  # Optional: detect + install a unit-test framework when the repo has none. OFF by default — it
-  # modifies build files (package.json / pom.xml / .csproj) and runs installs. Enable to opt in.
-  test_framework_bootstrap:
-    enabled: false # true = detect + install Jest / JUnit 5 / xUnit when missing
-    mode: auto # auto | jest | junit | xunit | off
-    pin_versions: false # exact semver in package.json for reproducibility
-    allow_lockfile_change: false # false = frozen lockfile (npm ci / --frozen-lockfile)
-  # Optional: set up an E2E runner when E2E gaps are requested (--max-gaps-e2e > 0) and the repo has
-  # none. OFF by default. C# creates a DEDICATED e2e/ Playwright test project (kept out of production
-  # projects); JS/TS installs Playwright/Cypress; Java patches Maven/Gradle + Playwright Java.
-  e2e_framework_bootstrap:
-    enabled: false # true = set up the E2E stack when --max-gaps-e2e > 0 and none exists
-    mode: auto # auto | playwright | cypress | off
-    execution: auto # auto | docker | local (auto = ephemeral Docker when runner.type: docker)
+  sandbox:
+    type: local # local | docker
+    timeout: "15m"
+    images:
+      # Empty uses the built-in image for each toolchain.
+      java_maven: "" # default: maven:3.9-eclipse-temurin-21
+      java_gradle: "" # default: gradle:8.11-jdk21
+      node: "" # default: node:20-bookworm
+      dotnet: "mcr.microsoft.com/dotnet/sdk:10.0"
+    caches:
+      # Compile and test run OFFLINE by default for reproducibility, so dependencies must already be
+      # cached. If a docker build cannot fetch dependencies, either mount the host cache here, or set
+      # sandbox.docker.offline_test: false to download live, or use sandbox.type: local.
+      maven: "" # host ~/.m2 → /root/.m2 in the container
+      gradle: "" # host ~/.gradle
+      npm: "" # host ~/.npm
+      nuget: "" # host ~/.nuget/packages
+    docker:
+      offline_test: true # false = allow network during compile and test
 
-# Optional: ship generated tests/docs to a VCS repo after a STABLE run (CLI flag --ship).
-vcs:
-  provider: github # github | gitlab | bitbucket | azure_devops
-  github:
-    token: "" # required for --ship: a PAT with `repo` scope (or via env GITHUB_TOKEN)
-    # owner/repo are auto-derived from the repo's origin URL (HTTPS or SSH). Set these only to
-    # override — e.g. when the origin isn't a recognized github.com URL.
+  # Ship generated tests and docs to a repository after a STABLE run (CLI flag --ship). One block:
+  # fill in the ACTIVE provider's values here, not a per-provider section.
+  git:
+    provider: github # github | gitlab | bitbucket | azure_devops
+    token: "" # required for --ship; a PAT with repo scope
+    # owner/repo are derived from the origin URL. Set them only to override — e.g. when the origin is
+    # not a recognised URL for the provider. GitLab namespace/project, Bitbucket workspace/repo and
+    # Azure organization/repository all map onto this pair.
     default_owner: "" # e.g. my-org
     default_repo: "" # e.g. my-service
     ship:
-      branch: "asqs-core" # branch asqs-core pushes (created/updated on each --ship run)
+      branch: "asqs-core" # branch to push (created or updated on each --ship run)
       base_branch: "main" # PR base branch
+
+  audit:
+    file_path: "" # append one JSON object per step; empty = stderr lines only
+
+# Detect and install a test framework when the repository has none. OFF by default: it modifies
+# build files and runs installs.
+bootstrap:
+  test_framework:
+    enabled: false
+    mode: auto # auto | jest | junit | xunit | off
+    pin_versions: false # exact versions, for reproducibility
+    allow_lockfile_change: false # false = frozen lockfile (npm ci / --frozen-lockfile)
+  e2e_framework:
+    enabled: false # set up the E2E stack when --max-gaps-e2e > 0 and none exists
+    mode: auto # auto | playwright | cypress | off
+    execution: auto # auto | docker | local
+
+indexer:
+  execution: local # local | docker (docker = no host JDK/Node/.NET needed)
+  java:
+    # auto = the JavaParser JAR when jar_path resolves, line-based heuristics otherwise. Setting the
+    # path is enough; v1 also needed a separate `type: advanced` and silently fell back without it.
+    mode: auto # auto | advanced | minimal
+    jar_path: "tools/java-indexer/target/java-indexer-0.1.0.jar"
+  jsts:
+    indexer_path: "tools/js-ts-indexer/dist/index.js"
+  csharp:
+    indexer_dll_path: "tools/csharp-indexer/publish/CSharpIndexer.dll"
+  policy:
+    # The --max-gaps / --max-gaps-e2e flags override these; the built-ins (10 unit, 0 E2E) apply only
+    # when both the flag and the key are absent.
+    max_gaps: 20
+    max_gaps_e2e: 5 # 0 = skip E2E entirely
+
+retrieval:
+  profile: "" # java_unit | http_api | react_feature | nest_module | full_stack; empty = detect
+
+generation:
+  policy:
+    tools:
+      # Let the generator query the index while writing, instead of working only from the context
+      # assembled up front. Needs a provider with tool calling; on Ollama it also needs
+      # general.llm.ollama_num_ctx.
+      enabled: false
+
+fixer:
+  iterations:
+    # Budget for the SINGLE whole-project compile+test evaluation over ALL generated tests, not per
+    # gap. Raise it for large batches. Tests still failing after this budget are discarded so the
+    # rest of the project stays green.
+    start: 10

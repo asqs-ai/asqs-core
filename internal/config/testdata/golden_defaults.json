@@ -133,9 +133,8 @@
     "FixerStructuredUserMessage": false,
     "DisableStructuredGenerateOutput": false,
     "PreferDefaultTestSuffix": false,
-    "Policy": null,
     "ProjectIntel": {
-      "Enabled": null,
+      "Enabled": true,
       "UseEmbeddingsRank": false,
       "ExtraDocGlobs": null,
       "ExtraSkillGlobs": null
@@ -180,7 +179,7 @@
       "MavenRepoDir": "",
       "NuGetPackagesDir": ""
     },
-    "Type": "",
+    "Type": "minimal",
     "Execution": "",
     "DockerCLI": "",
     "DockerJavaImage": "",
@@ -219,7 +218,7 @@
     "MinSimilarTestsForGeneration": 0,
     "MinSimilarityCosine": 0,
     "ContextCompact": {
-      "Enabled": null
+      "Enabled": true
     }
   },
   "Generation": {
