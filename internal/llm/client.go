@@ -135,6 +135,17 @@ func NewChatCompleterForStep(cfg *config.Config, step string) (model.ChatComplet
 	}
 }
 
+// EffectiveProviderForStep reports the lowercased provider name a step resolves to after the
+// per-step override / default-provider fallback — the same resolution NewChatCompleterForStep
+// applies. Exported so orchestration can make provider-aware decisions (notably: whether the fixer's
+// provider enforces a JSON schema as a grammar) without re-deriving the fallback chain.
+func EffectiveProviderForStep(cfg *config.Config, step string) string {
+	if cfg == nil {
+		return ""
+	}
+	return resolveStepConfig(cfg, step).Provider
+}
+
 // NewChatCompleter returns a ChatCompleter for the configured default provider and model. Returns (nil, nil) when cfg.LLM.Provider is empty.
 func NewChatCompleter(cfg *config.Config) (model.ChatCompleter, error) {
 	return NewChatCompleterForStep(cfg, "")

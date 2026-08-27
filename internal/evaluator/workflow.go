@@ -58,6 +58,11 @@ const errorLogLLMSummaryMinRunes = 8000
 // on the host because a formatter such as dotnet was not on PATH (local sandbox only; docker sandboxes run format in the toolchain container).
 var ErrFormatAfterFixSkipped = errors.New("format after fix skipped (formatter not on PATH)")
 
+// ErrFixArtifactTooLarge means every artifact in scope exceeds the full-file prompt ceiling, so
+// there is nothing the fixer can be asked to rewrite. Not retryable: the file will be the same size
+// next round.
+var ErrFixArtifactTooLarge = errors.New("fixer artifact exceeds full-file prompt ceiling")
+
 // EvalOptions configures the evaluation workflow (which steps to run, max fix iterations).
 type EvalOptions struct {
 	RepoPath             string              // repo root for reading/writing artifact files
@@ -2083,6 +2088,10 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		loopState.lastFileDiagnostics = nowDiagnostics
 	}
 
+	// Runtime counterpart to the compile-side facts: Mockito-misuse statements proved from the
+	// failure's own stack frames plus the generated test's source. Deterministic — nothing here is
+	// inferred — so the model is told what IS rather than what might be.
+	testFacts := testFailureFacts(ctx, step, errorOutput, files, writableArtifacts, audit)
 	// One summarisation per round, shared by the prompt and the audit row.
 	errorLogLLMSummary := computeErrorLogLLMSummary(ctx, opts, errorOutput)
 	attempt := currentAttempt
@@ -2100,6 +2109,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		TestCommand:               testCommandForFixStep(opts, step),
 		Manifests:                 manifests,
 		ErrorSummary:              errorLogLLMSummary,
+		TestFailureFacts:          testFacts,
 		PriorAttempts:             priorAttempts(loopState),
 		FixAttempt:                attempt,
 		MaxFixAttempt:             maxAttempts,
@@ -2220,6 +2230,41 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		recordFixRoundFailure(loopState, currentAttempt-1, roundSignature,
 			"Your reply could not be used at all (the response was not valid output for this contract). Return the required JSON shape, and keep the reply small enough to finish — prefer targeted edits over whole files.")
 		return false, nil, FixSkipResponseUnusable
+	}
+	// Targeted edits are resolved to whole-file content HERE, so everything downstream — path
+	// gating, low-value rejection, the coverage gate, the write, the applied-change record — is
+	// exactly the code that already runs for a whole-file response. The edit contract changes how a
+	// repair is EXPRESSED, not how it is validated.
+	var editRefusals map[string]string
+	if len(resp.Edits) > 0 {
+		resolved, editAudit, refusals := resolveFixEdits(opts, resp.Edits)
+		editRefusals = refusals
+		if audit != nil && len(editAudit) > 0 {
+			audit.Log(ctx, "evaluator.fix_edits_applied", map[string]interface{}{
+				"message": fmt.Sprintf("Model returned targeted edits for %d file(s).", len(resp.Edits)),
+				"step":    step,
+				"files":   editAudit,
+			})
+		}
+		if len(resolved) == 0 {
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_edits_none_applied", map[string]interface{}{
+					"message": "Every targeted edit was refused (anchors not found or ambiguous); nothing was written. " +
+						"The model is editing a version of the file that does not exist.",
+					"step":  step,
+					"files": editAudit,
+				})
+			}
+			recordFixAttempt(loopState, currentAttempt-1, roundSignature, nil, editRefusals)
+			return false, nil, FixSkipResponseUnusable
+		}
+		// Whole-file entries for paths the edits did not cover are still honoured.
+		if resp.Files == nil {
+			resp.Files = map[string]string{}
+		}
+		for rel, content := range resolved {
+			resp.Files[rel] = content
+		}
 	}
 	if len(resp.Files) == 0 {
 		if audit != nil {
@@ -2460,6 +2505,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// Bank the round before returning, on BOTH paths. A round that wrote nothing is exactly the
 	// round the next prompt most needs to know about — it is what stops the model re-sending a
 	// refused change — so the skip reasons are recorded even though nothing landed.
+	for rel, why := range editRefusals {
+		if _, taken := skippedPaths[rel]; !taken {
+			skippedPaths[rel] = why
+		}
+	}
 	recordFixAttempt(loopState, currentAttempt-1, roundSignature, appliedChanges, skippedPaths)
 	if len(pathsUpdated) == 0 {
 		return false, nil, FixSkipNoAcceptedWrites

@@ -356,6 +356,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// because nothing can fetch what an inventory merely names. Getting this backwards produces a
 	// context that promises lookups nobody can perform.
 	formatOpts.ToolsAvailable = generatorHasTools(gen)
+	// Resolved once, and recorded on every path — including the one that changes nothing, which
+	// used to be silent and left a post-mortem unable to tell configuration from downgrade.
+	fixerStructuredOff, fixerGrammarRisk := resolveFixerStructuredOutput(ctx, cfg, audit)
 	fixer := &llmfix.Fixer{
 		LLM:   trackedFixer,
 		Audit: audit,
@@ -366,8 +369,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// to be right here, because the tool-mode audit below reports on the schema it decides.
 		// runner.disable_multi_turn_fixer is deliberately NOT wired: its default would flip
 		// MultiTurnRepair on, which is a behaviour change owned by the fixer-hardening wave.
-		DisableStructuredFixOutput: cfg.Runner.DisableStructuredFixOutput,
-		StructuredUserMessage:      cfg.Runner.FixerStructuredUserMessage,
+		DisableStructuredFixOutput:  fixerStructuredOff,
+		StructuredOutputGrammarRisk: fixerGrammarRisk,
+		StructuredUserMessage:       cfg.Runner.FixerStructuredUserMessage,
 	}
 	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
 	// toggled independently so a fix-quality comparison can move one without the other.

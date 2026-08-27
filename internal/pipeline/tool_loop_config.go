@@ -6,6 +6,7 @@ import (
 	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"github.com/asqs/asqs-core/internal/llm"
 	"os"
 	"path/filepath"
 	"strings"
@@ -327,5 +328,61 @@ func reconcileDuplicateArtifacts(ctx context.Context, cfg *config.Config, audit 
 				"skipped":   res.Skipped,
 			})
 		}
+	}
+}
+
+// resolveFixerStructuredOutput decides whether the fixer asks for schema-constrained JSON, and
+// records the decision on EVERY path.
+//
+// The silent path was the problem: a post-mortem showed `structured_output_requested: false` with
+// nothing anywhere saying why, so the reader could not tell a deliberate configuration from a
+// provider-driven downgrade. Each branch below logs, including the one that changes nothing.
+//
+// grammarRisk is true when structured output stays ON against a provider that enforces the schema
+// as a GRAMMAR rather than treating it as a hint. On such a provider the constraint biases replies
+// toward whole-file reproduction and suppresses tool-call syntax, so the risk is worth naming in
+// every fix request rather than discovering from output quality.
+//
+// **Core divergence, deliberate:** upstream additionally defaults structured output OFF on Ollama
+// unless the operator set the key explicitly, which it can tell because its policy key is a
+// *bool. Core's `runner.disable_structured_fix_output` is a plain bool, where absent and
+// explicitly-false are the same value — so core honours the key as written and flags the risk
+// loudly instead of silently overriding a setting the operator may have chosen. Revisit when
+// CP38 re-keys the config.
+func resolveFixerStructuredOutput(ctx context.Context, cfg *config.Config, audit runAuditor) (disableStructured, grammarRisk bool) {
+	provider := llm.EffectiveProviderForStep(cfg, llm.StepFixer)
+	log := func(disable, risk bool, reason, detail string) {
+		if audit == nil {
+			return
+		}
+		state := "on"
+		if disable {
+			state = "off"
+		}
+		audit.Log(ctx, "evaluator.fixer_structured_output_resolved", map[string]interface{}{
+			"message":           fmt.Sprintf("Fixer structured output: %s (%s).", state, detail),
+			"structured_output": !disable,
+			"grammar_risk":      risk,
+			"provider":          provider,
+			"reason":            reason,
+		})
+	}
+	switch {
+	case cfg == nil:
+		log(true, false, "no_configuration", "no configuration")
+		return true, false
+	case cfg.Runner.DisableStructuredFixOutput:
+		log(true, false, "config_off", "runner.disable_structured_fix_output is set")
+		return true, false
+	case provider == "ollama":
+		log(false, true, "ollama_grammar_risk", "on, but Ollama enforces the schema as a grammar: replies bias toward whole-file reproduction")
+		return false, true
+	default:
+		p := provider
+		if p == "" {
+			p = "unknown"
+		}
+		log(false, false, "provider_composes", "on; provider "+p+" treats json_schema as a hint, not a grammar")
+		return false, false
 	}
 }

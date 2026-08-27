@@ -384,7 +384,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
 | CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `in review` |
 | CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `in review` |
-| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `ready` |
+| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `in review` (item 5's API-surface block waits on CP49) |
 
 ### P10 — Language indexers
 
@@ -3359,7 +3359,7 @@ be invented here.
 
 ### CP53 — Fixer robustness batches
 
-- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `in review` — items 1–4, 6, 7 complete; item 5 partial (see record) · **Effort:** 3–4 d · **Risk:** medium
 - **Provenance:** upstream `8640c59` (§2.6) — re-diff before implementing; upstream keeps moving.
 
 1. **Accept flat `{"edits":[…]}` arrays.** Models emit them; the parser rejected them and the round
@@ -3384,6 +3384,70 @@ be invented here.
 
 **Acceptance.** Each shape has a parser test built from a real captured model reply. A round that
 would previously have been "unusable" now applies. Every fallback records which rule fired.
+
+**Implementation record (2026-08-27).**
+
+- **Correction to the deferral trail.** CP50's in-file note deferred the targeted-edit tests to
+  "CP51", and CP51's record repeated it. Verified against upstream's own F-bundle table: CP51 maps
+  to F04/F07/F08/F11 (import union, one-artifact-one-layer, convention identity, duplicate
+  reconciliation) and **none of them is the edit contract** — that arrived with `8640c59`, which is
+  **this** bundle's provenance. So the whole targeted-edit contract landed here as CP53's
+  prerequisite: `FixResponse.Edits` + `FixEdit`, `fix_edits.go` (`ApplyFixEdits`, `resolveFixEdits`)
+  and the edits branch in `applyLLMFix`, where edits resolve to whole-file content **before** the
+  write gates so path gating, the coverage gate and the applied-change record are the same code a
+  whole-file response runs.
+- **Item 4 came with that contract** — `ApplyFixEdits` already applies k byte-identical edits when
+  the anchor occurs exactly k times, dedupes after a single apply, and refuses on a count mismatch
+  or conflicting replacements for one anchor.
+- **Item 1 — flat `{"edits":[…]}` arrays.** `parseFixEditsAnyShape` / `parseFlatFixEdits` /
+  `resolveFlatEditTarget` ported with the anchor-, path- and basename-based target resolution, and
+  wired **edits-first at all three parse sites** (first reply, structured→unstructured retry,
+  repair reply) — checking only the first silently drops the preferred shape from the other two.
+  The repair turn now names the actual defect when the failed reply was a flat array, because
+  re-sending the generic contract reproduced the same array on consecutive upstream rounds.
+  `classifyFixParseFailure` returns `edits_array_unresolved` rather than `not_json` — reporting
+  "not JSON" about a reply that was nothing but JSON cost an upstream run its diagnosis.
+- **Item 2** — `repairRawControlCharsInJSONStrings`, in the same extraction ladder.
+- **Item 3 — plain-source fallback.** Core had **no** fallback at all. `singleFilePlainFallback` +
+  `plainFallbackTarget` ported: the target is *resolved*, not guessed — single artifact in scope,
+  else the one in-scope artifact the failed replies name, else the one the error output names, each
+  rung requiring exactly one qualifying artifact — and the rule that fired is recorded in
+  `llmfix.single_file_fallback_used`. The result is gated on `SyntacticShellReason` so prose cannot
+  be laundered into a write. Its tool budget is this `Fix` call's, not a fresh one (CP52's
+  invariant): it is another completion for the same question.
+- **Item 6** — `partitionArtifactsBySize` withholds artifacts too large for a full-file contract
+  from the prompt AND the writable set, `writeWithheldArtifactNote` says so in the prompt, and an
+  all-oversized round fails with `ErrFixArtifactTooLarge` rather than silently. `MaxArtifactRunes`
+  is deliberately **not** shrunk by the transient-retry tiers: a windowed artifact under a full-file
+  demand invites a truncated rewrite.
+- **Item 7 — logs on every path.** `resolveFixerStructuredOutput` records the decision on all four
+  branches including the one that changes nothing; the silent path is why a post-mortem showed
+  `structured_output_requested: false` with no explanation. The grammar risk reaches every fix
+  request as `structured_output_grammar_warning`. The "no deferral note when structured output
+  resolved off" half was already satisfied by CP44's `appendStructuredDeferralNote`, wired for the
+  fixer in CP46. **Core divergence, deliberate:** upstream also defaults structured output OFF on
+  Ollama unless the key was set explicitly — it can tell, because its policy key is a `*bool`.
+  Core's `runner.disable_structured_fix_output` is a plain bool where absent and explicitly-false
+  are one value, so core honours the key as written and flags the risk loudly rather than silently
+  overriding an operator's setting. Revisit when CP38 re-keys the config.
+  `llm.EffectiveProviderForStep` came along as the prerequisite CP41 deferred until it had a caller.
+- **Item 5 — partial, and precisely so.** `fix_mockito_facts.go` (stdlib-only) ported with its
+  tests and wired: `FixRequest.TestFailureFacts` is populated per round and rendered ahead of the
+  failure, so the model reads what is proven before what went wrong. `AbsentSymbols` and its block
+  came along. **The API-surface block and `fix_missing_members.go` did NOT** — both import
+  `internal/evaluator/apisurface`, which is CP49's package; they land with it. Upstream's "rendered
+  by all three prompt builders" is satisfied by construction: core has one builder.
+- **A defect found while porting.** Core's fixer schema **forbade the `edits` key**
+  (`AdditionalProperties` string-valued, no explicit property), so the shape the prompt calls
+  PREFERRED was unexpressible — inert while no provider enforced the schema, but Ollama sends it as
+  a native grammar, making whole-file rewrites the only expressible answer. Fixed, with
+  `TestFixSchema_permitsEditsShape` pinning it.
+- **Deferred tests restored:** all nine that CP25 and CP50 pushed here (plain-fallback target
+  resolution, `classifyFixParseFailure`, the single-file fallback, the reasoning-model recovery),
+  plus upstream's eleven-test flat-edits suite and three schema tests. **Mutation-checked:**
+  disabling flat-array parsing fails ten of them.
+- Full gate green.
+
 
 ---
 

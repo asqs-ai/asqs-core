@@ -110,6 +110,26 @@ type FixRequest struct {
 	TestCommand string
 	// Manifests are dependency manifest files (e.g. package.json, pom.xml) so the LLM only suggests imports/packages that exist in the project. Key = repo-relative path (e.g. "package.json"); value = file content.
 	Manifests map[string]string
+	// AbsentSymbols are the type names the same classpath scan looked up and did NOT find — the
+	// negative half of APISurface, and the half that used to be discarded.
+	//
+	// A resolved surface tells the model where a type lives; nothing told it that a type lives
+	// nowhere. In run api-0c344e6bc0658e0db06506efb9d964f5 MockBean (removed in Spring Boot 4) and
+	// MockMvcRestServiceServer (never a real class) were looked up on all ten rounds, resolved on
+	// none, and were never mentioned in a prompt — so the model reintroduced them every round and
+	// they stayed in the diagnostic that produced the next round's targets. Only populated when at
+	// least one sibling target DID resolve, which is what separates "absent" from "classpath
+	// unreadable".
+	AbsentSymbols []string
+	// TestFailureFacts are deterministic statements derived from RUNTIME test failures plus the
+	// test class's own source — today, Mockito misuse: when()/given() on a receiver the test
+	// provably constructs with `new`, and stubbings the tested code never consumes. They exist
+	// because these defects survived six fixer rounds in run api-12aa1935d113c9ea8b50a516fd275660
+	// with the exception text and the production bodies both in the prompt: the model kept
+	// repairing around the misuse instead of naming it. Empty for compile steps and for failures
+	// the parser cannot prove — see fix_mockito_facts.go. Rendered beside MissingMemberFacts, in a
+	// separate block because these are runtime-verified, not compiler-verified.
+	TestFailureFacts []string
 	// ErrorSummary is an LLM-written summary of an oversized error log, attached ALONGSIDE the raw
 	// text rather than replacing it ("dependencies" prose can be wrong, and the raw text stays
 	// authoritative). Empty when the log is small, the feature is off, or no summarizer is wired.
@@ -150,6 +170,34 @@ const FixAttemptAutoEscalationThreshold = 3
 // FixResponse is the LLM fix output: updated content for files to apply.
 type FixResponse struct {
 	Files map[string]string // repo-relative path -> new full file content (only keys that changed)
+	// Edits is the preferred, targeted form: repo-relative path -> ordered search/replace edits.
+	// When non-empty it takes precedence over Files for those paths.
+	//
+	// Whole-file regeneration was the fixer's only unit of work, and it is why a one-token defect
+	// survived seven rounds. To change `Set<Visit>` to `Collection<Visit>` on line 32 the model had
+	// to reproduce two entire files (~140 lines) from scratch every round, so:
+	//
+	//   - nothing forced the change through — line 32 came back byte-identical seven times while
+	//     the fixer "successfully applied" that file each round;
+	//   - every regeneration could introduce new damage, and did (a fresh error appeared on line 33
+	//     in round 2, created by a round meant to be repairing);
+	//   - each rewrite re-picked the third-party API independently, producing a 2-cycle
+	//     (hasHeader -> assertThat(Map) -> hasHeader -> …) rather than convergence.
+	//
+	// An edit either matches its anchor and changes the file, or it does not match and says so.
+	// That is the property whole-file rewriting cannot provide.
+	Edits map[string][]FixEdit
+}
+
+// FixEdit is one exact-string search/replace within a file.
+//
+// Anchored on content rather than line numbers on purpose: line numbers drift the moment any
+// earlier edit lands, and the fixer applies several edits per file per round.
+type FixEdit struct {
+	// Find is the exact snippet to locate. Must appear exactly once in the file.
+	Find string `json:"find"`
+	// Replace is what replaces it. Empty means deletion.
+	Replace string `json:"replace"`
 }
 
 // Fixer is called when compile or test fails during evaluation. It receives the error and code and returns fixed file contents to apply. Optional; max attempts (e.g. 3) are enforced by the evaluator.
