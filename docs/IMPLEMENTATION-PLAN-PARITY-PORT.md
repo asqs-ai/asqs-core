@@ -373,7 +373,7 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `ready` |
+| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `in review` |
 | CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `in review` |
 
 ### P9 — Evaluator and fix loop *(highest per-day value here — see §2.5-5)*
@@ -2971,7 +2971,7 @@ test must be able to detect that). Ships off by default; enabling it is a CP16-m
 
 ### CP47 — Web search tool
 
-- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 4–5 d · **Risk:** medium
 - **Order (D17, 2026-08-26):** CP48 lands before this bundle starts.
 
 New `internal/websearch` + the `web_search` tool. SearXNG and Brave backends, a query ledger, a host
@@ -3002,6 +3002,45 @@ tool. Consequences to design for, not discover:
 **Acceptance.** With the offline switch on, no outbound connection is attempted (asserted by a
 transport that fails the test on any dial). A host outside the allow-list is refused and counted.
 Results are nonce-framed so a search result cannot impersonate an instruction block in the prompt.
+
+**Implementation record (2026-08-27).** Ordered after CP48 per D17, which was honoured.
+
+- `internal/websearch` ported whole (SearXNG + Brave backends, disk replay cache, host allow-list,
+  rebinding-safe fetch, extraction, sanitisation) and `tools/web_search.go` with it, restoring the
+  last rung of CP43's `get_symbol` miss ladder and the `web_fetch` URL ledger.
+- **Off by default, and absent rather than disabled.** A nil client registers NO web tools, so the
+  model is never shown a tool it cannot use — a visible-but-broken tool costs a turn and teaches it
+  to distrust the whole set. `buildWebClient` audits the resolution on EVERY branch as
+  `websearch.mode`, including the default-off one: "off" is a resolution an operator should be able
+  to read, not a silent absence.
+- **The offline switch makes egress structurally impossible**, not merely unconfigured: a cache miss
+  is an answer ("offline, not cached"), never a connection. Surfaced in the audit and in the
+  operator-facing message.
+- **The allow-list fails closed.** Empty disables fetch entirely, so an enabled client with no
+  configured hosts is given the curated official-documentation list rather than an empty one that
+  would read as a broken feature. Pinned by
+  `TestWebSearch_emptyAllowListDoesNotBecomeOpen`.
+- **The boundary test is real, not vacuous.** Its `go list` arguments were rewritten to core's
+  module path — the failure mode this section explicitly warns about — and the allow-list adapted
+  (core has no `internal/workflow`; the pipeline is the orchestration layer). **Verified by
+  construction:** adding a `_ "internal/websearch"` import to `internal/runner` makes it fail with
+  both its messages, and removing it makes it pass. Without that check the test would have passed
+  while asserting nothing.
+- **Nonce framing** carried over: results are fenced with a per-render random nonce, so a page
+  cannot forge the delimiter and impersonate a first-party instruction block. Three ported tests
+  cover framing, nonce variation, and an injection-shaped snippet staying fenced.
+- **Query deny tokens** are derived at wiring time from the repository's own identity (repo-id
+  segments and the checkout's base name), lowercased and length-floored, so the repository's private
+  names cannot leave the process inside a query. Hand-maintaining that list would rot.
+- **Cache location and its consequence, said plainly in the config doc** as this section requires:
+  the cache lives at `.asqs/websearch-cache.json` inside the repository under test, because the
+  queries belong to that repository. Two consequences an operator would otherwise discover: a run
+  against a local folder leaves the cache in that folder, and a shipped run can COMMIT it — so
+  **search queries and results can reach the repository's pull request**. An absolute `cache_path`
+  is the supported way out. (CP59's preserve-list is what keeps it through the pre-ship cleanup;
+  that half arrives with CP59.)
+- Full gate green.
+
 
 ### CP48 — Dependency doc indexing
 

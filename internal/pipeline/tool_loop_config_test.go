@@ -128,7 +128,7 @@ func TestFixerToolLoopFromConfig_defaultsToOneShot(t *testing.T) {
 	if reason == "" {
 		t.Error("a downgrade must carry a reason for the audit")
 	}
-	if buildFixerTools(&config.Config{}, nil, nil, nil, "r", "java", "/tmp", nil) != nil {
+	if buildFixerTools(&config.Config{}, nil, nil, nil, "r", "java", "/tmp", nil, nil) != nil {
 		t.Error("a default config must build no fixer registry")
 	}
 }

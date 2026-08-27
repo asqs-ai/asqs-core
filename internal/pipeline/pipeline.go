@@ -330,6 +330,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// own build inputs. Nil for a language with no provider, which is the documented no-op: the
 	// prompt renders no block, exactly as before this existed. Honest degradation is the contract —
 	// never a wrong or empty surface.
+	// The one outbound path in this tool, resolved once and audited on every branch. The deny
+	// tokens are derived from the repository's own identity so its private names cannot leave the
+	// process inside a query.
+	webClient := buildWebClient(ctx, cfg, audit, repoAbs, queryDenyTokens(opts.RepoID, repoAbs))
+
 	apiSurface := apisurface.NewProviderForLang(lang)
 	if apiSurface == nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: no API-surface provider for %s; the fixer gets no member-signature block\n", lang)
@@ -363,7 +368,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
 	// upstream against a labelled suite it delivers about half the relevant chunks, and the model
 	// has no way to ask for the rest. The registry is what turns a retrieval miss into a lookup.
-	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface); reg != nil {
+	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
 		loop, reason := toolLoopFromConfig(cfg, trackedGen)
 		gen.Tools = reg
 		gen.ToolLoop = loop
@@ -397,7 +402,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
 	// toggled independently so a fix-quality comparison can move one without the other.
-	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface); reg != nil {
+	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
 		loop, reason := fixerToolLoopFromConfig(cfg, trackedFixer)
 		fixer.Tools = reg
 		fixer.ToolLoop = loop

@@ -108,8 +108,10 @@ func (r *Registry) getSymbol(ctx context.Context, args []byte) (string, error) {
 					return r.capped(out), nil
 				}
 			}
-			// Upstream's last rung, one web search, returns with CP47.
-			return "", fmt.Errorf("%s; the index covers only this repository's sources", err)
+			if out, ok := r.webSearchForSymbolMiss(ctx, miss.fq); ok {
+				return out, nil
+			}
+			return "", fmt.Errorf("%s; the index covers only this repository's sources%s", err, missFollowUpHint(r.Web != nil))
 		}
 		return "", err
 	}

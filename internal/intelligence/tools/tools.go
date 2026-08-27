@@ -13,7 +13,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/websearch"
 	"strings"
+	"sync"
 
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/storage/embeddings"
@@ -69,8 +71,12 @@ type Registry struct {
 	// missed on three third-party types and then guessed one nonexistent method after another. The
 	// injected implementation may shell out (javap); this package still never execs.
 	ThirdPartySurface func(ctx context.Context, fqName string) (string, bool)
-	// Upstream's Registry additionally carries the external-documentation tools (a websearch client
-	// with its URL ledger); that field and its miss-ladder rung arrive with CP47.
+	// Web enables the external documentation tools. Nil — the default — registers neither: the
+	// first tool that sends data OUT stays absent unless an operator wired it on.
+	Web *websearch.Client
+	// webURLs is the per-run ledger of URLs searches returned; web_fetch retrieves only members.
+	webURLs *websearch.URLLedger
+	webMu   sync.Mutex
 	// lastTruncated records whether the most recent Invoke cut its result at MaxChars.
 	lastTruncated bool
 }
@@ -119,16 +125,18 @@ func (r rawJSON) MarshalJSON() ([]byte, error) { return []byte(r), nil }
 // a model that is told it can read files and then gets an error every time wastes turns and loses
 // confidence in the whole tool set.
 func (r *Registry) Definitions() []model.ToolDefinition {
-	var out []model.ToolDefinition
+	out := r.webDefinitions()
 	if r.Meta != nil {
 		// The description names what a miss falls back to, because the model demonstrably does not
 		// pivot on its own: upstream's run that motivated the fallbacks took a bare "not indexed"
 		// miss and spent its remaining turns on repo-only search_code, never touching web_search.
-		// The web branch of this description returns with CP47.
 		getSymbolDesc := "Return the source of a symbol by fully-qualified name, with its signature and location. Use this instead of guessing a signature. The index covers this repository's own sources"
-		if r.ThirdPartySurface != nil {
+		switch {
+		case r.ThirdPartySurface != nil:
 			getSymbolDesc += "; third-party types are answered from the build classpath when resolvable."
-		} else {
+		case r.Web != nil:
+			getSymbolDesc += "; for third-party or framework APIs use web_search."
+		default:
 			getSymbolDesc += " only."
 		}
 		out = append(out,
@@ -218,6 +226,16 @@ func (r *Registry) Invoke(ctx context.Context, name string, args json.RawMessage
 		return r.findTestsFor(ctx, args)
 	case ToolReadFileRange:
 		return r.readFileRange(args)
+	case ToolWebSearch:
+		if r.Web == nil {
+			return "", errToolUnavailable(ToolWebSearch, "web access")
+		}
+		return r.webSearch(ctx, args)
+	case ToolWebFetch:
+		if r.Web == nil {
+			return "", errToolUnavailable(ToolWebFetch, "web access")
+		}
+		return r.webFetch(ctx, args)
 	default:
 		return "", fmt.Errorf("tools: unknown tool %q", name)
 	}

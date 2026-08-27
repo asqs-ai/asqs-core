@@ -43,6 +43,10 @@ type Config struct {
 	// Generation configures the tool-calling generation loop.
 	Generation GenerationConfig `yaml:"generation"`
 
+	// WebSearch configures the external documentation tools. Off by default; the only feature that
+	// sends data out of the process.
+	WebSearch WebSearchConfig `yaml:"websearch"`
+
 	// Audit holds audit log settings (run-scoped step logging for debugging and improvement).
 	Audit AuditConfig `yaml:"audit"`
 }
@@ -483,6 +487,58 @@ type GatingConfig struct {
 	RequireBuildToolchain bool `yaml:"require_build_toolchain"`
 	// MaxFailingTests: skip when number of failing tests exceeds this; 0 = skip this gate.
 	MaxFailingTests int `yaml:"max_failing_tests"`
+}
+
+// WebSearchConfig configures the external documentation tools.
+//
+// **This is the only feature in asqs-core that sends data out of the process.** It is off by
+// default and registers no tools at all when disabled — not a disabled tool the model can see, but
+// no tool. Two independent brakes exist on top of that: an allow-list that gates page fetches and
+// fails CLOSED when empty, and an offline switch that makes egress structurally impossible by
+// serving replies only from the on-disk replay cache.
+//
+// **The cache lives inside the repository under test** (`.asqs/websearch-cache.json`), because the
+// queries belong to that repository rather than to the tool — the same ownership argument the
+// project-intel cache follows. Two consequences worth knowing before enabling this: a run against a
+// local folder leaves the cache in that folder, and a shipped run can COMMIT the cache, which means
+// **search queries and results can reach the repository's pull request**. Set an absolute
+// `cache_path` outside the repository if that is not wanted.
+type WebSearchConfig struct {
+	// Enabled turns the two tools on. False registers neither. Env: WEBSEARCH_ENABLED.
+	Enabled bool `yaml:"enabled" env:"WEBSEARCH_ENABLED"`
+	// Offline serves ONLY from the replay cache and never egresses: a cache miss is an answer
+	// ("offline, not cached"), not a network call. This is the switch that makes egress
+	// structurally impossible rather than merely unconfigured. Env: WEBSEARCH_OFFLINE.
+	Offline bool `yaml:"offline" env:"WEBSEARCH_OFFLINE"`
+	// Provider selects the backend: "brave" (hosted, needs a key, nothing to run) or "searxng"
+	// (self-hosted; keeps queries inside your own boundary). Env: WEBSEARCH_PROVIDER.
+	Provider string `yaml:"provider" env:"WEBSEARCH_PROVIDER"`
+	// Endpoint is the SearXNG base URL, e.g. http://searxng:8080 inside a cluster.
+	// Env: WEBSEARCH_ENDPOINT.
+	Endpoint string `yaml:"endpoint" env:"WEBSEARCH_ENDPOINT"`
+	// APIKey authenticates hosted providers. Prefer APIKeyFromEnv. Env: WEBSEARCH_API_KEY.
+	APIKey string `yaml:"api_key" env:"WEBSEARCH_API_KEY"`
+	// APIKeyFromEnv names an environment variable holding the key (overrides APIKey when set).
+	APIKeyFromEnv string `yaml:"api_key_from_env" env:"WEBSEARCH_API_KEY_FROM_ENV"`
+	// AllowedHosts gates web_fetch: exact hosts or "*.example.org" wildcards. **EMPTY DISABLES
+	// FETCH** — search still works, pages cannot be read. Empty fails closed, never open.
+	AllowedHosts []string `yaml:"allowed_hosts"`
+	// CachePath overrides the replay cache location. Empty = .asqs/websearch-cache.json inside the
+	// repository under test. An ABSOLUTE path is honoured as-is, which is how you keep the cache
+	// out of the repository (and out of any pull request a shipped run opens).
+	// Env: WEBSEARCH_CACHE_PATH.
+	CachePath string `yaml:"cache_path" env:"WEBSEARCH_CACHE_PATH"`
+}
+
+// WebSearchCacheFileName is the cache document's name when only a directory is known.
+const WebSearchCacheFileName = "websearch-cache.json"
+
+// EffectiveCachePath resolves the replay cache file, repo-relative unless explicitly absolute.
+func (c WebSearchConfig) EffectiveCachePath() string {
+	if p := strings.TrimSpace(c.CachePath); p != "" {
+		return p
+	}
+	return ".asqs/" + WebSearchCacheFileName
 }
 
 // LLMConfig configures the LLM/embedding API used for generation and RAG.

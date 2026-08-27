@@ -24,6 +24,16 @@ func (p *payloadAuditor) LogError(ctx context.Context, step string, payload inte
 	p.Log(ctx, step, payload)
 }
 
+// lastPayload returns the most recent payload logged under step, or nil.
+func (p *payloadAuditor) lastPayload(step string) map[string]interface{} {
+	for i := len(p.steps) - 1; i >= 0; i-- {
+		if p.steps[i] == step {
+			return p.payloads[i]
+		}
+	}
+	return nil
+}
+
 // A known model must yield a bounded budget below its window (output reservation and safety margin
 // subtracted), and the counter must be installed so section spends are measured consistently.
 func TestResolvePromptBudget_knownModelIsBounded(t *testing.T) {

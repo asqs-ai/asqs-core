@@ -8,6 +8,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
+	"github.com/asqs/asqs-core/internal/websearch"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,16 +54,16 @@ func toolLoopFromConfig(cfg *config.Config, cc model.ChatCompleter) (tools.LoopO
 //
 // (Upstream additionally wires web access and the build-classpath surface into the registry; those
 // arrive with CP47 and CP49.)
-func buildGenerationTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
+func buildGenerationTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider, web *websearch.Client) tools.ToolInvoker {
 	if cfg == nil || !cfg.Generation.ToolsEnabled {
 		return nil
 	}
-	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface)
+	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface, web)
 }
 
 // buildToolRegistry assembles the read-only registry shared by both loops, or nil when the pipeline
 // cannot support it.
-func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
+func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider, web *websearch.Client) tools.ToolInvoker {
 	// Metadata is what makes four of the five tools answerable; without it there is nothing worth
 	// advertising.
 	if meta == nil {
@@ -85,6 +86,8 @@ func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder mod
 	// The SAME provider instance the evaluator uses prompt-side, so javap / .d.ts / XML-doc caches
 	// are shared: whichever side resolves a type first spares the other the work.
 	reg.ThirdPartySurface = thirdPartySurfaceFunc(surface, repoRoot)
+	// Nil leaves both web tools unregistered — the model is never told about a tool it cannot use.
+	reg.Web = web
 	return reg
 }
 
@@ -194,11 +197,11 @@ func fixerToolLoopFromConfig(cfg *config.Config, cc model.ChatCompleter) (tools.
 // builder: generation and fixing are toggled independently for the A/B, but a registry that
 // answered differently for the two would make "the fixer looked it up" mean something different
 // from "the generator looked it up".
-func buildFixerTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
+func buildFixerTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider, web *websearch.Client) tools.ToolInvoker {
 	if cfg == nil || !cfg.Generation.FixerToolsEnabled {
 		return nil
 	}
-	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface)
+	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface, web)
 }
 
 // auditFixerToolMode is auditToolMode for the fixer's loop, under its own step so a reader can tell
@@ -392,4 +395,87 @@ func resolveFixerStructuredOutput(ctx context.Context, cfg *config.Config, audit
 		log(false, false, "provider_composes", "on; provider "+p+" treats json_schema as a hint, not a grammar")
 		return false, false
 	}
+}
+
+// buildWebClient resolves the external documentation tools, or nil when web access stays off.
+//
+// This is the one place in asqs-core that can open an outbound connection, so the resolution is
+// audited on every path — "off" is a legitimate outcome an operator should be able to read, not a
+// silent absence. A nil client registers NO web tools at all rather than disabled ones.
+//
+// The allow-list defaults to the curated official-documentation hosts rather than to empty: an
+// empty list disables page fetching entirely (it fails closed), and silently shipping that would
+// look like a broken feature rather than a deliberate one.
+func buildWebClient(ctx context.Context, cfg *config.Config, audit runAuditor, repoAbs string, denyTokens []string) *websearch.Client {
+	if cfg == nil {
+		return nil
+	}
+	key := strings.TrimSpace(cfg.WebSearch.APIKey)
+	if env := strings.TrimSpace(cfg.WebSearch.APIKeyFromEnv); env != "" {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			key = v
+		}
+	}
+	hosts := cfg.WebSearch.AllowedHosts
+	if len(hosts) == 0 && cfg.WebSearch.Enabled {
+		hosts = websearch.DefaultAllowedHosts
+	}
+	client, reason := websearch.New(websearch.Config{
+		Enabled:         cfg.WebSearch.Enabled,
+		ProviderName:    cfg.WebSearch.Provider,
+		Endpoint:        cfg.WebSearch.Endpoint,
+		APIKey:          key,
+		AllowedHosts:    hosts,
+		CachePath:       websearch.ResolveCachePath(repoAbs, cfg.WebSearch.EffectiveCachePath()),
+		Offline:         cfg.WebSearch.Offline,
+		QueryDenyTokens: denyTokens,
+	})
+	if audit != nil {
+		payload := map[string]interface{}{
+			"enabled":  client != nil,
+			"offline":  cfg.WebSearch.Offline,
+			"provider": strings.TrimSpace(cfg.WebSearch.Provider),
+			"hosts":    len(hosts),
+		}
+		if client == nil {
+			payload["message"] = "Web access is OFF: " + reason
+			payload["reason"] = reason
+		} else if cfg.WebSearch.Offline {
+			payload["message"] = "Web access is ON in OFFLINE replay mode: answers come only from the on-disk cache and no connection is ever attempted."
+		} else {
+			payload["message"] = fmt.Sprintf("Web access is ON via %s; %d host(s) may be fetched. Queries and results are cached inside the repository under test.",
+				strings.TrimSpace(cfg.WebSearch.Provider), len(hosts))
+		}
+		audit.Log(ctx, "websearch.mode", payload)
+	}
+	if client != nil && !cfg.WebSearch.Offline {
+		fmt.Fprintf(os.Stderr, "asqs-core: web search ENABLED (%s) — queries leave this machine, and the replay cache is written to the repository under test\n",
+			strings.TrimSpace(cfg.WebSearch.Provider))
+	}
+	return client
+}
+
+// queryDenyTokens are lowercase substrings that must never leave the process inside a search query.
+//
+// Derived from the repository's own identity rather than hand-maintained: the names most likely to
+// be both private and accidentally interesting to a model are exactly the ones it is looking at.
+func queryDenyTokens(repoID, repoAbs string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		// Two characters or fewer would match half the internet; skip rather than over-deny.
+		if len(s) < 3 || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	for _, seg := range strings.FieldsFunc(repoID, func(r rune) bool {
+		return r == '/' || r == ':' || r == '.' || r == '@' || r == '-' || r == '_'
+	}) {
+		add(seg)
+	}
+	add(filepath.Base(strings.TrimSpace(repoAbs)))
+	return out
 }
