@@ -3,6 +3,7 @@ package evaluator
 
 import (
 	"context"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"time"
 )
 
@@ -110,6 +111,23 @@ type FixRequest struct {
 	TestCommand string
 	// Manifests are dependency manifest files (e.g. package.json, pom.xml) so the LLM only suggests imports/packages that exist in the project. Key = repo-relative path (e.g. "package.json"); value = file content.
 	Manifests map[string]string
+	// APISurface carries real member signatures for the third-party types the diagnostic blamed,
+	// read from the project's compile classpath. Empty when no provider is configured, when the
+	// classpath could not be resolved, or when the failure named no third-party type.
+	//
+	// This exists because the fixer's success rate partitioned exactly on whether the repair was
+	// inferable from information already in the prompt: every missing-import error was fixed, and
+	// every wrong-third-party-API error (hasURLContaining, hasStatus, assertThat-with-a-lambda) was
+	// re-emitted unchanged for four rounds. The signatures are in the jars Maven already
+	// downloaded; nothing else in the prompt carries them.
+	APISurface []apisurface.TypeSurface
+	// MissingMemberFacts are deterministic, compiler-derived statements for methods the diagnostic
+	// rejected on REPO-OWNED types ("Vets has NO method setVets; declared methods: getVetList"),
+	// including static-import candidates for bare calls in the test class itself. They cover the
+	// half of "cannot find symbol: method" that the classpath APISurface deliberately does not
+	// (FilterOwnedTypes) — see fix_missing_members.go. Rendered by every builder as a block the
+	// model must treat as ground truth.
+	MissingMemberFacts []string
 	// AbsentSymbols are the type names the same classpath scan looked up and did NOT find — the
 	// negative half of APISurface, and the half that used to be discarded.
 	//

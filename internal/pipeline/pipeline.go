@@ -16,6 +16,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
@@ -316,6 +317,15 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
 	// same shrunken context and the cost is paid once per item.
 	compactPlanContexts(ctx, formatOpts, audit, plan)
+	// Real member signatures for the third-party types a diagnostic blames, read from the project's
+	// own build inputs. Nil for a language with no provider, which is the documented no-op: the
+	// prompt renders no block, exactly as before this existed. Honest degradation is the contract —
+	// never a wrong or empty surface.
+	apiSurface := apisurface.NewProviderForLang(lang)
+	if apiSurface == nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: no API-surface provider for %s; the fixer gets no member-signature block\n", lang)
+	}
+
 	rules := contract.ByLang(lang)
 	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
 	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).
@@ -335,13 +345,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		TwoPhaseTestGeneration:          cfg.Runner.TwoPhaseTestGeneration,
 		RepoPath:                        repoAbs,
 		Audit:                           audit,
+		// Generate-side member signatures, so an invented API is contradicted before the model
+		// writes it rather than by a containerised compile a round later.
+		APISurface: apiSurface,
 	}
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
 	// upstream against a labelled suite it delivers about half the relevant chunks, and the model
 	// has no way to ask for the rest. The registry is what turns a retrieval miss into a lookup.
-	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs); reg != nil {
+	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface); reg != nil {
 		loop, reason := toolLoopFromConfig(cfg, trackedGen)
 		gen.Tools = reg
 		gen.ToolLoop = loop
@@ -375,7 +388,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
 	// toggled independently so a fix-quality comparison can move one without the other.
-	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs); reg != nil {
+	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface); reg != nil {
 		loop, reason := fixerToolLoopFromConfig(cfg, trackedFixer)
 		fixer.Tools = reg
 		fixer.ToolLoop = loop
@@ -498,7 +511,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// Without this the run writes a sibling beside the file it should have extended, and once
 		// both exist the redirect picks on sort order — the tool's own leftover then shadows the
 		// repository's real suite permanently.
-		extendPath, existingBody, doExtend := resolveExtendTarget(item, gen, repoAbs)
+		extendPath, existingBody, doExtend := resolveExtendTarget(item, gen, repoAbs, cfg.Runner.PreferDefaultTestSuffix)
 		if doExtend {
 			prefix := generator.ExtendExistingTestContextPrefix
 			if item.Context != nil && len(item.Context.ExistingTestPaths) > 0 {
@@ -646,6 +659,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// The fixer may now repair inherited breakage on evidence rather than on a regex guess
 		// over each round's diagnostic.
 		BaselineFailingPaths: append([]string(nil), baseline.Paths...),
+		APISurfaceProvider:   apiSurface,
 		// Keep the evaluator's view of the flag in step with the Fixer's, or the audit payload
 		// (structured_user_message_config / _forced) contradicts what the fixer actually did.
 		FixerStructuredUserMessage: cfg.Runner.FixerStructuredUserMessage,

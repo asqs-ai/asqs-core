@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>Microsoft.Playwright</name>
+    </assembly>
+    <members>
+        <member name="T:Microsoft.Playwright.IAPIResponseAssertions">
+            <summary>Type entries describe the type, not a member, and must be skipped.</summary>
+        </member>
+        <member name="M:Microsoft.Playwright.IAPIResponseAssertions.ToBeOKAsync">
+            <summary>Ensures the response status code is within 200..299 range.</summary>
+        </member>
+        <member name="P:Microsoft.Playwright.IAPIResponseAssertions.Not">
+            <summary>Makes the assertion check for the opposite condition.</summary>
+        </member>
+        <member name="T:Microsoft.Playwright.ILocatorAssertions" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToContainTextAsync(System.String,Microsoft.Playwright.LocatorAssertionsToContainTextOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToContainTextAsync(System.Collections.Generic.IEnumerable{System.String},Microsoft.Playwright.LocatorAssertionsToContainTextOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToHaveTextAsync(System.Text.RegularExpressions.Regex,Microsoft.Playwright.LocatorAssertionsToHaveTextOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToHaveCountAsync(System.Int32,Microsoft.Playwright.LocatorAssertionsToHaveCountOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToHaveAttributeAsync(System.String,System.String,Microsoft.Playwright.LocatorAssertionsToHaveAttributeOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ToBeVisibleAsync(Microsoft.Playwright.LocatorAssertionsToBeVisibleOptions)" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.NestedGeneric(System.Collections.Generic.IDictionary{System.String,System.Collections.Generic.IEnumerable{System.Int32}})" />
+        <member name="M:Microsoft.Playwright.ILocatorAssertions.ArrayAndByRef(System.String[],System.Int32@)" />
+        <member name="P:Microsoft.Playwright.ILocatorAssertions.Not" />
+        <member name="T:Microsoft.Playwright.IPageAssertions" />
+        <member name="M:Microsoft.Playwright.IPageAssertions.ToHaveURLAsync(System.String,Microsoft.Playwright.PageAssertionsToHaveURLOptions)" />
+        <member name="P:Microsoft.Playwright.IPageAssertions.Not" />
+    </members>
+</doc>

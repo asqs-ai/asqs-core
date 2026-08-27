@@ -103,8 +103,12 @@ func (r *Registry) getSymbol(ctx context.Context, args []byte) (string, error) {
 			if out, ok := r.dependencyDocForSymbol(ctx, miss.fq); ok {
 				return out, nil
 			}
-			// Upstream's remaining rungs — the build-classpath surface (CP49) and one web search
-			// (CP47) — return with their bundles.
+			if r.ThirdPartySurface != nil {
+				if out, ok := r.ThirdPartySurface(ctx, miss.fq); ok && strings.TrimSpace(out) != "" {
+					return r.capped(out), nil
+				}
+			}
+			// Upstream's last rung, one web search, returns with CP47.
 			return "", fmt.Errorf("%s; the index covers only this repository's sources", err)
 		}
 		return "", err

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -136,6 +137,11 @@ type EvalOptions struct {
 	FixLoopRepeatStopThreshold     int
 	FixLoopRecurrenceStopThreshold int
 	FixLoopNoProgressStopThreshold int
+	// APISurfaceProvider, when set, extracts real member signatures for the third-party types a
+	// diagnostic blames, read from the project's compile classpath. Optional: a nil provider, an
+	// unresolvable classpath, or a lookup error all degrade to "no API block" — audited, never
+	// fatal. See fix_api_surface.go for why the fixer needs this at all.
+	APISurfaceProvider apisurface.Provider
 	// BaselineFailingPaths are repo-relative test files that were ALREADY failing before this run
 	// generated anything, captured by one pre-generation compile. They are adopted into the fixer's
 	// writable set as a known input rather than being re-derived from each round's diagnostic by
@@ -2088,6 +2094,15 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		loopState.lastFileDiagnostics = nowDiagnostics
 	}
 
+	// Real API signatures for the third-party types this diagnostic blames, read from the compile
+	// classpath — so the model is told what a member list actually contains instead of inferring it
+	// from a manifest that names artifacts but not their members. The fixer's success rate
+	// partitioned exactly on this: every missing-import error was fixed, and every
+	// wrong-third-party-API error was re-emitted unchanged for four rounds.
+	apiSurface, absentSymbols := lookupAPISurface(ctx, opts, errorOutput, files, step, audit)
+	// The owned-type counterpart: FilterOwnedTypes drops repo types from that lookup, so their
+	// "cannot find symbol: method" misses are answered here from source instead.
+	memberFacts := missingMemberFacts(ctx, opts, errorOutput, files, writableArtifacts, audit)
 	// Runtime counterpart to the compile-side facts: Mockito-misuse statements proved from the
 	// failure's own stack frames plus the generated test's source. Deterministic — nothing here is
 	// inferred — so the model is told what IS rather than what might be.
@@ -2109,6 +2124,9 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		TestCommand:               testCommandForFixStep(opts, step),
 		Manifests:                 manifests,
 		ErrorSummary:              errorLogLLMSummary,
+		APISurface:                apiSurface,
+		AbsentSymbols:             absentSymbols,
+		MissingMemberFacts:        memberFacts,
 		TestFailureFacts:          testFacts,
 		PriorAttempts:             priorAttempts(loopState),
 		FixAttempt:                attempt,

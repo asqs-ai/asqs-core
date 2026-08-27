@@ -677,3 +677,58 @@ func writeTestFailureFactsBlock(b *strings.Builder, req evaluator.FixRequest) {
 	}
 	b.WriteString("\n")
 }
+
+func writeAPISurfaceBlock(b *strings.Builder, req evaluator.FixRequest) {
+	if len(req.APISurface) == 0 {
+		return
+	}
+	b.WriteString("=== API SURFACE (verbatim from the compile classpath - these are the ONLY members that exist) ===\n\n")
+	for _, s := range req.APISurface {
+		if len(s.Members) == 0 {
+			// A symbol-only resolution: the point is the import line, not the member list.
+			b.WriteString(fmt.Sprintf("--- %s ---\n", s.FQCN))
+			b.WriteString(fmt.Sprintf("  (resolves the unimported symbol; import %s)\n\n", s.FQCN))
+			continue
+		}
+		origin := ""
+		if strings.TrimSpace(s.Origin) != "" {
+			origin = " [" + s.Origin + "]"
+		}
+		b.WriteString(fmt.Sprintf("--- %s%s ---\n", s.FQCN, origin))
+		for _, m := range s.Members {
+			b.WriteString("  " + m + "\n")
+		}
+		if s.Truncated {
+			b.WriteString("  ... (member list truncated; absence from this list is NOT proof a member does not exist)\n")
+		} else {
+			b.WriteString("  (complete member list: a member not shown above does not exist)\n")
+		}
+		b.WriteString("\n")
+	}
+}
+
+// writeAPISurfaceBlock renders real member signatures read from the compile classpath.
+//
+// The manifest block below tells the model which ARTIFACTS are on the classpath; it says nothing
+// about their MEMBERS, and that gap is what the fixer kept falling into — re-emitting
+// hasURLContaining, hasStatus and assertThat-with-a-lambda for four rounds because nothing in the
+// prompt could contradict them. These lines come from javap against the resolved classpath, so they
+// are authoritative in a way no amount of reasoning over the manifest can be.
+//
+// Truncation is stated per type. A member list reads as exhaustive, so silently cutting it would
+// make absence look like proof of non-existence — the same wrong conclusion in the other direction.
+// writeMissingMemberFactsBlock renders the compiler-verified facts for methods the diagnostic
+// rejected on repo-owned types (see evaluator/fix_missing_members.go). The API surface above
+// answers "what DOES this third-party type declare"; this block answers "the method you called on
+// a repo type DOES NOT exist, and here is what does" — the owned-type half FilterOwnedTypes
+// removes from the surface lookup.
+func writeMissingMemberFactsBlock(b *strings.Builder, req evaluator.FixRequest) {
+	if len(req.MissingMemberFacts) == 0 {
+		return
+	}
+	b.WriteString("=== MISSING MEMBER FACTS (compiler-verified; treat as ground truth) ===\n")
+	for _, f := range req.MissingMemberFacts {
+		b.WriteString("- " + f + "\n")
+	}
+	b.WriteString("\n")
+}

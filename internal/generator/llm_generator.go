@@ -3,10 +3,13 @@ package generator
 import (
 	"context"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
+	"golang.org/x/sync/singleflight"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
@@ -40,6 +43,19 @@ type LLMGenerator struct {
 	Tools tools.ToolInvoker
 	// ToolLoop bounds that access. Its zero Mode means one-shot regardless of Tools.
 	ToolLoop tools.LoopOptions
+	// APISurface, when set, resolves real member signatures from the compile classpath for the
+	// third-party types a generated test is about to call into. Optional: nil means generation
+	// behaves exactly as it did before this existed.
+	APISurface apisurface.Provider
+
+	// apiSurfaceMu guards apiSurfaceBlocks, which caches one rendered block per distinct TARGET
+	// SET for the life of the generator — not one block for the whole run. The target set varies
+	// with isE2E, so a single cached block let a unit gap's targets serve every E2E gap: upstream
+	// measured a run whose only api_surface event requested five Spring annotations and no
+	// Playwright types at all, despite e2e_framework=playwright-java.
+	apiSurfaceMu     sync.Mutex
+	apiSurfaceBlocks map[string]apiSurfaceEntry
+	apiSurfaceGroup  singleflight.Group
 	// RepoPath is the absolute or cwd-relative repo root. When set for C#, unit tests may be placed under a
 	// dedicated root-level tests directory (tests/, UnitTests/, …) instead of beside the source file.
 	RepoPath string
@@ -116,9 +132,15 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 		!strings.HasPrefix(strings.TrimSpace(contextStr), ExtendExistingTestContextPrefix)
 
 	system := g.buildGeneratorSystem(item, isE2E, itemLang, genModeSingle)
+	// Appended before the structured-output suffix so the output-format instruction stays last,
+	// where a small model weights it most heavily. Only the framework block belongs here: it is
+	// stable per (language, layer, framework), which is what makes caching it sound.
+	system += g.pregenerateAPISurface(ctx, itemLang, isE2E)
 	if useStructured {
 		system += structuredTestJSONSystemSuffix(suggestedPath)
 	}
+	// The per-symbol block goes in the USER message, where varying it per gap costs nothing.
+	contextStr += g.signatureAPISurface(ctx, item, itemLang)
 
 	runSinglePass := func(userText string) (string, string, error) {
 		messages := []model.Message{
@@ -136,6 +158,10 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	if err != nil {
 		return "", "", err
 	}
+	// A member the classpath proves exists under a different CASE is a repair, not a retry: the
+	// model had the right member and the wrong capitalisation, and a whole extra round to say so
+	// costs more than the substitution.
+	content = g.repairMemberCase(ctx, content, item, itemLang, isE2E)
 	if reason := lowValueGeneratedTestReason(item, isE2E, content); reason != "" {
 		retryUser := contextStr + "\n\n---\nQuality retry: your previous output was rejected because it produced low-value tests (" + reason + "). " +
 			"Replace reflection/existence/tautology checks with behavioral tests that invoke the production API and assert outcomes or verified mock interactions. " +
@@ -144,6 +170,7 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 		if err != nil {
 			return "", "", err
 		}
+		content = g.repairMemberCase(ctx, content, item, itemLang, isE2E)
 		if reason2 := lowValueGeneratedTestReason(item, isE2E, content); reason2 != "" {
 			return "", "", fmt.Errorf("llm generator: rejected low-value test output after retry (%s)", reason2)
 		}
@@ -821,4 +848,16 @@ func underCanonicalTestTree(p, lang string) bool {
 		}
 	}
 	return false
+}
+
+// auditCapabilityDegraded records that a requested CompleteOptions field is not supported by the
+// configured provider, so the fallback is a declared decision rather than an invisible one.
+func (g *LLMGenerator) auditCapabilityDegraded(ctx context.Context, capability, detail string) {
+	if g.Audit == nil {
+		return
+	}
+	g.Audit.Log(ctx, "llm.capability_degraded", map[string]interface{}{
+		"capability": capability,
+		"detail":     detail,
+	})
 }

@@ -380,11 +380,11 @@ implementation record can be found; it is provenance, not instruction.
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
+| CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `in review` |
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
 | CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `in review` |
 | CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `in review` |
-| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `in review` (item 5's API-surface block waits on CP49) |
+| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `in review` |
 
 ### P10 — Language indexers
 
@@ -3033,7 +3033,7 @@ improvement here is live on every core run.
 
 ### CP49 — `internal/evaluator/apisurface` (and the generator-file merge)
 
-- **Status:** `ready` · **Effort:** 5–6 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 5–6 d · **Risk:** medium
 
 **The semantic wall.** The fixer is asked to repair a compile error against a type it cannot see —
 it invents members, and the next round invents different ones. This package extracts the **real** API
@@ -3059,6 +3059,55 @@ a surface is non-fatal and counted.
 
 **Fixture note (ties to CP01).** This package's `testdata/cs_repo/bin/…/Microsoft.Playwright.xml` is
 a real fixture asserted on by name. Do not let a `**/bin/` ignore rule near it.
+
+**Implementation record (2026-08-27).**
+
+- **The package ported byte-clean.** `internal/evaluator/apisurface` has **zero** internal imports —
+  all twelve production files and their tests are stdlib-only — so it copied wholesale (~3 400
+  production lines) and passed on the first run with no adaptation at all. That includes
+  `8640c59`'s hardening named in this section: `repodeclared.go`, the extended `unresolveddep.go`,
+  `pregenerate.go`, `inventedmember.go` and `repomember.go`. The plan's note that Maven classpath
+  resolution comes "via `internal/javaproj`" does not hold at the pinned baseline — the package
+  resolves the classpath itself and imports nothing.
+- **Fixture note honoured.** `testdata/cs_repo/bin/Release/net8.0/Microsoft.Playwright.xml` copied
+  and verified against `git check-ignore`: no `**/bin/` rule shadows it, so the fixture the C# tests
+  assert on by name is committable.
+- **Fixer side.** `fix_api_surface.go` and `fix_missing_members.go` ported with their tests;
+  `EvalOptions.APISurfaceProvider` and `FixRequest.{APISurface,MissingMemberFacts}` added; both
+  lookups run per round in `applyLLMFix`. The prompt now renders the `=== API SURFACE ===` block and
+  the missing-member facts, which **completes CP53's item 5** — its record deferred exactly these
+  two to this bundle.
+- **Generate side.** The API-surface region of upstream's `llm_generator.go` ported into
+  `internal/generator/api_surface.go`: the framework block appended to the system prompt (before the
+  structured-output suffix, so the output-format instruction stays last), the per-symbol block
+  appended to the user message, and the per-target-set cache. That cache is keyed on the TARGET SET,
+  not once per run: the set varies with isE2E, and a single cached block let one unit gap's targets
+  serve every E2E gap upstream — a run whose only surface event requested five Spring annotations
+  and no Playwright types despite `e2e_framework=playwright-java`.
+- **`repairMemberCase`**, which the section notes no other bundle names, is wired on **both**
+  generation output paths (first pass and quality retry). A member the classpath proves exists under
+  a different case is a repair, not a retry: the model had the right member and the wrong
+  capitalisation, and a whole extra round to say so costs more than the substitution.
+- **CP43's stubbed miss-ladder rung restored.** `Registry.ThirdPartySurface` and its
+  `thirdPartySurfaceFunc` adapter are live, so a `get_symbol` miss on a third-party type is answered
+  from the build classpath instead of dead-ending — and `get_symbol`'s own description now says so,
+  because upstream measured that the model does not pivot on its own. Both tool registries receive
+  the SAME provider instance the evaluator uses, so javap / `.d.ts` / XML-doc caches are shared.
+  **Not taken:** upstream's `classpathAbsenceAnswer` proof-of-absence rung, which needs the
+  absence-prover plumbing; an empty result means "checked, not found" and the ladder continues.
+- **A TRIAGE'd key got its reader.** `runner.prefer_default_test_suffix` was declared, documented
+  and read by nobody — the exemption named this bundle, and it is now honoured in the extend-target
+  resolver (the escape hatch for a repository that wants the convention default even when an
+  existing file could be extended). Its lint exemption is deleted.
+- **Acceptance — honest degradation.** `NewProviderForLang` returns an **untyped** nil for every
+  unsupported language, which is what the fixer's and generator's nil checks depend on; a typed nil
+  from a switch would defeat them and render an empty block instead of none.
+  `TestAPISurfaceProvider_degradesToNoProviderNotAWrongOne` pins both directions, and the pipeline
+  says on stderr when a run gets no provider. Failure to build a surface stays non-fatal and
+  audited (`TestApplyLLMFix_apiSurfaceFailureIsNonFatal`). **Mutation-checked:** disabling the
+  lookup fails two tests.
+- Full gate green.
+
 
 ### CP50 — Fix-loop convergence core
 
@@ -3359,7 +3408,7 @@ be invented here.
 
 ### CP53 — Fixer robustness batches
 
-- **Status:** `in review` — items 1–4, 6, 7 complete; item 5 partial (see record) · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `in review` — all seven items (item 5 completed by CP49) · **Effort:** 3–4 d · **Risk:** medium
 - **Provenance:** upstream `8640c59` (§2.6) — re-diff before implementing; upstream keeps moving.
 
 1. **Accept flat `{"edits":[…]}` arrays.** Models emit them; the parser rejected them and the round

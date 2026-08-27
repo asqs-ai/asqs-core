@@ -47,9 +47,6 @@ var exemptConfigFields = map[string]string{
 	"PrivateRegistryCredential.Scope":    "TRIAGE: compile-only credential seam (CP33)",
 	// TRIAGE: consumed by the multi-turn fixer wave (CP50–CP53); the key predates its feature.
 	"RunnerConfig.DisableMultiTurnFixer": "TRIAGE: fixer-hardening wave (CP50–CP53) brings the reader",
-	// TRIAGE: read by the generator merge's suffix policy; arrives with CP49's llm_generator
-	// reconciliation. Note upstream's lint has a KNOWN BLIND SPOT on exactly this name.
-	"RunnerConfig.PreferDefaultTestSuffix": "TRIAGE: CP49 generator merge brings the reader",
 	// TRIAGE: pre-generation seam refactor is a later wave (P7); key shipped ahead of it.
 	"RunnerConfig.AutoSeamRefactorPreGenerate": "TRIAGE: seam-refactor bundle brings the reader",
 	// TRIAGE: the CLI pipeline is one-shot; the interval belongs to the serve-mode scheduler,

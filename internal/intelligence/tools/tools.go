@@ -63,10 +63,14 @@ type Registry struct {
 	RepoRoot string
 	// MaxChars caps every tool's output. 0 uses DefaultMaxChars.
 	MaxChars int
-	// Upstream's Registry additionally carries the external-documentation tools (a websearch
-	// client with its URL ledger — CP47) and a ThirdPartySurface hook answering get_symbol misses
-	// from the build classpath (internal/evaluator/apisurface — CP49). Both fields and their
-	// miss-ladder rungs arrive with those bundles.
+	// ThirdPartySurface, when set, answers a get_symbol miss with member signatures resolved from
+	// the project's build classpath. The symbol index covers only this repository's sources, and
+	// the questions a fix round actually asks are about DEPENDENCIES — upstream measured a run that
+	// missed on three third-party types and then guessed one nonexistent method after another. The
+	// injected implementation may shell out (javap); this package still never execs.
+	ThirdPartySurface func(ctx context.Context, fqName string) (string, bool)
+	// Upstream's Registry additionally carries the external-documentation tools (a websearch client
+	// with its URL ledger); that field and its miss-ladder rung arrive with CP47.
 	// lastTruncated records whether the most recent Invoke cut its result at MaxChars.
 	lastTruncated bool
 }
@@ -120,9 +124,13 @@ func (r *Registry) Definitions() []model.ToolDefinition {
 		// The description names what a miss falls back to, because the model demonstrably does not
 		// pivot on its own: upstream's run that motivated the fallbacks took a bare "not indexed"
 		// miss and spent its remaining turns on repo-only search_code, never touching web_search.
-		// The classpath (CP49) and web (CP47) branches of this switch return with those bundles.
+		// The web branch of this description returns with CP47.
 		getSymbolDesc := "Return the source of a symbol by fully-qualified name, with its signature and location. Use this instead of guessing a signature. The index covers this repository's own sources"
-		getSymbolDesc += " only."
+		if r.ThirdPartySurface != nil {
+			getSymbolDesc += "; third-party types are answered from the build classpath when resolvable."
+		} else {
+			getSymbolDesc += " only."
+		}
 		out = append(out,
 			model.ToolDefinition{
 				Name:        ToolGetSymbol,

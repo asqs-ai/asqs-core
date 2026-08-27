@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
@@ -52,16 +53,16 @@ func toolLoopFromConfig(cfg *config.Config, cc model.ChatCompleter) (tools.LoopO
 //
 // (Upstream additionally wires web access and the build-classpath surface into the registry; those
 // arrive with CP47 and CP49.)
-func buildGenerationTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string) tools.ToolInvoker {
+func buildGenerationTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
 	if cfg == nil || !cfg.Generation.ToolsEnabled {
 		return nil
 	}
-	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot)
+	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface)
 }
 
 // buildToolRegistry assembles the read-only registry shared by both loops, or nil when the pipeline
 // cannot support it.
-func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string) tools.ToolInvoker {
+func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
 	// Metadata is what makes four of the five tools answerable; without it there is nothing worth
 	// advertising.
 	if meta == nil {
@@ -81,6 +82,9 @@ func buildToolRegistry(meta *metadata.Store, emb *embeddings.Store, embedder mod
 	if embedder != nil {
 		reg.Embedder = embedder
 	}
+	// The SAME provider instance the evaluator uses prompt-side, so javap / .d.ts / XML-doc caches
+	// are shared: whichever side resolves a type first spares the other the work.
+	reg.ThirdPartySurface = thirdPartySurfaceFunc(surface, repoRoot)
 	return reg
 }
 
@@ -190,11 +194,11 @@ func fixerToolLoopFromConfig(cfg *config.Config, cc model.ChatCompleter) (tools.
 // builder: generation and fixing are toggled independently for the A/B, but a registry that
 // answered differently for the two would make "the fixer looked it up" mean something different
 // from "the generator looked it up".
-func buildFixerTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string) tools.ToolInvoker {
+func buildFixerTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.Store, embedder model.Embedder, repoID, lang, repoRoot string, surface apisurface.Provider) tools.ToolInvoker {
 	if cfg == nil || !cfg.Generation.FixerToolsEnabled {
 		return nil
 	}
-	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot)
+	return buildToolRegistry(meta, emb, embedder, repoID, lang, repoRoot, surface)
 }
 
 // auditFixerToolMode is auditToolMode for the fixer's loop, under its own step so a reader can tell
@@ -240,11 +244,14 @@ func errorLogSummarizer(cfg *config.Config, cc model.ChatCompleter) func(context
 // The decision is made BEFORE generation because it changes the request: extending asks for the new
 // methods only, creating asks for a whole file. It is deliberately conservative — the path must
 // already be on disk AND look like a test artifact, so a gap can never "extend" production source.
-func resolveExtendTarget(item *retrieval.TestPlanItem, gen *generator.LLMGenerator, repoAbs string) (path, body string, ok bool) {
+func resolveExtendTarget(item *retrieval.TestPlanItem, gen *generator.LLMGenerator, repoAbs string, preferDefaultSuffix bool) (path, body string, ok bool) {
 	if item == nil || gen == nil || strings.TrimSpace(repoAbs) == "" {
 		return "", "", false
 	}
-	target, _, _ := generator.ExistingOrSuggestedTestPath(item, gen.TestFramework, gen.E2EFramework, repoAbs, false)
+	// runner.prefer_default_test_suffix is the escape hatch for a repository that wants the
+	// convention default even when an existing file could be extended. It was declared and
+	// documented with no reader at all.
+	target, _, _ := generator.ExistingOrSuggestedTestPath(item, gen.TestFramework, gen.E2EFramework, repoAbs, preferDefaultSuffix)
 	target = strings.TrimSpace(filepath.ToSlash(target))
 	if target == "" {
 		return "", "", false

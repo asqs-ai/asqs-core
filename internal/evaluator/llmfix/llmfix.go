@@ -829,10 +829,10 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld
 	writeWithheldArtifactNote(&b, withheld)
 	// Deterministic, compiler- and runtime-derived statements, rendered ahead of the failure so the
 	// model reads what is PROVEN before it reads what went wrong. (Upstream renders these from
-	// three prompt builders; core has one, so "all three builders" is satisfied by construction.
-	// The API-surface block and the missing-member facts that share its classpath lookup arrive
-	// with CP49.)
+	// three prompt builders; core has one, so "all three builders" is satisfied by construction.)
+	writeAPISurfaceBlock(&b, req)
 	writeAbsentSymbolsBlock(&b, req)
+	writeMissingMemberFactsBlock(&b, req)
 	writeTestFailureFactsBlock(&b, req)
 	writeErrorSummaryBlock(&b, req)
 	// --- Error log (gist when truncated); surface primary error first when possible ---
