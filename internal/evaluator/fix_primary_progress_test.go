@@ -118,7 +118,56 @@ func TestApplyLLMFix_noWarningWhenPrimarySiteFixed(t *testing.T) {
 	}
 }
 
-// Upstream carries two more tests here, both on the targeted-edit response contract: that resolved
-// edits land as whole-file writes, and that a round whose anchors ALL miss is reported as an
-// unusable response rather than a silent no-op. They need FixResponse.Edits (CP51) and
-// applyLLMFix's skip-reason return (CP52's breaker refactor), so they return with those bundles.
+// The skip-reason half of upstream's remaining tests is restored here now that applyLLMFix reports
+// one. A round the model wasted must be reported as RETRYABLE, not as an exhausted fixer: before
+// the split, any no-write outcome was terminal, so a single unparseable response ended a run with a
+// non-compiling tree.
+//
+// (Upstream's other two tests here ride on the targeted-edit response contract — that resolved
+// edits land as whole-file writes, and that a round whose anchors all miss is reported rather than
+// silently dropped. They need FixResponse.Edits, so they return with CP51.)
+func TestApplyLLMFix_unusableReplyIsRetryableNotTerminal(t *testing.T) {
+	repo := t.TempDir()
+	rel := "src/test/java/p/PTest.java"
+	writeRepoFile(t, repo, rel, "package p;\nclass P {\n  @Test void a() {}\n}\n")
+
+	// The model answers with nothing usable.
+	fixer := &stubFixer{resp: FixResponse{Files: map[string]string{}}}
+	opts := EvalOptions{RepoPath: repo, Lang: "java", Fixer: fixer, ArtifactPaths: []string{rel}}
+
+	applied, _, reason := applyLLMFix(context.Background(), opts, StepCompile,
+		"[ERROR] /workspace/"+rel+":[3,1] boom\n", &recordingAuditor{}, new(int), 3, nil, "")
+
+	if applied {
+		t.Fatal("nothing was written; this is not a fix")
+	}
+	if reason != FixSkipResponseUnusable {
+		t.Fatalf("reason = %q, want %q so the caller can retry instead of ending the run", reason, FixSkipResponseUnusable)
+	}
+
+	// And the same reason must reach the caller through RunFix, flagged retryable.
+	res := RunFix(context.Background(), opts, StepCompile,
+		"[ERROR] /workspace/"+rel+":[3,1] boom\n", nil, 1, 3, nil)
+	if res.SkippedReason != FixSkipResponseUnusable || !res.Retryable {
+		t.Fatalf("RunFix reported reason=%q retryable=%v; a bad turn must stay distinguishable from an exhausted fixer",
+			res.SkippedReason, res.Retryable)
+	}
+}
+
+// A tripped breaker is the opposite case: terminal, and never retryable.
+func TestRunFix_breakerTripIsTerminal(t *testing.T) {
+	repo := t.TempDir()
+	rel := "src/test/java/p/QTest.java"
+	writeRepoFile(t, repo, rel, "package p;\nclass Q {\n  @Test void a() {}\n}\n")
+	opts := EvalOptions{RepoPath: repo, Lang: "java",
+		Fixer: &stubFixer{resp: FixResponse{Files: map[string]string{}}}, ArtifactPaths: []string{rel}}
+
+	state := &FixLoopState{tripped: true, trippedReason: FixSkipLoopNoProgress}
+	res := RunFix(context.Background(), opts, StepCompile, "[ERROR] boom\n", nil, 1, 3, state)
+	if res.SkippedReason != FixSkipLoopNoProgress {
+		t.Fatalf("reason = %q, want the breaker that fired", res.SkippedReason)
+	}
+	if res.Retryable {
+		t.Error("an exhausted fixer must not be reported as retryable")
+	}
+}

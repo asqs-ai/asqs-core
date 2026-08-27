@@ -383,8 +383,8 @@ implementation record can be found; it is provenance, not instruction.
 | CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
 | CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `ready` |
-| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `ready` |
-| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `blocked (CP52)` |
+| CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `in review` |
+| CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `ready` |
 
 ### P10 — Language indexers
 
@@ -3190,7 +3190,7 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
 
 ### CP52 — Fix-loop breakers and audit honesty
 
-- **Status:** `ready` · **Effort:** 2–3 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 2–3 d · **Risk:** medium
 
 1. Extract `checkFixLoopBreakers` and the three thresholds (`repeatStopThreshold`,
    `recurrenceStopThreshold`, `noProgressStopThreshold`) from `applyLLMFix`, which is currently one
@@ -3204,9 +3204,71 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
 5. Audit honesty: every stop reason is emitted with the evidence that produced it, so a post-mortem
    does not require re-deriving the loop's state. Requires CP03 to be worth anything.
 
+**Implementation record (2026-08-27).**
+
+- **Item 1 — breaker extraction.** `checkFixLoopBreakers` lifted out of `applyLLMFix`, which was one
+  function doing detection, prompting, writing and stopping; detection is now separable and
+  directly testable. It owns all mutation of `FixLoopState`. The three thresholds became
+  `EvalOptions.FixLoop{Repeat,Recurrence,NoProgress}StopThreshold` with accessors where a
+  non-positive value means **unset, never disabled** — a disabled breaker is how a loop burns its
+  whole budget on one unfixable error — plus the matching `runner.fix_loop_*_stop_threshold` keys.
+  They were hardcoded, leaving an operator watching a loop give up after three rounds no lever.
+- **Item 2 — read/write split.** `clampFixContextRunes` (sheds read-only dependencies largest-first;
+  writable artifacts are **never** shed, because a truncated artifact invites the model to
+  "complete" it from a fragment) and `sleepBetweenFixAttempts` (between attempts, never before the
+  first, and cancellable) ported with their call sites and the keys
+  `runner.fix_context_runes_max` / `runner.fix_backoff`. **`readFixContextFiles` / `applyFixWrites`
+  were NOT extracted**: upstream's versions are shaped around machinery core does not have yet
+  (`fixWriteOutcome`'s four rejection counters feed CP53's robustness batches, and the read side
+  carries the symbol-keep slicing). Extracting shells now would be a refactor with no reader —
+  they travel with CP53.
+- **Item 3 — error-log summary.** `computeErrorLogLLMSummary` extracted, and a real defect fixed
+  with it: core computed the summary inside the audit merge and **replaced `error_output` with
+  it**, which makes a post-mortem impossible without re-running and worse than impossible when the
+  prose is wrong (upstream measured a summary blaming "missing Spring Boot test dependencies" for a
+  package that had merely moved — the only error text four rounds of audit rows carried). The
+  summary is now attached **beside** the compiler text as `error_output_llm_summary`, and the same
+  text reaches the model through the new `FixRequest.ErrorSummary`, rendered as an explicitly
+  SECONDARY block ahead of the raw log. Previously it was computed for audit eyes only while the
+  model worked from a gist that had dropped the failures the summary named. **Toggle correction:**
+  the plan asks for "a toggle whose absence means enabled (a `*bool`)"; core already has
+  `runner.disable_error_log_llm_summary`, a `disable_*` bool whose absence already means enabled.
+  Adding a `*bool` would be a second key for one decision, so the existing key was **wired**
+  instead — it was declared, documented and never passed to the evaluator (the same field-name
+  collision that hides keys from CP17's lint), along with the `ErrorLogSummarizer` that makes it do
+  anything.
+- **Item 4 — the streak pauses.** A compile-broken iteration no longer resets the
+  repeated-test-failure streaks. That iteration's test step never runs, so there is no fingerprint
+  to compare; resetting made the early-exit discard unreachable whenever a fixer's own test-step
+  writes broke compilation between two identical test failures — the file shielded itself from
+  discard by breaking the build. A compile break that genuinely changes which files fail still
+  resets naturally, via the fingerprint mismatch.
+- **Item 5 — audit honesty.** The trip event now carries `rejection_class: "breaker"`,
+  `threshold_name`, and **the threshold that actually fired** rather than always the repeat
+  threshold (the two disagreed on every oscillation or no-progress trip, making the event read as
+  self-contradictory: "reappeared 2 time(s)" beside "threshold: 3"), alongside every counter that
+  could have tripped. `applyLLMFix` now returns the `FixSkip*` reason, surfaced on `FixStepResult`
+  as `SkippedReason` + `Retryable`, so a bad model turn stays distinguishable from an exhausted
+  fixer — collapsing the two meant one unparseable response ended a run with a non-compiling tree.
+  `trippedReason` makes the sticky no-op path report the same cause as the round that tripped.
+- **Came along with the extraction:** the parse-failure exclusion from magnitude tracking. A file
+  that does not parse aborts the compiler before attribution, so the output shrinks and the
+  magnitude measures the masking rather than progress; upstream measured healthy rounds afterwards
+  reading as "no progress" and tripping the breaker with half the budget unused on a demonstrably
+  converging loop.
+- **CP50's deferred test restored:** `applyLLMFix`'s skip-reason return now exists, so the
+  retryable-vs-terminal case is pinned here (through both `applyLLMFix` and `RunFix`). The
+  targeted-edit half still waits on CP51's `FixResponse.Edits`.
+- **Process note:** midway through, a `git checkout` intended to undo one bad edit script discarded
+  every uncommitted change in `workflow.go` and `steps.go`. All of it was reconstructed from the
+  edit scripts and re-verified; the record is here because the loss was real, not because anything
+  is outstanding.
+- Full gate green, live suite included.
+
+
 ### CP53 — Fixer robustness batches
 
-- **Status:** `blocked (CP52)` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** medium
 - **Provenance:** upstream `8640c59` (§2.6) — re-diff before implementing; upstream keeps moving.
 
 1. **Accept flat `{"edits":[…]}` arrays.** Models emit them; the parser rejected them and the round

@@ -587,6 +587,18 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		RunE2ETestPass:             anyE2E,
 		CompileOncePerEval:         true,
 		FormatAfterFix:             formatAfterFixHook,
+		// Fix-loop bounds. The breaker thresholds were hardcoded, leaving an operator watching a
+		// loop give up after three rounds with no lever at all.
+		FixLoopRepeatStopThreshold:     cfg.Runner.FixLoopRepeatStopThreshold,
+		FixLoopRecurrenceStopThreshold: cfg.Runner.FixLoopRecurrenceStopThreshold,
+		FixLoopNoProgressStopThreshold: cfg.Runner.FixLoopNoProgressStopThreshold,
+		FixContextRunesMax:             cfg.Runner.FixContextRunesMax,
+		BackoffBetweenFixAttempts:      fixBackoffDuration(cfg.Runner.FixBackoff),
+		// runner.disable_error_log_llm_summary was declared and documented but never passed on, so
+		// the summariser below could not be turned off — another key the inert-field lint could not
+		// see, because EvalOptions declares an identically named field.
+		DisableErrorLogLLMSummary: cfg.Runner.DisableErrorLogLLMSummary,
+		ErrorLogSummarizer:        errorLogSummarizer(cfg, fixerChat),
 	}, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)

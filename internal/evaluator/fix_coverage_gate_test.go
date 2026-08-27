@@ -85,7 +85,7 @@ func TestApplyLLMFix_rejectsCoverageDeletingFix(t *testing.T) {
 	audit := &recordingAuditor{}
 	opts := EvalOptions{RepoPath: repo, Lang: "java", Fixer: fixer, ArtifactPaths: []string{rel}}
 
-	applied, touched := applyLLMFix(context.Background(), opts, StepCompile,
+	applied, touched, _ := applyLLMFix(context.Background(), opts, StepCompile,
 		"[ERROR] /workspace/"+rel+":[10,17] cannot find symbol\n", audit, new(int), 3, nil, "")
 
 	if applied || len(touched) != 0 {
@@ -113,7 +113,7 @@ func TestApplyLLMFix_coverageReductionAllowedByConfig(t *testing.T) {
 		AllowFixCoverageReduction: true,
 	}
 
-	applied, _ := applyLLMFix(context.Background(), opts, StepCompile,
+	applied, _, _ := applyLLMFix(context.Background(), opts, StepCompile,
 		"[ERROR] /workspace/"+rel+":[10,17] cannot find symbol\n", audit, new(int), 3, nil, "")
 
 	if !applied {
@@ -136,7 +136,7 @@ func TestApplyLLMFix_acceptsRepairThatKeepsCoverage(t *testing.T) {
 	// Line 23 is `void welcomePageLoads() {`, the line the rename actually changes. The diagnostic
 	// must name a line the repair touches, or the primary-site enforcement correctly rejects the
 	// round as a rewrite that left the blamed line alone.
-	applied, _ := applyLLMFix(context.Background(), opts, StepCompile,
+	applied, _, _ := applyLLMFix(context.Background(), opts, StepCompile,
 		"[ERROR] /workspace/"+rel+":[23,7] cannot find symbol\n", audit, new(int), 3, nil, "")
 
 	if !applied {

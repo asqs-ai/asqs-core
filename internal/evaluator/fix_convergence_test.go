@@ -102,7 +102,7 @@ func TestApplyLLMFix_rejectsACoverageDeletingFix(t *testing.T) {
 	fixer := &stubFixer{resp: FixResponse{Files: map[string]string{rel: gutted}}}
 	opts := EvalOptions{RepoPath: repo, Lang: "java", Fixer: fixer, ArtifactPaths: []string{rel}}
 
-	applied, _ := applyLLMFix(context.Background(), opts, StepCompile,
+	applied, _, _ := applyLLMFix(context.Background(), opts, StepCompile,
 		"[ERROR] /workspace/"+rel+":[4,1] cannot find symbol\n", audit, new(int), 3, nil, "")
 
 	if applied {
@@ -114,7 +114,7 @@ func TestApplyLLMFix_rejectsACoverageDeletingFix(t *testing.T) {
 	// The escape hatch exists, and using it is loud.
 	audit2 := &recordingAuditor{}
 	opts.AllowFixCoverageReduction = true
-	if applied, _ := applyLLMFix(context.Background(), opts, StepCompile,
+	if applied, _, _ := applyLLMFix(context.Background(), opts, StepCompile,
 		"[ERROR] /workspace/"+rel+":[4,1] cannot find symbol\n", audit2, new(int), 3, nil, ""); !applied {
 		t.Fatal("the escape hatch must let a deliberate reduction through")
 	}

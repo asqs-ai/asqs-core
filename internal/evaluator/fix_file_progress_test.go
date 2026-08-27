@@ -118,7 +118,7 @@ func TestApplyLLMFix_reportsAFileRewrittenToNoEffect(t *testing.T) {
 	opts := EvalOptions{RepoPath: repo, Lang: "java", ArtifactPaths: []string{rel}}
 
 	opts.Fixer = &stubFixer{resp: FixResponse{Files: map[string]string{rel: v2}}}
-	if applied, _ := applyLLMFix(context.Background(), opts, StepCompile, errOut, audit, new(int), 5, state, ""); !applied {
+	if applied, _, _ := applyLLMFix(context.Background(), opts, StepCompile, errOut, audit, new(int), 5, state, ""); !applied {
 		t.Fatal("round 1 should have written the file")
 	}
 	if audit.hasStep("evaluator.fix_file_no_progress") {

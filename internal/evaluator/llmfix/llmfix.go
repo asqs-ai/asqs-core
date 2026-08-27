@@ -736,6 +736,7 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
 		b.WriteString(blk)
 		b.WriteString("\n")
 	}
+	writeErrorSummaryBlock(&b, req)
 	// --- Error log (gist when truncated); surface primary error first when possible ---
 	b.WriteString("=== ERROR LOG (gist when truncated) ===\n")
 	if primary := primaryErrorLine(req.ErrorOutput); primary != "" {
@@ -1410,4 +1411,24 @@ func IsStructuredOutputAPIError(err error) bool {
 // IsTransientNetworkError reports whether err may succeed on retry (timeouts, connection drops).
 func IsTransientNetworkError(err error) bool {
 	return isTransientNetworkError(err)
+}
+
+// maxErrorSummaryRunes caps the LLM error summary in the prompt. Summaries are normally ~1k runes;
+// the cap only guards against a summarizer that rambles.
+const maxErrorSummaryRunes = 2500
+
+// writeErrorSummaryBlock emits req.ErrorSummary as a labeled SECONDARY block ahead of the raw
+// error gist. The framing matters: summaries have misdiagnosed before, so the raw log must stay
+// the authority the model is told to trust when the two disagree.
+func writeErrorSummaryBlock(b *strings.Builder, req evaluator.FixRequest) {
+	s := strings.TrimSpace(req.ErrorSummary)
+	if s == "" {
+		return
+	}
+	if runes := []rune(s); len(runes) > maxErrorSummaryRunes {
+		s = string(runes[:maxErrorSummaryRunes]) + " … [summary truncated]"
+	}
+	b.WriteString("=== ERROR SUMMARY (LLM-generated, SECONDARY — the raw error log below is authoritative; if they disagree, trust the log) ===\n")
+	b.WriteString(s)
+	b.WriteString("\n\n")
 }

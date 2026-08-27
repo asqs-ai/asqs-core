@@ -110,6 +110,13 @@ type FixRequest struct {
 	TestCommand string
 	// Manifests are dependency manifest files (e.g. package.json, pom.xml) so the LLM only suggests imports/packages that exist in the project. Key = repo-relative path (e.g. "package.json"); value = file content.
 	Manifests map[string]string
+	// ErrorSummary is an LLM-written summary of an oversized error log, attached ALONGSIDE the raw
+	// text rather than replacing it ("dependencies" prose can be wrong, and the raw text stays
+	// authoritative). Empty when the log is small, the feature is off, or no summarizer is wired.
+	// Before this field existed the summary was computed for every oversized log and then shown
+	// only to audit readers, while the model worked from a head+tail gist that had dropped the
+	// failures the summary named.
+	ErrorSummary string
 	// PriorAttempts is the compacted record of fixer rounds already completed for this step in this
 	// run: what actually landed on disk, what was skipped and why, and the failure signature that
 	// came back afterwards. Empty on the first round.

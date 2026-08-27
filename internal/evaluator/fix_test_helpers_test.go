@@ -137,3 +137,15 @@ func writeRepoFile(t *testing.T, repo, rel, content string) {
 		t.Fatal(err)
 	}
 }
+
+// readWorkflowSource returns workflow.go's text for the guards that assert on code shape rather
+// than behaviour (a few lines deep inside a long loop, where a future edit could otherwise
+// reinstate a removed reset unnoticed).
+func readWorkflowSource(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("workflow.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/generator"
@@ -194,4 +195,35 @@ func buildFixerTools(cfg *config.Config, meta *metadata.Store, emb *embeddings.S
 // which of the two loops degraded.
 func auditFixerToolMode(ctx context.Context, audit runAuditor, mode tools.Mode, reason string) {
 	auditToolModeFor(ctx, audit, "Fixer", "fix.tool_mode", mode, reason)
+}
+
+// fixBackoffDuration parses runner.fix_backoff. An unparseable value is treated as "no wait"
+// rather than failing the run: pacing is an optimisation, and a typo in it should not cost a run.
+func fixBackoffDuration(s string) time.Duration {
+	d, err := time.ParseDuration(strings.TrimSpace(s))
+	if err != nil || d < 0 {
+		return 0
+	}
+	return d
+}
+
+// errorLogSummarizer builds the summariser the evaluator uses for oversized error logs, or nil
+// when the feature is off or no fixer completer exists.
+//
+// The summary is attached BESIDE the raw compiler text in both the audit row and the fix prompt,
+// never in place of it — summaries have misdiagnosed before, and the raw log stays authoritative.
+func errorLogSummarizer(cfg *config.Config, cc model.ChatCompleter) func(context.Context, string) (string, error) {
+	if cfg == nil || cfg.Runner.DisableErrorLogLLMSummary || cc == nil {
+		return nil
+	}
+	return func(ctx context.Context, text string) (string, error) {
+		res, err := cc.Complete(ctx, []model.Message{
+			{Role: model.RoleSystem, Content: "You summarize software test/build failure logs for operators. Reply with plain text only, at most 80 short lines: (1) probable root cause, (2) first failing test or error code if visible, (3) file:line references if present. Omit duplicated stack frames."},
+			{Role: model.RoleUser, Content: text},
+		}, model.CompleteOptions{MaxTokens: 1024})
+		if err != nil || res == nil {
+			return "", err
+		}
+		return strings.TrimSpace(res.Content), nil
+	}
 }

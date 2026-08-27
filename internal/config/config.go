@@ -730,6 +730,25 @@ type RunnerConfig struct {
 	SkipFixerOnInfrastructureFailure bool `yaml:"skip_fixer_on_infrastructure_failure" env:"RUNNER_SKIP_FIXER_ON_INFRASTRUCTURE_FAILURE"`
 	// DisableErrorLogLLMSummary when true disables LLM summarization of large error logs in evaluator.fix_request audit payloads. Default false = summarization on when a fixer LLM is configured.
 	DisableErrorLogLLMSummary bool `yaml:"disable_error_log_llm_summary" env:"RUNNER_DISABLE_ERROR_LOG_LLM_SUMMARY"`
+	// FixContextRunesMax caps the total size of the fix context handed to the fixer. Read-only
+	// dependency files are shed largest-first until it fits; writable artifacts are never shed,
+	// because a truncated artifact invites the model to "complete" it from a fragment. 0 =
+	// uncapped. Env: RUNNER_FIX_CONTEXT_RUNES_MAX.
+	FixContextRunesMax int `yaml:"fix_context_runes_max" env:"RUNNER_FIX_CONTEXT_RUNES_MAX"`
+	// FixBackoff waits before every fix attempt after the first (Go duration, e.g. "30s"). The
+	// provider clients already back off between retries WITHIN one call; this paces the evaluator's
+	// own rounds against a rate-limited provider. Empty = no wait. Env: RUNNER_FIX_BACKOFF.
+	FixBackoff string `yaml:"fix_backoff" env:"RUNNER_FIX_BACKOFF"`
+	// FixLoopRepeatStopThreshold / FixLoopRecurrenceStopThreshold / FixLoopNoProgressStopThreshold
+	// override the circuit-breaker defaults (3 / 2 / 6). A non-positive value means "unset", never
+	// "disabled" — a disabled breaker is how a loop burns its whole budget on one unfixable error.
+	// Raising them buys more rounds on a stubborn failure at the cost of wall-clock time on one
+	// that will never converge.
+	// Env: RUNNER_FIX_LOOP_REPEAT_STOP_THRESHOLD, RUNNER_FIX_LOOP_RECURRENCE_STOP_THRESHOLD,
+	// RUNNER_FIX_LOOP_NO_PROGRESS_STOP_THRESHOLD.
+	FixLoopRepeatStopThreshold     int `yaml:"fix_loop_repeat_stop_threshold" env:"RUNNER_FIX_LOOP_REPEAT_STOP_THRESHOLD"`
+	FixLoopRecurrenceStopThreshold int `yaml:"fix_loop_recurrence_stop_threshold" env:"RUNNER_FIX_LOOP_RECURRENCE_STOP_THRESHOLD"`
+	FixLoopNoProgressStopThreshold int `yaml:"fix_loop_no_progress_stop_threshold" env:"RUNNER_FIX_LOOP_NO_PROGRESS_STOP_THRESHOLD"`
 	// StartMaxIteration is the max evaluation fix-iteration budget for the first run. Stored as current_iteration in the run DB; if evaluation is still unstable after using this budget, current_iteration is increased and the pipeline is scheduled to rerun after SchedulerInterval. 0 = use default 3.
 	StartMaxIteration int `yaml:"start_max_iteration" env:"RUNNER_START_MAX_ITERATION"`
 	// MaxIteration is the ceiling for current_iteration; we never allow more than this many fix iterations per run. 0 = use default 10.
