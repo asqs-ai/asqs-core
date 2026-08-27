@@ -524,17 +524,36 @@ type LLMConfig struct {
 	MaxConcurrent int `yaml:"max_concurrent" env:"LLM_MAX_CONCURRENT"`
 }
 
-// GenerationConfig configures tool-calling during test generation.
+// GenerationConfig bounds the tool-calling loop during test generation.
 //
-// Upstream's edition additionally bounds the tool loop (max turns, calls per turn/run, result
-// characters); those keys arrive with the loop itself (CP44), and the prompted-JSON fallback
-// switch with the mode resolver (CP42) — a key without its reader would be a dead letter.
+// The defaults are deliberately small. Every extra turn is a round trip paid per gap, so an
+// unbounded loop is a cost and latency hazard rather than merely a slow one — and against a local
+// Ollama, the single-process case this project targets, it is also a queue.
+//
+// The fixer's own gates (fixer_tools_enabled, fixer_max_tool_turns) arrive with the bundle that
+// gives the fix loop tool access (CP46) — a key without its reader would be a dead letter.
 type GenerationConfig struct {
-	// ToolsEnabled turns tool calling on. False is the previous one-shot behaviour, byte-identical
-	// on the wire. Today this gates the startup Ollama tool-support probe (see
-	// llm.BuildStepCompleters); the generation loop that actually sends tools arrives with CP44.
-	// Env: GENERATION_TOOLS_ENABLED.
+	// ToolsEnabled turns the loop on. False is the previous one-shot behaviour, byte-identical on
+	// the wire. Env: GENERATION_TOOLS_ENABLED.
 	ToolsEnabled bool `yaml:"tools_enabled" env:"GENERATION_TOOLS_ENABLED"`
+	// PromptedToolsEnabled allows the prompted-JSON fallback on models without native tool calling
+	// (see tools.ResolveMode). Env: GENERATION_PROMPTED_TOOLS_ENABLED.
+	PromptedToolsEnabled bool `yaml:"prompted_tools_enabled" env:"GENERATION_PROMPTED_TOOLS_ENABLED"`
+	// MaxToolTurns caps model→tool→model round trips per gap. 0 = tools.DefaultMaxToolTurns (4).
+	// Env: GENERATION_MAX_TOOL_TURNS.
+	MaxToolTurns int `yaml:"max_tool_turns" env:"GENERATION_MAX_TOOL_TURNS"`
+	// MaxToolCallsPerTurn caps parallel calls in one turn. 0 = tools.DefaultMaxToolCallsPerTurn (3).
+	// Env: GENERATION_MAX_TOOL_CALLS_PER_TURN.
+	MaxToolCallsPerTurn int `yaml:"max_tool_calls_per_turn" env:"GENERATION_MAX_TOOL_CALLS_PER_TURN"`
+	// MaxToolCallsPerRun caps total calls for one gap, so a pathological gap cannot starve the
+	// shared LLM limiter. 0 = tools.DefaultMaxToolCallsPerRun (12).
+	// Env: GENERATION_MAX_TOOL_CALLS_PER_RUN.
+	MaxToolCallsPerRun int `yaml:"max_tool_calls_per_run" env:"GENERATION_MAX_TOOL_CALLS_PER_RUN"`
+	// MaxToolResultChars is the total characters tool results may add to the conversation across
+	// the whole loop, drawn from the same allowance as the prompt. Beyond it results are truncated
+	// and the loop stops requesting tools. 0 = tools.DefaultMaxToolResultChars (24000).
+	// Env: GENERATION_MAX_TOOL_RESULT_CHARS.
+	MaxToolResultChars int `yaml:"max_tool_result_chars" env:"GENERATION_MAX_TOOL_RESULT_CHARS"`
 }
 
 // RunnerConfig configures the test/CI runner (e.g. Docker).

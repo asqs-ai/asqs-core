@@ -306,11 +306,30 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	trackedGen := model.NewUsageTrackingChatCompleter(genChat, runUsage)
 	trackedFixer := model.NewUsageTrackingChatCompleter(fixerChat, runUsage)
 	gen := &generator.LLMGenerator{
-		LLM:                    trackedGen,
-		ContractRules:          &rules,
-		TwoPhaseTestGeneration: cfg.Runner.TwoPhaseTestGeneration,
-		RepoPath:               repoAbs,
-		Audit:                  audit,
+		LLM:           trackedGen,
+		ContractRules: &rules,
+		// runner.disable_structured_generate_output was declared, documented and never passed to
+		// the generator, so setting it did nothing. (The inert-field lint matches by field name and
+		// LLMGenerator has an identically named field, which is why it read as wired.) It has to be
+		// right here in particular: the tool loop's structured-deferral audit below reports on the
+		// schema this flag decides, and reporting a deferral for a schema that was never sent is
+		// exactly the false claim that misdirected an upstream post-mortem.
+		DisableStructuredGenerateOutput: cfg.Runner.DisableStructuredGenerateOutput,
+		TwoPhaseTestGeneration:          cfg.Runner.TwoPhaseTestGeneration,
+		RepoPath:                        repoAbs,
+		Audit:                           audit,
+	}
+	// Give the model read-only access to the index during generation.
+	//
+	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
+	// upstream against a labelled suite it delivers about half the relevant chunks, and the model
+	// has no way to ask for the rest. The registry is what turns a retrieval miss into a lookup.
+	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs); reg != nil {
+		loop, reason := toolLoopFromConfig(cfg, trackedGen)
+		gen.Tools = reg
+		gen.ToolLoop = loop
+		auditToolMode(ctx, audit, loop.Mode,
+			appendStructuredDeferralNote(reason, trackedGen, !cfg.Runner.DisableStructuredGenerateOutput))
 	}
 	fixer := &llmfix.Fixer{LLM: trackedFixer, Audit: audit}
 	sandbox := runner.NewSandboxFromConfig(cfg)

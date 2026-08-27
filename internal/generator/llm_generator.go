@@ -13,6 +13,7 @@ import (
 	"github.com/asqs/asqs-core/internal/generator/contract"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"github.com/asqs/asqs-core/internal/intelligence/tools"
 	"github.com/asqs/asqs-core/internal/layout"
 	"github.com/asqs/asqs-core/internal/workspace"
 )
@@ -33,6 +34,11 @@ type LLMGenerator struct {
 	E2EFramework                    string             // optional; playwright, cypress, …
 	DisableStructuredGenerateOutput bool
 	TwoPhaseTestGeneration          bool
+	// Tools optionally gives the model read-only access to the index during generation. Nil is the
+	// one-shot path: retrieval assembles a context and the model gets a single turn.
+	Tools tools.ToolInvoker
+	// ToolLoop bounds that access. Its zero Mode means one-shot regardless of Tools.
+	ToolLoop tools.LoopOptions
 	// RepoPath is the absolute or cwd-relative repo root. When set for C#, unit tests may be placed under a
 	// dedicated root-level tests directory (tests/, UnitTests/, …) instead of beside the source file.
 	RepoPath string
@@ -246,6 +252,33 @@ const maxGenerateOutputTokens = 16384
 // maxGenerateOutputTokens.
 const truncationEscalations = 2
 
+// completeOnce performs one generation attempt, with tool access when it is configured.
+//
+// The tool loop sits INSIDE the truncation retry: a completion cut short at max_tokens is retried as
+// a whole, tool calls included, because the retry re-asks the same question at a larger cap and the
+// lookups that informed the first attempt inform the second equally.
+func (g *LLMGenerator) completeOnce(ctx context.Context, messages []model.Message, opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, error) {
+	if g.Tools == nil || g.ToolLoop.Mode == "" || g.ToolLoop.Mode == tools.ModeOneShot {
+		return g.LLM.Complete(ctx, messages, opts)
+	}
+	loop := g.ToolLoop
+	// Attempts are audited per call. The hook is attached here rather than stored on the generator
+	// so it carries this call's ctx, which is what ties an attempt to its run in the audit log.
+	// (Upstream additionally composes in a context-carried observer installed by the session
+	// runner, so each lookup is also recorded as a gap-attributed session attempt; the session
+	// engine is outside core's seam, so there is nothing to compose with here.)
+	if loop.OnAttempt == nil {
+		loop.OnAttempt = g.auditToolAttempts(ctx)
+	}
+	if loop.OnCapHit == nil {
+		loop.OnCapHit = g.auditToolCapHit(ctx)
+	}
+	// The per-gap budget is supplied by the caller, not created here: this function runs once per
+	// retry attempt, so a budget created here would reset on every retry.
+	loop.Budget = budget
+	return tools.CompleteWithTools(ctx, g.LLM, g.Tools, messages, opts, loop)
+}
+
 func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = DefaultGenerateMaxTokens
@@ -264,11 +297,16 @@ func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages [
 	// escalation keeps its own separate budget — it re-asks a DIFFERENT question (a larger
 	// output cap), so it must not draw from this one.
 	const maxRetries = 2
+	// One budget for this gap, shared by every attempt below. Retries re-ask the same question, so
+	// their lookups draw from the same allowance rather than starting fresh — a budget created per
+	// attempt would reset on every retry and the per-run cap would bound nothing. Measured upstream
+	// before this was wired: one gap made 8 loop invocations and 60 tool calls against a cap of 12.
+	budget := &tools.RunBudget{}
 	var result *model.CompleteResult
 	var err error
 	escalations := 0
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err = g.LLM.Complete(ctx, messages, opts)
+		result, err = g.completeOnce(ctx, messages, opts, budget)
 		if err == nil {
 			// Provider-side conditions that did not fail the call but change how to read it —
 			// notably an Ollama prompt that filled num_ctx and was silently truncated at the

@@ -365,15 +365,15 @@ implementation record can be found; it is provenance, not instruction.
 | CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `in review` |
 | CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `in review` |
 | CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `in review` |
-| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `ready` |
-| CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `blocked (CP44, CP16)` |
-| CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP44, CP50)` |
+| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `in review` |
+| CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `ready` |
+| CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP50)` |
 
 ### P8 — External knowledge
 
 | ID | Bundle | Upstream | Depends on | Effort | Status |
 |----|--------|----------|-----------|--------|--------|
-| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `blocked (CP44)` |
+| CP47 | Web search tool: SearXNG + Brave, ledger, allow-list, offline replay | B54 | CP43, CP44 | 4–5 d | `ready` |
 | CP48 | Dependency doc indexing (offline: Maven sources, NuGet XML, `.d.ts`) | B55 | CP43, CP11 | 5–6 d | `blocked (CP43, CP11)` |
 
 ### P9 — Evaluator and fix loop *(highest per-day value here — see §2.5-5)*
@@ -2733,7 +2733,7 @@ root is refused, with the traversal attempt counted (CP03).
 
 ### CP44 — Bounded generation tool loop, budgets, attempt audit
 
-- **Status:** `ready` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `in review` · **Effort:** 3–4 d · **Risk:** high
 
 `internal/intelligence/tools/loop.go` + `config.go`, wired into `internal/generator/llm_generator.go`.
 Caps on turns per run, calls per turn, calls per run, and result characters per run.
@@ -2755,9 +2755,72 @@ history to validate at all, another does not — so it is a capability flag, not
 **Acceptance.** Caps are enforced and audited; a run that exhausts its result budget still produces
 valid messages; every attempt is recorded with tool name, arguments size and outcome.
 
+**Implementation record (2026-08-27).**
+
+- **Loop** — `tools/loop.go` and `tools/config.go` ported verbatim (imports re-based) with all four
+  loop test files: `RunBudget` (per-GAP, not per-call), the four caps with their `CapHit` records,
+  `CompleteWithTools` (one-shot and empty-registry paths are byte-identical to pre-tool
+  behaviour), the structured-deferral rule (`StructuredWithTools:false` providers get Structured
+  withheld from tool-offering turns and re-applied on the final tool-free turn — undeclared keeps
+  both, unknown ≠ incapable), and `LoopOptionsFor`.
+- **Both named defects came with their fixes.** (1) `toolResultContent(text, dropped)` — a
+  `RoleTool` message can never be empty, covering both the budget-blanked path and a tool that
+  legitimately returns `("", nil)`; CP25's `contentOrPlaceholder` sits underneath it as the
+  transport net, and both are now live. (2) The result-chars `CapHit` is reported **before**
+  blanking, so `Requested` is the real size instead of the 0 it always logged.
+- **Final turn** — the forced answer-now message, the capability-gated tool declaration
+  (`ToolChoiceNoneWithTools` — required on Anthropic, absent on Ollama's /api/chat), and the one
+  bounded retry on an empty reply with both conditions surfaced through `CompleteResult.Warnings`.
+- **Excluded (seam):** `observer.go` / `observer_test.go`. Its `WithAttemptObserver` is installed
+  only by the session runner, so in core `AttemptObserverFromContext` would always return nil and
+  `CombineAttemptHooks(audit, nil)` would always return audit — dead code by construction. The
+  generator therefore attaches `g.auditToolAttempts(ctx)` directly, with the composition noted
+  in-file.
+- **Generator** — `Tools` / `ToolLoop` fields, `completeOnce` (tool loop INSIDE the truncation
+  retry), and one `RunBudget` created per gap in `completeGenerateWithRetry` and shared by every
+  attempt. `tool_attempt_audit.go` ported (`generate.tool_call` / `generate.tool_cap`; result
+  bodies never recorded, only `result_chars`); its comments were re-based off upstream's session /
+  openapi references, and its ported test file came along.
+- **Pipeline** — `tool_loop_config.go`: `toolLoopFromConfig` (the only reader of `cfg.Generation`),
+  `buildGenerationTools` (registry from the live stores; web + classpath rungs stay with CP47 /
+  CP49), `auditToolMode` (one-shot is logged as `llm.capability_degraded`, every other tier under
+  `generate.tool_mode`) and `appendStructuredDeferralNote`. Upstream's `ToolLoopFromConfig` lives
+  in `orchestrator`; core's equivalent owner is the pipeline, which already maps config onto
+  generator fields, so it stays unexported there and `internal/generator` keeps no dependency on
+  `internal/config`. `FixerToolLoopFromConfig` is CP46's and `generatorHasTools` CP45's.
+- **Config** — `generation.{prompted_tools_enabled,max_tool_turns,max_tool_calls_per_turn,
+  max_tool_calls_per_run,max_tool_result_chars}` added, all read through `toolLoopFromConfig`
+  (CP42's deferred key lands here, with its reader). Fixer gates stay for CP46.
+- **Defect found in passing, fixed here because this bundle depends on it:**
+  `runner.disable_structured_generate_output` was **never passed to the generator** — the pipeline's
+  `LLMGenerator` literal omitted the field, so the documented key did nothing. CP17's inert-field
+  lint missed it because it matches by field NAME and `LLMGenerator` has an identically named
+  field. It is load-bearing here: `appendStructuredDeferralNote` reports on the schema this flag
+  decides, and announcing a deferral for a schema that was never sent is exactly the false claim
+  upstream's own comment warns about. Now wired.
+- **Acceptance.** Caps enforced and audited, and a budget-exhausted run still produces valid
+  messages: ported loop tests. Every attempt recorded with tool name, arguments and outcome:
+  ported audit tests. Authored for core's own wiring (`tool_loop_wiring_test.go`): the generator
+  actually reaches the registry and audits every lookup; all three no-tools shapes take the
+  one-shot path; and the per-run budget survives retries — that last one mutation-checked (a
+  per-attempt budget lets 5 calls through a cap of 3).
+- **Live end-to-end** against the local Ollama + scratch Postgres, real Registry over a seeded
+  symbol: the probe declared native, `toolLoopFromConfig` resolved `native`, `generate.tool_mode`
+  was audited, and the model made **three real lookups across three turns** — `get_symbol` (89
+  chars), `read_file_range` (a genuine miss, returned to the model as information and audited
+  `ok:false` through `LogError`), `find_tests_for` (51 chars) — then produced a 1862-character
+  artifact at `src/test/java/com/acme/OrderServiceTest.java`. Transient test deleted, scratch rows
+  swept.
+- **Unrelated flake found, not fixed here:** `TestNormalizeChunkEmbeddings_liveCorpus` fails
+  intermittently under `go test ./...` because `storage/embeddings`' dim-guard live test recreates
+  the shared scratch `chunks` table at 768 dimensions while `storage/migrate`'s test inserts
+  8-dimension vectors. Pre-existing test-isolation defect (reproduces with those two packages
+  alone, on a tree without this bundle's changes); spun out as its own task.
+
+
 ### CP45 — Core-plus-inventory context restructure
 
-- **Status:** `blocked (CP44, CP16)` · **Effort:** 3 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 3 d · **Risk:** medium
 
 When tools are enabled, the prompt carries a **core** context plus an **inventory** of what the model
 can fetch (`retrieval/available_context.go`), instead of everything inline.
@@ -2767,7 +2830,7 @@ setting defaulting to today's behaviour.
 
 ### CP46 — Fixer tool access
 
-- **Status:** `blocked (CP44, CP50)` · **Effort:** 3–5 d · **Risk:** medium
+- **Status:** `blocked (CP50)` · **Effort:** 3–5 d · **Risk:** medium
 
 Tool access inside the fix loop: `completeToolAware`, `resolvedToolMode`, `MultiTurnEffectiveForStep`,
 attempt and cap-hit auditing in `internal/evaluator/llmfix`.
@@ -2784,7 +2847,7 @@ test must be able to detect that). Ships off by default; enabling it is a CP16-m
 
 ### CP47 — Web search tool
 
-- **Status:** `blocked (CP43, CP44)` · **Effort:** 4–5 d · **Risk:** medium
+- **Status:** `ready` · **Effort:** 4–5 d · **Risk:** medium
 - **Order (D17, 2026-08-26):** CP48 lands before this bundle starts.
 
 New `internal/websearch` + the `web_search` tool. SearXNG and Brave backends, a query ledger, a host
