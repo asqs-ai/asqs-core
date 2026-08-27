@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/storage/embeddings"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 	"github.com/asqs/asqs-core/internal/storage/migrate"
 )
@@ -49,6 +50,27 @@ func runMigrate(args []string) error {
 	}{
 		{"metadata", metaURL, migrate.MetadataMigrations()},
 		{"embeddings", embURL, migrate.EmbeddingsMigrations()},
+	}
+
+	// Create every schema BEFORE running any migration, and in a pass of its own.
+	//
+	// Two reasons it cannot be folded into the loop below. Migrations assume the tables exist, so on
+	// a brand-new database the first one fails with `relation "symbols" does not exist` — and
+	// "run migrate" is the documented first step of an install, which made the documented order
+	// impossible to follow. And the two stores are not independent: metadata's repo-scoping migration
+	// reads `chunks`, which the EMBEDDINGS schema owns, so initialising each target just before its
+	// own migrations still fails when the two share one database — which is the default.
+	//
+	// InitSchema is idempotent, so this is a no-op on the existing databases migrations exist for.
+	if !*dryRun {
+		for _, tgt := range targets {
+			if tgt.connString == "" {
+				continue
+			}
+			if err := initSchemaForTarget(ctx, tgt.name, tgt.connString, cfg.Database.EmbeddingsDimension); err != nil {
+				return fmt.Errorf("%s: create schema: %w", tgt.name, err)
+			}
+		}
 	}
 
 	for _, tgt := range targets {
@@ -104,6 +126,32 @@ func runMigrate(args []string) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// initSchemaForTarget runs the target store's own InitSchema, so `migrate` works on a database that
+// has never been indexed into. Each store owns its schema, which is why this dispatches by name
+// rather than running one shared DDL.
+// dim matters on a fresh embeddings database: InitSchema creates the chunk vector column at that
+// width, and a later dimension change fails closed on a populated table. It comes from the config so
+// `migrate` cannot create a corpus the configured model will then be refused by.
+func initSchemaForTarget(ctx context.Context, name, connString string, dim int) error {
+	switch name {
+	case "metadata":
+		st, err := metadata.Open(connString)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = st.Close() }()
+		return st.InitSchema(ctx)
+	case "embeddings":
+		st, err := embeddings.Open(ctx, embeddings.Config{ConnString: connString, Dimension: dim})
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		return st.InitSchema(ctx)
 	}
 	return nil
 }
