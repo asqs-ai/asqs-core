@@ -19,6 +19,7 @@ import (
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
+	"github.com/asqs/asqs-core/internal/generator/extendmerge"
 	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
@@ -228,6 +229,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 
 	// --- Plan ---------------------------------------------------------------------------
+	// Between index and plan: the tree the run will work on is known, and nothing this run writes
+	// exists yet, so a duplicate found here is genuinely pre-existing.
+	reconcileDuplicateArtifacts(ctx, cfg, audit, repoAbs, lang, files)
+
 	planOpts := buildPlanOptions(cfg, lang, opts.RepoID)
 	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
 	planOpts.MaxGapsE2E = opts.MaxGapsE2E
@@ -483,6 +488,20 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 				ctxStr = piMarkdown + "\n\n" + ctxStr
 			}
 		}
+		// Extend-or-create, decided BEFORE generation because it changes what the model is asked
+		// for: a whole file, or only the new methods to splice into the one already on disk.
+		//
+		// Without this the run writes a sibling beside the file it should have extended, and once
+		// both exist the redirect picks on sort order — the tool's own leftover then shadows the
+		// repository's real suite permanently.
+		extendPath, existingBody, doExtend := resolveExtendTarget(item, gen, repoAbs)
+		if doExtend {
+			prefix := generator.ExtendExistingTestContextPrefix
+			if item.Context != nil && len(item.Context.ExistingTestPaths) > 0 {
+				prefix = fmt.Sprintf(generator.ExtendExistingRedirectPrefix, filepath.ToSlash(extendPath)) + prefix
+			}
+			ctxStr = prefix + existingBody + generator.ExtendExistingTestContextSuffix + ctxStr
+		}
 		auditPromptBudget(ctx, audit, out.Symbol, ctxStr, budget)
 		content, relPath, gerr := gen.Generate(ctx, item, ctxStr)
 		switch {
@@ -491,9 +510,39 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		case strings.TrimSpace(content) == "" || strings.TrimSpace(relPath) == "":
 			out.Err = "empty generation"
 		default:
-			if werr := writeArtifact(repoAbs, relPath, content); werr != nil {
-				out.Err = "write: " + werr.Error()
-			} else {
+			// Under extend semantics the target is authoritative: it is the path whose bytes were
+			// read above, while the generator derives its own path from the suggester and would
+			// silently write a near-duplicate sibling.
+			writePath := relPath
+			if doExtend {
+				writePath = extendPath
+			}
+			wrote, written, skips := extendmerge.Write(repoAbs, []extendmerge.Item{{
+				Path:             writePath,
+				Content:          content,
+				ExtendExisting:   doExtend,
+				SourceSymbolFile: planItemSourceFile(item),
+			}})
+			for _, sk := range skips {
+				audit.Log(ctx, "generate.write_skipped", map[string]interface{}{
+					"message": "Generated artifact was not written: " + sk,
+					"symbol":  out.Symbol,
+				})
+			}
+			switch {
+			case wrote == 0:
+				out.Err = "write skipped"
+				if len(skips) > 0 {
+					out.Err = "write skipped: " + skips[0]
+				}
+			default:
+				relPath = written[0]
+				// Record provenance so the convention vote and the duplicate reconciler can tell
+				// this run's files from the repository's own. Best-effort: an unrecorded write
+				// degrades to "human-authored", which is the safe reading.
+				if _, rerr := genmanifest.Record(repoAbs, runID, written); rerr != nil {
+					fmt.Fprintf(os.Stderr, "asqs-core: record generated artifact provenance: %v\n", rerr)
+				}
 				out.Path = relPath
 				out.Generated = true
 				sum.GapsGenerated++

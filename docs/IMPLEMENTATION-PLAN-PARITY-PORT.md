@@ -382,7 +382,7 @@ implementation record can be found; it is provenance, not instruction.
 |----|--------|----------|-----------|--------|--------|
 | CP49 | `internal/evaluator/apisurface` (+ the generator-file merge) | F02 + `8640c59` | CP06, CP32 | 5–6 d | `ready` |
 | CP50 | Fix-loop convergence core | F01, F03, F05, F09 | CP03 | 4–5 d | `in review` |
-| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `partial` (items 2 + 3a done; 1, 3b, 4 open) |
+| CP51 | Extend-merge and artifact identity | F04, F07, F08, F11 | CP06, CP50 | 5–6 d | `in review` |
 | CP52 | Fix-loop breakers and audit honesty | F10 + breaker refactor | CP03, CP50 | 2–3 d | `in review` |
 | CP53 | Fixer robustness batches | `8640c59` (§2.6) | CP49, CP50, CP52 | 3–4 d | `ready` |
 
@@ -3172,7 +3172,7 @@ inherited and does not consume the budget.
 
 ### CP51 — Extend-merge and artifact identity
 
-- **Status:** `partial` — items 2 and the convention half of 3 are `in review`; items 1, 4 and the rest of 3 remain **open** · **Effort:** 5–6 d (≈2 d spent) · **Risk:** high
+- **Status:** `in review` — all four items · **Effort:** 5–6 d · **Risk:** high
 
 1. **Import union on every extend-existing merge**, Java **and** C#. Hoist top-level imports; model
    import *kind* rather than a static/global boolean; handle the C# anchor chain, alias collisions and
@@ -3188,9 +3188,10 @@ inherited and does not consume the budget.
 **Adaptation.** Upstream runs the reconciliation between index and plan inside its orchestration
 package; in core that seam is `internal/pipeline/pipeline.go` between the index and plan blocks.
 
-**Progress record (2026-08-27) — PARTIAL, this bundle is not finished.**
+**Implementation record (2026-08-27).** All four items landed; the first pass covered items 2 and
+3a, the second the extend-merge write path.
 
-**Landed (items 2 and 3a):**
+**Items 2 and 3a:**
 
 - **Item 2 — one test artifact, one layer.** `test_path_layer.go` ported with its tests and the
   layer gate wired into `ExistingOrSuggestedTestPath`, ahead of canonical selection.
@@ -3211,24 +3212,62 @@ package; in core that seam is `internal/pipeline/pipeline.go` between the index 
   plus two authored ones (the convention reaches the default path; the vote excludes generated
   files).
 
-**Open, and what each needs:**
+**Items 1, 3b and 4 (second pass):**
 
-- **Item 1 (import union on extend-existing merge)** and **item 4 (reconcile duplicates on disk)**
-  both require an extend-existing WRITE PATH, which core does not have at all: the pipeline writes
-  artifacts with a plain `writeArtifact`, and while `ExtendExistingTestContextPrefix` and its two
-  consumers exist in the generator, **nothing ever prepends it** — the whole extend path is dead
-  here. Landing them means porting upstream's `postgenerate_write.go` extend branch
-  (`hoistTopLevelImports`, `classifyExtendPayload`, `unwrapCompilationUnit`,
-  `insertInsideClassBody`, `csharpInsertIndexBeforeTestClassClose`) plus `import_union.go` (491
-  lines) and `duplicate_artifacts.go`, and rewiring the gap loop onto it. Upstream's
-  `WriteCoordinator` is mostly per-gap concurrency and backups, which core's sequential loop does
-  not need, so the adapted surface is smaller than upstream's 1 800 lines — but this is still the
-  bulk of the bundle.
-- **Item 3b (provenance manifest wiring)** — `internal/genmanifest` exists in core from CP06 and is
-  now READ (the convention vote and the ranking both consult it), but nothing ever calls
-  `genmanifest.Record`, so the manifest is always empty and both consumers degrade to
-  "unknown provenance = human-authored". That degradation is deliberate and safe, but the manifest
-  only starts paying for itself once the write path records what it wrote — which is item 1's work.
+- **The write path core never had.** `ExtendExistingTestContextPrefix` and its two consumers existed
+  in the generator, but nothing ever prepended it, so the extend path was dead. New
+  `internal/generator/extendmerge` carries the merge — `hoistTopLevelImports` /
+  `classifyExtendPayload` / `unwrapCompilationUnit` / `dropDuplicateMembers` /
+  `mergedPayloadInsideTypeBody` / the splice helpers / `import_union.go` — behind one entry point,
+  `Write(repoRoot, []Item)`. Upstream's `WriteCoordinator` is **not** ported: it is per-gap
+  concurrency, path locking and backups, and core's gap loop is sequential, so it would be
+  machinery with nothing to coordinate.
+- **Item 1 — import union on every extend.** The payload's imports are lifted BEFORE anything else
+  looks at it (`unwrapCompilationUnit` keeps only the type body, so without hoisting first every
+  symbol the new methods introduce arrives unimported), unioned into the target's real import block
+  for Java and C#, and the merge **fails closed** when no insertion point can be found — a merge
+  known to be missing imports compiles no better than none and silently costs the fixer a round.
+  Alias and global/local collisions are refused rather than guessed. Both gates run against the
+  file that will actually be written: `EmptyTestFileReason` on the payload (its markers are
+  unanchored, so a methods-only body still passes; running it on the merged file would be a
+  tautology) and `SyntacticShellReason` plus the positional check on the merged result — a splice
+  appended after the closing brace stays brace-balanced and keeps its type declaration, so only
+  position can see it.
+- **Item 4 — reconcile duplicates on disk.** `FindDuplicateTestArtifacts` /
+  `ReconcileDuplicateTestArtifacts` / `DescribeDuplicateGroup` ported into `internal/generator` (they
+  need its ranking and convention detection), delegating the merge to `extendmerge.MergeArtifact` —
+  sharing it is the point, since a reconciler that spliced differently would produce a file
+  generation could not then extend. Called at the index/plan seam this section names.
+  **Report-only by default**, behind `runner.reconcile_duplicate_test_artifacts`, and gated twice
+  over: deletion is the only source-removing action in the system, so a file this tool has no
+  record of writing is never removed. **Adaptation:** upstream routes every touched path through the
+  WriteCoordinator's backup map so an aborted run restores them; core has no such map and no
+  restore path, so `backup` is passed nil and reconciliation is only safe *because* of the
+  provenance gate — worth revisiting if core ever grows a restore.
+- **Item 3b — provenance manifest.** `genmanifest.Record` is now called after every successful
+  write, so the manifest stops being empty. Both consumers were already reading it (the convention
+  vote excludes ASQS-authored files; the reconciler refuses to delete what it has no record of
+  writing), and both degraded to "unknown provenance = human-authored" until now — safe, but it
+  meant the convention vote could eventually count the tool's own mistakes and reconciliation could
+  never fire.
+- **Pipeline.** The gap loop decides extend-or-create **before** generating, because it changes what
+  the model is asked for: extending appends the existing body plus the methods-only contract to the
+  context, creating does not. Under extend semantics the resolved target is authoritative — the
+  generator derives its own path from the suggester and would otherwise write a near-duplicate
+  sibling.
+- **Acceptance.** The ported upstream suites pass (import union Java + C#, payload classification,
+  member dedup, nested types, primary-type-name enforcement), plus three authored end-to-end tests
+  on the real `Write` path: an extend unions its imports and splices inside the type with the
+  existing tests intact and imports ahead of the declaration; an all-duplicate payload is refused
+  rather than counted as a write; and a create still refuses to overwrite or to write into
+  production source. The import union is **mutation-checked** — disabling it makes the end-to-end
+  test fail on exactly the missing imports.
+- **Noted, out of scope:** the pipeline sets neither `LLMGenerator.TestFramework` nor
+  `E2EFramework`, so JS/TS artifact naming always takes the default and the duplicate finder is
+  passed an empty framework (its path mapper handles that). Framework detection is a separate
+  concern and belongs to whichever bundle owns it.
+- Full gate green.
+
 
 **Correction to this section, verified in both trees.** `PlanOptions.ExistingTestPathsBySource` —
 the field the plan's own comment names as the source of `ExistingTestPaths` — is **populated by

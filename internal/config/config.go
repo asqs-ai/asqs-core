@@ -730,6 +730,12 @@ type RunnerConfig struct {
 	SkipFixerOnInfrastructureFailure bool `yaml:"skip_fixer_on_infrastructure_failure" env:"RUNNER_SKIP_FIXER_ON_INFRASTRUCTURE_FAILURE"`
 	// DisableErrorLogLLMSummary when true disables LLM summarization of large error logs in evaluator.fix_request audit payloads. Default false = summarization on when a fixer LLM is configured.
 	DisableErrorLogLLMSummary bool `yaml:"disable_error_log_llm_summary" env:"RUNNER_DISABLE_ERROR_LOG_LLM_SUMMARY"`
+	// ReconcileDuplicateTestArtifacts turns duplicate reconciliation from report-only into a
+	// repair: each redundant member is merged into its canonical file and removed. Default false —
+	// report-only — because deletion is the only source-removing action in the system, and it is
+	// gated twice over: by this key AND by provenance (only files this tool is recorded as having
+	// written are ever removed). Env: RUNNER_RECONCILE_DUPLICATE_TEST_ARTIFACTS.
+	ReconcileDuplicateTestArtifacts bool `yaml:"reconcile_duplicate_test_artifacts" env:"RUNNER_RECONCILE_DUPLICATE_TEST_ARTIFACTS"`
 	// FixContextRunesMax caps the total size of the fix context handed to the fixer. Read-only
 	// dependency files are shed largest-first until it fits; writable artifacts are never shed,
 	// because a truncated artifact invites the model to "complete" it from a fragment. 0 =

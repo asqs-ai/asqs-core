@@ -3,6 +3,11 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/genmanifest"
+	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -225,5 +230,102 @@ func errorLogSummarizer(cfg *config.Config, cc model.ChatCompleter) func(context
 			return "", err
 		}
 		return strings.TrimSpace(res.Content), nil
+	}
+}
+
+// resolveExtendTarget decides whether this gap extends an existing test file, and returns that
+// file's body when it does.
+//
+// The decision is made BEFORE generation because it changes the request: extending asks for the new
+// methods only, creating asks for a whole file. It is deliberately conservative — the path must
+// already be on disk AND look like a test artifact, so a gap can never "extend" production source.
+func resolveExtendTarget(item *retrieval.TestPlanItem, gen *generator.LLMGenerator, repoAbs string) (path, body string, ok bool) {
+	if item == nil || gen == nil || strings.TrimSpace(repoAbs) == "" {
+		return "", "", false
+	}
+	target, _, _ := generator.ExistingOrSuggestedTestPath(item, gen.TestFramework, gen.E2EFramework, repoAbs, false)
+	target = strings.TrimSpace(filepath.ToSlash(target))
+	if target == "" {
+		return "", "", false
+	}
+	b, err := os.ReadFile(filepath.Join(repoAbs, filepath.FromSlash(target)))
+	if err != nil {
+		// Nothing there yet: this is a create, which is the common case.
+		return "", "", false
+	}
+	return target, string(b), true
+}
+
+// planItemSourceFile is the symbol-under-test's file, which the writer uses to refuse writing unit
+// tests into production source.
+func planItemSourceFile(item *retrieval.TestPlanItem) string {
+	if item == nil || item.Gap == nil || item.Gap.Symbol == nil {
+		return ""
+	}
+	return filepath.ToSlash(strings.TrimSpace(item.Gap.Symbol.File))
+}
+
+// reconcileDuplicateArtifacts reports — and, when configured, repairs — test files that duplicate
+// one another under two naming conventions.
+//
+// Report-only is the default and is worth shipping on its own: nothing surfaces these pairs today,
+// and both members match the build's default test includes, so both run. Deletion is the only
+// source-removing action in the system, so it is gated twice: by config, and by provenance — a file
+// this tool has no record of writing is never removed, because it may be someone's real test.
+//
+// It runs between the index and the plan: after indexing (so CurrentFiles reflects the tree the run
+// will work on) and before generation (so nothing this run writes is counted as a duplicate).
+func reconcileDuplicateArtifacts(ctx context.Context, cfg *config.Config, audit runAuditor, repoAbs, lang string, files []indexer.FileVersion) {
+	if cfg == nil || strings.TrimSpace(repoAbs) == "" || len(files) == 0 {
+		return
+	}
+	generated := genmanifest.LoadSet(repoAbs)
+	// The framework is only used to map a test path back to its source; core does not detect one
+	// (LLMGenerator.TestFramework is unset here too), and the mapper handles an empty value.
+	groups := generator.FindDuplicateTestArtifacts(files, lang, "", repoAbs, generated)
+	if len(groups) == 0 {
+		return
+	}
+	reconcilable := 0
+	described := make([]map[string]interface{}, 0, len(groups))
+	for _, g := range groups {
+		described = append(described, generator.DescribeDuplicateGroup(g))
+		if g.Reconcilable() {
+			reconcilable++
+		}
+	}
+	if audit != nil {
+		audit.Log(ctx, "index.duplicate_test_artifacts", map[string]interface{}{
+			"message": fmt.Sprintf(
+				"Found %d duplicate test artifact group(s); %d can be reconciled (every redundant member is recorded as ASQS-authored). Both members of a pair match the build's default test includes, so both run.",
+				len(groups), reconcilable),
+			"groups":              described,
+			"reconcile_enabled":   cfg.Runner.ReconcileDuplicateTestArtifacts,
+			"groups_total":        len(groups),
+			"groups_reconcilable": reconcilable,
+		})
+	}
+	fmt.Fprintf(os.Stderr, "asqs-core: %d duplicate test artifact group(s) found, %d reconcilable\n", len(groups), reconcilable)
+	if !cfg.Runner.ReconcileDuplicateTestArtifacts {
+		return
+	}
+	for _, res := range generator.ReconcileDuplicateTestArtifacts(repoAbs, groups, nil) {
+		if audit == nil {
+			continue
+		}
+		if len(res.Merged) > 0 {
+			audit.Log(ctx, "index.duplicate_test_artifacts_reconciled", map[string]interface{}{
+				"message":   fmt.Sprintf("Merged %d duplicate test file(s) into %s and removed them.", len(res.Merged), res.Group.Canonical),
+				"canonical": res.Group.Canonical,
+				"merged":    res.Merged,
+			})
+		}
+		if len(res.Skipped) > 0 {
+			audit.Log(ctx, "index.duplicate_test_artifacts_skipped", map[string]interface{}{
+				"message":   fmt.Sprintf("Left %d duplicate test file(s) in place next to %s.", len(res.Skipped), res.Group.Canonical),
+				"canonical": res.Group.Canonical,
+				"skipped":   res.Skipped,
+			})
+		}
 	}
 }
