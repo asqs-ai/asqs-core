@@ -330,3 +330,47 @@ func TestJSONLLogger_unmarshalablePayloadStillProducesALine(t *testing.T) {
 		t.Errorf("payload = %v, want an audit_marshal_error explanation", p)
 	}
 }
+
+// A count is not a secret, and hashing one destroys what the field exists for.
+//
+// The key-name convention over-matches by design — it is a smoke alarm, not a classifier — but
+// `prompt_tokens`, `prompt_bytes` and `max_prompt_tokens` are numbers. CP28's
+// generate.prompt_budget event was shipping `prompt_tokens: {sha256, len: 4}`: the token figure
+// CP29's provider-reported ground truth is meant to be calibrated against, replaced by a hash of its
+// own digits. Found by reading a real run's audit log.
+func TestRedactPayload_keepsNumericPromptFields(t *testing.T) {
+	in := []byte(`{"prompt_tokens":8234,"prompt_bytes":41170,"over_budget":false,"prompt":"class Foo { secret }"}`)
+	out := RedactPayload(in)
+
+	var got map[string]interface{}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := got["prompt_tokens"].(float64); !ok || v != 8234 {
+		t.Errorf("prompt_tokens = %v, want the number 8234 — a count carries no prompt text", got["prompt_tokens"])
+	}
+	if v, ok := got["prompt_bytes"].(float64); !ok || v != 41170 {
+		t.Errorf("prompt_bytes = %v, want the number", got["prompt_bytes"])
+	}
+	if v, ok := got["over_budget"].(bool); !ok || v {
+		t.Errorf("over_budget = %v, want the boolean", got["over_budget"])
+	}
+	// The actual prompt text must still be redacted — narrowing the rule must not open it.
+	m, ok := got["prompt"].(map[string]interface{})
+	if !ok || m["sha256"] == nil {
+		t.Errorf("prompt = %v, want {sha256, len}; prompt BODIES must still be redacted", got["prompt"])
+	}
+}
+
+// A structure that contains text anywhere under a prompt-shaped key is still redacted whole.
+func TestRedactPayload_redactsNestedText(t *testing.T) {
+	in := []byte(`{"messages":[{"role":"system","content":"repository source"}]}`)
+	var got map[string]interface{}
+	if err := json.Unmarshal(RedactPayload(in), &got); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := got["messages"].(map[string]interface{})
+	if !ok || m["sha256"] == nil {
+		t.Errorf("messages = %v, want {sha256, len}", got["messages"])
+	}
+}

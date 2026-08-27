@@ -203,8 +203,9 @@ func AuditTestStackContract(ctx context.Context, audit Auditor, repoPath string)
 	c, ok := teststack.Read(repoPath)
 	if !ok {
 		audit.Log(ctx, "generate.test_stack_contract_unavailable", map[string]interface{}{
-			"message": fmt.Sprintf("No %s: generation states test-library availability from the raw build files only. "+
-				"Expected when the test-framework bootstrap is disabled.", teststack.RelPath),
+			"message": fmt.Sprintf("No %s: generation states test-library availability from the raw build files "+
+				"only. Either the test-framework bootstrap is off (the default), or it ran and did not "+
+				"finish — check the test_bootstrap.* events in this run before assuming the former.", teststack.RelPath),
 			"path":   teststack.RelPath,
 			"reason": "absent_or_unreadable",
 		})

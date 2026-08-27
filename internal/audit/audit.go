@@ -215,9 +215,12 @@ func (l *JSONLLogger) Close() error {
 
 // --- Redaction ------------------------------------------------------------------------------
 
-// isRedactedKey reports whether a payload key carries prompt or completion text by convention:
+// isRedactedKey reports whether a payload key MAY carry prompt or completion text by convention:
 // any key containing "prompt" or "completion" (prompt, system_prompt, completion_text, …), plus
 // "messages", which is a chat transcript and therefore both at once.
+//
+// The name match alone is not sufficient — see carriesText. A count is not a secret, and hashing one
+// destroys the observability the event exists for.
 func isRedactedKey(k string) bool {
 	k = strings.ToLower(k)
 	return strings.Contains(k, "prompt") || strings.Contains(k, "completion") || k == "messages"
@@ -251,7 +254,7 @@ func redactValue(v interface{}) (interface{}, bool) {
 	case map[string]interface{}:
 		changed := false
 		for k, val := range t {
-			if isRedactedKey(k) {
+			if isRedactedKey(k) && carriesText(val) {
 				t[k] = digest(val)
 				changed = true
 				continue
@@ -273,6 +276,38 @@ func redactValue(v interface{}) (interface{}, bool) {
 		return t, changed
 	default:
 		return v, false
+	}
+}
+
+// carriesText reports whether a value could actually BE prompt or completion text.
+//
+// The key-name convention over-matches: `prompt_tokens`, `prompt_bytes` and `max_prompt_tokens` are
+// COUNTS, and hashing a count protects nothing while destroying the thing the field exists for.
+// CP28's generate.prompt_budget event was shipping `prompt_tokens: {sha256, len:4}` — the token
+// figure that CP29's provider-reported ground truth is supposed to be calibrated against, replaced
+// by a hash of its own digits. Found by reading a real run's audit log, which is what the log is for.
+//
+// Strings and structures containing them are redacted; numbers and booleans pass through.
+func carriesText(v interface{}) bool {
+	switch t := v.(type) {
+	case string:
+		return true
+	case map[string]interface{}:
+		for _, val := range t {
+			if carriesText(val) {
+				return true
+			}
+		}
+		return false
+	case []interface{}:
+		for _, val := range t {
+			if carriesText(val) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
 	}
 }
 
