@@ -214,6 +214,11 @@ type RetrievalConfig struct {
 	// as a REGRESSION on its golden suite (nDCG@10 0.4792 → 0.2736); leave it on dense unless an
 	// ab-report comparison on your corpus says otherwise. Env: RETRIEVAL_FUSION.
 	Fusion string `yaml:"fusion" env:"RETRIEVAL_FUSION"`
+	// MaxContextTokens caps the assembled generation prompt in TOKENS (0 = derive from the model's
+	// context window, or unbounded when the model is unknown). Sections are allocated shares of
+	// this budget and unspent allowance flows to later sections; the target symbol and the output
+	// contract are never truncated. Env: RETRIEVAL_MAX_CONTEXT_TOKENS.
+	MaxContextTokens int `yaml:"max_context_tokens" env:"RETRIEVAL_MAX_CONTEXT_TOKENS"`
 	// MaxSimilarTests global default before profile_budgets (0 = use built-in default 5 in retrieval.ResolveRetrievalBudgets). Env: RETRIEVAL_MAX_SIMILAR_TESTS.
 	MaxSimilarTests int `yaml:"max_similar_tests" env:"RETRIEVAL_MAX_SIMILAR_TESTS"`
 	// MaxDependencyChunks global default before profile_budgets (0 = built-in 15). Env: RETRIEVAL_MAX_DEPENDENCY_CHUNKS.

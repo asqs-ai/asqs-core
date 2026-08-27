@@ -333,7 +333,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP25 | Output truncation and transport hardening | B01 (+ latent `content` fix, §2.6) | — | 2–3 d | `in review` |
 | CP26 | Provider capability contract and Ollama parity | B08, R08 | CP25 | 2 d | `in review` |
 | CP27 | Anthropic block messages *(no prompt caching)* | B12 | CP25 | 1–2 d | `in review` |
-| CP28 | Token budget and prompt accounting | B07 | CP06, CP17 | 3–4 d | `blocked (CP06, CP17)` |
+| CP28 | Token budget and prompt accounting | B07 | CP06, CP17 | 3–4 d | `in review` |
 | CP29 | `prompt_tokens` end to end | R07 | CP26 | 0.5 d | `blocked (CP26)` |
 | CP60 | LLM concurrency limiter — wires two inert core keys | (unbundled upstream) | CP26 | 1–2 d | `blocked (CP26)` |
 
@@ -365,7 +365,7 @@ implementation record can be found; it is provenance, not instruction.
 | CP41 | Tool contract in `model` + OpenAI/Ollama/Anthropic support | B15, B16, B17 | CP25, CP26, CP27 | 4–5 d | `blocked (CP25–CP27)` |
 | CP42 | Prompted-JSON fallback and 3-tier mode resolution | B18 | CP41, CP06 | 2–3 d | `blocked (CP06, CP41)` |
 | CP43 | Read-only retrieval tool suite | B19 | CP41, CP06, CP12 | 4 d | `blocked (CP41)` |
-| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP03, CP28, CP42, CP43)` |
+| CP44 | Bounded generation tool loop, budgets, attempt audit | B20 | CP42, CP43, CP28, CP03 | 3–4 d | `blocked (CP03, CP42, CP43)` |
 | CP45 | Core-plus-inventory context restructure | B21 | CP44, CP16 | 3 d | `blocked (CP44, CP16)` |
 | CP46 | Fixer tool access | B30 | CP44, CP50 | 3–5 d | `blocked (CP44, CP50)` |
 
@@ -1925,7 +1925,7 @@ creep back.
 
 ### CP28 — Token budget and prompt accounting
 
-- **Status:** `blocked (CP06, CP17)` · **Effort:** 3–4 d · **Risk:** medium
+- **Status:** `in review` · **Effort:** 3–4 d · **Risk:** medium
 
 **Tasks**
 
@@ -1943,6 +1943,52 @@ creep back.
 
 **Acceptance.** A prompt built with a 3000-token budget measures ≤ 3000 by the counter. The target
 method survives at any budget. The calibration delta is recorded per completion.
+
+**Implementation record (2026-08-27).**
+
+- **Renderer** — `chunk_block.go` + `chunk_block_test.go` + `context_budget_test.go` copied from
+  upstream verbatim (imports re-based). `context_builder.go` gained
+  `FormatOptions.{MaxContextTokens, TokenCounter, LastBudget}` and `counter()` /
+  `CounterOrDefault()` / `newBudget()`; `BuildLLMContext` creates one budget per render (or uses
+  the caller's via `LastBudget`) and every section call site spends from it: target →
+  `SectionTarget`, enclosing class → `SectionTargetClass`, dependencies → `SectionDependencies`,
+  domain models → `SectionDomain`, similar tests (2 sites) → `SectionSimilar`, fixtures/config
+  (2 sites) → `SectionFixtures`. `chunkBlock` was replaced with the budget-aware version
+  (`maxChunkChars` converted to a token allowance; tighter of it and the section remainder wins;
+  spends what it actually emitted), plus `budgetCounter` and `memberListBlock`.
+- **Never-truncate discipline (tasks 3–4)** — enforced inside `tokens.Budget` (CP06):
+  `SectionTarget` is untruncatable, `SectionTargetClass` is truncatable at a ~20% share, and only
+  emitted output is spent. Pinned by the five ported acceptance tests
+  (`TestBuildLLMContext_respectsTokenBudget`, `_targetSurvivesTightBudget`,
+  `_zeroBudgetIsUnchanged`, `_everyCodeBlockIsTaggedAndAnchored`, `_reportsPerSectionSpend`).
+- **Members fallback** — `SymbolChunk.Members []string` added (dormant: populated by the
+  chunk-miss fallback that arrives with CP45); `memberListBlock` renders and budgets it now, so
+  CP45 only has to fill the field.
+- **Config (task 2)** — `retrieval.max_context_tokens` added
+  (`RetrievalConfig.MaxContextTokens`, env `RETRIEVAL_MAX_CONTEXT_TOKENS`), default 0 = derive
+  from the model window via `tokens.Resolve`, unbounded when the model is unknown. The CP17
+  inert-field lint sees its pipeline reader — no exemption needed.
+- **Pipeline wiring** — `internal/pipeline/prompt_budget.go`: `resolvePromptBudget` (upstream
+  `orchestrator.ResolvePromptBudget`, unexported here because core's pipeline is its only caller;
+  output reservation is `generator.DefaultGenerateMaxTokens`) applied to `formatOpts` right after
+  compaction setup; the gap loop copies `FormatOptions` per item, installs a fresh budget via
+  `LastBudget`, and `auditPromptBudget` emits `generate.prompt_budget`
+  (fq_name/prompt_tokens/prompt_bytes/counter, + budget_tokens/sections/over_budget when bounded)
+  after project-intel markdown is prepended, before `Generate`. Core adaptation: the auditor is
+  passed as `runAuditor` directly (upstream reaches it through the orchestrator `Config`). The
+  doc pass (`docFmt`) stays unbudgeted, matching upstream where `ResolvePromptBudget` installs on
+  the generation `ContextFormat` only. Authored tests: `prompt_budget_test.go` (bounded for a
+  known model, unbounded preserved for unknown, configured cap wins, audit payload shape both
+  ways).
+- **Not applicable in core (yet)** — upstream also clamps the extend-existing test-file prepend
+  to `SectionExisting`; core's gap loop has no extend-existing path, so that clamp travels with
+  the bundle that ports it. **Plan correction (task 5)** — `CalibrationDelta` has **no
+  production consumer upstream** either: it is an instrument (already in core since CP06), and
+  the "calibration delta recorded per completion" acceptance line describes an audit that was
+  never built. The ground-truth half is CP29's `prompt_tokens`; a per-completion calibration
+  audit would be new work, not parity.
+- **Verification** — full gate green (`go build/vet/test ./...`, `gofmt -l` empty); live suite
+  green against `asqs_scratch` (retrieval/pipeline/storage, `-count=1`).
 
 ### CP29 — `prompt_tokens` end to end
 
@@ -2514,7 +2560,7 @@ root is refused, with the traversal attempt counted (CP03).
 
 ### CP44 — Bounded generation tool loop, budgets, attempt audit
 
-- **Status:** `blocked (CP42, CP43, CP28, CP03)` · **Effort:** 3–4 d · **Risk:** high
+- **Status:** `blocked (CP42, CP43, CP03)` · **Effort:** 3–4 d · **Risk:** high
 
 `internal/intelligence/tools/loop.go` + `config.go`, wired into `internal/generator/llm_generator.go`.
 Caps on turns per run, calls per turn, calls per run, and result characters per run.

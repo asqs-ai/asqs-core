@@ -24,6 +24,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
+	"github.com/asqs/asqs-core/internal/llm/tokens"
 	"github.com/asqs/asqs-core/internal/overview"
 	"github.com/asqs/asqs-core/internal/runner"
 	"github.com/asqs/asqs-core/internal/storage/embeddings"
@@ -290,6 +291,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
 	applyRetrievalContextCompactToFormat(&cfg.Retrieval, &formatOpts)
+	formatOpts = resolvePromptBudget(cfg, formatOpts)
 	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
 	// same shrunken context and the cost is paid once per item.
 	compactPlanContexts(ctx, formatOpts, audit, plan)
@@ -373,12 +375,17 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	docInsertsByFile := map[string][]docInsert{} // collected per-symbol docs, applied per file after the loop
 	for _, item := range plan.Items {
 		out := GapOutcome{Symbol: planItemSymbol(item)}
-		ctxStr := retrieval.BuildLLMContextForGap(item, formatOpts)
+		// One budget per item. formatOpts is copied here, so items never share a budget.
+		itemFmt := formatOpts
+		budget := tokens.NewBudget(itemFmt.MaxContextTokens, itemFmt.CounterOrDefault())
+		itemFmt.LastBudget = budget
+		ctxStr := retrieval.BuildLLMContextForGap(item, itemFmt)
 		if piResult != nil {
 			if piMarkdown := strings.TrimSpace(projectIntelForGap(piResult, piCfg, item)); piMarkdown != "" {
 				ctxStr = piMarkdown + "\n\n" + ctxStr
 			}
 		}
+		auditPromptBudget(ctx, audit, out.Symbol, ctxStr, budget)
 		content, relPath, gerr := gen.Generate(ctx, item, ctxStr)
 		switch {
 		case gerr != nil:

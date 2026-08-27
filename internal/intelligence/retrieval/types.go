@@ -44,6 +44,10 @@ type ContextRequest struct {
 type SymbolChunk struct {
 	Symbol *metadata.Symbol
 	Chunk  *embeddings.Chunk
+	// Members is the index-derived member summary rendered when no chunk resolved for the symbol
+	// (see memberListBlock). Populated by the chunk-miss fallback, which arrives with CP45; until
+	// then it stays empty and the renderer emits nothing.
+	Members []string
 }
 
 // DependencyEdge is a dependency (callee) with the edge type (calls, extends, implements).
