@@ -579,8 +579,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		switch {
 		case gerr != nil:
 			out.Err = gerr.Error()
+			auditGenerateFailed(ctx, audit, out.Symbol, "generator_error", gerr.Error())
 		case strings.TrimSpace(content) == "" || strings.TrimSpace(relPath) == "":
 			out.Err = "empty generation"
+			auditGenerateFailed(ctx, audit, out.Symbol, "empty_generation",
+				"the model returned no content, or no path to write it to")
 		default:
 			// Under extend semantics the target is authoritative: it is the path whose bytes were
 			// read above, while the generator derives its own path from the suggester and would
@@ -687,6 +690,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 
 	if len(artifactPaths) == 0 {
+		auditNoArtifacts(ctx, audit, sum.Outcomes)
 		fmt.Fprintln(os.Stderr, "asqs-core: no test files were generated — skipping evaluation.")
 		completeRun(ctx, meta, runID, nil, nil, nil)
 		return sum, nil
