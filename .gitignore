@@ -6,8 +6,15 @@
 # Local config & secrets
 config.local.yaml
 config.yaml
+# Backups of the local config carry the same tokens it does.
+config.yaml.*
 *.local.yaml
 .env
+
+# Audit JSONL. general.audit.file_path appends one JSON object per step; the payloads carry
+# repository source and compiler output, so a run's log is never something to commit.
+/audit.log
+/audit-*.log
 
 # Built external indexers (built via `make build-indexers`)
 tools/java-indexer/target/
