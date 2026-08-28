@@ -2,6 +2,8 @@ package apisurface
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -56,11 +58,37 @@ func TestPregenerateTargets_nodeKeepsAssertionsOnly(t *testing.T) {
 	}
 }
 
+// playwrightJarOrSkip locates the Playwright jar in the local Maven repository, and skips the test
+// when it is not there.
+//
+// The path used to be a hard-coded /Users/<name>/.m2/... literal, which is to say the test asserted
+// against one developer's laptop and could not pass anywhere else — CI included. It did carry a
+// skip, but on the wrong condition: Lookup drops names it cannot resolve WITHOUT returning an
+// error, so a missing jar produced an empty result rather than a failure to skip on, and every
+// assertion below then failed. The existence check has to happen here, before Lookup is asked
+// anything.
+func playwrightJarOrSkip(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skipf("no home directory to resolve the local Maven repository from: %v", err)
+	}
+	repo := os.Getenv("MAVEN_REPO_LOCAL")
+	if repo == "" {
+		repo = filepath.Join(home, ".m2", "repository")
+	}
+	jar := filepath.Join(repo, "com", "microsoft", "playwright", "playwright", "1.49.0", "playwright-1.49.0.jar")
+	if _, err := os.Stat(jar); err != nil {
+		t.Skipf("playwright 1.49.0 is not in the local Maven repository (%s) — run `mvn dependency:get -Dartifact=com.microsoft.playwright:playwright:1.49.0` to include this check", jar)
+	}
+	return jar
+}
+
 // The list is only worth anything if the types actually resolve, and a typo would be silent —
 // Lookup drops an unresolvable name without complaint. This runs against the real Playwright jar
 // when it is in the local Maven repository, and skips when it is not.
 func TestPregenerateTargets_javaRequestTypesResolveAgainstTheRealJar(t *testing.T) {
-	const jar = "/Users/maximal/.m2/repository/com/microsoft/playwright/playwright/1.49.0/playwright-1.49.0.jar"
+	jar := playwrightJarOrSkip(t)
 	p := NewJavaProvider()
 	p.cpCache["/repo"] = classpathEntry{classpath: jar, fingerprint: "pregenerate-request", at: time.Now()}
 
