@@ -1,0 +1,110 @@
+# Fixture for the golden resolved-config test. It is deliberately BROAD rather than realistic: the
+# point is to touch as many resolution paths as possible — defaults that survive, defaults that get
+# overridden, pointer-bool tri-states, every inversion, nested blocks, list keys, the map key, and
+# the VCS provider merge — so that a later bundle changing any of them shows up as a diff.
+schema_version: 2
+
+general:
+  database:
+    metadata_url: postgres://user:pass@localhost:5432/meta?sslmode=disable
+    embeddings_url: postgres://user:pass@localhost:5432/emb?sslmode=disable
+    max_open_conns: 12
+
+  git:
+    provider: gitlab
+    token: PLACEHOLDER-NOT-A-REAL-TOKEN
+    base_url: https://gitlab.example.com/api/v4
+    default_owner: acme
+    default_repo: widgets
+    ship:
+      enabled: true
+      branch: asqs-core
+      base_branch: main
+
+  llm:
+    provider: ollama
+    model: qwen3-coder
+    max_concurrent: 3
+    ollama_num_ctx: 32768
+    http:
+      timeout: 10m
+    embeddings:
+      model: nomic-embed-text
+      dimension: 768
+      cache:
+        # Exercises an inversion: enabled:false must reach the runtime as disable_embedding_cache:true.
+        enabled: false
+        retention_days: 14
+
+  build:
+    toolchain: java-maven
+    build_tool: mvn
+    workspace:
+      path: services/api
+
+  sandbox:
+    type: local
+    timeout: 45m
+    docker:
+      # Second inversion: offline_test:false → docker_disable_offline_test:true.
+      offline_test: false
+    resources:
+      cpus: 2
+      memory: 4g
+
+  audit:
+    file_path: /var/log/asqs/audit.jsonl
+
+  websearch:
+    enabled: false
+
+bootstrap:
+  test_framework:
+    enabled: true
+    mode: apply
+
+indexer:
+  java:
+    mode: advanced
+  policy:
+    max_gaps: 25
+    max_gaps_e2e: 4
+  dependency_docs:
+    enabled: true
+
+retrieval:
+  profile: java_unit
+  fusion: dense
+  max_context_tokens: 60000
+  failure_hint:
+    file: .asqs/ci-build.log
+    persist: true
+  profile_budgets:
+    http_api:
+      max_similar_tests: 8
+      max_dependency_chunks: 20
+  policy:
+    # Third and fourth inversions.
+    abstention:
+      enabled: false
+    hybrid_module_filter:
+      enabled: false
+
+generation:
+  policy:
+    tools:
+      enabled: true
+      max_turns: 5
+    # Fifth inversion.
+    structured_output:
+      enabled: false
+
+fixer:
+  policy:
+    # Sixth and seventh inversions.
+    structured_output:
+      enabled: false
+    error_log_llm_summary:
+      enabled: false
+    circuit_breakers:
+      repeat_stop_threshold: 4

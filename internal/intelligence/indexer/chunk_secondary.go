@@ -93,19 +93,17 @@ func routeManifestChunkPlan(parsed *ParsedFile, repoID string, cfg ChunkConfig) 
 		header = truncateRunes(fmt.Sprintf("[chunk_role=route_manifest file=%s routes=%d]\n\n", parsed.Path, len(routes)), maxH) + "\n\n"
 	}
 	return &ChunkPlan{
-		Content:       header + body,
-		File:          parsed.Path,
-		Lang:          parsed.Lang,
-		ChunkType:     "route",
-		StartLine:     1,
-		EndLine:       1,
-		RepoID:        repoID,
-		SymbolFQ:      "",
-		SymbolKind:    "ROUTE_MANIFEST",
-		ChunkIndex:    0,
-		ParentFQ:      "",
-		SecondaryRole: "route_manifest",
-		MetadataJSON:  metaJSON,
+		Content:      header + body,
+		File:         parsed.Path,
+		Lang:         parsed.Lang,
+		ChunkType:    "route",
+		StartLine:    1,
+		EndLine:      1,
+		RepoID:       repoID,
+		SymbolFQ:     "",
+		ChunkIndex:   0,
+		ParentFQ:     "",
+		MetadataJSON: metaJSON,
 	}
 }
 
@@ -162,19 +160,17 @@ func angularTemplateChunkPlans(parsed *ParsedFile, repoID, repoRoot string, cfg 
 			endLine = 1
 		}
 		out = append(out, ChunkPlan{
-			Content:       header + text,
-			File:          parsed.Path,
-			Lang:          parsed.Lang,
-			ChunkType:     "definition",
-			StartLine:     1,
-			EndLine:       endLine,
-			RepoID:        repoID,
-			SymbolFQ:      s.FQName,
-			SymbolKind:    s.Kind,
-			ChunkIndex:    0,
-			ParentFQ:      "",
-			SecondaryRole: "angular_template_file",
-			MetadataJSON:  metaJSON,
+			Content:      header + text,
+			File:         parsed.Path,
+			Lang:         parsed.Lang,
+			ChunkType:    "definition",
+			StartLine:    1,
+			EndLine:      endLine,
+			RepoID:       repoID,
+			SymbolFQ:     s.FQName,
+			ChunkIndex:   0,
+			ParentFQ:     "",
+			MetadataJSON: metaJSON,
 		})
 	}
 	return out

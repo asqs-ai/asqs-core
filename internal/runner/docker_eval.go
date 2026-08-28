@@ -29,34 +29,28 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	if err != nil || abs == "" {
 		return evaluator.StepResult{Step: stepEval, OK: false, Summary: "invalid repo path", Output: ""}
 	}
-	absCwd := s.evalHostCwd(abs)
-	p, err := profile.ResolveToolchain(absCwd, lang, s.EvalProfile, s.ImageJavaMaven, s.ImageJavaGradle, s.ImageNode, s.ImageDotNet)
-	if err != nil {
-		return evaluator.StepResult{Step: stepEval, OK: true, Summary: fmt.Sprintf("skip (docker: %v)", err), Output: ""}
+	// Since CP31 the step plan is the single source of argv, restore and skip/fail decisions —
+	// the same plan the parity harness compares and the local target executes.
+	plan, perr := s.buildStepPlan(abs, lang, imageOverride)
+	if perr != nil {
+		return evaluator.StepResult{Step: stepEval, OK: false, Summary: perr.Error(), Output: ""}
 	}
-	p = profile.ApplyCommandOverrides(p, s.CompileCommand, s.TestCommand)
-	if strings.TrimSpace(imageOverride) != "" {
-		p.Image = strings.TrimSpace(imageOverride)
-	}
-	s.logDockerEvalEnvOnce(p, abs)
-	if stepEval == evaluator.StepCompile && (lang == "javascript" || lang == "typescript") {
-		if !pathExists(filepath.Join(absCwd, "package.json")) {
-			return evaluator.StepResult{Step: stepEval, OK: true, Summary: "skip (no package.json)"}
-		}
+	p := plan.Profile
+	// An empty Image means the toolchain did not resolve, in which case every step is a skip and
+	// the pre-plan code did not log the env block either.
+	if plan.Image != "" {
+		s.logEvalEnvOnce(plan, abs)
 	}
 
-	argv := dockerArgvForStep(s, p, stepEval)
+	switch dec := plan.DecisionFor(stepEval); dec.Action {
+	case ActionSkip:
+		return evaluator.StepResult{Step: stepEval, OK: true, Summary: dec.Reason, Output: ""}
+	case ActionFail:
+		return evaluator.StepResult{Step: stepEval, OK: false, Summary: dec.Reason, Output: ""}
+	}
+	argv := plan.ArgvFor(stepEval)
 	if len(argv) == 0 {
 		return evaluator.StepResult{Step: stepEval, OK: true, Summary: "skip (no command)"}
-	}
-	argv, dotnetErr := s.patchDotnetDockerEvalArgv(p, argv, abs, absCwd)
-	if dotnetErr != nil {
-		return evaluator.StepResult{Step: stepEval, OK: false, Summary: dotnetErr.Error(), Output: ""}
-	}
-	if p.ID == profile.CSharpDotnet && (stepEval == evaluator.StepTest || stepEval == evaluator.StepCoverage) {
-		argv = ApplyDotnetTestDockerHangMitigationProps(argv)
-		argv = ApplyDotnetTestDockerVSTestCLIArgs(argv, s.jobTimeout())
-		argv = WrapDotnetDockerTestWithBuildServerShutdown(argv)
 	}
 
 	netRestore := strings.TrimSpace(s.JobNetworkRestore)
@@ -71,20 +65,23 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 		netTest = netRestore
 	}
 
-	// Restore phase (NuGet, Maven, npm, etc.): run whenever the profile defines it, before compile/test/coverage.
-	// When docker_disable_offline_test is false, restore uses network=restore (usually bridge) and the main step
-	// often uses network=none with --no-restore/--frozen so deps must be populated here. When docker_disable_offline_test
-	// is true, the main step also uses bridge—but we still must restore first because compile argv is still --no-restore.
-	if len(p.Restore) > 0 && (stepEval == evaluator.StepCompile || stepEval == evaluator.StepTest || stepEval == evaluator.StepCoverage) {
-		restoreArgv := append([]string(nil), p.Restore...)
-		restoreArgv, dotnetErr = s.patchDotnetDockerEvalArgv(p, restoreArgv, abs, absCwd)
-		if dotnetErr != nil {
-			return evaluator.StepResult{Step: stepEval, OK: false, Summary: dotnetErr.Error(), Output: ""}
-		}
-		fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=restore-deps argv=[%s] network=%s\n", label, strings.Join(restoreArgv, " "), netRestore)
-		if _, rerr := s.runDockerJob(ctx, abs, p, restoreArgv, netRestore, dockerImageNeedsPlaywrightIPC(p.Image)); rerr != nil {
-			fmt.Fprintf(os.Stderr, "  docker restore: %v (continuing)\n", rerr)
-		}
+	// Restore phase (NuGet, Maven, npm, etc.): before the step, at most once per manifest
+	// fingerprint (see restore.go). Previously this ran before EVERY step invocation — compile,
+	// test, coverage, the E2E pass and each scoped-compile fallback: five to six installs per
+	// fix-loop iteration. The memo lives on the shared run state so clones share it, and the
+	// fingerprint key means a fixer edit to a manifest re-restores automatically. Restore uses
+	// network=restore (usually bridge) because the main step often runs network=none with
+	// --no-restore/--frozen, so dependencies must be populated here.
+	if plan.RestoreDecision.Action == ActionFail {
+		return evaluator.StepResult{Step: stepEval, OK: false, Summary: plan.RestoreDecision.Reason, Output: ""}
+	}
+	if len(plan.Restore) > 0 {
+		s.runState().restoreOnce(plan.RestoreKey, func() {
+			fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=restore-deps argv=[%s] network=%s\n", label, strings.Join(plan.Restore, " "), netRestore)
+			if _, rerr := s.runDockerJob(ctx, abs, p, plan.Restore, netRestore, dockerImageNeedsPlaywrightIPC(p.Image)); rerr != nil {
+				fmt.Fprintf(os.Stderr, "  docker restore: %v (continuing)\n", rerr)
+			}
+		})
 	}
 
 	network := netTest
@@ -94,21 +91,30 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=main argv=[%s] network=%s\n", label, strings.Join(argv, " "), network)
 	res, runErr := s.runDockerJob(ctx, abs, p, argv, network, dockerImageNeedsPlaywrightIPC(p.Image))
 	out := res.CombinedOutput
-	if runErr != nil && res.ExitCode == 0 {
-		return evaluator.StepResult{Step: stepEval, OK: false, Summary: runErr.Error(), Output: out}
+	// A non-nil runErr means the JOB failed to run to completion — the CLI would not start, the
+	// JobSpec was rejected, or the deadline fired — as distinct from the container running and
+	// exiting non-zero, which jobrunner reports as (res, nil) via its ExitError branch.
+	//
+	// The gate used to be `runErr != nil && res.ExitCode == 0`, which silently dropped every
+	// timeout: CommandContext SIGKILLs the docker CLI, so ProcessState.ExitCode() is -1 and the
+	// branch was skipped. CommandContext also discards the buffered output on a kill, so the step
+	// fell through to a bare "failed" summary with an empty Output — which the evaluator treats as
+	// in-scope, handing the fixer a blank prompt. See the package comment on step_failure.go.
+	if runErr != nil {
+		return sandboxStepFailure(stepEval, out, runErr, s.jobTimeout())
 	}
 	ok := res.ExitCode == 0
-	if !ok && stepEval == evaluator.StepTest && (lang == "javascript" || lang == "typescript") && jsTestOutputSummaryShowsZeroFailures(out) {
+	if !ok && stepEval == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
 		ok = true
 	}
-	summary := label + " ok"
+	// Result shaping comes from the shared helpers, so a step that passes reads the same on both
+	// targets — including the coverage summary, which used to be a flat "<label> ok" here and
+	// could never name the report it produced.
+	summary := stepSuccessSummary(stepEval, plan, s.evalHostCwd(abs))
 	if !ok {
-		summary = firstLines(out, 5)
-		if summary == "" {
-			summary = "failed"
-		}
-	} else if res.ExitCode != 0 && stepEval == evaluator.StepTest && (lang == "javascript" || lang == "typescript") && strings.Contains(summary, " ok") {
-		summary = label + " ok (summary all passed; exit code ignored)"
+		summary = failedStepSummary(stepEval, out, 5)
+	} else if res.ExitCode != 0 && stepEval == evaluator.StepTest && isJSLang(lang) {
+		summary += jsExitCodeIgnoredSuffix
 	}
 	if ok {
 		fmt.Fprintf(os.Stderr, "  %s (docker): ok.\n", label)
@@ -128,14 +134,7 @@ func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir strin
 	if jobTimeout > 0 {
 		t = jobTimeout
 	}
-	env := []string{"CI=true"}
-	if p.ID == profile.CSharpDotnet {
-		// Avoid MSBuild worker node reuse holding outputs open across interrupted runs; pairs with jobrunner
-		// cidfile cleanup when the docker CLI is killed on timeout.
-		// DOTNET_EnableDiagnostics=0 avoids the diagnostic IPC server keeping the process alive in some Linux/Docker setups.
-		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
-	}
-	env = append(env, s.DockerEvalExtraEnv...)
+	env := dockerJobEnv(p, s.DockerEvalExtraEnv)
 	spec := jobrunner.JobSpec{
 		Image:          p.Image,
 		HostWorkDir:    hostWorkDir,
@@ -153,6 +152,42 @@ func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir strin
 		IpcHost:        ipcHost,
 	}
 	return (&jobrunner.DockerRunner{Docker: s.dockerBin()}).Run(ctx, spec)
+}
+
+// stepEnv is the environment an evaluation step sets explicitly, on either target (CP33).
+//
+// One source for both, so a variable cannot reach a container and quietly miss the host. The
+// .NET additions avoid MSBuild worker-node reuse holding outputs open across interrupted runs —
+// pairing with jobrunner's cidfile cleanup when the CLI is killed on timeout — and
+// DOTNET_EnableDiagnostics=0 stops the diagnostic IPC server keeping the process alive on some
+// Linux/Docker setups. None of that is container-specific; the host had simply never been given
+// them, and local compile had not even been given CI=true.
+//
+// How the environment is DELIVERED still differs, and that is the permitted difference (§1): a
+// container receives only these variables, while a host process receives them appended to
+// os.Environ() — which is where its toolchain, PATH and ~/.m2/settings.xml come from.
+//
+// dockerExtra carries the NuGet credential envelope, which reaches a container as `-e`; the local
+// target delivers the same variable through localCredentialEnv (credentials.go).
+func stepEnv(id profile.ToolchainID, target Target, dockerExtra []string) []string {
+	env := append([]string(nil), baseStepEnv()...)
+	if id == profile.CSharpDotnet {
+		env = append(env, "NuGetAudit=false", "MSBUILDDISABLENODEREUSE=1", "DOTNET_EnableDiagnostics=0", "DOTNET_CLI_TELEMETRY_OPTOUT=1")
+	}
+	if target == TargetDocker {
+		env = append(env, dockerExtra...)
+	}
+	return env
+}
+
+// baseStepEnv is what every step sets on every target: CI=true, so build plugins and watch-mode
+// test runners behave as they would in CI rather than waiting for a terminal.
+func baseStepEnv() []string { return []string{"CI=true"} }
+
+// dockerJobEnv is the environment a Docker eval job runs with. Shared by runDockerJobWithTimeout
+// and the step planner so the plan cannot disagree with what the container actually receives.
+func dockerJobEnv(p profile.ToolchainProfile, extra []string) []string {
+	return stepEnv(p.ID, TargetDocker, extra)
 }
 
 func (s *Sandbox) dockerBin() string {
@@ -225,38 +260,49 @@ func privateRegistryMountAppliesToProfile(target string, id profile.ToolchainID)
 }
 
 // patchDotnetDockerEvalArgv mirrors test_framework_bootstrap C# Docker fixes: multitarget TFM pin, fallback TFM,
-// relaxed MSBuild props, and Playwright/dotnet side-by-side runtime/SDK install prepended per container run.
-func (s *Sandbox) patchDotnetDockerEvalArgv(p profile.ToolchainProfile, argv []string, absGitRoot, absCwd string) ([]string, error) {
+// relaxed MSBuild props. Target-neutral since CP31: the local target applies the same chain, which
+// is what makes the parity harness's claim about local C# true rather than aspirational.
+func (s *Sandbox) patchDotnetEvalArgv(p profile.ToolchainProfile, argv []string, absGitRoot, absCwd string, target Target) ([]string, error) {
 	if p.ID != profile.CSharpDotnet {
 		return argv, nil
 	}
 	var err error
-	argv, err = ensureDotnetDockerInvocation(p, argv, absCwd)
+	argv, err = ensureDotnetInvocation(p, argv, absCwd)
 	if err != nil {
 		return nil, err
 	}
-	csprojAbs, err := ResolveCsprojAbsForDotnetDockerEval(absCwd, argv)
+	csprojAbs, err := ResolveCsprojAbsForDotnetEval(absCwd, argv)
 	if err != nil {
 		return nil, err
 	}
-	argv = ApplyDotnetDockerMultiTargetFramework(argv, absCwd, csprojAbs, s.DotNetFallbackTargetFramework)
-	argv, err = applyDotnetDockerTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
+	argv = ApplyDotnetMultiTargetFramework(argv, absCwd, csprojAbs, s.DotNetFallbackTargetFramework)
+	argv, err = applyDotnetEvalTargetFrameworkFallback(argv, absCwd, s.DotNetFallbackTargetFramework)
 	if err != nil {
 		return nil, err
 	}
 	argv = ApplyDotnetTestFrameworkBootstrapMSBuildProps(argv)
+	return argv, nil
+}
+
+// applyDotnetContainerProvisioning prepends the shell snippets that install software INTO the
+// container: a side-by-side .NET runtime for the Playwright image, and the Artifacts credential
+// provider the stock SDK image lacks (NU1301 against any private feed without it). Docker-only —
+// the host equivalent is a preflight (CP33) — and applied LAST, after every argv transform:
+// prepending earlier means the script no longer begins with `dotnet …`, and the MSBuild-property
+// insertion is anchored at the start of the line.
+func (s *Sandbox) applyDotnetContainerProvisioning(p profile.ToolchainProfile, argv []string, absGitRoot, absCwd string) []string {
+	if p.ID != profile.CSharpDotnet {
+		return argv
+	}
 	if dockerImageIsPlaywrightDotnet(p.Image) {
-		install := PlaywrightDotnetDockerInstallShell(absGitRoot, csprojAbs, s.DotNetFallbackTargetFramework)
-		if install != "" {
-			argv = PrependShellSnippetToDockerCommand(argv, install)
+		if csprojAbs, err := ResolveCsprojAbsForDotnetEval(absCwd, argv); err == nil {
+			if install := PlaywrightDotnetDockerInstallShell(absGitRoot, csprojAbs, s.DotNetFallbackTargetFramework); install != "" {
+				argv = PrependShellSnippetToDockerCommand(argv, install)
+			}
 		}
 	}
-	// Install the Artifacts Credential Provider plugin inside the container whenever ASQS
-	// is injecting a VSS_NUGET_EXTERNAL_FEED_ENDPOINTS envelope. The stock dotnet SDK image
-	// doesn't ship the plugin, and without it `dotnet restore` ignores the envelope and
-	// fails against any private feed (NU1301).
 	if DockerEvalEnvHasNuGetCredentialEnvelope(s.DockerEvalExtraEnv) {
 		argv = PrependShellSnippetToDockerCommand(argv, NuGetCredentialProviderDockerInstallShell())
 	}
-	return argv, nil
+	return argv
 }

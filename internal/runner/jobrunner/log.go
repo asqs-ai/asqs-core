@@ -6,13 +6,17 @@ import (
 )
 
 // FormatDockerInvocation returns a shell-like single line for logging (copy-paste debugging).
+//
+// Credential-bearing `-e` / `--env` values are masked (see redact.go): the container environment
+// can carry a live PAT, and this line goes to stderr. A credentialed invocation is therefore not
+// copy-pasteable as-is — re-supply the secret by hand.
 func FormatDockerInvocation(bin string, args []string) string {
 	if bin == "" {
 		bin = "docker"
 	}
 	var b strings.Builder
 	b.WriteString(bin)
-	for _, a := range args {
+	for _, a := range redactSecretArgs(args) {
 		b.WriteByte(' ')
 		b.WriteString(shellQuoteArg(a))
 	}

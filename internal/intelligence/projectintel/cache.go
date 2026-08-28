@@ -16,11 +16,13 @@ import (
 const CacheFormatVersion = 2
 
 type diskCacheCandidate struct {
-	RelPath      string    `json:"rel_path"`
-	Kind         string    `json:"kind"`
-	Score        float64   `json:"score"`
-	Content      string    `json:"content"`
-	DocEmbedding []float32 `json:"doc_embedding,omitempty"`
+	RelPath         string    `json:"rel_path"`
+	Kind            string    `json:"kind"`
+	Score           float64   `json:"score"`
+	Content         string    `json:"content"`
+	DocEmbedding    []float32 `json:"doc_embedding,omitempty"`
+	LinkedSymbolIDs []string  `json:"linked_symbol_ids,omitempty"`
+	LinkedFQNames   []string  `json:"linked_fq_names,omitempty"`
 }
 
 type diskCache struct {
@@ -116,10 +118,12 @@ func tryLoadCache(repoAbs, cacheRel, filesFP, relFP, cfgFP string) (*Snapshot, [
 	var cands []RankedCandidate
 	for _, cc := range dc.Candidates {
 		cands = append(cands, RankedCandidate{
-			Candidate:    Candidate{RelPath: cc.RelPath, Kind: DocKind(cc.Kind)},
-			Score:        cc.Score,
-			Content:      cc.Content,
-			DocEmbedding: append([]float32(nil), cc.DocEmbedding...),
+			Candidate:       Candidate{RelPath: cc.RelPath, Kind: DocKind(cc.Kind)},
+			Score:           cc.Score,
+			Content:         cc.Content,
+			DocEmbedding:    append([]float32(nil), cc.DocEmbedding...),
+			LinkedSymbolIDs: append([]string(nil), cc.LinkedSymbolIDs...),
+			LinkedFQNames:   append([]string(nil), cc.LinkedFQNames...),
 		})
 	}
 	return snap, cands, true

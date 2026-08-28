@@ -123,10 +123,25 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		if role == "" {
 			role = openai.ChatMessageRoleUser
 		}
-		msgs = append(msgs, openai.ChatCompletionMessage{
+		om := openai.ChatCompletionMessage{
 			Role:    role,
 			Content: sanitizeChatMessageContent(m.Content),
-		})
+		}
+		// A tool result must carry the id of the call it answers, or the API rejects the turn.
+		om.ToolCallID = strings.TrimSpace(m.ToolCallID)
+		for _, tc := range m.ToolCalls {
+			args := string(tc.Args)
+			if strings.TrimSpace(args) == "" {
+				args = "{}"
+			}
+			om.ToolCalls = append(om.ToolCalls, openai.ToolCall{
+				ID:       tc.ID,
+				Type:     openai.ToolTypeFunction,
+				Function: openai.FunctionCall{Name: tc.Name, Arguments: args},
+			})
+		}
+		om.Content = contentOrPlaceholder(om.Content, om.Role, len(om.ToolCalls) > 0)
+		msgs = append(msgs, om)
 	}
 
 	req := openai.ChatCompletionRequest{
@@ -137,7 +152,17 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 	if opts.MaxTokens > 0 {
 		req.MaxCompletionTokens = opts.MaxTokens
 	}
-	if opts.Temperature != nil {
+	// Reasoning models fix the sampling parameters and REJECT the request outright when one is
+	// sent with any other value — they do not ignore it:
+	//
+	//	this model has beta-limitations, temperature, top_p and n are fixed at 1,
+	//	while presence_penalty and frequency_penalty are fixed at 0
+	//
+	// That is a 400 per call, so every gap fails and the run generates nothing.
+	//
+	// Omitted rather than pinned to the permitted value: 1 is already the server-side default, and
+	// sending it would silently reinstate the field the day OpenAI widens what these models accept.
+	if opts.Temperature != nil && !modelFixesSamplingParams(c.model) {
 		req.Temperature = float32(*opts.Temperature)
 	}
 	if s := opts.Structured; s != nil && s.Schema != nil && strings.TrimSpace(s.Name) != "" {
@@ -149,6 +174,37 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 				Schema:      s.Schema,
 				Strict:      s.Strict,
 			},
+		}
+	}
+	// Tool fields are only set when tools are actually requested, so a request built without them
+	// marshals exactly as it did before tools existed (omitempty on Tools/ToolChoice).
+	if len(opts.Tools) > 0 {
+		req.Tools = make([]openai.Tool, 0, len(opts.Tools))
+		for _, t := range opts.Tools {
+			name := strings.TrimSpace(t.Name)
+			if name == "" {
+				return nil, fmt.Errorf("openai chat: tool definition with empty name")
+			}
+			req.Tools = append(req.Tools, openai.Tool{
+				Type: openai.ToolTypeFunction,
+				Function: &openai.FunctionDefinition{
+					Name:        name,
+					Description: strings.TrimSpace(t.Description),
+					Parameters:  t.Schema,
+				},
+			})
+		}
+		if tc := strings.TrimSpace(opts.ToolChoice); tc != "" {
+			switch tc {
+			case model.ToolChoiceAuto, model.ToolChoiceNone, model.ToolChoiceRequired:
+				req.ToolChoice = tc
+			default:
+				// Any other value names a specific tool to force.
+				req.ToolChoice = openai.ToolChoice{
+					Type:     openai.ToolTypeFunction,
+					Function: openai.ToolFunction{Name: tc},
+				}
+			}
 		}
 	}
 
@@ -178,8 +234,41 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		return nil, fmt.Errorf("openai chat: no choices in response")
 	}
 
+	choice := resp.Choices[0]
+	stopReason := strings.ToLower(strings.TrimSpace(string(choice.FinishReason)))
+
+	// finish_reason "length" means the model hit MaxCompletionTokens mid-output. The HTTP status is
+	// 200 and the body parses, so without this check a half-written test class — or a JSON object
+	// cut mid-string — is consumed as a finished artifact.
+	if model.IsLengthStopReason(stopReason) {
+		return nil, &model.TruncatedCompletionError{
+			Provider:  "openai",
+			Reason:    stopReason,
+			MaxTokens: opts.MaxTokens,
+			GotTokens: resp.Usage.CompletionTokens,
+			Content:   choice.Message.Content,
+		}
+	}
+
+	// An OpenAI-compatible endpoint fronting a reasoning model (Ollama, vLLM, DeepSeek's own API)
+	// returns the chain of thought inline in Content. See model.StripReasoningBlock.
+	content, thought := model.StripReasoningBlock(choice.Message.Content)
 	out := &model.CompleteResult{
-		Content: resp.Choices[0].Message.Content,
+		Content:        content,
+		StopReason:     stopReason,
+		ReasoningRunes: thought,
+	}
+	// OpenAI sends `arguments` as a JSON string; normalize so callers unmarshal Args directly.
+	for i, tc := range choice.Message.ToolCalls {
+		args, err := model.NormalizeToolArgs("openai", tc.Function.Name, i, tc.Function.Arguments)
+		if err != nil {
+			return nil, err
+		}
+		out.ToolCalls = append(out.ToolCalls, model.ToolCall{
+			ID:   tc.ID,
+			Name: tc.Function.Name,
+			Args: args,
+		})
 	}
 	if resp.Usage.TotalTokens != 0 {
 		out.Usage = &model.Usage{
@@ -313,4 +402,79 @@ func isRetriableOpenAIChatError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// emptyContentPlaceholder stands in for a message body that reached the client empty. Its text is
+// deliberately self-describing: it can surface in a transcript, and "(empty)" reads better there
+// than a lone space would.
+const emptyContentPlaceholder = "(empty)"
+
+// contentOrPlaceholder keeps a message body from vanishing on the wire.
+//
+// go-openai marshals the field as `json:"content,omitempty"`, so an empty Content DROPS the key
+// rather than sending "". The API types `content` as a string wherever it is required and reports
+// the missing key as null — `Invalid value for 'content': expected a string, got null` — which is
+// a 400 that kills the whole request, not just the offending message. An upstream run died exactly
+// there when a tool result was blanked by the shared context budget.
+//
+// The one place an absent content is legal is an assistant message that carries tool_calls: the
+// model asked for tools and said nothing, and OpenAI's schema allows it. Every other role needs a
+// string, so an empty one becomes a placeholder.
+//
+// This is the transport-level net; today core never builds an empty message, but the tool loop
+// will. Callers that know WHY a body is empty should say so in the body itself — reaching this
+// function means nobody did.
+func contentOrPlaceholder(content, role string, hasToolCalls bool) string {
+	if strings.TrimSpace(content) != "" {
+		return content
+	}
+	if role == openai.ChatMessageRoleAssistant && hasToolCalls {
+		return content
+	}
+	return emptyContentPlaceholder
+}
+
+// modelFixesSamplingParams reports whether a model pins temperature/top_p/n/presence_penalty/
+// frequency_penalty and rejects any request that sets one to another value.
+//
+// This is the reasoning-model family: the o-series and gpt-5.x. Matching is by prefix on the bare
+// model name so a dated snapshot (o3-mini-2025-01-31), a fine-tune suffix, or an Azure deployment
+// named after its model all resolve the same way. An Azure deployment given an unrelated name
+// cannot be classified from the string and falls through to sending the parameter — the same
+// behaviour as before this existed, and the API's error names the cause.
+//
+// Deliberately not a general "is a reasoning model" predicate: the only thing being decided is
+// whether these five request fields are accepted.
+func modelFixesSamplingParams(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	// Azure deployments are often referenced with a path-ish or suffixed name.
+	if i := strings.LastIndexAny(n, "/:"); i >= 0 && i+1 < len(n) {
+		n = n[i+1:]
+	}
+	for _, p := range []string{"o1", "o3", "o4", "gpt-5"} {
+		if n == p || strings.HasPrefix(n, p+"-") || strings.HasPrefix(n, p+".") {
+			return true
+		}
+	}
+	return false
+}
+
+// Capabilities implements model.CapabilityReporter. OpenAI/Azure acts on every CompleteOptions
+// field today except Temperature on a reasoning model, which pins it (see
+// modelFixesSamplingParams). Prompt caching is automatic for prefixes over the provider's
+// threshold and needs no directive, so it is declared true without a cache_control equivalent.
+func (c *Client) Capabilities() model.Capabilities {
+	return model.Capabilities{
+		StructuredOutput: true,
+		Temperature:      !modelFixesSamplingParams(c.model),
+		MaxTokens:        true,
+		UsageReporting:   true,
+		PromptCaching:    true,
+		ToolCalling:      true,
+		// response_format and tools are separate request fields; the API composes them.
+		StructuredWithTools: true,
+		// tool_choice "none" is legal alongside tools; the API keeps the declarations (and the
+		// cacheable prefix) while forbidding calls.
+		ToolChoiceNoneWithTools: true,
+	}
 }

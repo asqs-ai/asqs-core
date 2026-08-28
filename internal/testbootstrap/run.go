@@ -21,11 +21,11 @@ type Params struct {
 	Lang string
 	// Config holds enabled, mode (auto|jest|junit|xunit|off), pin_versions, allow_lockfile_change.
 	Config *config.TestFrameworkBootstrapConfig
-	// RunnerTimeout is runner.timeout from config (e.g. 15m) for install/verify subprocess budget.
+	// RunnerTimeout is general.sandbox.timeout from config (e.g. 15m) for install/verify subprocess budget.
 	RunnerTimeout string
 	// Runner is optional; when set with RunnerType and execution auto/docker, install/verify run in ephemeral Docker for TS/JS and Java.
 	Runner *config.RunnerConfig
-	// RunnerType is normalized runner.type (e.g. docker, local).
+	// RunnerType is normalized general.sandbox.type (e.g. docker, local).
 	RunnerType string
 	// DockerExtraEnv is appended to ephemeral bootstrap containers (e.g. VSS_NUGET_EXTERNAL_FEED_ENDPOINTS).
 	DockerExtraEnv []string
@@ -52,19 +52,22 @@ func Run(ctx context.Context, p Params, audit Auditor) error {
 		return fmt.Errorf("test_framework_bootstrap: unsupported mode %q (use auto, jest, junit, xunit, or off)", cfg.Mode)
 	}
 
-	repo := filepath.Clean(strings.TrimSpace(p.RepoPath))
+	// Emptiness must be checked BEFORE Clean: filepath.Clean("") returns ".", so cleaning first
+	// silently turns "no path given" into the process working directory.
+	repo := strings.TrimSpace(p.RepoPath)
 	if repo == "" {
 		return fmt.Errorf("test_framework_bootstrap: empty repo path")
 	}
 	var err error
-	repo, err = filepath.Abs(repo)
+	repo, err = filepath.Abs(filepath.Clean(repo))
 	if err != nil {
 		return fmt.Errorf("test_framework_bootstrap: %w", err)
 	}
-	gitRoot := filepath.Clean(strings.TrimSpace(p.GitRepoRoot))
+	gitRoot := strings.TrimSpace(p.GitRepoRoot)
 	if gitRoot == "" {
 		gitRoot = repo
 	} else {
+		gitRoot = filepath.Clean(gitRoot)
 		gitRoot, err = filepath.Abs(gitRoot)
 		if err != nil {
 			return fmt.Errorf("test_framework_bootstrap: %w", err)
@@ -143,7 +146,21 @@ func Run(ctx context.Context, p Params, audit Auditor) error {
 			"reason":    rep.Reason,
 			"has_setup": true,
 		})
-		fmt.Fprintf(os.Stderr, "  test_framework_bootstrap: skipped — unit test stack already present (%s: %s)\n", rep.Framework, rep.Reason)
+		// "Already set up" is a claim about manifests. Prove it: write one throwaway smoke test, run it
+		// with the repository's OWN runner, and remove it again. Without this, a repo whose stack is
+		// declared but broken sails through here and generation produces artifacts nothing can run.
+		verification := verifyExistingStack(ctx, audit, repo, lang, p.RunnerTimeout, ed)
+
+		// Detection has just computed the full profile even though nothing needs applying, so record
+		// it. A repository that arrives already equipped is exactly the case that would otherwise have
+		// no contract at all, and generation would fall back to reading raw manifests.
+		writeSkipContract(ctx, audit, repo, lang, verification)
+
+		if err := auditExistingStackVerification(ctx, audit, verification, rep); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "  test_framework_bootstrap: skipped — unit test stack already present (%s: %s)%s\n",
+			rep.Framework, rep.Reason, verifiedSuffix(verification))
 		return nil
 	}
 
@@ -155,7 +172,7 @@ func Run(ctx context.Context, p Params, audit Auditor) error {
 		if mode != "auto" && mode != "jest" {
 			return fmt.Errorf("test_framework_bootstrap: mode %q not valid for JS/TS", mode)
 		}
-		return runJestBootstrap(ctx, repo, cfg, lang, audit, p.RunnerTimeout, ed)
+		return runJSBootstrap(ctx, repo, cfg, lang, audit, p.RunnerTimeout, ed)
 	case lang == "java":
 		if err := enforceRequireDockerBootstrap(p.Runner, lang, ed, "test_framework_bootstrap"); err != nil {
 			return err

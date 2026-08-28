@@ -178,19 +178,33 @@ func splitChunkForEmbedding(c *ChunkToEmbed, maxRunes, overlapRunes int) []*Chun
 		return []*ChunkToEmbed{cloneChunkToEmbed(c)}
 	}
 
-	totalLines := c.EndLine - c.StartLine + 1
-	if totalLines < 1 {
-		totalLines = 1
-	}
-	totalRunes := len(runes)
+	// Line numbers are COUNTED, not interpolated.
+	//
+	// This used to scale the rune offset by the chunk's line span:
+	//
+	//	segStartOff := (w.start * totalLines) / totalRunes
+	//
+	// which assumes every line is the same length. Real code is not uniform — imports and closing
+	// braces are short, string literals and argument lists are long — so the estimate drifts, and
+	// measured on ordinary Java it drifted by ~14 lines. The numbers are not cosmetic: they become
+	// `symbolLoc` in the generation prompt and the `errloc` window in the fixer, which is told to
+	// "fix the PRIMARY ERROR line first". An off-by-14 line reference there is worse than no line
+	// reference, because the model acts on it.
+	//
+	// Counting is O(n) per segment against an embedding HTTP call, so the cost is not measurable.
+	newlinesBefore := prefixNewlineCounts(runes)
 	out := make([]*ChunkToEmbed, 0, len(windows))
 	for i, w := range windows {
 		seg := cloneChunkToEmbed(c)
 		seg.Content = string(runes[w.start:w.end])
-		segStartOff := (w.start * totalLines) / totalRunes
-		segEndOff := ((w.end - 1) * totalLines) / totalRunes
-		seg.StartLine = c.StartLine + segStartOff
-		seg.EndLine = c.StartLine + segEndOff
+		// The last rune of the window, so a window ending exactly on a newline is attributed to the
+		// line it closes rather than the next one.
+		lastIdx := w.end - 1
+		if lastIdx < w.start {
+			lastIdx = w.start
+		}
+		seg.StartLine = c.StartLine + newlinesBefore[w.start]
+		seg.EndLine = c.StartLine + newlinesBefore[lastIdx]
 		if seg.EndLine < seg.StartLine {
 			seg.EndLine = seg.StartLine
 		}
@@ -281,4 +295,21 @@ func embedSkipReason(err error) string {
 		// Recoverable per IsRecoverableEmbedError but not one of the cases above (see substring list in recoverable.go).
 		return "recoverable_api_error"
 	}
+}
+
+// prefixNewlineCounts returns, for each rune index i, how many newlines appear strictly before i.
+//
+// One pass for the whole chunk rather than a scan per window: splitting a large chunk into k
+// segments would otherwise be O(k·n).
+func prefixNewlineCounts(runes []rune) []int {
+	out := make([]int, len(runes)+1)
+	n := 0
+	for i, r := range runes {
+		out[i] = n
+		if r == '\n' {
+			n++
+		}
+	}
+	out[len(runes)] = n
+	return out
 }

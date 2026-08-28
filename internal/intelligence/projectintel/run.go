@@ -11,6 +11,13 @@ import (
 	"unicode/utf8"
 )
 
+// DefaultCachePathRel is where the scan caches itself when a caller names no path.
+//
+// It is FROZEN (CP37) and must stay equal to config.ProjectIntelCachePath, which the pre-ship
+// preserve list uses to decide what survives a ship. Two spellings of one path is how a cache
+// silently stops being committed and every run starts cold; pipeline pins the equality.
+const DefaultCachePathRel = ".asqs/project-intel-cache.json"
+
 const rankLeadRunes = 8000
 
 const maxScannedRelPathsInResult = 100
@@ -62,7 +69,7 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 
 	cachePath := strings.TrimSpace(in.Opts.CachePath)
 	if cachePath == "" {
-		cachePath = ".asqs/project-intel-cache.json"
+		cachePath = DefaultCachePathRel
 	}
 	res.CachePath = cachePath
 	if in.Opts.CacheEnabled && !in.Opts.ForceRefresh {
@@ -195,7 +202,15 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 
 	res.Candidates = ranked
 
-	// Phase 3: build the pre-computed markdown block (fallback / default path).
+	// Phase 3: resolve symbol references from doc content.
+	if in.SymbolResolver != nil {
+		for i := range ranked {
+			refs := ExtractSymbolRefs(ranked[i].Content)
+			ranked[i].LinkedSymbolIDs, ranked[i].LinkedFQNames = ResolveDocSymbolLinksWithNames(ctx, in.RepoID, refs, in.SymbolResolver)
+		}
+	}
+
+	// Phase 4: build the pre-computed markdown block (fallback for callers that don't use SelectForGap).
 	var b strings.Builder
 	b.WriteString("## Repository documentation and agent skills (ASQS project intel)\n\n")
 	b.WriteString("The following excerpts summarize **existing** repo docs and Cursor-style skills. Where these repo-specific conventions conflict with generic skill pack guidance in the system prompt, **these repo conventions take precedence**. Do not contradict indexed source code.\n\n")
@@ -249,11 +264,13 @@ func Run(ctx context.Context, in Input) (*Result, error) {
 		var diskCands []diskCacheCandidate
 		for _, rc := range ranked {
 			diskCands = append(diskCands, diskCacheCandidate{
-				RelPath:      rc.RelPath,
-				Kind:         string(rc.Kind),
-				Score:        rc.Score,
-				Content:      rc.Content,
-				DocEmbedding: append([]float32(nil), rc.DocEmbedding...),
+				RelPath:         rc.RelPath,
+				Kind:            string(rc.Kind),
+				Score:           rc.Score,
+				Content:         rc.Content,
+				DocEmbedding:    append([]float32(nil), rc.DocEmbedding...),
+				LinkedSymbolIDs: append([]string(nil), rc.LinkedSymbolIDs...),
+				LinkedFQNames:   append([]string(nil), rc.LinkedFQNames...),
 			})
 		}
 		dc := diskCache{

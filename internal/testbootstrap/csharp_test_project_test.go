@@ -47,7 +47,7 @@ func TestDedicatedCSharpTestProjectRoutesTestsOutOfProduction(t *testing.T) {
 		t.Fatalf("test must not be placed inside production (src/): %q", got)
 	}
 
-	testProj, changed, err := createDedicatedCSharpTestProject(repo, repo, prod, "")
+	testProj, changed, err := createDedicatedCSharpTestProject(repo, repo, prod, "", csharpRunnerOnlyProfile(CSharpTestXunit))
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestDedicatedCSharpTestProjectRoutesTestsOutOfProduction(t *testing.T) {
 	}
 
 	// Idempotent: a second call makes no changes and returns the same path.
-	again, changed2, err := createDedicatedCSharpTestProject(repo, repo, prod, "")
+	again, changed2, err := createDedicatedCSharpTestProject(repo, repo, prod, "", csharpRunnerOnlyProfile(CSharpTestXunit))
 	if err != nil || again != testProj || len(changed2) != 0 {
 		t.Fatalf("idempotency: again=%q changed=%v err=%v", again, changed2, err)
 	}
@@ -104,7 +104,6 @@ func TestMigrateStrayCSharpTestsIntoTestRoot(t *testing.T) {
 	if err := os.WriteFile(stray, []byte("using Xunit;\npublic class LegacyXmlCatalogReaderTests { [Fact] public void T(){} }\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A non-test production file with a similar name must NOT be moved.
 	keep := filepath.Join(repo, "src", "Core", "Legacy", "LegacyXmlCatalogReader.cs")
 	if err := os.WriteFile(keep, []byte("public class LegacyXmlCatalogReader {}\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -114,7 +113,7 @@ func TestMigrateStrayCSharpTestsIntoTestRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := createDedicatedCSharpTestProject(repo, repo, prod, ""); err != nil {
+	if _, _, err := createDedicatedCSharpTestProject(repo, repo, prod, "", csharpRunnerOnlyProfile(CSharpTestXunit)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -161,7 +160,7 @@ func TestDedicatedCSharpE2EProjectIsSeparateAndPlaywright(t *testing.T) {
 		}
 	}
 
-	unitProj, _, err := createDedicatedCSharpTestProject(repo, repo, prod, "")
+	unitProj, _, err := createDedicatedCSharpTestProject(repo, repo, prod, "", csharpRunnerOnlyProfile(CSharpTestXunit))
 	if err != nil {
 		t.Fatalf("create unit: %v", err)
 	}

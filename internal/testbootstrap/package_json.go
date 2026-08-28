@@ -5,17 +5,27 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
-// mergeJestIntoPackageJSON reads package.json, merges devDependencies and always sets scripts.test to "jest".
-func mergeJestIntoPackageJSON(pkgPath string, isTS, pinVersions bool) error {
+// mergeJSTestDepsIntoPackageJSON merges the profile's missing devDependencies and adds its runner
+// script.
+//
+// Two changes from the previous behaviour, both of which were destructive:
+//
+//   - the dependency set now comes from the profile rather than a fixed jest/ts-jest list, so a React
+//     package gets jsdom and Testing Library and an Angular package gets its preset;
+//   - the script is written to `test:asqs`, NOT `test`. The old code did `scripts.test = "jest"`
+//     unconditionally, which destroyed `ng test` on Angular repos and any custom harness elsewhere.
+//     `test` is only set when the package has no test script at all.
+func mergeJSTestDepsIntoPackageJSON(pkgPath string, p jsTestProfile, missing []jsDep, pinVersions bool) (addedScript string, err error) {
 	data, err := os.ReadFile(pkgPath)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var root map[string]interface{}
 	if err := json.Unmarshal(data, &root); err != nil {
-		return fmt.Errorf("package.json: %w", err)
+		return "", fmt.Errorf("package.json: %w", err)
 	}
 	dev, _ := root["devDependencies"].(map[string]interface{})
 	if dev == nil {
@@ -28,24 +38,31 @@ func mergeJestIntoPackageJSON(pkgPath string, isTS, pinVersions bool) error {
 		}
 		return "^" + v
 	}
-	dev["jest"] = ver(VersionJest)
-	if isTS {
-		dev["ts-jest"] = ver(VersionTSJest)
-		dev["@types/jest"] = ver(VersionTypesJest)
-		dev["@types/node"] = ver(VersionTypesNode)
+	for _, d := range missing {
+		dev[d.Name] = ver(d.Version)
 	}
+
 	scripts, _ := root["scripts"].(map[string]interface{})
 	if scripts == nil {
 		scripts = make(map[string]interface{})
 		root["scripts"] = scripts
 	}
-	scripts["test"] = "jest"
+	runnerCmd := "jest"
+	if p.Runner == JSRunnerVitest {
+		runnerCmd = "vitest run"
+	}
+	scripts[p.TestScript] = runnerCmd
+	addedScript = p.TestScript
+	if existing, ok := scripts["test"].(string); !ok || strings.TrimSpace(existing) == "" {
+		scripts["test"] = runnerCmd
+	}
+
 	out, err := json.MarshalIndent(root, "", "  ")
 	if err != nil {
-		return err
+		return "", err
 	}
 	out = append(out, '\n')
-	return atomicWrite(pkgPath, out)
+	return addedScript, atomicWrite(pkgPath, out)
 }
 
 func atomicWrite(path string, data []byte) error {

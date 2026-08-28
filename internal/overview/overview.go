@@ -85,7 +85,7 @@ func overviewCanonicalLang(lang string) string {
 // BuildOverviewVisualSections returns Markdown sections to append to the overview doc: (1) a module/file
 // structure diagram (when there are files), (2) a file dependency graph from AST edges when present.
 // Both are Mermaid flowcharts that render in GitHub and most Markdown viewers.
-func BuildOverviewVisualSections(ctx context.Context, meta *metadata.Store, lang, repoRoot, overviewPath string) string {
+func BuildOverviewVisualSections(ctx context.Context, meta *metadata.Store, repoID, lang, repoRoot, overviewPath string) string {
 	if meta == nil || lang == "" {
 		return ""
 	}
@@ -93,7 +93,7 @@ func BuildOverviewVisualSections(ctx context.Context, meta *metadata.Store, lang
 	var b strings.Builder
 
 	// Module and file structure (Mermaid)
-	if mermaid := buildModuleFileStructureMermaid(ctx, meta, lang); mermaid != "" {
+	if mermaid := buildModuleFileStructureMermaid(ctx, meta, repoID, lang); mermaid != "" {
 		b.WriteString("\n\n## Module and file structure\n\n")
 		b.WriteString("Files grouped by module (from the index).\n\n")
 		b.WriteString(mermaid)
@@ -101,7 +101,7 @@ func BuildOverviewVisualSections(ctx context.Context, meta *metadata.Store, lang
 
 	// File dependency graph (Mermaid); uses all indexed languages (not only dominant workflow lang).
 	// Empty-state copy follows workflow lang so JS/TS overviews are not told to enable the Java advanced JAR.
-	b.WriteString(buildFileDependencySectionMermaid(ctx, meta, lang))
+	b.WriteString(buildFileDependencySectionMermaid(ctx, meta, repoID, lang))
 	out := b.String()
 	if out == "" {
 		return ""
@@ -113,9 +113,9 @@ func BuildOverviewVisualSections(ctx context.Context, meta *metadata.Store, lang
 const mermaidMaxNodesPerDiagram = 8 // max file nodes per diagram in hierarchical layout
 
 // buildModuleFileStructureMermaid returns Mermaid graph TD blocks with hierarchical layout: module → directory (package) → files. Uses TB direction for vertical hierarchy.
-func buildModuleFileStructureMermaid(ctx context.Context, meta *metadata.Store, lang string) string {
+func buildModuleFileStructureMermaid(ctx context.Context, meta *metadata.Store, repoID, lang string) string {
 	isTest := false
-	files, err := meta.ListFiles(ctx, lang, &isTest)
+	files, err := meta.ListFiles(ctx, repoID, lang, &isTest)
 	if err != nil || len(files) == 0 {
 		return ""
 	}
@@ -297,7 +297,7 @@ func emptyFileDependencyGraphExplanation(workflowLang string) string {
 		"An empty graph is common when callees are unresolved, calls stay within one file, or dependencies point only at external or standard-library code."
 	switch l {
 	case "java":
-		return base + " For Java **call** edges, use the **advanced** indexer (`indexer.type: advanced` + `indexer.advanced_jar_path`); cross-file arcs still require symbols to resolve."
+		return base + " For Java **call** edges, use the **advanced** indexer (`indexer.type: advanced` + `indexer.java.jar_path`); cross-file arcs still require symbols to resolve."
 	case "javascript", "typescript", "js", "ts":
 		return base + " For JavaScript/TypeScript, in-repo arcs come from resolved **imports** and **calls** to symbols in indexed project files; unresolved specifiers and third-party modules usually do not add file pairs here."
 	case "csharp", "cs":
@@ -310,8 +310,8 @@ func emptyFileDependencyGraphExplanation(workflowLang string) string {
 // buildFileDependencySectionMermaid returns the file dependency section as Mermaid or an explanation when empty.
 // Aggregates edges for every indexed language so Java AST edges still appear when the workflow dominant lang is JS/TS.
 // workflowLang tailors the empty-state explanation (see emptyFileDependencyGraphExplanation).
-func buildFileDependencySectionMermaid(ctx context.Context, meta *metadata.Store, workflowLang string) string {
-	edgeFiles, err := meta.ListEdgeFiles(ctx, "")
+func buildFileDependencySectionMermaid(ctx context.Context, meta *metadata.Store, repoID, workflowLang string) string {
+	edgeFiles, err := meta.ListEdgeFiles(ctx, repoID, "")
 	if err != nil {
 		return "\n\n## File dependency graph (from AST)\n\n*Could not load edges from the index.*\n"
 	}
@@ -331,12 +331,12 @@ func buildFileDependencySectionMermaid(ctx context.Context, meta *metadata.Store
 // BuildFileDependencyGraphMermaid returns a Markdown section with a Mermaid flowchart of file-level
 // dependencies (from AST edges). Prefer BuildOverviewVisualSections to get the full overview with both sections.
 // lang is ignored: edges include every language in the index (same as the overview appendix graph).
-func BuildFileDependencyGraphMermaid(ctx context.Context, meta *metadata.Store, lang string) string {
+func BuildFileDependencyGraphMermaid(ctx context.Context, meta *metadata.Store, repoID, lang string) string {
 	_ = lang
 	if meta == nil {
 		return ""
 	}
-	edgeFiles, err := meta.ListEdgeFiles(ctx, "")
+	edgeFiles, err := meta.ListEdgeFiles(ctx, repoID, "")
 	if err != nil || len(edgeFiles) == 0 {
 		return ""
 	}
@@ -356,8 +356,8 @@ const defaultOverviewContextMaxRunes = 200_000
 
 // overviewMetaReader is the subset of metadata.Store used to build overview index text (allows tests to use fakes).
 type overviewMetaReader interface {
-	ListFiles(ctx context.Context, lang string, isTest *bool) ([]*metadata.File, error)
-	ListSymbolsByLang(ctx context.Context, lang string, kind string) ([]*metadata.Symbol, error)
+	ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error)
+	ListSymbolsByLang(ctx context.Context, repoID, lang string, kind string) ([]*metadata.Symbol, error)
 }
 
 // applyOverviewContextSizeLimit truncates s to at most maxRunes runes when maxRunes >= 0.
@@ -415,7 +415,7 @@ func truncateUTF8ToMaxRunesWithTrailer(s string, maxRunes int, trailer string) s
 // buildOverviewContextForSourceFiles builds the same index snapshot shape as BuildOverviewContext, but only for
 // repo-relative paths listed in files (non-test production files as returned by the indexer). Used for Plan B
 // batched overview LLM calls.
-func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaReader, lang string, files []string) (string, error) {
+func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaReader, repoID, lang string, files []string) (string, error) {
 	if meta == nil {
 		return "", fmt.Errorf("overview: Meta required")
 	}
@@ -434,7 +434,7 @@ func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaRe
 		return "", fmt.Errorf("overview: empty file slice")
 	}
 	isTest := false
-	allFiles, err := meta.ListFiles(ctx, lang, &isTest)
+	allFiles, err := meta.ListFiles(ctx, repoID, lang, &isTest)
 	if err != nil {
 		return "", err
 	}
@@ -473,7 +473,7 @@ func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaRe
 		}
 		b.WriteString("\n")
 	}
-	classes, err := meta.ListSymbolsByLang(ctx, lang, "class")
+	classes, err := meta.ListSymbolsByLang(ctx, repoID, lang, "class")
 	if err != nil {
 		return "", err
 	}
@@ -491,7 +491,7 @@ func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaRe
 		b.WriteString(c.File)
 		b.WriteString(")\n")
 	}
-	methods, err := meta.ListSymbolsByLang(ctx, lang, "method")
+	methods, err := meta.ListSymbolsByLang(ctx, repoID, lang, "method")
 	if err != nil {
 		return "", err
 	}
@@ -550,7 +550,7 @@ func buildOverviewContextForSourceFiles(ctx context.Context, meta overviewMetaRe
 // BuildOverviewContext builds a text summary of the codebase (files, symbols) for the overview/workflows document.
 // Lang filters to one language (e.g. "java"). The full index is included (no rune cap for this helper). The LLM path
 // uses GenerateOverviewWithMeta (batched slices; optional per-slice index rune cap) when the generator is *LLMOverviewDocGenerator.
-func BuildOverviewContext(ctx context.Context, meta *metadata.Store, lang string) (string, error) {
+func BuildOverviewContext(ctx context.Context, meta *metadata.Store, repoID, lang string) (string, error) {
 	if meta == nil {
 		return "", fmt.Errorf("overview: Meta required")
 	}
@@ -560,7 +560,7 @@ func BuildOverviewContext(ctx context.Context, meta *metadata.Store, lang string
 	}
 	var b strings.Builder
 	isTest := false
-	files, err := meta.ListFiles(ctx, lang, &isTest)
+	files, err := meta.ListFiles(ctx, repoID, lang, &isTest)
 	if err != nil {
 		return "", err
 	}
@@ -588,7 +588,7 @@ func BuildOverviewContext(ctx context.Context, meta *metadata.Store, lang string
 		}
 		b.WriteString("\n")
 	}
-	classes, err := meta.ListSymbolsByLang(ctx, lang, "class")
+	classes, err := meta.ListSymbolsByLang(ctx, repoID, lang, "class")
 	if err != nil {
 		return "", err
 	}
@@ -603,7 +603,7 @@ func BuildOverviewContext(ctx context.Context, meta *metadata.Store, lang string
 		b.WriteString(c.File)
 		b.WriteString(")\n")
 	}
-	methods, err := meta.ListSymbolsByLang(ctx, lang, "method")
+	methods, err := meta.ListSymbolsByLang(ctx, repoID, lang, "method")
 	if err != nil {
 		return "", err
 	}

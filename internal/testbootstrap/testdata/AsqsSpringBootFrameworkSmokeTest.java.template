@@ -1,0 +1,26 @@
+package __ASQS_PACKAGE__;
+
+import org.junit.jupiter.api.Test;
+
+import org.springframework.boot.test.context.SpringBootTest;
+
+/**
+ * ASQS test_framework_bootstrap framework smoke test (Spring Boot).
+ *
+ * <p>
+ * Loading the application context is the assertion: it is
+ * what @SpringBootTest, @WebMvcTest and every other Spring test slice generation produces
+ * depends on. This class lives in the application's base package because @SpringBootTest
+ * searches UP the package tree for @SpringBootConfiguration.
+ *
+ * <p>
+ * Safe to delete.
+ */
+@SpringBootTest
+class AsqsFrameworkSmokeTest {
+
+	@Test
+	void applicationContextLoads() {
+	}
+
+}

@@ -1,0 +1,38 @@
+using System.Net.Http;
+
+using FluentAssertions;
+using Microsoft.AspNetCore.Mvc.Testing;
+__ASQS_TEST_USING__
+
+namespace Asqs.Bootstrap
+{
+    /// <summary>
+    /// ASQS test_framework_bootstrap framework smoke test (ASP.NET Core).
+    ///
+    /// Starting the host is the assertion: WebApplicationFactory boots the real application when
+    /// CreateClient() is called, which is what every generated integration-style test depends on.
+    ///
+    /// The type argument is a public type from the web project rather than Program, because
+    /// top-level statements make the generated Program class internal — not visible here without an
+    /// InternalsVisibleTo edit to the production project. WebApplicationFactory only needs a type
+    /// from the web assembly in order to locate its entry point and content root.
+    ///
+    /// Block namespace and explicit types throughout: repos routinely pin LangVersion 8.0 on a
+    /// modern TargetFramework, where file-scoped namespaces and target-typed new() do not compile.
+    ///
+    /// Safe to delete.
+    /// </summary>
+    __ASQS_TEST_CLASSATTR__public class AsqsFrameworkSmokeTest
+    {
+        __ASQS_TEST_METHODATTR__
+        public void ApplicationHostStarts()
+        {
+            using (var factory = new WebApplicationFactory<__ASQS_ENTRYPOINT__>())
+            {
+                HttpClient client = factory.CreateClient();
+
+                client.Should().NotBeNull();
+            }
+        }
+    }
+}

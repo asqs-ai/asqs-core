@@ -32,12 +32,22 @@ type ContextRequest struct {
 	FailureHint string
 	// DisableHybridModuleFilter when true, skips SQL module matching (chunk_metadata.module) on similar-chunk vector search and list fallbacks. Default false = hybrid filter + adaptive widening.
 	DisableHybridModuleFilter bool
+	// Fusion selects how candidate lists are combined: "dense" (default, previous behaviour) or
+	// "rrf" (dense lists plus a lexical list, fused by reciprocal rank). See fusion.go.
+	Fusion string
+	// LexicalQuery is the synthesized term query for the lexical channel. Empty disables it even
+	// when Fusion is rrf. Built by LexicalQueryForTarget from the target symbol.
+	LexicalQuery string
 }
 
 // SymbolChunk is a symbol plus its chunk content (for inclusion in context).
 type SymbolChunk struct {
 	Symbol *metadata.Symbol
 	Chunk  *embeddings.Chunk
+	// Members is the index-derived member summary rendered when no chunk resolved for the symbol
+	// (see memberListBlock). Populated by the chunk-miss fallback, which arrives with CP45; until
+	// then it stays empty and the renderer emits nothing.
+	Members []string
 }
 
 // DependencyEdge is a dependency (callee) with the edge type (calls, extends, implements).
@@ -79,6 +89,17 @@ type RetrievalContext struct {
 	// ExistingTestCoverage summarizes branch-intent hints when tests already exist for the target source file.
 	// Used to steer generation toward missing branches instead of duplicating covered happy paths.
 	ExistingTestCoverage *ExistingTestCoverageHint
+
+	// TestSuffixConvention is the repository's detected UNIT-test naming suffix ("Test"/"Tests" for
+	// Java and C#, ".test."/".spec." for JS/TS), or empty when no convention was detected. It rides
+	// on the context because the generator resolves the default path per item and has no view of
+	// the repository's file list.
+	//
+	// Without it the built-in default (FooTest.java) disagrees with a *Tests repository on every
+	// run, so each run writes a sibling beside the file it should have extended — and once both
+	// exist the redirect picks on sort order, where "Test.java" precedes "Tests.java", so the
+	// tool's own leftover shadows the repository's real suite permanently.
+	TestSuffixConvention string
 
 	// ExistingTestPaths is the sorted list of on-disk test files that already cover the target
 	// symbol's source file (repo-relative). Populated from PlanOptions.ExistingTestPathsBySource.

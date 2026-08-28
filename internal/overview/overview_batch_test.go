@@ -19,14 +19,14 @@ type stubOverviewMeta struct {
 	methods []*metadata.Symbol
 }
 
-func (s *stubOverviewMeta) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*metadata.File, error) {
+func (s *stubOverviewMeta) ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error) {
 	if isTest != nil && *isTest {
 		return nil, nil
 	}
 	return s.files, nil
 }
 
-func (s *stubOverviewMeta) ListSymbolsByLang(ctx context.Context, lang, kind string) ([]*metadata.Symbol, error) {
+func (s *stubOverviewMeta) ListSymbolsByLang(ctx context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error) {
 	switch kind {
 	case "class":
 		return s.classes, nil
@@ -48,7 +48,7 @@ func TestPartitionOverviewFileBatches_ordersAndSplits(t *testing.T) {
 			{File: "beta/x.go", Lang: "go", Module: "m1"},
 		},
 	}
-	batches, err := partitionOverviewFileBatches(ctx, st, "go", 2)
+	batches, err := partitionOverviewFileBatches(ctx, st, "", "go", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestPartitionOverviewFileBatches_skipsIgnoredPaths(t *testing.T) {
 			{File: "dist/bundle.js", Lang: "go", Module: ""},
 		},
 	}
-	batches, err := partitionOverviewFileBatches(ctx, st, "go", 10)
+	batches, err := partitionOverviewFileBatches(ctx, st, "", "go", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestBuildOverviewContextForSourceFiles_filtersFilesAndSymbols(t *testing.T)
 			{FQName: "pkg.U.N", File: "drop/p2.go", Kind: "method"},
 		},
 	}
-	out, err := buildOverviewContextForSourceFiles(ctx, st, "go", []string{"keep/p1.go"})
+	out, err := buildOverviewContextForSourceFiles(ctx, st, "", "go", []string{"keep/p1.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,7 +198,7 @@ func TestCompleteOverviewIncrementalSliceWithEOFResplit_splits(t *testing.T) {
 	llm := &eofSplitIncrementalCompleter{}
 	g := &LLMOverviewDocGenerator{LLM: llm}
 	stat := &OverviewLLMStats{}
-	delta, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, st, "go", 0, 1, []string{"a.go", "b.go"},
+	delta, err := g.completeOverviewIncrementalSliceWithEOFResplit(ctx, st, "", "go", 0, 1, []string{"a.go", "b.go"},
 		"# Title\n\nexisting", "system prompt", "2099-01-01", 0, false, 0, stat)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestRefineOverviewBatchesByIndexRunes_splitsHeavyBatch(t *testing.T) {
 		methods: methods,
 	}
 	batches := [][]string{{"a.go", "b.go"}}
-	out, err := refineOverviewBatchesByIndexRunes(ctx, st, "go", batches, 12_000)
+	out, err := refineOverviewBatchesByIndexRunes(ctx, st, "", "go", batches, 12_000)
 	if err != nil {
 		t.Fatal(err)
 	}

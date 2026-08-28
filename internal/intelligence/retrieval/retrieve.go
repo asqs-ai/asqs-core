@@ -22,12 +22,12 @@ const (
 
 // MetaReader is the subset of metadata needed for symbol-aware retrieval.
 type MetaReader interface {
-	GetSymbolByID(ctx context.Context, id string) (*metadata.Symbol, error)
-	ListSymbolsByFile(ctx context.Context, file string) ([]*metadata.Symbol, error)
-	GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*metadata.Edge, error)
-	GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*metadata.Edge, error)
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
+	GetSymbolByID(ctx context.Context, repoID, id string) (*metadata.Symbol, error)
+	ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*metadata.Symbol, error)
+	GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*metadata.Edge, error)
+	GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*metadata.Edge, error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
 }
 
 // ChunkReader is the subset of embeddings store for listing chunks by symbol/file/repo/type.
@@ -64,14 +64,14 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	out := &RetrievalContext{}
 
 	// Target method + class
-	targetSym, err := meta.GetSymbolByID(ctx, req.SymbolID)
+	targetSym, err := meta.GetSymbolByID(ctx, req.RepoID, req.SymbolID)
 	if err != nil || targetSym == nil {
 		return nil, err
 	}
 	methodChunk := chunkForSymbol(ctx, chunks, req.SymbolID, req.RepoID)
 	out.TargetMethod = &SymbolChunk{Symbol: targetSym, Chunk: methodChunk}
 
-	containerSym := enclosingContainer(ctx, meta, targetSym)
+	containerSym := enclosingContainer(ctx, meta, req.RepoID, targetSym)
 	if containerSym != nil {
 		var classChunk *embeddings.Chunk
 		if containerSym.ID != targetSym.ID {
@@ -98,7 +98,7 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	// class's field declarations (= injected collaborators to mock), and the method body — then
 	// resolve each to a repo symbol. Resolution is cross-package: the prior `<module>.<name>` guess
 	// only found same-package types, so cross-package domain types (the common case) never resolved.
-	f, _ := meta.GetFile(ctx, targetSym.File)
+	f, _ := meta.GetFile(ctx, req.RepoID, targetSym.File)
 	fileModule := ""
 	if f != nil {
 		fileModule = strings.TrimSpace(f.Module)
@@ -109,19 +109,25 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 		}
 		seen[s.ID] = true
 		c := chunkForSymbol(ctx, chunks, s.ID, req.RepoID)
-		out.DomainModels = append(out.DomainModels, &SymbolChunk{Symbol: s, Chunk: c})
+		sc := &SymbolChunk{Symbol: s, Chunk: c}
+		if c == nil {
+			// No chunk resolved: without a member list the model sees only a type name and
+			// invents members for it. Derive them from the index instead.
+			sc.Members = memberSummaryForType(ctx, meta, req.RepoID, s, maxMembersPerType)
+		}
+		out.DomainModels = append(out.DomainModels, sc)
 	}
 	// Same-file types first (cheap, certain).
-	fileSyms, _ := meta.ListSymbolsByFile(ctx, targetSym.File)
+	fileSyms, _ := meta.ListSymbolsByFile(ctx, req.RepoID, targetSym.File)
 	for _, s := range fileSyms {
 		addDomainModel(s)
 	}
 	// Referenced type names, highest-signal source first so the budget fills with the most relevant.
-	for _, typeName := range referencedTypeNames(ctx, meta, targetSym, out.TargetClass, methodChunk) {
+	for _, typeName := range referencedTypeNames(ctx, meta, req.RepoID, targetSym, out.TargetClass, methodChunk) {
 		if len(out.DomainModels) >= maxDomainModels {
 			break
 		}
-		for _, s := range resolveTypeNameToSymbols(ctx, meta, typeName, fileModule) {
+		for _, s := range resolveTypeNameToSymbols(ctx, meta, req.RepoID, typeName, fileModule) {
 			addDomainModel(s)
 		}
 	}
@@ -156,13 +162,19 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	// Fixtures / helpers: test-related chunks
 	out.Fixtures = listChunksByType(ctx, chunks, req.RepoID, req.Lang, "fixture", req.MaxFixtures, "")
 	if len(out.Fixtures) < req.MaxFixtures {
-		extra := listChunksByPathPattern(ctx, chunks, req.RepoID, req.Lang, []string{"fixture", "helper", "builder"}, req.MaxFixtures-len(out.Fixtures))
+		// Ranked by relevance to the target rather than by alphabetical file path — see
+		// relevantChunksByPathPattern for what the previous behaviour actually returned.
+		extra := relevantChunksByPathPattern(ctx, chunks, targetChunk, req.RepoID, req.Lang,
+			[]string{"fixture", "helper", "builder"}, req.MaxFixtures-len(out.Fixtures))
 		out.Fixtures = append(out.Fixtures, extra...)
 	}
 	annotateChunkGroupProvenance(out.Fixtures, "fixtures", "fixture/helper candidates for setup and test data")
 
 	// Config: DI, Spring, test runner
-	out.Config = listChunksByPathPattern(ctx, chunks, req.RepoID, req.Lang, []string{"config", "context", "spring", "test-config"}, req.MaxConfigChunks)
+	// Config is ranked by PATH PROXIMITY, not vector distance: application-test.yml shares almost no
+	// vocabulary with a service method body, so cosine between them is noise.
+	out.Config = configChunksByPathProximity(ctx, chunks, targetChunk, req.RepoID, req.Lang,
+		[]string{"config", "context", "spring", "test-config"}, req.MaxConfigChunks)
 	annotateChunkGroupProvenance(out.Config, "config", "configuration/DI/runtime context likely needed for wiring")
 
 	applyFailureLocalizedRetrieval(out, req.FailureHint)
@@ -221,7 +233,7 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 	if max <= 0 {
 		max = 15
 	}
-	graph := collectGraphEdges(ctx, meta, targetID, profile, req.DependencyMaxDepth)
+	graph := collectGraphEdges(ctx, meta, req.RepoID, targetID, profile, req.DependencyMaxDepth)
 	seen := map[string]bool{targetID: true}
 	var out []*DependencyEdge
 
@@ -237,7 +249,7 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 		if ge.otherID == "" || seen[ge.otherID] {
 			return false
 		}
-		callee, _ := meta.GetSymbolByID(ctx, ge.otherID)
+		callee, _ := meta.GetSymbolByID(ctx, req.RepoID, ge.otherID)
 		if callee == nil {
 			return false
 		}
@@ -250,8 +262,14 @@ func buildDependenciesFromGraph(ctx context.Context, meta MetaReader, chunks Chu
 		if c != nil {
 			annotateChunkGroupProvenance([]*embeddings.Chunk{c}, "dependency", "graph dependency expansion")
 		}
+		sc := SymbolChunk{Symbol: callee, Chunk: c}
+		if c == nil {
+			// Same chunk-miss fallback as domain models: a dependency shown as a bare name is an
+			// invitation to invent its API.
+			sc.Members = memberSummaryForType(ctx, meta, req.RepoID, callee, maxMembersPerType)
+		}
 		out = append(out, &DependencyEdge{
-			SymbolChunk: SymbolChunk{Symbol: callee, Chunk: c},
+			SymbolChunk: sc,
 			EdgeType:    label,
 			Depth:       ge.depth,
 			GraphPath:   ge.path,
@@ -362,6 +380,9 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 		assemblyPoolLimit = limit
 	}
 	seen := make(map[string]bool)
+	// channelLists holds one ranked list per retrieval channel (one per chunk_type, plus the
+	// lexical list when fusion is enabled). RRF fuses by rank across these.
+	var channelLists [][]embeddings.SearchResult
 	var out []*embeddings.Chunk
 	addChunk := func(ch *embeddings.Chunk) {
 		if ch == nil {
@@ -415,9 +436,15 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 				loose.Module = ""
 				wide, werr := chunks.Search(ctx, targetChunk.Embedding, loose)
 				if werr == nil && len(wide) > 0 {
-					similar = append(append([]embeddings.SearchResult(nil), similar...), wide...)
+					// Merge by distance rather than concatenating. The concatenation left the tail
+					// unordered and duplicated the overlap, which is harmless for the max-cosine
+					// merge below but feeds RRF fabricated ranks.
+					similar = mergeByBestDistance(similar, wide)
 				}
 			}
+			// Keep each channel's ranked list so RRF can fuse by rank. The dense-only path below
+			// still consumes bestByKey, so both modes read from the same searches.
+			channelLists = append(channelLists, similar)
 			for i := range similar {
 				sc := similar[i].Chunk
 				key := chunkStableKey(&sc)
@@ -435,6 +462,45 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 				bestByKey[key] = mmrScoredChunk{chunk: cp, relevance: rel}
 			}
 		}
+
+		// Lexical channel + reciprocal-rank fusion, behind retrieval.fusion: rrf.
+		//
+		// Default is dense (unchanged behaviour) because this changes ranking and must be A/B'd
+		// against a measured baseline before it becomes the default.
+		if NormalizeFusionMode(req.Fusion) == FusionRRF && len(bestByKey) > 0 {
+			if lex := lexicalChannel(ctx, chunks, req, targetChunk, poolSize, hybridMod); len(lex) > 0 {
+				channelLists = append(channelLists, lex)
+				// A lexical hit may be absent from every dense list; it still belongs in the pool.
+				for i := range lex {
+					sc := lex[i].Chunk
+					key := chunkStableKey(&sc)
+					if key == "" {
+						continue
+					}
+					if _, ok := bestByKey[key]; !ok {
+						cp := sc
+						bestByKey[key] = mmrScoredChunk{chunk: cp}
+					}
+				}
+			}
+			// Rescale before the scores become MMR's relevance input: raw RRF values are ~60x
+			// weaker than MMR's diversity term at the default lambda, which stops MMR ranking.
+			fused := normalizeFusedScores(FuseRRF(channelLists))
+			for key, sc := range bestByKey {
+				f, ok := fused[key]
+				if !ok {
+					// Every pool member came from a list in channelLists, so this cannot happen —
+					// but if it ever does, the chunk would keep a raw cosine relevance (0..1)
+					// among peers holding rescaled RRF scores and would dominate the pool. Fail
+					// to the bottom instead of silently to the top.
+					sc.relevance = 0
+					bestByKey[key] = sc
+					continue
+				}
+				sc.relevance = f
+				bestByKey[key] = sc
+			}
+		}
 		if len(bestByKey) > 0 {
 			pool := make([]mmrScoredChunk, 0, len(bestByKey))
 			for _, c := range bestByKey {
@@ -442,7 +508,15 @@ func gatherSimilarReferenceChunks(ctx context.Context, chunks ChunkReader, targe
 			}
 			sortMMRPool(pool)
 			lambda := normalizeSimilarMMRLambda(req.SimilarMMRLambda)
-			for _, ch := range maximalMarginalRelevance(query, pool, assemblyPoolLimit, lambda) {
+			// MMR selects the FINAL k; the larger pool exists to give it candidates to choose
+			// among. Asking it for k = assemblyPoolLimit (up to 120) meant fully ordering the pool
+			// and then discarding all but ~5 — and because greedy MMR is prefix-stable, the output
+			// was byte-identical to asking for k = limit. Pure waste: the greedy loop is O(k·n·d),
+			// so k=120 vs k=5 is a ~24x difference, ~1.3 GFLOP per run for a discarded result.
+			//
+			// The margin covers chunks that assembleSegmentedContextWindows may drop while
+			// regrouping embedding segments, so selecting exactly `limit` cannot under-fill.
+			for _, ch := range maximalMarginalRelevance(query, pool, mmrSelectionSize(limit), lambda) {
 				addChunk(ch)
 			}
 		}
@@ -473,6 +547,24 @@ type embeddingSegmentInfo struct {
 type indexedSegmentChunk struct {
 	ch  *embeddings.Chunk
 	idx int
+}
+
+// mmrSelectionSize is the k passed to maximalMarginalRelevance.
+//
+// It is NOT simply `limit`. assembleSegmentedContextWindows collapses embedding segments of the
+// same source file into windows of up to maxSegmentsPerWindow chunks, so in the worst case each of
+// the `limit` output windows consumes maxSegmentsPerWindow selected chunks. Selecting only `limit`
+// (or limit+3) under-fills on segment-heavy corpora — a large TS spec file split into six segments
+// would crowd out the breadth the caller asked for. TestGatherSimilarReferenceChunks_segmentedPerFileCapPreservesBreadth
+// covers exactly that case.
+//
+// maximalMarginalRelevance caps k at the pool size internally, so this never over-selects; for a
+// typical limit of 5 it asks for 15 rather than the old 120.
+func mmrSelectionSize(limit int) int {
+	if limit <= 0 {
+		return maxSegmentsPerWindow
+	}
+	return limit * maxSegmentsPerWindow
 }
 
 func assembleSegmentedContextWindows(in []*embeddings.Chunk, limit int) []*embeddings.Chunk {
@@ -705,7 +797,11 @@ func listChunksByType(ctx context.Context, chunks ChunkReader, repoID, lang, chu
 }
 
 func listChunksByPathPattern(ctx context.Context, chunks ChunkReader, repoID, lang string, substrings []string, limit int) []*embeddings.Chunk {
-	list, err := chunks.List(ctx, embeddings.ListOptions{RepoID: repoID, Limit: 100})
+	// Fixtures and config chunks are rendered into the prompt as text and never scored: they do
+	// not reach MMR (which needs pairwise cosines) or the abstention gate (which cosines the
+	// SimilarTests against the target). Skipping the vector column avoids decoding 100 x ~6 KB of
+	// []float32 per gap for data nothing measures.
+	list, err := chunks.List(ctx, embeddings.ListOptions{RepoID: repoID, Limit: 100, OmitEmbedding: true})
 	if err != nil {
 		return nil
 	}
@@ -821,28 +917,28 @@ var commonNonDomainTypeNames = map[string]bool{
 // package are looked up repo-wide by their simple name. Kept optional so existing MetaReader fakes
 // in tests need no changes.
 type typeSimpleNameResolver interface {
-	ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*metadata.Symbol, error)
+	ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleName string, limit int) ([]*metadata.Symbol, error)
 }
 
 // resolveTypeNameToSymbols resolves a (possibly simple) type name to repo type symbols. Order:
 // exact FQ name → same-package guess (<fileModule>.<name>) → bare name → repo-wide simple-name
 // fallback (cross-package, optional capability). Returns the first non-empty match.
-func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fileModule string) []*metadata.Symbol {
+func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, repoID, typeName, fileModule string) []*metadata.Symbol {
 	typeName = strings.TrimSpace(typeName)
 	if typeName == "" {
 		return nil
 	}
 	if strings.Contains(typeName, ".") {
-		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, typeName); len(syms) > 0 {
 			return syms
 		}
 	} else {
 		if fileModule != "" {
-			if syms, _ := meta.ListSymbolsByFQName(ctx, fileModule+"."+typeName); len(syms) > 0 {
+			if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, fileModule+"."+typeName); len(syms) > 0 {
 				return syms
 			}
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, typeName); len(syms) > 0 {
+		if syms, _ := meta.ListSymbolsByFQName(ctx, repoID, typeName); len(syms) > 0 {
 			return syms
 		}
 	}
@@ -851,7 +947,7 @@ func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fi
 		simple = simple[i+1:]
 	}
 	if r, ok := meta.(typeSimpleNameResolver); ok && simple != "" {
-		if syms, _ := r.ListSymbolsByTypeSimpleName(ctx, simple, maxDomainModels); len(syms) > 0 {
+		if syms, _ := r.ListSymbolsByTypeSimpleName(ctx, repoID, simple, maxDomainModels); len(syms) > 0 {
 			return syms
 		}
 	}
@@ -861,11 +957,11 @@ func resolveTypeNameToSymbols(ctx context.Context, meta MetaReader, typeName, fi
 // fieldTypeNamesForContainer returns the declared field/property types of the enclosing class —
 // these are exactly the injected collaborators a unit test must mock. Scoped to the container's
 // line range so other types in the same file don't leak in.
-func fieldTypeNamesForContainer(ctx context.Context, meta MetaReader, classSym *metadata.Symbol) []string {
+func fieldTypeNamesForContainer(ctx context.Context, meta MetaReader, repoID string, classSym *metadata.Symbol) []string {
 	if classSym == nil {
 		return nil
 	}
-	syms, _ := meta.ListSymbolsByFile(ctx, classSym.File)
+	syms, _ := meta.ListSymbolsByFile(ctx, repoID, classSym.File)
 	var out []string
 	for _, s := range syms {
 		if s == nil {
@@ -964,7 +1060,7 @@ func typeNamesFromCodeBody(content string) []string {
 // reliably carry the declared TYPE (observed for Java: only the constructor signature names the
 // injected collaborator). Reading the class chunk recovers constructor-injected / field-declared
 // collaborators (e.g. `private final OrderService orderService`) regardless of field-symbol metadata.
-func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metadata.Symbol, targetClass *SymbolChunk, methodChunk *embeddings.Chunk) []string {
+func referencedTypeNames(ctx context.Context, meta MetaReader, repoID string, targetSym *metadata.Symbol, targetClass *SymbolChunk, methodChunk *embeddings.Chunk) []string {
 	seen := make(map[string]bool)
 	var out []string
 	add := func(names []string) {
@@ -980,7 +1076,7 @@ func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metada
 	add(typeNamesFromSignature(targetSym))
 	if targetClass != nil {
 		if targetClass.Symbol != nil {
-			add(fieldTypeNamesForContainer(ctx, meta, targetClass.Symbol))
+			add(fieldTypeNamesForContainer(ctx, meta, repoID, targetClass.Symbol))
 		}
 		if targetClass.Chunk != nil {
 			add(typeNamesFromCodeBody(targetClass.Chunk.Content))
@@ -990,4 +1086,107 @@ func referencedTypeNames(ctx context.Context, meta MetaReader, targetSym *metada
 		add(typeNamesFromCodeBody(methodChunk.Content))
 	}
 	return out
+}
+
+// maxMembersPerType bounds the member list derived for a type whose chunk did not resolve. Twelve
+// keeps a typical service or entity (OrderService, OwnerRepository) whole while bounding a
+// god-class.
+const maxMembersPerType = 12
+
+// memberSummaryForType returns compact one-line member rows for typeSym, derived from persisted
+// symbols in the same file whose line range is enclosed by typeSym.
+//
+// This is the fallback for a chunk-lookup miss. chunkForSymbol resolves by exact SymbolID with
+// Limit 1, so a type whose chunk was split, merged, or never attributed shows up in the prompt as a
+// name with no members at all — and a model asked to write a test against a name will invent
+// plausible members for it. Reuses the same line-range containment walk as
+// fieldTypeNamesForContainer, and the same ListSymbolsByFile reader, so no new interface method and
+// no reindex are needed.
+func memberSummaryForType(ctx context.Context, meta MetaReader, repoID string, typeSym *metadata.Symbol, max int) []string {
+	if meta == nil || typeSym == nil {
+		return nil
+	}
+	if max <= 0 {
+		max = maxMembersPerType
+	}
+	syms, _ := meta.ListSymbolsByFile(ctx, repoID, typeSym.File)
+	type row struct {
+		line int
+		text string
+	}
+	var rows []row
+	for _, s := range syms {
+		if s == nil || s.ID == typeSym.ID {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(s.Kind)) {
+		case "method", "constructor", "field", "property":
+		default:
+			continue
+		}
+		if s.StartLine < typeSym.StartLine || (typeSym.EndLine > 0 && s.EndLine > typeSym.EndLine) {
+			continue
+		}
+		if symbolVisibility(s) == "private" {
+			continue
+		}
+		text := strings.TrimSpace(symbolSignatureText(s))
+		if text == "" {
+			text = strings.TrimSpace(s.FQName)
+		}
+		if text == "" {
+			continue
+		}
+		rows = append(rows, row{line: s.StartLine, text: text})
+	}
+	sort.SliceStable(rows, func(i, j int) bool { return rows[i].line < rows[j].line })
+	out := make([]string, 0, len(rows))
+	seen := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if seen[r.text] {
+			continue
+		}
+		seen[r.text] = true
+		out = append(out, r.text)
+		if len(out) >= max {
+			break
+		}
+	}
+	return out
+}
+
+// symbolVisibility reads the visibility field out of signature_json ("" when absent).
+func symbolVisibility(sym *metadata.Symbol) string {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Visibility string `json:"visibility"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(parsed.Visibility))
+}
+
+// symbolSignatureText prefers the indexed signature, falling back to the type token for fields.
+func symbolSignatureText(sym *metadata.Symbol) string {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return ""
+	}
+	var parsed struct {
+		Signature string `json:"signature"`
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
+		return ""
+	}
+	if s := strings.TrimSpace(parsed.Signature); s != "" {
+		return s
+	}
+	if t := strings.TrimSpace(parsed.Type); t != "" && strings.TrimSpace(parsed.Name) != "" {
+		return t + " " + strings.TrimSpace(parsed.Name)
+	}
+	return strings.TrimSpace(parsed.Name)
 }

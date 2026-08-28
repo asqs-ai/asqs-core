@@ -46,9 +46,23 @@ func rootCsprojFiles(dir string) ([]string, error) {
 	return out, nil
 }
 
+// reCsprojSdkAttr captures the Sdk attribute value on the <Project> element.
+var reCsprojSdkAttr = regexp.MustCompile(`(?i)<Project[^>]*\bSdk\s*=\s*["']([^"']+)["']`)
+
+// isSdkStyleCsproj reports whether a project uses the modern SDK format.
+//
+// It matches the whole Microsoft.NET.Sdk FAMILY, not just the bare value. The previous exact match on
+// `Sdk="Microsoft.NET.Sdk"` excluded `Microsoft.NET.Sdk.Web`, which made every ASP.NET Core project
+// invisible to discovery: a Web API solution reported "no SDK-style .csproj found under repo", and in
+// a Web+library solution the generated test project referenced only the library, so no controller was
+// reachable from a test. Legacy non-SDK projects (ToolsVersion + Microsoft.CSharp.targets import)
+// still do not match, which is the distinction that matters.
 func isSdkStyleCsproj(content string) bool {
-	s := strings.ToLower(content)
-	return strings.Contains(s, `sdk="microsoft.net.sdk"`) || strings.Contains(s, `sdk='microsoft.net.sdk'`)
+	m := reCsprojSdkAttr.FindStringSubmatch(content)
+	if m == nil {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(m[1])), "microsoft.net.sdk")
 }
 
 // reDotnetOptionalWorkloadTFM matches TFMs that need optional SDK workloads (MAUI / mobile / Windows desktop packs).
@@ -146,29 +160,31 @@ func pickRootCsprojForBootstrap(repo string) (string, error) {
 	return "", nil
 }
 
-// applyCSharpXUnit adds Microsoft.NET.Test.Sdk + xUnit PackageReferences when missing (SDK-style csproj only).
-// When Directory.Packages.props exists above the project, uses Central Package Management (no Version on PackageReference)
-// and merges PackageVersion entries into that props file.
-// gitRepoRoot is the full clone root when repoRoot is a mono-repo subfolder (e.g. mono_repo_test_workspace); empty means use repoRoot for CPM search.
-// Returns absolute paths of files that were modified (csproj and/or Directory.Packages.props).
-func applyCSharpXUnit(repoRoot, csprojPath string, gitRepoRoot string) (changedFiles []string, err error) {
+// applyCSharpTestPackages adds the profile's missing test PackageReferences (SDK-style csproj only).
+//
+// This replaced applyCSharpXUnit, which added exactly Microsoft.NET.Test.Sdk + xunit + the VS runner
+// regardless of what the solution was. That set cannot host what generation writes: the generation
+// contract steers the model to Moq, generated C# assertions idiomatically use FluentAssertions, and
+// an ASP.NET Core project needs Microsoft.AspNetCore.Mvc.Testing — none of which were ever added.
+//
+// When Directory.Packages.props exists above the project, uses Central Package Management (no Version
+// on PackageReference) and merges PackageVersion entries into that props file.
+// gitRepoRoot is the full clone root when repoRoot is a mono-repo subfolder; empty means use repoRoot.
+// Returns absolute paths of files that were modified, plus the packages actually added.
+func applyCSharpTestPackages(repoRoot, csprojPath, gitRepoRoot string, prof csharpTestProfile) (changedFiles []string, added []csharpPkg, err error) {
 	b, err := os.ReadFile(csprojPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s := string(b)
 	orig := s
 	if !isSdkStyleCsproj(s) {
-		return nil, fmt.Errorf("only SDK-style .csproj is supported (expected Sdk=\"Microsoft.NET.Sdk\")")
+		return nil, nil, fmt.Errorf("only SDK-style .csproj is supported (expected Sdk=\"Microsoft.NET.Sdk\")")
 	}
 
-	lower := strings.ToLower(s)
-	needSDK := !strings.Contains(lower, "microsoft.net.test.sdk")
-	needXunit := !strings.Contains(lower, `include="xunit"`)
-	needRunner := !strings.Contains(lower, "xunit.runner.visualstudio")
-
-	if !needSDK && !needXunit && !needRunner {
-		return nil, nil
+	missing := prof.missingPackages(s)
+	if len(missing) == 0 {
+		return nil, nil, nil
 	}
 
 	ceiling := centralPackageManagementSearchCeiling(repoRoot, gitRepoRoot, csprojPath)
@@ -176,57 +192,29 @@ func applyCSharpXUnit(repoRoot, csprojPath string, gitRepoRoot string) (changedF
 	useCPM := propsPath != ""
 
 	if useCPM {
-		pkgs := map[string]string{}
-		if needSDK {
-			pkgs["Microsoft.NET.Test.Sdk"] = VersionDotNetTestSDK
-		}
-		if needXunit {
-			pkgs["xunit"] = VersionXunit
-		}
-		if needRunner {
-			pkgs["xunit.runner.visualstudio"] = VersionXunitRunnerVS
-		}
-		propsChanged, err := ensureCentralPackageVersions(propsPath, pkgs)
-		if err != nil {
-			return nil, fmt.Errorf("Directory.Packages.props: %w", err)
+		propsChanged, cerr := ensureCentralPackageVersions(propsPath, cpmVersionMap(missing))
+		if cerr != nil {
+			return nil, nil, fmt.Errorf("Directory.Packages.props: %w", cerr)
 		}
 		if propsChanged {
 			changedFiles = append(changedFiles, propsPath)
 		}
 	}
 
-	var refs []string
-	if needSDK {
-		if useCPM {
-			refs = append(refs, csharpPkgTestSDKCPM)
-		} else {
-			refs = append(refs, csharpPkgTestSDK)
-		}
-	}
-	if needXunit {
-		if useCPM {
-			refs = append(refs, csharpPkgXunitCPM)
-		} else {
-			refs = append(refs, csharpPkgXunit)
-		}
-	}
-	if needRunner {
-		if useCPM {
-			refs = append(refs, csharpPkgRunnerCPM)
-		} else {
-			refs = append(refs, csharpPkgRunner)
-		}
+	refs := make([]string, 0, len(missing))
+	for _, pkg := range missing {
+		refs = append(refs, renderCSharpPackageRef(pkg, useCPM))
 	}
 	block := "  <ItemGroup>\n" + strings.Join(refs, "\n") + "\n  </ItemGroup>\n"
 	s = insertBeforeClosingCsproj(s, block)
 	if s == orig {
-		return nil, fmt.Errorf(".csproj: could not find closing </Project>")
+		return nil, nil, fmt.Errorf(".csproj: could not find closing </Project>")
 	}
 	if err := atomicWrite(csprojPath, []byte(s)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	changedFiles = append(changedFiles, csprojPath)
-	return dedupeAbsPaths(changedFiles), nil
+	return dedupeAbsPaths(changedFiles), missing, nil
 }
 
 func dedupeAbsPaths(paths []string) []string {

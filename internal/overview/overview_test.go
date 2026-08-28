@@ -69,7 +69,7 @@ func TestIsOverviewIgnoredPath(t *testing.T) {
 }
 
 func TestBuildOverviewContext_nilMeta(t *testing.T) {
-	_, err := BuildOverviewContext(context.Background(), nil, "java")
+	_, err := BuildOverviewContext(context.Background(), nil, "", "java")
 	if err == nil {
 		t.Fatal("BuildOverviewContext(nil meta): want error")
 	}
@@ -96,19 +96,19 @@ func TestApplyOverviewContextSizeLimit(t *testing.T) {
 }
 
 func TestBuildFileDependencyGraphMermaid_nilOrEmpty(t *testing.T) {
-	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "java"); got != "" {
+	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "", "java"); got != "" {
 		t.Errorf("BuildFileDependencyGraphMermaid(nil meta): got %q; want empty", got)
 	}
-	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, ""); got != "" {
+	if got := BuildFileDependencyGraphMermaid(context.Background(), nil, "", ""); got != "" {
 		t.Errorf("BuildFileDependencyGraphMermaid(empty lang): got %q; want empty", got)
 	}
 }
 
 func TestBuildOverviewVisualSections_nilOrEmpty(t *testing.T) {
-	if got := BuildOverviewVisualSections(context.Background(), nil, "java", "", ""); got != "" {
+	if got := BuildOverviewVisualSections(context.Background(), nil, "", "java", "", ""); got != "" {
 		t.Errorf("BuildOverviewVisualSections(nil meta): got %q; want empty", got)
 	}
-	if got := BuildOverviewVisualSections(context.Background(), nil, "", "", ""); got != "" {
+	if got := BuildOverviewVisualSections(context.Background(), nil, "", "", "", ""); got != "" {
 		t.Errorf("BuildOverviewVisualSections(empty lang): got %q; want empty", got)
 	}
 }
@@ -155,21 +155,21 @@ func TestCanonicalOverviewRepoPath(t *testing.T) {
 
 func TestEmptyFileDependencyGraphExplanation_byWorkflowLang(t *testing.T) {
 	js := emptyFileDependencyGraphExplanation("typescript")
-	if strings.Contains(js, "advanced_jar_path") || strings.Contains(js, "Java **call**") {
+	if strings.Contains(js, "indexer.java.jar_path") || strings.Contains(js, "Java **call**") {
 		t.Errorf("TS empty explanation should not focus on Java JAR; got:\n%s", js)
 	}
 	if !strings.Contains(js, "JavaScript/TypeScript") || !strings.Contains(js, "imports") {
 		t.Errorf("TS explanation should mention JS/TS indexer behavior; got:\n%s", js)
 	}
 	java := emptyFileDependencyGraphExplanation("java")
-	if !strings.Contains(java, "advanced") || !strings.Contains(java, "advanced_jar_path") {
+	if !strings.Contains(java, "advanced") || !strings.Contains(java, "indexer.java.jar_path") {
 		t.Errorf("Java explanation should mention advanced indexer; got:\n%s", java)
 	}
 	gen := emptyFileDependencyGraphExplanation("go")
 	if !strings.Contains(gen, "Java") || !strings.Contains(gen, "JavaScript") {
 		t.Errorf("generic explanation should mention Java and JS/TS; got:\n%s", gen)
 	}
-	if strings.Contains(gen, "advanced_jar_path") {
+	if strings.Contains(gen, "indexer.java.jar_path") {
 		t.Errorf("generic explanation should not name advanced_jar_path; got:\n%s", gen)
 	}
 }

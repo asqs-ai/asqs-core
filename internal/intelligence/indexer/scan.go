@@ -90,6 +90,60 @@ func pathHasTestDirectorySegment(low string) bool {
 	return false
 }
 
+// fileBaseNamesATest reports whether the FILE NAME (not the whole path) names a test, using
+// camelCase word boundaries.
+//
+// This replaces a raw `strings.Contains(relSlash, "Test")` over the entire path, which had two
+// failure modes and no test covering either:
+//
+//   - `src/TestData/Model.cs` — a fixture-data directory. Every symbol under it was classified as
+//     test code and therefore PERMANENTLY excluded from gap analysis: no tests would ever be
+//     generated for that code, and nothing reported why.
+//   - `TestimonialService.java` — "Test" is a substring of "Testimonial". Same consequence.
+//
+// Matching on the base name with a word boundary keeps what the check was for — `TestUtils.java`,
+// `FooTest.cs`, `OrderTests.kt` — while a directory called TestData is left to the known-conventions
+// segment check, which does not list it.
+//
+// The boundary is the camelCase one: "Test" must be followed by an uppercase letter, a digit, a
+// separator, or the end of the name. That is what distinguishes TestUtils (a test helper) from
+// Testimonial (a domain noun).
+func fileBaseNamesATest(relSlash string) bool {
+	base := filepath.Base(relSlash)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	if name == "" {
+		return false
+	}
+	for _, word := range []string{"Test", "Tests"} {
+		idx := 0
+		for {
+			at := strings.Index(name[idx:], word)
+			if at < 0 {
+				break
+			}
+			at += idx
+			afterAt := at + len(word)
+			// Boundary before: start of name, or a separator, or a lowercase-to-uppercase step.
+			beforeOK := at == 0
+			if !beforeOK {
+				prev := rune(name[at-1])
+				beforeOK = prev == '_' || prev == '-' || prev == '.' || (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9')
+			}
+			// Boundary after: end of name, a separator, an uppercase letter, or a digit.
+			afterOK := afterAt >= len(name)
+			if !afterOK {
+				next := rune(name[afterAt])
+				afterOK = next == '_' || next == '-' || next == '.' || (next >= 'A' && next <= 'Z') || (next >= '0' && next <= '9')
+			}
+			if beforeOK && afterOK {
+				return true
+			}
+			idx = at + 1
+		}
+	}
+	return false
+}
+
 func IsLikelyTestSourcePath(relPath string) bool {
 	relPath = strings.TrimSpace(relPath)
 	if relPath == "" {
@@ -100,7 +154,7 @@ func IsLikelyTestSourcePath(relPath string) bool {
 	if pathHasTestDirectorySegment(low) {
 		return true
 	}
-	if strings.Contains(relSlash, "Test") {
+	if fileBaseNamesATest(relSlash) {
 		return true
 	}
 	// Maven Failsafe: .../src/it/java/... (path segment "it", not a substring like "reddit")
@@ -141,6 +195,16 @@ func IsLikelyTestSourcePath(relPath string) bool {
 			return true
 		}
 		if strings.Contains(baseLow, ".spec.") || strings.Contains(baseLow, ".test.") || strings.Contains(baseLow, ".cy.") {
+			return true
+		}
+		// Match tools/js-ts-indexer isLikelyE2ESpecPath / isTestFilePath so files.is_test stays aligned with E2E_SPEC.
+		if strings.Contains(low, "/cypress/") || strings.HasPrefix(low, "cypress/") {
+			return true
+		}
+		if strings.Contains(low, "playwright") {
+			return true
+		}
+		if strings.Contains(baseLow, ".e2e.") || strings.Contains(baseLow, ".e2e-spec.") {
 			return true
 		}
 		// Match tools/js-ts-indexer isLikelyE2ESpecPath / isTestFilePath so files.is_test stays aligned with E2E_SPEC.

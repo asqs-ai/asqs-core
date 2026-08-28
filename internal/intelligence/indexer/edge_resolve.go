@@ -95,13 +95,94 @@ func hintFileSet(hintFiles []string) map[string]struct{} {
 
 // resolveSymbolIDForFQName picks a symbol row when ListSymbolsByFQName returns multiple matches.
 // hintFiles should include the current source file and paths inferred from IMPORTS (MODULE) edges.
-func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, fqName string, hintFiles []string, preferLang string) (id string, ambiguous bool) {
+func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, repoID, fqName string, hintFiles []string, preferLang string) (id string, ambiguous bool) {
+	return resolveSymbolIDForFQNameCached(ctx, meta, nil, repoID, fqName, hintFiles, preferLang)
+}
+
+// fqNameCache holds symbols pre-fetched for a file in one query, keyed by fq_name.
+//
+// A nil cache is valid and means "always query" — that is what the uncached entry point above
+// passes, so behaviour is identical either way and only the number of round trips differs.
+type fqNameCache map[string][]*metadata.Symbol
+
+// prefetchFQNames resolves every name a file might need in ONE query.
+//
+// Absent names are recorded as an empty slice rather than left missing, so a later lookup knows the
+// database has already been asked and does not ask again. Without that, every unindexed import —
+// third-party packages, which is most of them — would still cost a round trip each.
+func prefetchFQNames(ctx context.Context, meta MetadataWriter, repoID string, names []string) fqNameCache {
+	if meta == nil || len(names) == 0 {
+		return nil
+	}
+	found, err := meta.ListSymbolsByFQNames(ctx, repoID, names)
+	if err != nil {
+		// Fall back to the per-name path rather than failing the run: a resolution that costs
+		// round trips is worse than one that costs none, but far better than no index.
+		return nil
+	}
+	cache := make(fqNameCache, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		cache[n] = found[n] // nil when the name is not indexed; the key still marks it as asked
+	}
+	return cache
+}
+
+// lookupFQName returns the symbols for fqName, from the cache when it was pre-fetched and from the
+// database otherwise.
+func lookupFQName(ctx context.Context, meta MetadataWriter, cache fqNameCache, repoID, fqName string) []*metadata.Symbol {
+	if cache != nil {
+		if syms, asked := cache[fqName]; asked {
+			return syms
+		}
+	}
+	syms, err := meta.ListSymbolsByFQName(ctx, repoID, fqName)
+	if err != nil {
+		return nil
+	}
+	if cache != nil {
+		cache[fqName] = syms
+	}
+	return syms
+}
+
+// edgeResolutionCandidates lists every fq_name a file's edges could ask the database about.
+func edgeResolutionCandidates(parsed *ParsedFile) []string {
+	if parsed == nil {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Edges)*2+len(parsed.Symbols))
+	for _, e := range parsed.Edges {
+		out = append(out, e.CallerFQName, e.CalleeFQName)
+	}
+	// Java/C# CONTAINS resolution asks for the declaring type of each method.
+	if parsed.Lang == "java" || parsed.Lang == "csharp" {
+		for _, sym := range parsed.Symbols {
+			k := strings.ToLower(sym.Kind)
+			if k != "method" && k != "constructor" {
+				continue
+			}
+			if classFQ, _ := methodFQNameToClassFQName(sym.FQName); classFQ != "" {
+				out = append(out, classFQ)
+			}
+		}
+	}
+	return out
+}
+
+// resolveSymbolIDForFQNameCached is resolveSymbolIDForFQName over a pre-fetched cache. The
+// disambiguation below is unchanged and deliberately shared: the point of batching is to move where
+// the rows come from, not which row wins.
+func resolveSymbolIDForFQNameCached(ctx context.Context, meta MetadataWriter, cache fqNameCache, repoID, fqName string, hintFiles []string, preferLang string) (id string, ambiguous bool) {
 	fqName = strings.TrimSpace(fqName)
 	if fqName == "" || meta == nil {
 		return "", false
 	}
-	syms, err := meta.ListSymbolsByFQName(ctx, fqName)
-	if err != nil || len(syms) == 0 {
+	syms := lookupFQName(ctx, meta, cache, repoID, fqName)
+	if len(syms) == 0 {
 		return "", false
 	}
 	if len(syms) == 1 {
@@ -143,7 +224,7 @@ func resolveSymbolIDForFQName(ctx context.Context, meta MetadataWriter, fqName s
 
 // resolveCSharpImportCalleeID maps a using-namespace string to an existing symbol id (TYPE, MODULE, …)
 // by trimming suffixes, similar to resolveJavaImportCalleeID.
-func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, symbolIDByFQName, fqNameToID map[string]string, raw string) string {
+func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, cache fqNameCache, repoID string, symbolIDByFQName, fqNameToID map[string]string, raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
 		return ""
@@ -155,7 +236,7 @@ func resolveCSharpImportCalleeID(ctx context.Context, meta MetadataWriter, symbo
 		if id := fqNameToID[cur]; id != "" {
 			return id
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, cur); len(syms) > 0 {
+		if syms := lookupFQName(ctx, meta, cache, repoID, cur); len(syms) > 0 {
 			return syms[0].ID
 		}
 		i := strings.LastIndex(cur, ".")

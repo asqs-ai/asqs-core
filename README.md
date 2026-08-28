@@ -41,7 +41,7 @@ bootstrap → index → plan → project intel → generate (every gap) → eval
   dependencies, file-graph visuals from the index) are produced; the overview is generated **in parallel**
   with the per-symbol test/doc generation.
 - **evaluate** — compile and test the **whole project once** (not per gap) in a sandbox; an LLM
-  fixer repairs failures over a bounded loop (`runner.start_max_iteration`). Tests that can't be
+  fixer repairs failures over a bounded loop (`fixer.iterations.start`). Tests that can't be
   made to pass are discarded so the rest stay green.
 
 Optionally **ship** the result: after a _stable_ run, commit + push a branch and open/update a PR/MR
@@ -65,6 +65,18 @@ This starts `pgvector/pgvector:pg16` (db/user/password = `asqs`) on port 5432. T
 edges, files, index_runs, and the `chunks` table with a `vector(1536)` column + HNSW index) is
 applied automatically on first run.
 
+**Live tests use a separate scratch database, never `asqs`.** The `*_live_test.go` suites write
+fixtures, so they only run when `ASQS_TEST_METADATA_URL` points at a database whose *name*
+contains `test` or `scratch` — anything else is refused, so an indexed corpus cannot be written to
+by accident:
+
+```bash
+docker compose exec postgres createdb -U asqs asqs_scratch   # once
+ASQS_TEST_METADATA_URL='postgres://asqs:asqs@localhost:5432/asqs_scratch?sslmode=disable' make test-live
+```
+
+With the variable unset, `make test-live` skips every live test and exits 0.
+
 ## 2. Build the language indexers
 
 ```bash
@@ -77,7 +89,14 @@ make build-indexers
 Point `indexer.*_path` in your config at the produced artifacts (defaults shown in
 `config.example.yaml`).
 
-## 3. Docker sandbox images (only when `runner.type: docker`)
+> **Rebuild the C# indexer after upgrading.** It now compiles per `.csproj` group — each project
+> together with the sources of the projects it transitively references — instead of one file at a
+> time. That is what lets a call from one project into another resolve to a fully-qualified callee
+> at all; a stale `publish/CSharpIndexer.dll` silently keeps the old per-file behaviour and simply
+> emits fewer `CALLS` edges. Each run now also reports how many invocations it resolved and how many
+> it could not, so the gap is visible rather than a silent `continue`.
+
+## 3. Docker sandbox images (only when `general.sandbox.type: docker`)
 
 Pulled on first use; override any of them in config:
 
@@ -90,7 +109,7 @@ Pulled on first use; override any of them in config:
 | Playwright (Java) | `mcr.microsoft.com/playwright/java`   |
 | Playwright (.NET) | `mcr.microsoft.com/playwright/dotnet` |
 
-With `runner.type: local`, the toolchains run on the host instead.
+With `general.sandbox.type: local`, the toolchains run on the host instead.
 
 ## 4. Configure
 
@@ -99,12 +118,12 @@ cp config.example.yaml config.yaml
 # edit: database URL, llm provider + key/model, indexer artifact paths, runner type
 ```
 
-Project intel is on by default and needs no configuration. To tune or disable it, use the
-`runner.project_intel` block — `enabled`, `max_total_runes` (default 12000), `max_doc_files` (12),
-`max_skill_files` (8), `min_relevance_score` (0.08), `summarize_above_runes` (6000),
-`extra_doc_globs` / `extra_skill_globs`, `cache_enabled`, `cache_path`, `force_refresh`, and
-`fingerprint_mode` (`stat` | `content`). The same keys are settable via `RETRIEVAL_PROJECT_INTEL_*`
-environment variables. `use_embeddings_rank` embeds the selected docs but does not change what is
+Project intel is on by default and needs no configuration. The `generation.policy.project_intel` block keeps
+`enabled`, `extra_doc_globs` / `extra_skill_globs` and `use_embeddings_rank`; the scan's shape — the
+rune budget, the file counts, the relevance floor, the cache location and the fingerprint mode — is
+fixed in code, because an operator has no basis on which to prefer 11 doc files to 12 and this
+project's discipline is that a default earns its change through measurement. The remaining keys are
+settable via `RETRIEVAL_PROJECT_INTEL_*` environment variables. `use_embeddings_rank` embeds the selected docs but does not change what is
 injected — asqs-core builds one shared context block per run rather than re-ranking it per gap.
 
 ## 5. Run
@@ -133,7 +152,7 @@ Flags: `--lang` (auto-detected if omitted), `--max-gaps`, `--max-gaps-e2e`, `--d
 | Source                                              | `max-gaps` | `max-gaps-e2e` |
 | --------------------------------------------------- | ---------- | -------------- |
 | `--max-gaps` / `--max-gaps-e2e` on the command line | wins       | wins           |
-| `indexer.max_gaps` / `indexer.max_gaps_e2e`         | then this  | then this      |
+| `indexer.policy.max_gaps` / `indexer.policy.max_gaps_e2e`         | then this  | then this      |
 | built-in default                                    | `10`       | `0` (skip E2E) |
 
 The config keys also accept the `ASQS_INDEXER_MAX_GAPS` and `ASQS_INDEXER_MAX_GAPS_E2E` environment
@@ -153,10 +172,13 @@ Two details worth knowing:
 
 `--docs` produces both per-symbol documentation **and** a whole-repo overview document
 (`docs/documentation.md`), the latter generated in parallel with test/doc generation. Tune the overview
-via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
-`indexer.overview_max_index_runes_per_slice`, and `indexer.overview_max_completion_tokens`.
+via `generation.docs.overview.path`, `generation.docs.overview.max_files_per_slice` and
+`generation.docs.overview.max_index_runes_per_slice`; the completion-token cap is a constant.
 
 ## How it works
+
+Behaviour is documented in [docs/DOCUMENTATION.md](./docs/DOCUMENTATION.md) — what each phase does and
+why it works that way. This section is the summary.
 
 - **Indexing** runs language-native parsers (Java AST, C# Roslyn, TypeScript) that emit symbols,
   typed edges, and source chunks; chunks are embedded into pgvector. On subsequent runs, it performs
@@ -171,11 +193,25 @@ via `indexer.overview_doc_path`, `indexer.overview_max_files_per_slice`,
   Results are cached in `.asqs/project-intel-cache.json`, keyed by a file/config fingerprint, so repeat
   runs skip the work.
 - **Generation** uses a provider-agnostic LLM with embedded per-language skill-packs and contracts.
-  This includes first-level support for self-hosted open-source models (such as Llama, Codestral, and Qwen),
+  This includes first-level support for self-hosted open-source models (such as Llama and Qwen),
   ensuring no source code leaves your local environment for ultimate data security and cost reduction.
+  Optionally the generator can **query the index while writing** — look up a symbol, read a file
+  range, search code, walk the call graph — instead of working only from the context assembled up
+  front. Off by default (`generation.policy.tools.enabled`); see
+  [DOCUMENTATION.md — The tool loop](./docs/DOCUMENTATION.md#the-tool-loop).
+- **Two knowledge sources** supplement the repository's own code. **Dependency documentation** ingests
+  docs for direct dependencies — Maven sources jars, NuGet XML, `node_modules` type declarations — so
+  the model reads a third-party API instead of guessing it; local only, nothing reaches the network.
+  **Web search** gives the tool loop bounded access to external documentation, and is the one
+  component that sends data out of the process: off by default, host allow-list failing closed, an
+  offline replay mode, and deny tokens derived from the repository's own identity. Both are described
+  under [Knowledge sources](./docs/DOCUMENTATION.md#knowledge-sources).
+- **Test framework bootstrap** (optional, off by default) detects a repository with no usable test
+  stack, installs one, and smoke-verifies that it runs — then hands generation an authoritative
+  allow-list of importable libraries. See [Test framework bootstrap](./docs/DOCUMENTATION.md#test-framework-bootstrap).
 - **Evaluation** generates every gap's test first, then compiles + runs the **whole project once**
   in a local or Docker sandbox (not per gap — one compile per fix iteration, not N). The LLM fixer
-  repairs failures over a bounded loop (`runner.start_max_iteration`); tests that repeatedly fail are
+  repairs failures over a bounded loop (`fixer.iterations.start`); tests that repeatedly fail are
   discarded so the rest stay green. Only artifacts that compile and pass survive. A **quality gate**
   rejects any fixer edit that would degrade the test (e.g. gutting assertions into an empty/tautological
   shell), so repairs never trade correctness for a green compile.
@@ -191,25 +227,25 @@ database, an LLM, language toolchains, optionally Docker), so check these first.
 
 ### Environment & prerequisites
 
-- **Local sandbox needs the toolchain on PATH.** With `runner.type: local`, asqs-core shells out to
+- **Local sandbox needs the toolchain on PATH.** With `general.sandbox.type: local`, asqs-core shells out to
   the repo's real build tools — so **Java** (JDK + Maven/Gradle), **.NET SDK**, and/or **Node** must be
   installed and on `PATH` for the language you're running. Missing tools surface as "command not found"
-  or compile/test steps that never start. If you don't want to install them, use `runner.type: docker`
+  or compile/test steps that never start. If you don't want to install them, use `general.sandbox.type: docker`
   (the SDK lives in the image instead).
 - **Build the indexers first.** The advanced indexers are separate artifacts: run `make build-indexers`
-  and point `indexer.advanced_jar_path` (Java JAR), `indexer.jst_indexer_path` (JS/TS `dist/index.js`),
-  and `indexer.csharp_indexer_dll_path` (C# DLL) at them. Symptom: `indexer.jst_indexer_path is not set …`
+  and point `indexer.java.jar_path` (Java JAR), `indexer.jsts.indexer_path` (JS/TS `dist/index.js`),
+  and `indexer.csharp.indexer_dll_path` (C# DLL) at them. Symptom: `indexer.jsts.indexer_path is not set …`
   or `… is not set (dotnet publish tools/csharp-indexer)`. Building the indexers needs JDK 21 + Maven,
   Node 20+, and .NET SDK 10 respectively.
 - **PostgreSQL + pgvector must be running with the vector extension.** `docker compose up -d` starts
   `pgvector/pgvector:pg16` (the `vector` extension is what stores embeddings). A plain Postgres without
-  pgvector fails on the `vector(…)` column / index. Point `database.metadata_url` at it. Also keep
-  `database.embeddings_dimension` (default `1536`) in sync with your embedding model — a mismatch causes
+  pgvector fails on the `vector(…)` column / index. Point `general.database.metadata_url` at it. Also keep
+  `general.llm.embeddings.dimension` (default `1536`) in sync with your embedding model — a mismatch causes
   insert/query errors against the `vector(1536)` column.
-- **An LLM key/provider is required.** Set `llm.provider` + `llm.model` and either `llm.api_key` or
-  `llm.api_key_from_env` (Ollama needs no key, just `llm.base_url`). With no key the generation/fixer/doc
-  steps fail or no-op. Embeddings can use a different provider via `llm.embedding_provider`.
-- **Docker must be available for the Docker paths.** When `runner.type: docker` (or `indexer.execution:
+- **An LLM key/provider is required.** Set `general.llm.provider` + `general.llm.model` and either `general.llm.api_key` or
+  `general.llm.api_key_from_env` (Ollama needs no key, just `general.llm.base_url`). With no key the generation/fixer/doc
+  steps fail or no-op. Embeddings can use a different provider via `general.llm.embeddings.provider`.
+- **Docker must be available for the Docker paths.** When `general.sandbox.type: docker` (or `indexer.execution:
 docker`, or the test/E2E bootstrap runs in Docker), the Docker daemon must be running and `docker` on
   `PATH`. Symptom: "Cannot connect to the Docker daemon".
 
@@ -218,9 +254,9 @@ docker`, or the test/E2E bootstrap runs in Docker), the Docker daemon must be ru
 - **Offline-by-default: cache your dependencies.** The Docker sandbox runs compile/test **offline**
   (`job_network_test: none`) for reproducibility, so dependencies must already be cached. If a build
   can't fetch deps (e.g. Maven `Temporary failure in name resolution`, NuGet `NETSDK1064 … was not
-found`), do **one** of: (a) mount your host package cache — `cache_maven_host`, `cache_gradle_host`,
-  `cache_npm_host`, `cache_nuget_host`; (b) set `runner.docker_disable_offline_test: true` to download
-  live (needs working Docker DNS); or (c) use `runner.type: local`. For a fully offline machine, mount a
+found`), do **one** of: (a) mount your host package cache — `general.sandbox.caches.maven`, `general.sandbox.caches.gradle`,
+  `general.sandbox.caches.npm`, `general.sandbox.caches.nuget`; (b) set `general.sandbox.docker.offline_test: false` to download
+  live (needs working Docker DNS); or (c) use `general.sandbox.type: local`. For a fully offline machine, mount a
   **pre-populated** host cache (run a build once with network, then point the `cache_*_host` key at it).
 - **Custom / version-pinned images must exist locally.** If you override an image to a specific build
   (e.g. `image_playwright_dotnet: asqs-playwright-dotnet:net10`), that image must be present in the local
@@ -231,15 +267,15 @@ found`), do **one** of: (a) mount your host package cache — `cache_maven_host`
 
 - **Match the SDK image to the project's target framework.** A `net8.0` project built in a `sdk:10.0`
   image fails with `NETSDK1127: The targeting pack Microsoft.NETCore.App is not installed`. Leave
-  `runner.image_dotnet: ""` so asqs-core infers `sdk:{major}` from your `.csproj` TFMs, or set it
+  `general.sandbox.images.dotnet: ""` so asqs-core infers `sdk:{major}` from your `.csproj` TFMs, or set it
   explicitly (e.g. `mcr.microsoft.com/dotnet/sdk:8.0`).
 - **`CS0246: 'Xunit' could not be found` → enable the test-framework bootstrap.** Generated C# tests
-  must live in a project that references xUnit. Set `runner.test_framework_bootstrap.enabled: true`
+  must live in a project that references xUnit. Set `bootstrap.test_framework.enabled: true`
   (mode `xunit`/`auto`); asqs-core then creates a dedicated `tests/<Repo>.Tests.csproj` and routes tests
   there instead of into a production project. (Generated tests now default to a `tests/` tree even
   without it, so production still compiles — but they only _run_ when a test project exists.)
 - **Style gates and `dotnet format`.** With C#, asqs-core runs `dotnet format` on generated tests by
-  default (override via `runner.format_command`). For the **local** sandbox the `dotnet` CLI must be on
+  default (override via `general.build.format_command`). For the **local** sandbox the `dotnet` CLI must be on
   PATH; for **Docker** the SDK image provides it. If you don't want formatting, set `format_command` to a
   no-op or use a repo without a `dotnet format --verify-no-changes` gate.
 
@@ -247,17 +283,17 @@ found`), do **one** of: (a) mount your host package cache — `cache_maven_host`
 
 - **Result quality depends heavily on the LLM.** The strength of the generation/fixer model is the
   single biggest factor in test quality and how often the fixer succeeds. Prefer a strong, current model
-  for `llm.model`; weak models produce low-value tests (which the quality gate rejects) and fewer
-  successful repairs. Larger `runner.start_max_iteration` gives the fixer more attempts at the cost of
+  for `general.llm.model`; weak models produce low-value tests (which the quality gate rejects) and fewer
+  successful repairs. Larger `fixer.iterations.start` gives the fixer more attempts at the cost of
   more LLM calls.
 - **"could not detect a supported language" / "no source files found".** Language is auto-detected from
   the file scan; an empty or wrong detection usually means everything was filtered by
-  `indexer.skip_path_prefixes`, or the repo path is wrong. Pass `--lang` to force it.
+  `indexer.policy.skip_path_prefixes`, or the repo path is wrong. Pass `--lang` to force it.
 - **`--docs` writes into your source tree.** Per-symbol docs are inserted above declarations in source
-  files, and the overview is written to `indexer.overview_doc_path` (default `docs/documentation.md`).
+  files, and the overview is written to `generation.docs.overview.path` (default `docs/documentation.md`).
   Point asqs-core at a clean working tree (or a branch) so you can review the diff.
 - **Shipping (`--ship`) requirements.** Ship only runs on a **stable** result (`run not stable — not
-shipping` otherwise), and needs a VCS token (`vcs.github.token`) and a recognizable origin (HTTPS or
+shipping` otherwise), and needs a VCS token (`general.git.token`) and a recognizable origin (HTTPS or
   SSH — asqs-core rewrites SSH→HTTPS for the push). If the PR step can't resolve owner/repo from the
   origin URL, set `vcs.<provider>.default_owner` / `default_repo`.
 - **Exit code 1 on a green-looking run.** The CLI exits non-zero when generated tests didn't end up in a
@@ -275,30 +311,51 @@ Not included (these live in the commercial layer):
 - **Serve mode** — no cron scheduler, no automatic reruns, no PR-webhook triggers or PR gating.
 - **Persisted audit** — steps are logged to stderr only; nothing is written to an audit log table and
   there is no audit reporting/export CLI.
-- **Governance/policy engine** — a `runner.policy:` block parses but is ignored. No coverage gate, no
-  mutation-testing gate.
-- **Parallelism** — gaps are generated sequentially. `runner.gap_concurrency` and `llm.max_concurrent`
-  are not honoured. (The whole-repo overview is the one exception: it runs in parallel with generation.)
-- **Pre-generation seams** — no controlled source-seam edits or C# project-reference fixes before
-  generation. (The evaluator's in-loop C# project-reference autofix _is_ included.)
-- **Per-step LLM providers** — one `llm.provider` + `llm.model` drives generation, docs, fixing, and
-  embeddings. Per-step overrides are not wired.
-- **Mono-repo scoping** — `indexer.mono_repo_workspace` and related keys are ignored; asqs-core indexes
-  from the repo root and picks a single primary language by file count.
-- **Retrieval tuning** — the `retrieval:` config block is not read. Profiles, per-profile budgets,
-  MMR lambda, context compaction, and retrieval **abstention** all run at their built-in defaults
-  (abstention is off, so low-confidence gaps are still generated).
-- **Post-generate static micro-gate** — `runner.post_generate_static_check` is ignored; generated files
-  go straight to the sandbox after formatting.
-- **Private registries** — no Maven `settings.xml` / npm `.npmrc` / NuGet credential injection into the
-  Docker sandbox.
-- **GitHub Copilot SDK** — the `copilot:` config block parses but no code consumes it.
+- **Governance/policy engine** — not present, and no longer parses: the `runner.policy:` block went
+  with the v1 schema. No coverage gate, no mutation-testing gate.
+- **Parallelism** — gaps are generated sequentially. `general.llm.max_concurrent` bounds concurrent
+  LLM calls across the run; there is no per-gap worker pool. (The whole-repo overview is the one
+  exception: it runs in parallel with generation.)
+- **Pre-generation seams** — no controlled source-seam edits before generation. (The evaluator's
+  in-loop C# project-reference autofix _is_ included.)
+- **Post-generate static micro-gate** — no language lint between writing a test and evaluating it;
+  generated files go straight to the sandbox after formatting.
+- **Offline retrieval evaluation** — no labelled IR suite and no nDCG harness. Retrieval changes are
+  judged by outcome through `asqs-core ab-report`; see
+  [First-wave quality metrics](./docs/DOCUMENTATION.md#first-wave-quality-metrics).
+
+Several things this list used to disclaim **are now included**: per-step LLM provider overrides,
+mono-repo workspace scoping, the retrieval block (profiles, per-profile budgets, fusion, context
+compaction and abstention are all read), private-registry credential injection for the sandbox, and
+the generation tool loop with its two knowledge sources.
 
 ### Config keys that are CLI-driven here
 
-Shipping is enabled by `--ship`, not by `vcs.<provider>.ship.enabled`. The rest of that block _is_
-read: `branch` and `base_branch` supply the defaults for `--ship-branch` / `--base-branch`, and
-`draft_pr` opens the PR as a draft (GitHub; ignored for Azure DevOps).
+Shipping is enabled by `--ship`, not by `general.git.ship.enabled`. The rest of that block _is_ read:
+`branch` and `base_branch` supply the defaults for `--ship-branch` / `--base-branch`, and `draft_pr`
+opens the PR as a draft (GitHub; ignored for Azure DevOps).
+
+Gap caps work the other way round: `--max-gaps` / `--max-gaps-e2e` override
+`indexer.policy.max_gaps` / `max_gaps_e2e` when passed, and the config values apply otherwise.
+
+### Upgrading
+
+Configuration is **schema v2** and the loader is strict — a pre-v2 file fails the load and says which
+sections moved. [Upgrading from the pre-v2 schema](./docs/DOCUMENTATION.md#upgrading-from-the-pre-v2-schema)
+has the key-by-key migration table and the three things to do before your first run on this version.
+
+### Where the full key list lives
+
+[`internal/config/schema_v2.go`](./internal/config/schema_v2.go). Every field carries its own doc
+comment with the type, the effective default and the derived environment variable, and a test fails
+on an undocumented key — so the structs are the reference rather than a generated copy of them that
+could drift. `config.example.yaml` is deliberately much shorter: a starting point, not an inventory.
+
+Two properties are worth knowing before you edit a config:
+
+- **Unknown keys fail the load** and name their own path. A typo is an error, not a silent no-op.
+- **Every key has an environment variable**, derived rather than tagged: `ASQS_` plus the dotted path
+  upper-cased, with a leading `general.` dropped. `general.llm.model` is `ASQS_LLM_MODEL`.
 
 ## License
 

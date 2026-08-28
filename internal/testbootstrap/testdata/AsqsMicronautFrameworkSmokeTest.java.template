@@ -1,0 +1,33 @@
+package com.asqs.bootstrap;
+
+import jakarta.inject.Inject;
+
+import org.junit.jupiter.api.Test;
+
+import io.micronaut.context.ApplicationContext;
+import io.micronaut.test.extensions.junit5.annotation.MicronautTest;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * ASQS test_framework_bootstrap framework smoke test (Micronaut).
+ *
+ * <p>
+ * @MicronautTest starts the application context and injects it; a running context is what
+ * generated @MicronautTest classes depend on.
+ *
+ * <p>
+ * Safe to delete.
+ */
+@MicronautTest
+class AsqsFrameworkSmokeTest {
+
+	@Inject
+	ApplicationContext applicationContext;
+
+	@Test
+	void applicationContextStarts() {
+		assertThat(applicationContext.isRunning()).isTrue();
+	}
+
+}

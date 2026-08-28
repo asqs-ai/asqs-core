@@ -4,9 +4,9 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
@@ -67,14 +67,22 @@ type Sandbox struct {
 	// design — the generated files are immutable for the life of the sandbox.
 	DockerEvalExtraMounts []jobrunner.CacheMount
 
-	dockerEvalEnvOnce *sync.Once // log full docker eval environment once per Sandbox
-	localEvalEnvOnce  *sync.Once // log local eval once per Sandbox
+	// PrivateRegistryCredentials are the same generated files as DockerEvalExtraMounts, tagged by
+	// ecosystem so the LOCAL target can deliver them without a mount table (`mvn -s <path>`,
+	// npm_config_userconfig). Always empty in the open core — the enterprise seam never
+	// materialises a credential — but the delivery code compiles and the parity fixtures exercise it.
+	PrivateRegistryCredentials []CredentialFile
+
+	// run is the per-run state shared by every clone of this Sandbox (see run_state.go). Behind a
+	// pointer so TestWithCommand-style shallow copies share it structurally rather than by the
+	// accident of a field's type.
+	run *sandboxRunState
 }
 
 // NewSandboxFromConfig builds a Sandbox from application config.
 func NewSandboxFromConfig(cfg *config.Config) *Sandbox {
 	if cfg == nil {
-		return &Sandbox{Type: "local"}
+		return &Sandbox{Type: "local", run: &sandboxRunState{}}
 	}
 	r := cfg.Runner
 	t := strings.ToLower(strings.TrimSpace(r.Type))
@@ -126,10 +134,13 @@ func NewSandboxFromConfig(cfg *config.Config) *Sandbox {
 		EvalWorkSubpath:               evalSub,
 		DotNetFallbackTargetFramework: strings.TrimSpace(r.DotNetFallbackTargetFramework),
 	}
-	// (asqs-core: Azure DevOps NuGet env + private-registry credential mounts are an enterprise
-	// feature and are intentionally omitted.)
-	sb.dockerEvalEnvOnce = &sync.Once{}
-	sb.localEvalEnvOnce = &sync.Once{}
+	// The enterprise seam: MaterialisePrivateRegistryMounts always returns nil in the open core
+	// (config/private_registry_compat.go), so no mount and no credential file ever appears here.
+	// The call stays so the delivery path is identical to upstream's shape.
+	if mounts, err := cfg.Runner.MaterialisePrivateRegistryMounts(); err == nil {
+		sb.PrivateRegistryCredentials = credentialFilesFromConfig(mounts)
+	}
+	sb.run = &sandboxRunState{}
 	return sb
 }
 
@@ -178,30 +189,36 @@ func (s *Sandbox) timeoutDuration() time.Duration {
 func (s *Sandbox) Compile(ctx context.Context, repoPath, lang string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		s.logLocalEvalEnvOnce(repoPath)
-		return runLocalCompile(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepCompile, "Compile")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCompile), "Compile")
 	}
-	return evaluator.StepResult{Step: evaluator.StepCompile, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepCompile)
 }
 
 // Test runs the test suite.
 func (s *Sandbox) Test(ctx context.Context, repoPath, lang string) evaluator.StepResult {
+	return s.testWithLabel(ctx, repoPath, lang, "Tests")
+}
+
+// testWithLabel runs the test step under a human label. The label is what the step announces in
+// the evaluation log; the E2E pass uses a distinct one so the two test passes of a single round
+// are told apart at a glance, on both targets.
+func (s *Sandbox) testWithLabel(ctx context.Context, repoPath, lang, label string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		return runLocalTest(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepTest, label)
 	}
 	if s.Type == "docker" {
-		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepTest), "Tests")
+		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepTest), label)
 	}
-	return evaluator.StepResult{Step: evaluator.StepTest, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepTest)
 }
 
 // TestWithCommand runs the test step using testCommand instead of the sandbox's configured TestCommand (dual unit/E2E eval).
 func (s *Sandbox) TestWithCommand(ctx context.Context, repoPath, lang, testCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	return s2.Test(ctx, repoPath, lang)
 }
@@ -211,7 +228,7 @@ func (s *Sandbox) TestWithCommand(ctx context.Context, repoPath, lang, testComma
 // shared state (cache mount configuration, auth, docker binary, timeouts) is preserved while only the compile
 // command is overridden for this one invocation.
 func (s *Sandbox) CompileWithCommand(ctx context.Context, repoPath, lang, compileCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.CompileCommand = strings.TrimSpace(compileCommand)
 	return s2.Compile(ctx, repoPath, lang)
 }
@@ -232,10 +249,13 @@ func (s *Sandbox) ReportEvalWorkSubpath() string {
 
 // TestE2EPass runs the second (E2E) test pass. For Docker + JS/TS + Playwright/Cypress, uses the Playwright Node OCI image; for Docker + Java + playwright-java, uses mcr.microsoft.com/playwright/java (browsers + OS deps); for Docker + C# + playwright-dotnet, uses mcr.microsoft.com/playwright/dotnet (browsers + .NET SDK). Otherwise uses the normal toolchain image (plain sdk/maven images lack bundled browsers for Playwright).
 func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, e2eFramework string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	if s2.Type != "docker" {
-		return s2.Test(ctx, repoPath, lang)
+		// No image to swap in, so the host must already have browsers. Bootstrap installs them
+		// when enabled; when it has not, say so before the runner fails with a stack trace.
+		s2.warnLocalE2EBrowsersMissing(lang, e2eFramework)
+		return s2.testWithLabel(ctx, repoPath, lang, "Tests (E2E)")
 	}
 	img := ""
 	if usePlaywrightDockerForJSE2E(lang, e2eFramework) {
@@ -250,7 +270,7 @@ func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, 
 
 // CoverageWithCommand runs coverage using testCommand (typically the unit test command so E2E is not re-run for coverage).
 func (s *Sandbox) CoverageWithCommand(ctx context.Context, repoPath, lang, testCommand string) evaluator.StepResult {
-	s2 := *s
+	s2 := s.clone()
 	s2.TestCommand = strings.TrimSpace(testCommand)
 	return s2.Coverage(ctx, repoPath, lang)
 }
@@ -264,12 +284,12 @@ func (s *Sandbox) Lint(ctx context.Context, repoPath, lang string) evaluator.Ste
 func (s *Sandbox) Coverage(ctx context.Context, repoPath, lang string) evaluator.StepResult {
 	cwd := s.evalHostCwd(repoPath)
 	if s.Type == "local" {
-		return runLocalCoverage(ctx, cwd, lang, s.timeoutDuration(), s.BuildTool, s.CompileCommand, s.TestCommand, s.DotNetFallbackTargetFramework)
+		return s.runLocalPlannedStep(ctx, repoPath, cwd, lang, evaluator.StepCoverage, "Coverage")
 	}
 	if s.Type == "docker" {
 		return s.runDockerEval(ctx, repoPath, lang, string(evaluator.StepCoverage), "Coverage")
 	}
-	return evaluator.StepResult{Step: evaluator.StepCoverage, OK: true, Summary: "stub"}
+	return unknownRunnerTypeResult(s.Type, evaluator.StepCoverage)
 }
 
 // Mutation runs mutation tests for critical modules.
@@ -278,3 +298,44 @@ func (s *Sandbox) Mutation(ctx context.Context, repoPath, lang string, criticalM
 }
 
 var _ evaluator.E2EPassDockerRunner = (*Sandbox)(nil)
+
+// stepSuccessSummary is the Summary of a step that passed, identical on both targets.
+//
+// The two used to disagree in wording and in substance: Docker built "<Label> ok" from its own
+// human label while local said "compile ok"/"tests ok", and Docker's coverage step reported a flat
+// "Coverage ok" that could never name a report. One lookup now serves both, for every ecosystem.
+func stepSuccessSummary(step evaluator.SandboxStep, plan StepPlan, cwd string) string {
+	switch step {
+	case evaluator.StepCompile:
+		return "compile ok"
+	case evaluator.StepCoverage:
+		return coverageSummaryFromPlan(cwd, plan)
+	default:
+		return "tests ok"
+	}
+}
+
+// jsExitCodeIgnoredSuffix marks a JS/TS test step whose runner exited non-zero while its own
+// summary reported no failures — most often Jest holding an open handle after the suite passed.
+const jsExitCodeIgnoredSuffix = " (summary all passed; exit code ignored)"
+
+// validRunnerTypes is the single source of the accepted runner.type values. Config validation
+// rejects anything else at startup (config.normaliseAndValidateRunnerType names the same two), and
+// the executor backstop below fails rather than stubbing — a future type cannot be added without
+// updating this set, which the tests enumerate.
+var validRunnerTypes = map[string]bool{
+	string(TargetLocal):  true,
+	string(TargetDocker): true,
+}
+
+// unknownRunnerTypeResult fails a step whose runner.type is neither local nor docker.
+//
+// This used to report {OK: true, Summary: "stub"}, so a typo in runner.type produced a run that
+// compiled nothing, tested nothing, and reported success all the way to the ship decision. Config
+// validation now rejects such a value at startup, which is where an operator can act on it; this
+// is the backstop for a Sandbox constructed directly, and it fails loudly rather than passing
+// quietly.
+func unknownRunnerTypeResult(runnerType string, step evaluator.SandboxStep) evaluator.StepResult {
+	msg := fmt.Sprintf("%s step did not run: runner.type is %q, which is neither \"local\" nor \"docker\"", step, runnerType)
+	return evaluator.StepResult{Step: step, OK: false, Summary: msg, Output: msg}
+}

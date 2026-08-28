@@ -17,12 +17,22 @@ import (
 	"github.com/asqs/asqs-core/internal/evaluator"
 	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
+	"github.com/asqs/asqs-core/internal/intelligence/tools"
 )
 
 // Fixer uses the LLM to produce fixed file content when compile or test fails.
+// FixAudit is the minimal audit sink this package needs. Deliberately narrow so llmfix does not
+// depend on the orchestrating package's Auditor.
+type FixAudit interface {
+	Log(ctx context.Context, step string, payload interface{})
+}
+
 type Fixer struct {
 	LLM    model.ChatCompleter
 	Prompt string // optional system prompt; empty = use default
+	// Audit is optional. When set, recovery paths that would otherwise be invisible in the audit
+	// trail — output-cap truncation and its retry, provider completion warnings — are recorded.
+	Audit FixAudit
 	// MultiTurnRepair when true (default when set from qualitybot via runner.disable_multi_turn_fixer=false), reuses prior user/assistant turns for the same repo path and sandbox step within one evaluation run. Follow-up user turns send new errors plus artifact files only, reducing repeated static context (conversational repair; see docs/DOCUMENTATION.md).
 	MultiTurnRepair bool
 	// DisableStructuredFixOutput when true, skips provider JSON-schema structured completions and relies on the prompt plus the existing multi-strategy parser (and optional repair turn). Default false: first completion uses structured output when supported (e.g. OpenAI); see runner.disable_structured_fix_output.
@@ -33,6 +43,16 @@ type Fixer struct {
 	// keeps the legacy layout. Older / weaker models may handle tagged blocks worse; the flag is
 	// meant for providers that follow structural cues more reliably (e.g. GPT-4-class models).
 	StructuredUserMessage bool
+	// StructuredOutputGrammarRisk is true when structured output stays ON against a provider that
+	// enforces the schema as a GRAMMAR rather than treating it as a hint (Ollama). It changes
+	// nothing about the request; it is reported in the fix-request audit so a reader can attribute
+	// whole-file reproduction and absent tool calls to the constraint rather than to the model.
+	StructuredOutputGrammarRisk bool
+	// Tools optionally gives the model read-only access to the index while fixing. Nil is the
+	// one-shot path: the model gets the error log and the artifact, and one turn.
+	Tools tools.ToolInvoker
+	// ToolLoop bounds that access. Its zero Mode means one-shot regardless of Tools.
+	ToolLoop tools.LoopOptions
 
 	mu               sync.Mutex
 	convRepoPath     string
@@ -50,6 +70,11 @@ func (f *Fixer) FixRequestAuditMetadata() map[string]any {
 		"multi_turn":                  f.MultiTurnRepair,
 		"structured_output_requested": !f.DisableStructuredFixOutput,
 		"structured_user_message":     f.StructuredUserMessage,
+		// True only when structured output stays enabled on a grammar-enforcing provider.
+		"structured_output_grammar_warning": f.StructuredOutputGrammarRisk,
+		// tools_mode records what the model could actually DO on this request, so a fix-quality
+		// A/B can split runs by capability rather than by config intent.
+		"tools_mode": string(f.resolvedToolMode()),
 	}
 }
 
@@ -139,6 +164,29 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		system = defaultFixPrompt
 	}
 	system = augmentFixSystemPrompt(system, req)
+	if f.resolvedToolMode() != tools.ModeOneShot {
+		system += fixToolsSystemNote
+	}
+	// Artifacts too large to show in full cannot participate in a full-file response contract, so
+	// they are withheld from the prompt AND from the writable set for this round. Doing this before
+	// the prompt is built is what makes "windowed artifact + full-file demand" unreachable rather
+	// than merely discouraged.
+	keepArtifacts, oversizedArtifacts := partitionArtifactsBySize(req, defaultFixPromptLimits().MaxArtifactRunes)
+	if len(oversizedArtifacts) > 0 {
+		if len(keepArtifacts) == 0 {
+			// Nothing fixable remains. Not retryable: the file will be the same size next round.
+			return evaluator.FixResponse{}, fmt.Errorf("llmfix: %w: every artifact exceeds the full-file prompt ceiling (%d runes): %s",
+				evaluator.ErrFixArtifactTooLarge, defaultFixPromptLimits().MaxArtifactRunes, strings.Join(oversizedArtifacts, ", "))
+		}
+		req.ArtifactPaths = keepArtifacts
+	}
+	// One tool budget for this Fix call, shared by every completion attempt below. The structured→
+	// unstructured fallbacks and transient retries re-ask the SAME question, so their lookups draw
+	// from one allowance rather than starting fresh — the same invariant the generator holds per
+	// gap. A fresh budget per attempt would let a flapping provider multiply index load by the
+	// retry count. Each new Fix call (a new fix attempt with new errors) IS a different question
+	// and gets a fresh budget.
+	toolBudget := &tools.RunBudget{}
 
 	structuredOn := !f.DisableStructuredFixOutput
 	// useStructuredUser resolves the tagged-<error>/<file> user-message layout: it's on when the
@@ -160,7 +208,7 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		case useStructuredUser:
 			u = buildStructuredFixUserMessage(req, lim)
 		default:
-			u = buildFixUserMessage(req, lim)
+			u = buildFixUserMessage(req, lim, oversizedArtifacts)
 		}
 		msgs := []model.Message{{Role: "system", Content: system}}
 		// Drop prior conversation turns when escalation forced structured layout: the whole point
@@ -175,15 +223,15 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 	}
 	completeMain := func() (content string, sentUser string, err error) {
 		opts := f.fixCompleteOpts(structuredOn, req)
-		result, sentUser, err := f.completeWithRetryBuilder(ctx, buildMainUser, opts)
+		result, sentUser, err := f.completeWithRetryBuilder(ctx, buildMainUser, opts, toolBudget)
 		if err != nil && structuredOn && isStructuredOutputAPIError(err) {
 			structuredOn = false
-			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req))
+			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req), toolBudget)
 		}
 		// Large json_schema bodies + long JS/TS logs occasionally yield mid-stream EOF from the API or proxies.
 		if err != nil && structuredOn && isTransientNetworkError(err) {
 			structuredOn = false
-			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req))
+			result, sentUser, err = f.completeWithRetryBuilder(ctx, buildMainUser, f.fixCompleteOpts(false, req), toolBudget)
 		}
 		if err != nil {
 			return "", "", err
@@ -196,6 +244,18 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		f.convMsgs = savedConv
 		return evaluator.FixResponse{}, err
 	}
+	// Targeted edits are the preferred shape and are checked first. When the model returns them the
+	// whole-file chain is bypassed entirely; when it does not, nothing below changes.
+	if edits := f.parseFixEditsAnyShape(ctx, req, assistant1); edits != nil {
+		if f.MultiTurnRepair && !escalatedThisTurn {
+			f.convMsgs = append(savedConv,
+				model.Message{Role: "user", Content: user},
+				model.Message{Role: "assistant", Content: assistant1},
+			)
+			trimConvMsgs(&f.convMsgs)
+		}
+		return evaluator.FixResponse{Edits: edits}, nil
+	}
 	parsed, parseErr := parseFixResponse(assistant1)
 	if parseErr != nil && structuredOn {
 		structuredOn = false
@@ -203,6 +263,19 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 		if err != nil {
 			f.convMsgs = savedConv
 			return evaluator.FixResponse{}, err
+		}
+		// The retry reply gets the same edits-first treatment as the original: the prompt prefers
+		// targeted edits, so every completion's answer must be checked for them before the
+		// whole-file parse — otherwise this path silently drops the preferred shape.
+		if edits := f.parseFixEditsAnyShape(ctx, req, assistant1); edits != nil {
+			if f.MultiTurnRepair && !escalatedThisTurn {
+				f.convMsgs = append(savedConv,
+					model.Message{Role: "user", Content: user},
+					model.Message{Role: "assistant", Content: assistant1},
+				)
+				trimConvMsgs(&f.convMsgs)
+			}
+			return evaluator.FixResponse{Edits: edits}, nil
 		}
 		parsed, parseErr = parseFixResponse(assistant1)
 	}
@@ -218,33 +291,67 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 	}
 
 	repairBase, _ := buildMainUser(0)
+	// The repair re-states the contract; when the failed reply was the flat {"edits": [...]} array
+	// whose targets could not be resolved, the one defect worth naming is the missing path level —
+	// re-sending the generic contract alone reproduced the same array on consecutive rounds
+	// upstream.
+	repairUser := repairFixJSONUserMessage
+	if parseFlatFixEdits(assistant1) != nil {
+		repairUser += "\n\nYour previous reply put an ARRAY under \"edits\". \"edits\" must be an OBJECT keyed by repo-relative file path: {\"edits\": {\"path/to/file\": [{\"find\": \"…\", \"replace\": \"…\"}]}}."
+	}
 	repairMsgs := make([]model.Message, 0, len(repairBase)+2)
 	repairMsgs = append(repairMsgs, repairBase...)
 	repairMsgs = append(repairMsgs,
 		model.Message{Role: "assistant", Content: assistant1},
-		model.Message{Role: "user", Content: repairFixJSONUserMessage},
+		model.Message{Role: "user", Content: repairUser},
 	)
 	repairOpts := f.fixCompleteOpts(structuredOn, req)
-	repairResult, err2 := f.completeWithRetry(ctx, repairMsgs, repairOpts)
+	repairResult, err2 := f.completeWithRetry(ctx, repairMsgs, repairOpts, toolBudget)
 	if err2 != nil && structuredOn && (isStructuredOutputAPIError(err2) || isTransientNetworkError(err2)) {
-		repairResult, err2 = f.completeWithRetry(ctx, repairMsgs, f.fixCompleteOpts(false, req))
+		repairResult, err2 = f.completeWithRetry(ctx, repairMsgs, f.fixCompleteOpts(false, req), toolBudget)
 	}
 	if err2 != nil {
 		f.convMsgs = savedConv
 		return evaluator.FixResponse{}, fmt.Errorf("llmfix: repair Complete failed: %w; first_parse=%v; first_preview=%q", err2, parseErr, previewForFixError(assistant1))
 	}
 	assistant2 := repairResult.Content
+	if edits := f.parseFixEditsAnyShape(ctx, req, assistant2); edits != nil {
+		if f.MultiTurnRepair && !escalatedThisTurn {
+			f.convMsgs = append(savedConv,
+				model.Message{Role: "user", Content: user},
+				model.Message{Role: "assistant", Content: assistant2},
+			)
+			trimConvMsgs(&f.convMsgs)
+		}
+		return evaluator.FixResponse{Edits: edits}, nil
+	}
 	parsed2, parseErr2 := parseFixResponse(assistant2)
 	if parseErr2 != nil || len(parsed2) == 0 {
+		// Last resort before the round is scored unusable: ask for the file as plain source. Two
+		// unparseable JSON replies do not mean the model cannot fix the code — only that it cannot
+		// package the answer — and the target is RESOLVED rather than guessed (see
+		// plainFallbackTarget), with the rule that fired recorded.
+		if kept, ok := f.singleFilePlainFallback(ctx, req, repairBase, assistant1, assistant2, toolBudget); ok {
+			if f.MultiTurnRepair && !escalatedThisTurn {
+				f.convMsgs = append(savedConv,
+					model.Message{Role: "user", Content: user},
+					model.Message{Role: "assistant", Content: assistant1},
+				)
+				trimConvMsgs(&f.convMsgs)
+			}
+			return evaluator.FixResponse{Files: kept}, nil
+		}
 		f.convMsgs = savedConv
-		return evaluator.FixResponse{}, fmt.Errorf("llmfix: invalid JSON after repair: %v (first: %v); first_preview=%q repair_preview=%q",
-			parseErr2, parseErr, previewForFixError(assistant1), previewForFixError(assistant2))
+		// The classification says WHICH shape failed. "not JSON" about a reply that was nothing but
+		// JSON cost an upstream run its diagnosis.
+		return evaluator.FixResponse{}, fmt.Errorf("llmfix: invalid JSON after repair (%s): %v (first: %v); first_preview=%q repair_preview=%q",
+			classifyFixParseFailure(assistant2), parseErr2, parseErr, previewForFixError(assistant1), previewForFixError(assistant2))
 	}
 	if f.MultiTurnRepair {
 		f.convMsgs = append(savedConv,
 			model.Message{Role: "user", Content: user},
 			model.Message{Role: "assistant", Content: assistant1},
-			model.Message{Role: "user", Content: repairFixJSONUserMessage},
+			model.Message{Role: "user", Content: repairUser},
 			model.Message{Role: "assistant", Content: assistant2},
 		)
 		trimConvMsgs(&f.convMsgs)
@@ -283,7 +390,7 @@ func sleepFixerOuterRetry(ctx context.Context, attempt int) error {
 	}
 }
 
-func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
+func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, error) {
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = 8192
 	}
@@ -293,9 +400,17 @@ func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message,
 	var result *model.CompleteResult
 	var err error
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err = f.LLM.Complete(ctx, messages, opts)
+		result, err = f.completeToolAware(ctx, messages, opts, budget)
 		if err == nil {
+			f.auditFixCompletionWarnings(ctx, result)
 			return result, nil
+		}
+		if trunc, isTrunc := model.IsTruncatedCompletion(err); isTrunc {
+			was, retrying := bumpForTruncation(&opts, err)
+			f.auditTruncation(ctx, "secondary", trunc, was, opts.MaxTokens, retrying)
+			if retrying {
+				continue
+			}
 		}
 		if attempt == maxRetries-1 {
 			return nil, err
@@ -310,9 +425,99 @@ func (f *Fixer) completeWithRetry(ctx context.Context, messages []model.Message,
 	return nil, err
 }
 
+// auditTruncation records an output-cap truncation and what was done about it.
+//
+// bumpForTruncation used to fire silently, so a round that hit the cap, doubled its budget and
+// retried looked identical in the log to one that never hit it — and a round that hit the cap while
+// ALREADY at maxFixerOutputTokens simply disappeared into a parse error.
+// was is the cap in force BEFORE the bump. bumpForTruncation reports 0 when it declines, which is
+// not a cap anyone set — fall back to the unchanged current value so the field cannot read as "the
+// previous limit was zero".
+func (f *Fixer) auditTruncation(ctx context.Context, turn string, trunc *model.TruncatedCompletionError, was, now int, retrying bool) {
+	if f.Audit == nil || trunc == nil {
+		return
+	}
+	if was <= 0 {
+		was = now
+	}
+	msg := fmt.Sprintf("Fix %s completion hit the output cap (provider %s, stop reason %q, max_tokens=%d, produced=%d); no headroom left at %d, so the partial reply is what the parser will see.",
+		turn, trunc.Provider, trunc.Reason, trunc.MaxTokens, trunc.GotTokens, maxFixerOutputTokens)
+	if retrying {
+		msg = fmt.Sprintf("Fix %s completion hit the output cap (provider %s, stop reason %q, max_tokens=%d, produced=%d); retrying at %d.",
+			turn, trunc.Provider, trunc.Reason, trunc.MaxTokens, trunc.GotTokens, now)
+	}
+	f.Audit.Log(ctx, "fix.completion_truncated", map[string]interface{}{
+		"message":         msg,
+		"turn":            turn,
+		"provider":        trunc.Provider,
+		"stop_reason":     trunc.Reason,
+		"max_tokens":      trunc.MaxTokens,
+		"produced_tokens": trunc.GotTokens,
+		"retrying":        retrying,
+		"max_tokens_was":  was,
+		"max_tokens_now":  now,
+		"partial_runes":   len([]rune(trunc.Content)),
+	})
+}
+
+// maxFixerOutputTokens bounds the truncation retry for fix attempts.
+const maxFixerOutputTokens = 16384
+
+// bumpForTruncation doubles opts.MaxTokens once when err is a truncated completion and there is
+// headroom left, reporting whether the caller should retry.
+//
+// Truncation matters more in the fixer than in the generator: an unparseable response consumes one
+// of a small number of fix attempts on a failure that had nothing to do with the model's reasoning,
+// and the repair turn then re-asks about content the model never finished writing.
+func bumpForTruncation(opts *model.CompleteOptions, err error) (int, bool) {
+	trunc, ok := model.IsTruncatedCompletion(err)
+	if !ok || trunc == nil {
+		return 0, false
+	}
+	if opts.MaxTokens >= maxFixerOutputTokens {
+		return 0, false
+	}
+	was := opts.MaxTokens
+	next := was * 2
+	if next > maxFixerOutputTokens {
+		next = maxFixerOutputTokens
+	}
+	opts.MaxTokens = next
+	return was, true
+}
+
+func hasPromptTruncatedWarning(res *model.CompleteResult) bool {
+	if res == nil {
+		return false
+	}
+	for _, w := range res.Warnings {
+		if model.IsPromptTruncatedWarning(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// auditFixCompletionWarnings mirrors the generator's auditCompletionWarnings: provider-side
+// conditions that did not fail the call but change how to read it. The fixer used to discard
+// these, which is how a run with three front-truncated fix prompts audited as clean requests
+// with unusable replies and no explanation.
+func (f *Fixer) auditFixCompletionWarnings(ctx context.Context, res *model.CompleteResult) {
+	if f.Audit == nil || res == nil || len(res.Warnings) == 0 {
+		return
+	}
+	for _, w := range res.Warnings {
+		f.Audit.Log(ctx, "fix.completion_warning", map[string]interface{}{
+			"message":          "Fixer completion warning: " + w,
+			"warning":          w,
+			"prompt_truncated": model.IsPromptTruncatedWarning(w),
+		})
+	}
+}
+
 // completeWithRetryBuilder calls Complete; on transient errors it bumps retryLevel, rebuilds messages
 // (tighter prompt budgets via build), sleeps with jitter, and retries. Returns the user string from the last build attempt.
-func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLevel int) ([]model.Message, string), opts model.CompleteOptions) (*model.CompleteResult, string, error) {
+func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLevel int) ([]model.Message, string), opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, string, error) {
 	if opts.MaxTokens == 0 {
 		opts.MaxTokens = 8192
 	}
@@ -321,12 +526,35 @@ func (f *Fixer) completeWithRetryBuilder(ctx context.Context, build func(retryLe
 	var err error
 	retryLevel := 0
 	var sentUser string
+	truncationRebuilds := 0
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		msgs, u := build(retryLevel)
 		sentUser = u
-		result, err = f.LLM.Complete(ctx, msgs, opts)
+		result, err = f.completeToolAware(ctx, msgs, opts, budget)
 		if err == nil {
+			f.auditFixCompletionWarnings(ctx, result)
+			// A front-truncated prompt SUCCEEDED as far as the provider is concerned, but the
+			// model never saw the system prompt or the output contract — its reply is an answer to
+			// a different, smaller question. Rebuild once at the next tighter limit tier instead of
+			// consuming the reply. Once, not until it fits: the tiers deliberately never shrink
+			// artifacts, so a prompt that still overflows after one tightening will keep
+			// overflowing, and looping here would burn the retry budget on requests that cannot
+			// change. Observed upstream before this existed: three consecutive test-step rounds
+			// each sent ~136k runes into a 32k-token window, got unusable replies, and the warning
+			// saying exactly why was discarded unread.
+			if truncationRebuilds == 0 && hasPromptTruncatedWarning(result) && attempt < maxRetries-1 {
+				truncationRebuilds++
+				retryLevel++
+				continue
+			}
 			return result, sentUser, nil
+		}
+		if trunc, isTrunc := model.IsTruncatedCompletion(err); isTrunc {
+			was, retrying := bumpForTruncation(&opts, err)
+			f.auditTruncation(ctx, "main", trunc, was, opts.MaxTokens, retrying)
+			if retrying {
+				continue
+			}
 		}
 		if attempt == maxRetries-1 {
 			return nil, sentUser, err
@@ -380,6 +608,11 @@ type fixPromptLimits struct {
 	ErrorLogTailRunes int
 	MaxRunesPerFile   int
 	MaxManifestRunes  int
+	// MaxArtifactRunes is the largest artifact emitted in full. Deliberately NOT shrunk by
+	// fixPromptLimitsForTransientRetryLevel: shrinking an artifact is what recreates the
+	// window-vs-full-file contradiction. Transient retries shrink dependencies, manifests and the
+	// error log instead.
+	MaxArtifactRunes int
 }
 
 func defaultFixPromptLimits() fixPromptLimits {
@@ -389,6 +622,7 @@ func defaultFixPromptLimits() fixPromptLimits {
 		ErrorLogTailRunes: errorLogTailRunes,
 		MaxRunesPerFile:   maxRunesPerFile,
 		MaxManifestRunes:  maxManifestRunes,
+		MaxArtifactRunes:  maxArtifactFileRunes,
 	}
 }
 
@@ -408,11 +642,14 @@ func fixPromptLimitsForTransientRetryLevel(retryLevel int) fixPromptLimits {
 	if retryLevel <= 0 {
 		return d
 	}
+	// MaxArtifactRunes is deliberately NOT shrunk by the transient-retry tiers: the artifact is the
+	// file the model must return in full, and a windowed artifact under a full-file contract invites
+	// a truncated rewrite. Only the surrounding context tightens.
 	rows := []fixPromptLimits{
-		{42000, 6500, 1200, 10000, 5000},
-		{34000, 5000, 1000, 8500, 4200},
-		{26000, 3800, 800, 7000, 3500},
-		{20000, 2800, 600, 5500, 2800},
+		{MaxTotalRunes: 42000, MaxErrorLogRunes: 6500, ErrorLogTailRunes: 1200, MaxRunesPerFile: 10000, MaxManifestRunes: 5000, MaxArtifactRunes: d.MaxArtifactRunes},
+		{MaxTotalRunes: 34000, MaxErrorLogRunes: 5000, ErrorLogTailRunes: 1000, MaxRunesPerFile: 8500, MaxManifestRunes: 4200, MaxArtifactRunes: d.MaxArtifactRunes},
+		{MaxTotalRunes: 26000, MaxErrorLogRunes: 3800, ErrorLogTailRunes: 800, MaxRunesPerFile: 7000, MaxManifestRunes: 3500, MaxArtifactRunes: d.MaxArtifactRunes},
+		{MaxTotalRunes: 20000, MaxErrorLogRunes: 2800, ErrorLogTailRunes: 600, MaxRunesPerFile: 5500, MaxManifestRunes: 2800, MaxArtifactRunes: d.MaxArtifactRunes},
 	}
 	idx := retryLevel - 1
 	if idx >= len(rows) {
@@ -499,7 +736,7 @@ func rankDependencyPaths(files map[string]string, emitted map[string]bool, lineB
 }
 
 // buildFixUserMessage builds the user message: metadata, then dependency manifests (so LLM only uses listed packages), then error log, then files.
-func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
+func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld []string) string {
 	var b strings.Builder
 	// --- Metadata ---
 	b.WriteString("=== METADATA ===\n")
@@ -581,6 +818,23 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
 			}
 		}
 	}
+	// Prior attempts BEFORE the error log: the model should know what it already tried before it
+	// reads the failure again, or it re-derives the same answer it derived last time.
+	if blk := evaluator.RenderFixAttemptMemory(req.PriorAttempts); blk != "" {
+		b.WriteString(blk)
+		b.WriteString("\n")
+	}
+	// Say what was withheld and why. Silently dropping an oversized artifact leaves the model
+	// reading a failure about a file it was never shown, with no way to know that is what happened.
+	writeWithheldArtifactNote(&b, withheld)
+	// Deterministic, compiler- and runtime-derived statements, rendered ahead of the failure so the
+	// model reads what is PROVEN before it reads what went wrong. (Upstream renders these from
+	// three prompt builders; core has one, so "all three builders" is satisfied by construction.)
+	writeAPISurfaceBlock(&b, req)
+	writeAbsentSymbolsBlock(&b, req)
+	writeMissingMemberFactsBlock(&b, req)
+	writeTestFailureFactsBlock(&b, req)
+	writeErrorSummaryBlock(&b, req)
 	// --- Error log (gist when truncated); surface primary error first when possible ---
 	b.WriteString("=== ERROR LOG (gist when truncated) ===\n")
 	if primary := primaryErrorLine(req.ErrorOutput); primary != "" {
@@ -1255,4 +1509,24 @@ func IsStructuredOutputAPIError(err error) bool {
 // IsTransientNetworkError reports whether err may succeed on retry (timeouts, connection drops).
 func IsTransientNetworkError(err error) bool {
 	return isTransientNetworkError(err)
+}
+
+// maxErrorSummaryRunes caps the LLM error summary in the prompt. Summaries are normally ~1k runes;
+// the cap only guards against a summarizer that rambles.
+const maxErrorSummaryRunes = 2500
+
+// writeErrorSummaryBlock emits req.ErrorSummary as a labeled SECONDARY block ahead of the raw
+// error gist. The framing matters: summaries have misdiagnosed before, so the raw log must stay
+// the authority the model is told to trust when the two disagree.
+func writeErrorSummaryBlock(b *strings.Builder, req evaluator.FixRequest) {
+	s := strings.TrimSpace(req.ErrorSummary)
+	if s == "" {
+		return
+	}
+	if runes := []rune(s); len(runes) > maxErrorSummaryRunes {
+		s = string(runes[:maxErrorSummaryRunes]) + " … [summary truncated]"
+	}
+	b.WriteString("=== ERROR SUMMARY (LLM-generated, SECONDARY — the raw error log below is authoritative; if they disagree, trust the log) ===\n")
+	b.WriteString(s)
+	b.WriteString("\n\n")
 }

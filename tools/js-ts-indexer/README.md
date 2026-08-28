@@ -11,7 +11,7 @@ npm install
 npm run build
 ```
 
-**Docker indexing (QualityBot):** With **`indexer.execution: docker`**, Go runs `node dist/index.js` inside **`node:20-bookworm`** (or **`indexer.docker_node_image`**). The whole **`tools/js-ts-indexer`** tree (including **`node_modules`**) is mounted read-only at **`/indexer`**; the repo at **`/workspace`**; JSONL is written to a host temp file mounted at **`/out/asqs-jst-index.jsonl`**. Heap size: **`indexer.docker_node_heap_mb`** (default 4096). Shared flags: **`docker_cli`**, **`docker_memory`**, **`docker_cpus`**, **`docker_network`**.
+**Docker indexing (QualityBot):** With **`indexer.execution: docker`**, Go runs `node dist/index.js` inside **`node:20-bookworm`** (or **`indexer.docker.node_image`**). The whole **`tools/js-ts-indexer`** tree (including **`node_modules`**) is mounted read-only at **`/indexer`**; the repo at **`/workspace`**; JSONL is written to a host temp file mounted at **`/out/asqs-jst-index.jsonl`**. Heap size: **`indexer.docker.node_heap_mb`** (default 4096). Shared: **`indexer.docker.cli`**, **`indexer.docker.memory`**. CPU limits and the container network are constants (CP37).
 
 Integration smoke:
 
@@ -25,7 +25,7 @@ go test -tags=integration ./tools/js-ts-indexer/... -count=1 -run TestRunIndexer
 npm test
 ```
 
-Covers Nest `API_ROUTE`, React / Angular / Vue / Solid `PAGE_ROUTE`, E2E spec heuristics, and HTTP client symbols. See **`docs/E2E-INDEXING.md`** in the repo root.
+Covers Nest `API_ROUTE`, React / Angular / Vue / Solid `PAGE_ROUTE`, E2E spec heuristics, and HTTP client symbols.
 
 **Filesystem scan:** `src/file-list.ts` **`SKIP_DIRS`** must **not** skip **`e2e`**, **`e2e-tests`**, **`__tests__`**, or **`cypress`** — those trees hold Playwright/Cypress/Jest specs that become **`E2E_SPEC`**; skipping them used to empty **`ListGapsE2E`** for JS/TS (aligned with Go **`ScanRepoForFiles`**).
 
@@ -36,11 +36,11 @@ node dist/index.js --repo /path/to/repo [--jsonl-out /path/to/index.jsonl] [--ou
 ```
 
 - **--repo** (required): repository root.
-- **--jsonl-out** (optional): write JSONL **only** to this file (directories created); stdout stays free for anything else. Same records as default stdout mode. QualityBot can set **`indexer.jst_jsonl_out: temp`** so Go uses a temp file instead of a pipe (recommended if you hit parse errors on huge single-file payloads).
+- **--jsonl-out** (optional): write JSONL **only** to this file (directories created); stdout stays free for anything else. Same records as the default stdout mode. Go ALWAYS uses this route — `indexer.jst_jsonl_out` was frozen to `temp` in CP37 and is no longer a key — because a pipe can fail on a huge single-record payload.
 - **--output** (optional): directory for **Phase 1 artifacts** after indexing:
   - **`packages.jsonl`** — one JSON object per workspace package (paths, `moduleKind`, `packageRole`, `sourceRoots` / `testRoots`, split `dependencies` / `devDependencies`, scripts).
   - **`index-summary.json`** — repo metadata, all `tsconfig` hints (`extends`, **`extendsChain`** base→leaf, **`mergedCompilerOptions`** shallow merge, `references`), Angular projects from `angular.json`, per-package **source file lists** (filesystem), and `indexedFileCount` from the AST pass.
-- **--frameworks**: `auto` (default) uses **`package.json` discovery** for React/Nest/Angular/Vue/Solid/AngularJS and always enables **Node** builtins/entry/CLI + **HTTP client** + **E2E** enrichers on matching files. `none` = core TS/JS graph only (no framework/router/E2E/HTTP/node extras). Otherwise a **comma- or pipe-separated** list: `node`, `nest`, `react`, `angular`, `angularjs`, `vue`, `solid`, `http`, `e2e`, **`tanstack`** (`@tanstack/react-router` / `createFileRoute`) — each framework token still requires the matching dependency signal from discovery (except `node`, `http`, `e2e`; **`tanstack`** can be forced explicitly). See **`docs/PLAN.md`** §2.
+- **--frameworks**: `auto` (default) uses **`package.json` discovery** for React/Nest/Angular/Vue/Solid/AngularJS and always enables **Node** builtins/entry/CLI + **HTTP client** + **E2E** enrichers on matching files. `none` = core TS/JS graph only (no framework/router/E2E/HTTP/node extras). Otherwise a **comma- or pipe-separated** list: `node`, `nest`, `react`, `angular`, `angularjs`, `vue`, `solid`, `http`, `e2e`, **`tanstack`** (`@tanstack/react-router` / `createFileRoute`) — each framework token still requires the matching dependency signal from discovery (except `node`, `http`, `e2e`; **`tanstack`** can be forced explicitly).
 
 **Workspaces:** npm/yarn `workspaces` plus `pnpm-workspace.yaml` are expanded for `packages/*` and single-folder entries. Patterns containing `**` are not expanded.
 
@@ -63,7 +63,7 @@ These files are not emitted in the JSONL output, so they are not indexed, chunke
 
 - **A — discovery:** `package.json`, `tsconfig.json` (extends chain + merged `compilerOptions`), workspaces (`packages/*`, `packages/**`, `**`), framework signals (**Nuxt**: `frameworkSignals.nuxt`, **`nuxtPagePaths`** from `pages/**/*.vue` when `nuxt` / `@nuxt/schema` is a dependency).
 - **B — language indexer:** ts-morph project, AST, symbols, edges (core semantics: type aliases, enums, JSDoc on symbols, `EXPORTS` / `RE_EXPORTS`, `REFS_TYPE`, `INTERFACE_METHOD`, `TEST_BLOCK` — see `src/enrichers-semantics.ts`).
-- **C — framework enrichers:** **Node** (Phase 3), **Nest** (Phase 4), **React** (Phase 5: `enrichers-react-graph.ts` — components, hooks, context, props hints; router `PAGE_ROUTE`), **Angular** (Phase 6: `enrichers-angular-graph.ts` — decorators, NgModule, templates path), **AngularJS** (`enrichers-angularjs-graph.ts`), **Vue / Solid** router `PAGE_ROUTE`, E2E/HTTP-client extras. **Still open:** template AST (Angular HTML), full `exports` map, Nest DTO/guards, deeper React graphs. See **`docs/JS-TS-PHASE-STATUS.md`**.
+- **C — framework enrichers:** **Node** (Phase 3), **Nest** (Phase 4), **React** (Phase 5: `enrichers-react-graph.ts` — components, hooks, context, props hints; router `PAGE_ROUTE`), **Angular** (Phase 6: `enrichers-angular-graph.ts` — decorators, NgModule, templates path), **AngularJS** (`enrichers-angularjs-graph.ts`), **Vue / Solid** router `PAGE_ROUTE`, E2E/HTTP-client extras. **Still open:** template AST (Angular HTML), full `exports` map, Nest DTO/guards, deeper React graphs.
 - **D — chunk builder:** symbol-centred chunks (future).
 - **E — retrieval profiles:** test/doc/architecture (future).
 
@@ -73,4 +73,4 @@ Each stdout line = `LangIndexerJSON` (see `internal/intelligence/indexer/lang.go
 
 - `path`, `lang` ("javascript" / "typescript"), `module`, `is_test`
 - `symbols`: `{ kind, fq_name, start_line, end_line, signature? }` — base kinds: MODULE, CLASS, INTERFACE, **INTERFACE_METHOD**, FUNCTION, METHOD, VARIABLE, **TYPE_ALIAS**, **ENUM**, **ENUM_MEMBER**, **TEST_BLOCK**; Node: **ENTRYPOINT**, **CLI_COMMAND**, **BUILTIN_MODULE_USE**; React: **REACT_COMPONENT**, **REACT_HOOK**, **REACT_CONTEXT**, **REACT_PROVIDER**, **REACT_CUSTOM_HOOK**; Angular: **ANGULAR_COMPONENT**, **ANGULAR_SERVICE**, **ANGULAR_MODULE**, **ANGULAR_DIRECTIVE**, **ANGULAR_PIPE**, **ANGULAR_TEMPLATE**; AngularJS: **ANGULARJS_MODULE**, **ANGULARJS_CONTROLLER**, **ANGULARJS_SERVICE**, …; Nest: **NEST_CONTROLLER**, **NEST_ROUTE_HANDLER**, **NEST_MODULE**, **NEST_PROVIDER**, **API_ROUTE**; E2E: **E2E_SPEC** (heuristic). `signature` may include **`jsdoc`** (first paragraph). For **VARIABLE** / `const` **FUNCTION** arrows, **`jsdoc` is only taken at module or namespace scope** so a `/** … */` before an inner `let`/`const` is not stored as that local’s documentation.
-- `edges`: `{ caller_fq_name, callee_fq_name, edge_type }` — IMPORTS, EXTENDS, IMPLEMENTS, CALLS, CONTAINS, RENDERS, **EXPORTS**, **RE_EXPORTS**, **REFS_TYPE**, **ROUTE_TO_HANDLER**, **USES_HOOK**, **USES_CONTEXT**, **ACCEPTS_PROPS_TYPE**, **USES_TEMPLATE**, **STANDALONE_IMPORTS**, **MODULE_DECLARATIONS**, **MODULE_BOOTSTRAP**, **DECLARES**, **PACKAGE_EXPORT** (package name → resolved file path from `exports`), … plus Node/Nest/package edges documented above. **Both endpoint names must match symbol `fq_name` values** so the Go indexer can store edges (see `docs/E2E-INDEXING.md`). (`REFS_TYPE` / `RE_EXPORTS` callees are often unresolved strings — edges may be dropped in metadata.)
+- `edges`: `{ caller_fq_name, callee_fq_name, edge_type }` — IMPORTS, EXTENDS, IMPLEMENTS, CALLS, CONTAINS, RENDERS, **EXPORTS**, **RE_EXPORTS**, **REFS_TYPE**, **ROUTE_TO_HANDLER**, **USES_HOOK**, **USES_CONTEXT**, **ACCEPTS_PROPS_TYPE**, **USES_TEMPLATE**, **STANDALONE_IMPORTS**, **MODULE_DECLARATIONS**, **MODULE_BOOTSTRAP**, **DECLARES**, **PACKAGE_EXPORT** (package name → resolved file path from `exports`), … plus Node/Nest/package edges documented above. **Both endpoint names must match symbol `fq_name` values** so the Go indexer can store edges. (`REFS_TYPE` / `RE_EXPORTS` callees are often unresolved strings — edges may be dropped in metadata.)

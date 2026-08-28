@@ -7,42 +7,187 @@ CREATE TABLE IF NOT EXISTS symbols (
     file           TEXT NOT NULL,
     start_line     INTEGER NOT NULL,
     end_line       INTEGER NOT NULL,
-    signature_json JSONB
+    signature_json JSONB,
+    -- repo_id scopes per-file deletes. The indexer removes a file's symbols before re-inserting
+    -- them, and without this column that DELETE matched every repository sharing the path.
+    repo_id        TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_symbols_lang ON symbols (lang);
+
+-- CREATE TABLE IF NOT EXISTS above is a no-op on a database that already has `symbols`, so a column
+-- added to that definition never reaches an existing deployment and the index below then fails with
+-- `column "repo_id" does not exist`. Every column added after the table first shipped needs its own
+-- idempotent ALTER here.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
+
+-- Degree columns are recomputed at the end of an index run. in_degree_non_test excludes
+-- TESTS_SOURCE because the centrality signal in gap listing does: counting a test-coverage edge
+-- would inflate "central dependency, under-tested" for symbols that already have tests.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS out_degree INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS in_degree_non_test INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_symbols_in_degree_non_test ON symbols (in_degree_non_test);
+
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols (file);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_file ON symbols (repo_id, file);
 CREATE INDEX IF NOT EXISTS idx_symbols_fq_name ON symbols (fq_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_fq_name ON symbols (repo_id, fq_name);
+CREATE INDEX IF NOT EXISTS idx_symbols_repo_lang_kind ON symbols (repo_id, lang, kind);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON symbols (kind);
+
+-- Stable symbol identity (CP13). The natural key is (repo_id, file, fq_name, kind, dup_ordinal):
+-- dup_ordinal is the 1-based order of appearance among same-key symbols in one file, and it exists
+-- because not every indexer can distinguish overloads in the FQName — the advanced Java indexer
+-- emits "Type#method" for every overload (C# stopped doing this in CP55). The ordinal keeps such
+-- collisions as SEPARATE stable rows instead of silently merging them; identity degrades only if
+-- overloads are REORDERED within the file, which is rare and self-heals on the next reindex.
+--
+-- InsertSymbols is an upsert on this key, so an unchanged file keeps its symbol ids across
+-- reindexes — which is what makes chunks.symbol_id durable and symbol_versions possible at all.
+ALTER TABLE symbols ADD COLUMN IF NOT EXISTS dup_ordinal INTEGER NOT NULL DEFAULT 1;
+
+-- Existing databases carry same-key duplicates (Java overloads, pre-CP55 C#). Assign ordinals ONCE,
+-- before the unique index first builds, guarded on that index's absence.
+--
+-- The guard is the whole point. InitSchema runs on every startup, so an unguarded UPDATE would
+-- renumber ordinals on each one — and because the ordinal is part of the identity, renumbering
+-- REASSIGNS symbol ids. Durable ids that shuffle on restart are worse than no durable ids: they
+-- would silently re-point chunks.symbol_id and scatter each symbol's history across rows.
+DO $symbols_natural_key$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_indexes
+        WHERE schemaname = current_schema() AND indexname = 'uq_symbols_natural_key'
+    ) THEN
+        UPDATE symbols SET dup_ordinal = ranked.rn
+        FROM (
+            SELECT id, row_number() OVER (
+                PARTITION BY repo_id, file, fq_name, kind
+                ORDER BY start_line, end_line, id
+            ) AS rn
+            FROM symbols
+        ) ranked
+        WHERE symbols.id = ranked.id AND symbols.dup_ordinal <> ranked.rn;
+        CREATE UNIQUE INDEX uq_symbols_natural_key
+            ON symbols (repo_id, file, fq_name, kind, dup_ordinal);
+    END IF;
+END
+$symbols_natural_key$;
+
+-- symbol_versions: one row per (symbol, commit) with the hash of the symbol's source span (CP13).
+-- Churn — count(DISTINCT body_hash) over a window — is the temporal ranking signal that stable
+-- identity exists to enable. Cascade: a symbol pruned from the index takes its history with it.
+CREATE TABLE IF NOT EXISTS symbol_versions (
+    symbol_id  UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
+    commit_sha TEXT NOT NULL,
+    body_hash  TEXT NOT NULL,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (symbol_id, commit_sha)
+);
+
+-- CREATE TABLE IF NOT EXISTS is a no-op on a database that already has the table, and that is true
+-- of its CONSTRAINTS as well as its columns — the same trap this file already documents for
+-- `symbols`. A pre-existing symbol_versions without the foreign key would never gain it, and the
+-- cascade is not decoration: without it, deleting a symbol orphans its history rows, which then
+-- point at an id a later insert can reuse. Found live: a scratch database carrying an older copy of
+-- this table kept every version row after its symbol was deleted.
+DO $symbol_versions_fk$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'symbol_versions_symbol_id_fkey' AND conrelid = 'symbol_versions'::regclass
+    ) THEN
+        DELETE FROM symbol_versions sv
+        WHERE NOT EXISTS (SELECT 1 FROM symbols s WHERE s.id = sv.symbol_id);
+        ALTER TABLE symbol_versions
+            ADD CONSTRAINT symbol_versions_symbol_id_fkey
+            FOREIGN KEY (symbol_id) REFERENCES symbols (id) ON DELETE CASCADE;
+    END IF;
+END
+$symbol_versions_fk$;
+
+-- Churn reads the window by repo and time, joining back to symbols for the repo scope.
+CREATE INDEX IF NOT EXISTS idx_symbol_versions_seen_at ON symbol_versions (seen_at);
 
 -- Optional precise span (see docs/DOCUMENTATION.md — Symbol line/column spans). NULL when unknown or line-only indexer.
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS start_column INTEGER;
 ALTER TABLE symbols ADD COLUMN IF NOT EXISTS end_column INTEGER;
 
 -- edges: directed relationships between symbols (caller -> callee)
+--
+-- repo_id is denormalized from the caller symbol. It is redundant with symbols.repo_id and that is
+-- the point: edge traversal joins symbols on every hop, and a scoped traversal that has to reach
+-- through symbols to learn the repository cannot use an index on the edge itself.
 CREATE TABLE IF NOT EXISTS edges (
     caller_symbol_id UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
     callee_symbol_id UUID NOT NULL REFERENCES symbols (id) ON DELETE CASCADE,
     edge_type       TEXT NOT NULL,
+    repo_id         TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (caller_symbol_id, callee_symbol_id, edge_type)
 );
+
+-- See the note on symbols: a column added after the table first shipped needs its own idempotent
+-- ALTER, because CREATE TABLE IF NOT EXISTS is a no-op on an existing deployment.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS idx_edges_caller ON edges (caller_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_callee ON edges (callee_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_edges_type ON edges (edge_type);
+CREATE INDEX IF NOT EXISTS idx_edges_repo_caller ON edges (repo_id, caller_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_edges_repo_callee ON edges (repo_id, callee_symbol_id);
 
 -- files: tracked source and test files
+--
+-- The primary key is (repo_id, file), not file. `file` is a repo-RELATIVE path, so `pom.xml` and
+-- `src/index.ts` are the same key in every repository that has one — which made incremental
+-- change detection read another repository's SHA and skip files that had in fact changed.
 CREATE TABLE IF NOT EXISTS files (
-    file    TEXT PRIMARY KEY,
+    file    TEXT NOT NULL,
     sha     TEXT NOT NULL,
     lang    TEXT NOT NULL,
     module  TEXT NOT NULL DEFAULT '',
-    is_test BOOLEAN NOT NULL DEFAULT FALSE
+    is_test BOOLEAN NOT NULL DEFAULT FALSE,
+    repo_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (repo_id, file)
 );
+
+ALTER TABLE files ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT '';
+
+-- Move the primary key to (repo_id, file) on databases that predate it.
+--
+-- CREATE TABLE IF NOT EXISTS above is a no-op on an existing deployment, so the composite key it
+-- declares never reached one. The repo-scoping migration moves the key too, but migrations are run
+-- by hand — and UpsertFile's ON CONFLICT (repo_id, file) requires the key to exist. On a database
+-- still keyed on `file` alone, EVERY file upsert fails with SQLSTATE 42P10, which produced a run
+-- that indexed 367 symbols, wrote zero `files` rows, and then planned zero gaps because every
+-- consumer of `files` returned nothing.
+--
+-- The key therefore belongs here alongside the added columns, for exactly the reason stated above
+-- them: structure the code depends on cannot be optional. The migration still owns the data
+-- backfill; this owns the shape.
+--
+-- Safe to run repeatedly, and safe on data: the old key made `file` unique, so (repo_id, file)
+-- cannot collide.
+DO $files_pk$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_constraint c
+         WHERE c.conrelid = 'files'::regclass
+           AND c.contype = 'p'
+           AND array_length(c.conkey, 1) = 1
+    ) THEN
+        ALTER TABLE files DROP CONSTRAINT files_pkey;
+        ALTER TABLE files ADD PRIMARY KEY (repo_id, file);
+    END IF;
+END
+$files_pk$;
 
 CREATE INDEX IF NOT EXISTS idx_files_lang ON files (lang);
 CREATE INDEX IF NOT EXISTS idx_files_module ON files (module);
 CREATE INDEX IF NOT EXISTS idx_files_is_test ON files (is_test);
+CREATE INDEX IF NOT EXISTS idx_files_repo_lang ON files (repo_id, lang);
+CREATE INDEX IF NOT EXISTS idx_files_repo_is_test ON files (repo_id, is_test);
 
 -- index_runs: versioning and scheduling of indexing (incremental updates)
 -- repo_id: required stable key for symbols/chunks/edges (derived from clone URL, explicit repo_id, or local path). Not a FK, separate from control-plane linkage below.
@@ -94,7 +239,8 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_run_id ON audit_log (run_id);
 CREATE INDEX IF NOT EXISTS idx_audit_log_at ON audit_log (at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_step ON audit_log (step);
 
--- Control plane: versioned named configs (see docs/API-IMPLEMENTATION_PLAN.md)
+-- Control plane: versioned named configs. The control plane itself is enterprise-excluded; the
+-- table stays so a shared database is schema-compatible in both directions.
 CREATE TABLE IF NOT EXISTS configs (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL UNIQUE,
@@ -147,7 +293,8 @@ CREATE TABLE IF NOT EXISTS audit_exports (
 
 CREATE INDEX IF NOT EXISTS idx_audit_exports_pending ON audit_exports (created_at) WHERE status = 'pending';
 
--- Multi-tenant control plane: tenants → projects → runs (see docs/API-IMPLEMENTATION_PLAN.md §13).
+-- Multi-tenant control plane: tenants → projects → runs. Enterprise-excluded, kept for schema
+-- compatibility; nothing in the open core writes these tables.
 CREATE TABLE IF NOT EXISTS tenants (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name          TEXT NOT NULL,
@@ -198,11 +345,11 @@ CREATE INDEX IF NOT EXISTS idx_run_jobs_project ON run_jobs (project_id) WHERE p
 
 DROP TABLE IF EXISTS repos;
 
--- Agent-session engine (see docs/SESSIONS.md). Each qualitybot run produces one run_sessions row
--- and N gap_sessions rows (one per plan item). session_attempts logs tool invocations
--- (do not use semicolons inside these line comments: store.go splitSQL splits on semicolon only)
--- session_feedback stores normalized structured observations emitted by normalizers.
--- Writes are best-effort from internal/session/engine. Failing to persist never aborts a run.
+-- Agent-session engine tables. The engine itself (internal/session/engine) and its reference doc
+-- are enterprise-excluded, so NOTHING IN THE OPEN CORE WRITES THESE TABLES; they are kept so a
+-- shared database stays schema-compatible in both directions. Each run would produce one
+-- run_sessions row and N gap_sessions rows (one per plan item); session_attempts logs tool
+-- invocations and session_feedback stores normalized observations from normalizers.
 CREATE TABLE IF NOT EXISTS run_sessions (
     id                  TEXT PRIMARY KEY,
     run_id              TEXT NOT NULL,

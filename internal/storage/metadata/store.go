@@ -9,33 +9,107 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/asqs/asqs-core/internal/sqlsplit"
 )
 
 //go:embed schema.sql
 var schemaFS embed.FS
 
-// Store provides access to metadata tables (symbols, edges, files).
-type Store struct {
-	db *sql.DB
+// querier is the subset of *pgxpool.Pool this package uses. Production always holds a real pool;
+// the interface exists so the connection-failure tests in materialize_tests_source_retry_test.go
+// can still inject transient errors, which they used to do by registering a fake database/sql
+// driver — an option pgxpool does not offer.
+type querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+	BeginTx(ctx context.Context, txOptions pgx.TxOptions) (pgx.Tx, error)
+	Ping(ctx context.Context) error
 }
 
-// Open opens a Postgres connection and returns a Store. connString must be a valid libpq connection string.
+var _ querier = (*pgxpool.Pool)(nil)
+
+// Store provides access to metadata tables (symbols, edges, files).
+//
+// Nullable columns are still scanned into database/sql's sql.NullX types. That is deliberate and
+// not leftover: pgx routes any destination implementing sql.Scanner through the codec's
+// DecodeDatabaseSQLValue, which yields the same value database/sql delivered, so null semantics
+// and scanned values are unchanged by the pgx migration. Rewriting 60-odd destinations to
+// pgtype/pointer equivalents would have been 60 chances to change behaviour in a bundle whose
+// whole point is that behaviour does not change.
+type Store struct {
+	db querier
+	// pool is the handle db is backed by, or nil when a test injected a fake. It owns Close and
+	// exposes pool statistics; every query goes through db.
+	pool *pgxpool.Pool
+	// simpleName / trigram cache whether the migration-added lookup aids exist, so queries can use
+	// the indexed form when available and the original predicates otherwise.
+	simpleName simpleNameProbe
+	trigram    simpleNameProbe
+}
+
+// Config configures the metadata connection pool. Only ConnString is required.
+type Config struct {
+	// ConnString is a libpq connection string or postgres:// URL.
+	ConnString string
+	// MaxConns caps the pool. 0 leaves pgxpool's default, which is max(4, NumCPU).
+	MaxConns int32
+	// MinConns is the pool floor kept warm. 0 leaves pgxpool's default of 0.
+	MinConns int32
+}
+
+// Open opens a Postgres connection pool with default sizing and returns a Store. connString must be
+// a valid libpq connection string. Use OpenWithConfig to size the pool.
 func Open(connString string) (*Store, error) {
-	db, err := sql.Open("pgx", connString)
+	return OpenWithConfig(context.Background(), Config{ConnString: connString})
+}
+
+// OpenWithConfig opens a Postgres connection pool with explicit sizing and returns a Store.
+func OpenWithConfig(ctx context.Context, cfg Config) (*Store, error) {
+	if strings.TrimSpace(cfg.ConnString) == "" {
+		return nil, fmt.Errorf("metadata open: ConnString required")
+	}
+	poolCfg, err := pgxpool.ParseConfig(cfg.ConnString)
 	if err != nil {
 		return nil, fmt.Errorf("metadata open: %w", err)
 	}
-	if err := db.Ping(); err != nil {
-		_ = db.Close()
+	if cfg.MaxConns > 0 {
+		poolCfg.MaxConns = cfg.MaxConns
+	}
+	if cfg.MinConns > 0 {
+		poolCfg.MinConns = cfg.MinConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return nil, fmt.Errorf("metadata open: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("metadata ping: %w", err)
 	}
-	return &Store{db: db}, nil
+	return &Store{db: pool, pool: pool}, nil
 }
 
-// Close closes the database connection.
+// Close closes the connection pool. It returns an error only to keep the call sites that check one
+// compiling; pgxpool.Close cannot fail.
 func (s *Store) Close() error {
-	return s.db.Close()
+	if s.pool != nil {
+		s.pool.Close()
+	}
+	return nil
+}
+
+// PoolStat reports connection pool statistics, or nil when the store is backed by a test fake.
+func (s *Store) PoolStat() *pgxpool.Stat {
+	if s.pool == nil {
+		return nil
+	}
+	return s.pool.Stat()
 }
 
 // InitSchema runs the embedded schema.sql to create tables and indexes if they do not exist.
@@ -44,27 +118,22 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("read schema: %w", err)
 	}
-	statements := splitSQL(string(b))
+	// sqlsplit understands string literals, dollar quotes and comments, so a semicolon inside any of
+	// them is no longer a statement boundary. This used to be a naive strings.Split on ';', under
+	// which a prose comment containing a semicolon split its statement in half and produced a
+	// "syntax error at end of input" naming the statement's opening comment rather than the comment
+	// that broke it.
+	statements := sqlsplit.Statements(string(b))
 	for _, stmt := range statements {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+		if _, err := s.db.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("exec schema %q: %w", truncate(stmt, 60), err)
 		}
 	}
 	return nil
-}
-
-func splitSQL(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ";") {
-		if t := strings.TrimSpace(part); t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
 }
 
 func truncate(s string, n int) string {
@@ -76,58 +145,187 @@ func truncate(s string, n int) string {
 
 // --- Symbols ---
 
-// InsertSymbol inserts a symbol and returns its generated ID.
+// InsertSymbol inserts a symbol and returns its generated ID. Batch callers (the indexer) go
+// through InsertSymbols; both run the shared symbolInsertQuery so the paths cannot drift.
 func (s *Store) InsertSymbol(ctx context.Context, sym *Symbol) (id string, err error) {
-	query := `
-		INSERT INTO symbols (lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-		RETURNING id`
-	var sig *[]byte
-	if len(sym.SignatureJSON) > 0 {
-		sig = &sym.SignatureJSON
-	}
-	var startCol, endCol interface{}
-	if sym.StartColumn != nil {
-		startCol = *sym.StartColumn
-	}
-	if sym.EndColumn != nil {
-		endCol = *sym.EndColumn
-	}
-	err = s.db.QueryRowContext(ctx, query,
-		sym.Lang, sym.Kind, sym.FQName, sym.File, sym.StartLine, sym.EndLine, startCol, endCol, sig,
-	).Scan(&id)
+	// A single insert is ordinal 1 by definition: batch callers (the indexer) always go through
+	// InsertSymbols, which numbers same-key symbols per file. Two same-key SINGLE inserts therefore
+	// upsert onto ONE row — a caller that needs collision rows must batch them.
+	err = s.db.QueryRow(ctx, symbolInsertQuery, symbolInsertArgs(sym, 1)...).Scan(&id)
 	return id, err
 }
 
-// DeleteSymbolsByFile deletes all symbols (and their edges via cascade) for the given file. Use before reindexing.
-func (s *Store) DeleteSymbolsByFile(ctx context.Context, file string) (deleted int64, err error) {
-	res, err := s.db.ExecContext(ctx, "DELETE FROM symbols WHERE file = $1", file)
+// DeleteOutboundEdgesForFile removes every edge whose CALLER is declared in the file. With stable
+// symbol ids the old delete-symbols cascade no longer clears a reindexed file's edges, so stale
+// outbound edges (calls that no longer exist) must be dropped explicitly before the fresh set is
+// inserted. Inbound edges belong to their calling files and are deliberately left alone.
+func (s *Store) DeleteOutboundEdgesForFile(ctx context.Context, repoID, file string) (int64, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return 0, fmt.Errorf("metadata: delete outbound edges: empty repoID")
+	}
+	ct, err := s.db.Exec(ctx, `
+		DELETE FROM edges e
+		USING symbols s
+		WHERE e.caller_symbol_id = s.id AND s.repo_id = $1 AND s.file = $2`, repoID, file)
 	if err != nil {
 		return 0, err
 	}
-	n, err := res.RowsAffected()
-	return n, err
+	return ct.RowsAffected(), nil
 }
 
-// DeleteFile deletes the file row. Call after DeleteSymbolsByFile when removing a file from the index.
-func (s *Store) DeleteFile(ctx context.Context, file string) error {
-	_, err := s.db.ExecContext(ctx, "DELETE FROM files WHERE file = $1", file)
-	return err
+// DeleteSymbolsByFile deletes the repository's symbols (and their edges via cascade) for the given
+// file. Use before reindexing. The repo_id predicate is what keeps two repositories sharing a
+// relative path — `pom.xml`, `package.json` — from stripping each other's rows mid-run.
+func (s *Store) DeleteSymbolsByFile(ctx context.Context, repoID, file string) (deleted int64, err error) {
+	res, err := s.db.Exec(ctx, "DELETE FROM symbols WHERE file = $1 AND repo_id = $2",
+		file, strings.TrimSpace(repoID))
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected(), nil
 }
 
-// GetSymbolByID returns the symbol with the given ID, or nil if not found.
-func (s *Store) GetSymbolByID(ctx context.Context, id string) (*Symbol, error) {
+// DeleteSymbolsByFileExcept removes a file's symbols whose ids are NOT in keep — the second half
+// of the CP13 upsert flow: upsert what the file declares now, then prune what it no longer does.
+// Cascade takes the pruned symbols' edges and symbol_versions. Chunks live in the embeddings
+// store and are rewritten per file in the same pass; keeping ids stable is what makes their
+// symbol_id references survive that rewrite.
+func (s *Store) DeleteSymbolsByFileExcept(ctx context.Context, repoID, file string, keep []string) (int64, error) {
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return 0, fmt.Errorf("metadata: delete symbols except: empty repoID")
+	}
+	if len(keep) == 0 {
+		return s.DeleteSymbolsByFile(ctx, repoID, file)
+	}
+	ct, err := s.db.Exec(ctx, `
+		DELETE FROM symbols
+		WHERE repo_id = $1 AND file = $2 AND NOT (id = ANY($3::uuid[]))`, repoID, file, keep)
+	if err != nil {
+		return 0, err
+	}
+	return ct.RowsAffected(), nil
+}
+
+// SymbolVersion is one observation of a symbol's body at a commit (CP13).
+type SymbolVersion struct {
+	SymbolID  string
+	CommitSHA string
+	BodyHash  string
+}
+
+// InsertSymbolVersions records body hashes for this run's commit in one round trip. Upsert on
+// (symbol_id, commit_sha): re-indexing the same commit refreshes rather than duplicates, and a
+// dirty worktree indexed twice under one sha keeps the latest observation. Churn queries count
+// DISTINCT body_hash, so re-observations of identical content never inflate the signal.
+func (s *Store) InsertSymbolVersions(ctx context.Context, versions []*SymbolVersion) error {
+	if len(versions) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, v := range versions {
+		if v == nil || strings.TrimSpace(v.SymbolID) == "" || strings.TrimSpace(v.CommitSHA) == "" {
+			continue
+		}
+		batch.Queue(`
+			INSERT INTO symbol_versions (symbol_id, commit_sha, body_hash)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (symbol_id, commit_sha) DO UPDATE SET body_hash = EXCLUDED.body_hash, seen_at = now()`,
+			v.SymbolID, v.CommitSHA, v.BodyHash)
+	}
+	if batch.Len() == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("metadata: insert symbol versions: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	br := tx.SendBatch(ctx, batch)
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			_ = br.Close()
+			return fmt.Errorf("metadata: insert symbol version: %w", err)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("metadata: insert symbol versions: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+// SymbolChurn returns, per symbol id, the number of DISTINCT body hashes observed since the given
+// time — the temporal signal CP13 exists to enable ("this symbol changed 4 times last month").
+// 1 means "seen, unchanged"; only values > 1 indicate churn. Symbols with no versions are absent.
+func (s *Store) SymbolChurn(ctx context.Context, repoID string, since time.Time) (map[string]int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT sv.symbol_id::text, count(DISTINCT sv.body_hash)::int
+		FROM symbol_versions sv
+		JOIN symbols sy ON sy.id = sv.symbol_id
+		WHERE sy.repo_id = $1 AND sv.seen_at >= $2
+		GROUP BY sv.symbol_id`, strings.TrimSpace(repoID), since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int)
+	for rows.Next() {
+		var id string
+		var n int
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, err
+		}
+		out[id] = n
+	}
+	return out, rows.Err()
+}
+
+// DeleteFile removes the repository's `files` row for a path. Call after DeleteSymbolsByFile when
+// removing a file from the index.
+//
+// This ran as `DELETE FROM files WHERE file = $1` — no repo predicate — while the cross-repo fix
+// scoped the symbol and chunk deletes around it. So repos A and B both indexed, both containing
+// `package.json`; B's tree drops it; B's run deletes B's chunks and symbols correctly and then
+// deletes A's `files` row. A's symbols and chunks survive but lose their `files` join, and with it
+// `is_test`, `lang`, `module` and `sha`: MaterializeTestsSourceEdges INNER JOINs `files` and drops
+// those symbols, GetFile returns nil in the retrieve path, and A's next DetectChanges reclassifies
+// the path as new.
+//
+// `files` now carries its own repo_id and is keyed (repo_id, file), so ownership is a column
+// predicate rather than an inference. An empty repoID still matches the empty repo_id exactly,
+// never as a wildcard, so an unscoped run cannot delete a scoped repository's row.
+//
+// Returns whether the row was actually removed, so a caller can report retained rows rather than
+// silently believing it cleaned up.
+func (s *Store) DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error) {
+	res, err := s.db.Exec(ctx, `DELETE FROM files WHERE repo_id = $2 AND file = $1`,
+		file, strings.TrimSpace(repoID))
+	if err != nil {
+		return false, err
+	}
+	return res.RowsAffected() > 0, nil
+}
+
+// GetSymbolByID returns a symbol by primary key, scoped to repoID, or nil if not found.
+//
+// The id is a UUID and therefore already unique across repositories, so the repo_id predicate is
+// not needed for correctness of the LOOKUP — it is needed because the id itself can arrive from
+// outside. Passing an empty repoID is a programming error and returns nothing rather than
+// everything.
+func (s *Store) GetSymbolByID(ctx context.Context, repoID, id string) (*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE id = $1`
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols WHERE id = $1 AND repo_id = $2`
 	var sym Symbol
 	var sig sql.Null[[]byte]
 	var startCol, endCol sql.NullInt32
-	err := s.db.QueryRowContext(ctx, query, id).Scan(
+	err := s.db.QueryRow(ctx, query, id, repoID).Scan(
 		&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 		&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
+		&sym.InDegree, &sym.OutDegree, &sym.InDegreeNonTest,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -141,11 +339,11 @@ func (s *Store) GetSymbolByID(ctx context.Context, id string) (*Symbol, error) {
 }
 
 // ListSymbolsByFile returns all symbols in the given file, ordered by start_line.
-func (s *Store) ListSymbolsByFile(ctx context.Context, file string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFile(ctx context.Context, repoID, file string) ([]*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE file = $1 ORDER BY start_line`
-	rows, err := s.db.QueryContext(ctx, query, file)
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols WHERE repo_id = $1 AND file = $2 ORDER BY start_line`
+	rows, err := s.db.Query(ctx, query, repoID, file)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +352,7 @@ func (s *Store) ListSymbolsByFile(ctx context.Context, file string) ([]*Symbol, 
 }
 
 // ListSymbolsByFQSubstring returns symbols whose fq_name contains needle (case-insensitive), ordered by fq_name, capped.
-func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, limit int) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, repoID, needle string, limit int) ([]*Symbol, error) {
 	if limit < 1 {
 		limit = 50
 	}
@@ -165,13 +363,27 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, lim
 	if needle == "" {
 		return nil, nil
 	}
+	// strpos(lower(fq_name), lower($1)) > 0 cannot use any index — idx_symbols_fq_name is a plain
+	// btree, useless for a substring search — so this is a sequential scan over every symbol, and
+	// it backs the interactive `?q=` graph API search.
+	//
+	// With pg_trgm present, ILIKE '%needle%' uses idx_symbols_fq_trgm, and ordering by
+	// similarity() is also a better answer than alphabetical for someone typing into a search box.
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
-		WHERE strpos(lower(fq_name), lower($1)) > 0
+		WHERE repo_id = $3 AND strpos(lower(fq_name), lower($1)) > 0
 		ORDER BY fq_name
 		LIMIT $2`
-	rows, err := s.db.QueryContext(ctx, query, needle, limit)
+	if s.hasTrigram(ctx) {
+		query = `
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols
+		WHERE repo_id = $3 AND fq_name ILIKE '%' || $1 || '%'
+		ORDER BY similarity(fq_name, $1) DESC, fq_name
+		LIMIT $2`
+	}
+	rows, err := s.db.Query(ctx, query, needle, limit, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -180,11 +392,11 @@ func (s *Store) ListSymbolsByFQSubstring(ctx context.Context, needle string, lim
 }
 
 // ListSymbolsByFQName returns all symbols with the given fully qualified name (may be multiple overloads/locations).
-func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*Symbol, error) {
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE fq_name = $1 ORDER BY file, start_line`
-	rows, err := s.db.QueryContext(ctx, query, fqName)
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols WHERE repo_id = $1 AND fq_name = $2 ORDER BY file, start_line`
+	rows, err := s.db.Query(ctx, query, repoID, fqName)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +410,7 @@ func (s *Store) ListSymbolsByFQName(ctx context.Context, fqName string) ([]*Symb
 // anchored at the package separator ('.') so "Order" does NOT match "OrderController" or
 // "PurchaseOrder". Used by retrieval to resolve cross-package param/return/field types into domain
 // models + collaborators (the prior `<module>.<name>` guess only found same-package types). Capped.
-func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName string, limit int) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleName string, limit int) ([]*Symbol, error) {
 	simpleName = strings.TrimSpace(simpleName)
 	if simpleName == "" {
 		return nil, nil
@@ -209,14 +421,32 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName stri
 	if limit > 100 {
 		limit = 100
 	}
+	// `fq_name LIKE '%.' || $1` is a leading-wildcard match, so it is a sequential scan over the
+	// whole symbols table — and this runs PER GAP, once per candidate type name (up to 8 domain
+	// models). On a 200k-symbol repo with 50 gaps that is up to 400 full scans inside the plan
+	// phase, which is also the phase running an 8-way errgroup, so they contend with each other.
+	//
+	// The generated simple_name column turns it into an indexed equality lookup. Semantics are
+	// equivalent for the kinds filtered here: type FQNames use '.' separators, so the final
+	// segment is exactly what the LIKE anchored on.
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
-		WHERE lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
+		WHERE repo_id = $3
+		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
 		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`
-	rows, err := s.db.QueryContext(ctx, query, simpleName, limit)
+	if s.hasSimpleNameColumn(ctx) {
+		query = `
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols
+		WHERE repo_id = $3 AND simple_name = $1
+		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
+		ORDER BY length(fq_name), fq_name
+		LIMIT $2`
+	}
+	rows, err := s.db.Query(ctx, query, simpleName, limit, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -224,13 +454,20 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, simpleName stri
 	return scanSymbols(rows)
 }
 
+// normalizeSymbolKind mirrors InsertSymbol's write-time normalization so kind comparisons stay
+// symmetric: the store lowercases kind on the way in, and every exact comparison must lowercase
+// its argument or SCREAMING_CASE callers (API_ROUTE, E2E_SPEC, PAGE_ROUTE) silently match nothing.
+func normalizeSymbolKind(kind string) string {
+	return strings.ToLower(strings.TrimSpace(kind))
+}
+
 // ListSymbolsByLang returns symbols for the given language, optionally filtered by kind.
-func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsByLang(ctx context.Context, repoID, lang string, kind string) ([]*Symbol, error) {
 	if kind != "" {
 		query := `
-			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-			FROM symbols WHERE lang = $1 AND kind = $2 ORDER BY file, start_line`
-		rows, err := s.db.QueryContext(ctx, query, lang, kind)
+			SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+			FROM symbols WHERE repo_id = $3 AND lang = $1 AND kind = $2 ORDER BY file, start_line`
+		rows, err := s.db.Query(ctx, query, strings.ToLower(strings.TrimSpace(lang)), normalizeSymbolKind(kind), repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -238,9 +475,9 @@ func (s *Store) ListSymbolsByLang(ctx context.Context, lang string, kind string)
 		return scanSymbols(rows)
 	}
 	query := `
-		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json
-		FROM symbols WHERE lang = $1 ORDER BY file, start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang)
+		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
+		FROM symbols WHERE repo_id = $2 AND lang = $1 ORDER BY file, start_line`
+	rows, err := s.db.Query(ctx, query, lang, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +496,7 @@ func applySymbolColumns(sym *Symbol, startCol, endCol sql.NullInt32) {
 	}
 }
 
-func scanSymbols(rows *sql.Rows) ([]*Symbol, error) {
+func scanSymbols(rows pgx.Rows) ([]*Symbol, error) {
 	var list []*Symbol
 	for rows.Next() {
 		var sym Symbol
@@ -268,6 +505,7 @@ func scanSymbols(rows *sql.Rows) ([]*Symbol, error) {
 		if err := rows.Scan(
 			&sym.ID, &sym.Lang, &sym.Kind, &sym.FQName, &sym.File,
 			&sym.StartLine, &sym.EndLine, &startCol, &endCol, &sig,
+			&sym.InDegree, &sym.OutDegree, &sym.InDegreeNonTest,
 		); err != nil {
 			return nil, err
 		}
@@ -282,15 +520,18 @@ func scanSymbols(rows *sql.Rows) ([]*Symbol, error) {
 
 // ListSymbolsInNonTestFiles returns symbols of the given kind (e.g. "method") from files where is_test = false.
 // Used for test-gap analysis (find methods that may need tests).
-func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kind string) ([]*Symbol, error) {
+	// The join carries repo_id as well as file. Without it a symbol joins any repository's row for
+	// the same relative path, so `src/index.ts` being a test file in one repository hid the other
+	// repository's symbols from gap analysis entirely.
 	query := `
-		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
+		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json, s.in_degree, s.out_degree, s.in_degree_non_test
 		FROM symbols s
-		INNER JOIN files f ON s.file = f.file
-		WHERE f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
+		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
+		WHERE s.repo_id = $3 AND f.is_test = false AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		  AND LOWER(s.file) NOT LIKE '%.d.ts'
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, normalizeSymbolKind(kind), repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -299,14 +540,14 @@ func (s *Store) ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string
 }
 
 // ListSymbolsInTestFiles returns symbols of the given kind from files where is_test = true (e.g. E2E specs).
-func (s *Store) ListSymbolsInTestFiles(ctx context.Context, lang, kind string) ([]*Symbol, error) {
+func (s *Store) ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind string) ([]*Symbol, error) {
 	query := `
-		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json
+		SELECT s.id, s.lang, s.kind, s.fq_name, s.file, s.start_line, s.end_line, s.start_column, s.end_column, s.signature_json, s.in_degree, s.out_degree, s.in_degree_non_test
 		FROM symbols s
-		INNER JOIN files f ON s.file = f.file
-		WHERE f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
+		INNER JOIN files f ON s.file = f.file AND s.repo_id = f.repo_id
+		WHERE s.repo_id = $3 AND f.is_test = true AND LOWER(s.lang) = LOWER($1) AND s.kind = $2
 		ORDER BY s.file, s.start_line`
-	rows, err := s.db.QueryContext(ctx, query, lang, kind)
+	rows, err := s.db.Query(ctx, query, lang, normalizeSymbolKind(kind), repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -316,22 +557,27 @@ func (s *Store) ListSymbolsInTestFiles(ctx context.Context, lang, kind string) (
 
 // --- Edges ---
 
+// edgeInsertQuery writes an edge with its denormalized repo_id.
+//
+// ON CONFLICT DO UPDATE rather than DO NOTHING so a re-index repairs the repo_id of an edge written
+// before repository scoping, instead of silently keeping it unattributed forever.
+const edgeInsertQuery = `
+		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type, repo_id)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO UPDATE SET repo_id = EXCLUDED.repo_id`
+
 // InsertEdge inserts an edge. Idempotent if (caller, callee, type) already exists.
 func (s *Store) InsertEdge(ctx context.Context, e *Edge) error {
-	query := `
-		INSERT INTO edges (caller_symbol_id, callee_symbol_id, edge_type)
-		VALUES ($1, $2, $3)
-		ON CONFLICT (caller_symbol_id, callee_symbol_id, edge_type) DO NOTHING`
-	_, err := s.db.ExecContext(ctx, query, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType)
+	_, err := s.db.Exec(ctx, edgeInsertQuery, e.CallerSymbolID, e.CalleeSymbolID, e.EdgeType, e.RepoID)
 	return err
 }
 
 // GetEdgesFrom returns all edges whose caller is the given symbol ID.
-func (s *Store) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*Edge, error) {
+func (s *Store) GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*Edge, error) {
 	query := `
-		SELECT caller_symbol_id, callee_symbol_id, edge_type
-		FROM edges WHERE caller_symbol_id = $1`
-	rows, err := s.db.QueryContext(ctx, query, callerSymbolID)
+		SELECT caller_symbol_id, callee_symbol_id, edge_type, repo_id
+		FROM edges WHERE repo_id = $1 AND caller_symbol_id = $2`
+	rows, err := s.db.Query(ctx, query, repoID, callerSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -341,11 +587,11 @@ func (s *Store) GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*Edg
 
 // GetEdgesTo returns all edges whose callee is the given symbol ID (inbound: who references this symbol).
 // Uses idx_edges_callee. Use for “who targets this route/DTO?” style expansion.
-func (s *Store) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*Edge, error) {
+func (s *Store) GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*Edge, error) {
 	query := `
-		SELECT caller_symbol_id, callee_symbol_id, edge_type
-		FROM edges WHERE callee_symbol_id = $1`
-	rows, err := s.db.QueryContext(ctx, query, calleeSymbolID)
+		SELECT caller_symbol_id, callee_symbol_id, edge_type, repo_id
+		FROM edges WHERE repo_id = $1 AND callee_symbol_id = $2`
+	rows, err := s.db.Query(ctx, query, repoID, calleeSymbolID)
 	if err != nil {
 		return nil, err
 	}
@@ -353,11 +599,11 @@ func (s *Store) GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*Edge,
 	return scanEdges(rows)
 }
 
-func scanEdges(rows *sql.Rows) ([]*Edge, error) {
+func scanEdges(rows pgx.Rows) ([]*Edge, error) {
 	var list []*Edge
 	for rows.Next() {
 		var e Edge
-		if err := rows.Scan(&e.CallerSymbolID, &e.CalleeSymbolID, &e.EdgeType); err != nil {
+		if err := rows.Scan(&e.CallerSymbolID, &e.CalleeSymbolID, &e.EdgeType, &e.RepoID); err != nil {
 			return nil, err
 		}
 		list = append(list, &e)
@@ -369,11 +615,11 @@ func scanEdges(rows *sql.Rows) ([]*Edge, error) {
 // If lang is empty, all languages are included (caller and callee always share the same lang on an edge).
 // If lang is non-empty, only edges whose symbols are that language (typical: workflow dominant lang).
 // Used to build a file-level dependency graph for the overview document.
-func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, error) {
+func (s *Store) ListEdgeFiles(ctx context.Context, repoID, lang string) ([]*EdgeFile, error) {
 	lang = strings.TrimSpace(lang)
 	var (
 		query string
-		rows  *sql.Rows
+		rows  pgx.Rows
 		err   error
 	)
 	if lang == "" {
@@ -382,16 +628,16 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
-		WHERE s1.lang = s2.lang`
-		rows, err = s.db.QueryContext(ctx, query)
+		WHERE e.repo_id = $1 AND s1.repo_id = $1 AND s2.repo_id = $1 AND s1.lang = s2.lang`
+		rows, err = s.db.Query(ctx, query, repoID)
 	} else {
 		query = `
 		SELECT s1.file AS caller_file, s2.file AS callee_file, e.edge_type
 		FROM edges e
 		JOIN symbols s1 ON s1.id = e.caller_symbol_id
 		JOIN symbols s2 ON s2.id = e.callee_symbol_id
-		WHERE s1.lang = $1 AND s2.lang = $1`
-		rows, err = s.db.QueryContext(ctx, query, lang)
+		WHERE e.repo_id = $2 AND s1.repo_id = $2 AND s2.repo_id = $2 AND s1.lang = $1 AND s2.lang = $1`
+		rows, err = s.db.Query(ctx, query, lang, repoID)
 	}
 	if err != nil {
 		return nil, err
@@ -410,22 +656,28 @@ func (s *Store) ListEdgeFiles(ctx context.Context, lang string) ([]*EdgeFile, er
 
 // --- Files ---
 
-// UpsertFile inserts or updates a file row (by path).
+// UpsertFile inserts or updates a file row, keyed by (repo_id, file).
+//
+// The conflict target is the primary key as of the repo-scoping migration. On a database whose key
+// is still `file` alone this statement fails loudly with SQLSTATE 42P10 — which is the intended
+// failure mode: silently upserting under the old key is how one repository's SHA ended up
+// answering another repository's change detection. schema.sql moves the key itself (guarded DO
+// block), so any database that has been through InitSchema has the composite key.
 func (s *Store) UpsertFile(ctx context.Context, f *File) error {
 	query := `
-		INSERT INTO files (file, sha, lang, module, is_test)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (file) DO UPDATE SET sha = $2, lang = $3, module = $4, is_test = $5`
-	_, err := s.db.ExecContext(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest)
+		INSERT INTO files (file, sha, lang, module, is_test, repo_id)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (repo_id, file) DO UPDATE SET sha = $2, lang = $3, module = $4, is_test = $5`
+	_, err := s.db.Exec(ctx, query, f.File, f.SHA, f.Lang, f.Module, f.IsTest, f.RepoID)
 	return err
 }
 
-// GetFile returns the file row for the given path, or nil if not found.
-func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
-	query := `SELECT file, sha, lang, module, is_test FROM files WHERE file = $1`
+// GetFile returns the file row for the given path within repoID, or nil if not found.
+func (s *Store) GetFile(ctx context.Context, repoID, file string) (*File, error) {
+	query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $1 AND file = $2`
 	var f File
-	err := s.db.QueryRowContext(ctx, query, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, query, repoID, file).Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest, &f.RepoID)
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -435,10 +687,10 @@ func (s *Store) GetFile(ctx context.Context, file string) (*File, error) {
 }
 
 // ListFiles returns all files, optionally filtered by lang and is_test.
-func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*File, error) {
+func (s *Store) ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*File, error) {
 	if lang != "" && isTest != nil {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 AND is_test = $2 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, lang, *isTest)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $3 AND lang = $1 AND is_test = $2 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, lang, *isTest, repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -446,8 +698,8 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 		return scanFiles(rows)
 	}
 	if lang != "" {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE lang = $1 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, lang)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $2 AND lang = $1 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, lang, repoID)
 		if err != nil {
 			return nil, err
 		}
@@ -455,16 +707,16 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 		return scanFiles(rows)
 	}
 	if isTest != nil {
-		query := `SELECT file, sha, lang, module, is_test FROM files WHERE is_test = $1 ORDER BY file`
-		rows, err := s.db.QueryContext(ctx, query, *isTest)
+		query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $2 AND is_test = $1 ORDER BY file`
+		rows, err := s.db.Query(ctx, query, *isTest, repoID)
 		if err != nil {
 			return nil, err
 		}
 		defer rows.Close()
 		return scanFiles(rows)
 	}
-	query := `SELECT file, sha, lang, module, is_test FROM files ORDER BY file`
-	rows, err := s.db.QueryContext(ctx, query)
+	query := `SELECT file, sha, lang, module, is_test, repo_id FROM files WHERE repo_id = $1 ORDER BY file`
+	rows, err := s.db.Query(ctx, query, repoID)
 	if err != nil {
 		return nil, err
 	}
@@ -472,11 +724,11 @@ func (s *Store) ListFiles(ctx context.Context, lang string, isTest *bool) ([]*Fi
 	return scanFiles(rows)
 }
 
-func scanFiles(rows *sql.Rows) ([]*File, error) {
+func scanFiles(rows pgx.Rows) ([]*File, error) {
 	var list []*File
 	for rows.Next() {
 		var f File
-		if err := rows.Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest); err != nil {
+		if err := rows.Scan(&f.File, &f.SHA, &f.Lang, &f.Module, &f.IsTest, &f.RepoID); err != nil {
 			return nil, err
 		}
 		list = append(list, &f)
@@ -527,7 +779,7 @@ func (s *Store) InsertIndexRun(ctx context.Context, runID, repoID, commitSHA str
 			projectID = sql.NullString{String: id, Valid: true}
 		}
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		`INSERT INTO index_runs (run_id, repo_id, commit_sha, started_at, last_heartbeat_at, current_iteration, status, stable, trigger_source, repo_url, repo_local_path, config_revision_id, project_id) VALUES ($1, $2, $3, $4, $4, $5, 'running', NULL, $6, $7, $8, $9, $10)
 		 ON CONFLICT (run_id) DO UPDATE SET started_at = EXCLUDED.started_at, last_heartbeat_at = EXCLUDED.last_heartbeat_at, finished_at = 0, scheduled_rerun_at = NULL, status = 'running', first_wave_metrics = NULL, trigger_source = EXCLUDED.trigger_source, repo_url = EXCLUDED.repo_url, repo_local_path = EXCLUDED.repo_local_path, config_revision_id = EXCLUDED.config_revision_id, project_id = EXCLUDED.project_id`,
 		runID, repoID, commitSHA, startedAt, currentIteration, ts, repoURL, repoLocalPath, configRev, projectID)
@@ -537,22 +789,22 @@ func (s *Store) InsertIndexRun(ctx context.Context, runID, repoID, commitSHA str
 // SetIndexRunFirstWaveMetrics writes first-wave quality metrics for the run (JSONB). Nil m clears the column.
 func (s *Store) SetIndexRunFirstWaveMetrics(ctx context.Context, runID string, m *FirstWaveRunMetrics) error {
 	if m == nil {
-		_, err := s.db.ExecContext(ctx, `UPDATE index_runs SET first_wave_metrics = NULL WHERE run_id = $1`, runID)
+		_, err := s.db.Exec(ctx, `UPDATE index_runs SET first_wave_metrics = NULL WHERE run_id = $1`, runID)
 		return err
 	}
 	b, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE index_runs SET first_wave_metrics = $1 WHERE run_id = $2`, b, runID)
+	_, err = s.db.Exec(ctx, `UPDATE index_runs SET first_wave_metrics = $1 WHERE run_id = $2`, b, runID)
 	return err
 }
 
 // GetIndexRunFirstWaveMetrics returns stored metrics or (nil, nil) when the column is NULL or missing row.
 func (s *Store) GetIndexRunFirstWaveMetrics(ctx context.Context, runID string) (*FirstWaveRunMetrics, error) {
 	var ns sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT first_wave_metrics::text FROM index_runs WHERE run_id = $1`, runID).Scan(&ns)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, `SELECT first_wave_metrics::text FROM index_runs WHERE run_id = $1`, runID).Scan(&ns)
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -572,18 +824,18 @@ func (s *Store) GetIndexRunFirstWaveMetrics(ctx context.Context, runID string) (
 // Only rows with status = 'running' are updated so duplicate completion calls are idempotent no-ops.
 func (s *Store) SetRunCompleted(ctx context.Context, runID string, stable *bool, iterations *int) error {
 	if stable == nil && iterations == nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed' WHERE run_id = $1 AND status = 'running'", runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed' WHERE run_id = $1 AND status = 'running'", runID)
 		return err
 	}
 	if stable != nil && iterations != nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', stable = $1, iterations = $2 WHERE run_id = $3 AND status = 'running'", *stable, *iterations, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', stable = $1, iterations = $2 WHERE run_id = $3 AND status = 'running'", *stable, *iterations, runID)
 		return err
 	}
 	if stable != nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', stable = $1 WHERE run_id = $2 AND status = 'running'", *stable, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', stable = $1 WHERE run_id = $2 AND status = 'running'", *stable, runID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET status = 'completed', iterations = $1 WHERE run_id = $2 AND status = 'running'", *iterations, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET status = 'completed', iterations = $1 WHERE run_id = $2 AND status = 'running'", *iterations, runID)
 	return err
 }
 
@@ -591,8 +843,8 @@ func (s *Store) SetRunCompleted(ctx context.Context, runID string, stable *bool,
 func (s *Store) GetRunStatus(ctx context.Context, runID string) (status string, stable *bool, err error) {
 	var st string
 	var sval sql.NullBool
-	err = s.db.QueryRowContext(ctx, "SELECT status, stable FROM index_runs WHERE run_id = $1", runID).Scan(&st, &sval)
-	if err == sql.ErrNoRows {
+	err = s.db.QueryRow(ctx, "SELECT status, stable FROM index_runs WHERE run_id = $1", runID).Scan(&st, &sval)
+	if err == pgx.ErrNoRows {
 		return "", nil, nil
 	}
 	if err != nil {
@@ -607,8 +859,8 @@ func (s *Store) GetRunStatus(ctx context.Context, runID string) (status string, 
 // GetCurrentIteration returns the current_iteration for the run (max evaluation fix-iteration budget). Returns 0 if the run does not exist.
 func (s *Store) GetCurrentIteration(ctx context.Context, runID string) (int, error) {
 	var cur int
-	err := s.db.QueryRowContext(ctx, "SELECT current_iteration FROM index_runs WHERE run_id = $1", runID).Scan(&cur)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, "SELECT current_iteration FROM index_runs WHERE run_id = $1", runID).Scan(&cur)
+	if err == pgx.ErrNoRows {
 		return 0, nil
 	}
 	return cur, err
@@ -620,10 +872,10 @@ func (s *Store) UpdateCurrentIterationAndScheduledRerun(ctx context.Context, run
 		currentIteration = 3
 	}
 	if scheduledRerunAt == nil {
-		_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = NULL WHERE run_id = $2", currentIteration, runID)
+		_, err := s.db.Exec(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = NULL WHERE run_id = $2", currentIteration, runID)
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = $2 WHERE run_id = $3", currentIteration, *scheduledRerunAt, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET current_iteration = $1, scheduled_rerun_at = $2 WHERE run_id = $3", currentIteration, *scheduledRerunAt, runID)
 	return err
 }
 
@@ -635,7 +887,7 @@ type ScheduledRerun struct {
 
 // ListRunsDueForRerun returns runs where scheduled_rerun_at is set and <= nowMs (unix milliseconds). Used by the scheduler to trigger reruns.
 func (s *Store) ListRunsDueForRerun(ctx context.Context, nowMs int64) ([]ScheduledRerun, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT run_id, repo_id FROM index_runs WHERE scheduled_rerun_at IS NOT NULL AND scheduled_rerun_at <= $1", nowMs)
+	rows, err := s.db.Query(ctx, "SELECT run_id, repo_id FROM index_runs WHERE scheduled_rerun_at IS NOT NULL AND scheduled_rerun_at <= $1", nowMs)
 	if err != nil {
 		return nil, err
 	}
@@ -653,34 +905,31 @@ func (s *Store) ListRunsDueForRerun(ctx context.Context, nowMs int64) ([]Schedul
 
 // UpdateIndexRunFinished sets the finished_at timestamp for a run.
 func (s *Store) UpdateIndexRunFinished(ctx context.Context, runID string, finishedAt int64) error {
-	_, err := s.db.ExecContext(ctx, "UPDATE index_runs SET finished_at = $1 WHERE run_id = $2", finishedAt, runID)
+	_, err := s.db.Exec(ctx, "UPDATE index_runs SET finished_at = $1 WHERE run_id = $2", finishedAt, runID)
 	return err
 }
 
 // CountIndexRuns returns the number of index runs for the given repo_id (for first-run detection).
 func (s *Store) CountIndexRuns(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM index_runs WHERE repo_id = $1", repoID).Scan(&n)
+	err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM index_runs WHERE repo_id = $1", repoID).Scan(&n)
 	return n, err
 }
 
-// CountSymbols returns the total number of symbols currently stored across all repos. The
-// symbols table is intentionally repo-agnostic (see schema.sql) so the count is global. Used by
-// the indexer after a run finishes to populate IndexPhaseResult.SymbolsTotal so the
-// session_feedback "index_delta" payload reports e.g. "now 678 symbols" alongside the per-run
-// delta (A.7).
-func (s *Store) CountSymbols(ctx context.Context) (int64, error) {
+// CountSymbols returns the number of symbols stored for the repository. Used by the indexer after
+// a run finishes to populate IndexPhaseResult.SymbolsTotal so the session_feedback "index_delta"
+// payload reports e.g. "now 678 symbols" alongside the per-run delta (A.7).
+func (s *Store) CountSymbols(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM symbols`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE repo_id = $1`, repoID).Scan(&n)
 	return n, err
 }
 
-// CountEdges returns the total number of edges currently stored across all repos. As with
-// CountSymbols the edges table is repo-agnostic, so the count is global. Populates
+// CountEdges returns the number of edges stored for the repository. Populates
 // IndexPhaseResult.EdgesTotal (A.7).
-func (s *Store) CountEdges(ctx context.Context) (int64, error) {
+func (s *Store) CountEdges(ctx context.Context, repoID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM edges`).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM edges WHERE repo_id = $1`, repoID).Scan(&n)
 	return n, err
 }
 
@@ -696,7 +945,7 @@ func (s *Store) InsertAudit(ctx context.Context, runID, step, level string, payl
 			return err
 		}
 	}
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		"INSERT INTO audit_log (run_id, step, payload, level) VALUES ($1, $2, $3, $4)",
 		runID, step, raw, level)
 	return err
@@ -735,7 +984,7 @@ func (s *Store) ListAuditEntries(ctx context.Context, opts ListAuditOptions) ([]
 	query += fmt.Sprintf(" ORDER BY id ASC LIMIT $%d", argNum)
 	args = append(args, limit)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -775,7 +1024,7 @@ func (s *Store) ListAuditRunIDs(ctx context.Context, since, until *time.Time) ([
 	}
 	query += " GROUP BY run_id ORDER BY MAX(at) DESC"
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -790,4 +1039,65 @@ func (s *Store) ListAuditRunIDs(ctx context.Context, since, until *time.Time) ([
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// ListSymbolFilesByRepo answers "which files does THIS repository have symbols for" — the
+// repo-scoped way for a reindex to list what to delete, where ListFiles used to enumerate the
+// whole database.
+func (s *Store) ListSymbolFilesByRepo(ctx context.Context, repoID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT file FROM symbols WHERE repo_id = $1 ORDER BY file`,
+		strings.TrimSpace(repoID))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			return out, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// RecomputeSymbolDegrees refreshes symbols.in_degree / out_degree / in_degree_non_test from edges.
+//
+// It replaces a per-symbol GetEdgesTo during gap listing — on a 30k-symbol repository that was 30k
+// queries per run, all of them answerable by a column read. Run it once at the end of an index run,
+// after edges are written.
+//
+// in_degree_non_test excludes TESTS_SOURCE because the centrality signal it feeds does. A test that
+// covers a symbol creates an inbound edge, so counting it would inflate "central dependency,
+// under-tested" for exactly the symbols that already have tests — inverting the signal's meaning.
+//
+// The three counts are computed in one pass and applied in one UPDATE. Symbols with no edges are
+// reset to zero rather than skipped, or a symbol that lost its last caller would keep a stale
+// degree forever.
+// It is scoped to one repository: an index run rewrites only its own edges, and recomputing every
+// repository's degrees on each run would make a large neighbour's index run a source of write
+// amplification for everyone else in the database.
+func (s *Store) RecomputeSymbolDegrees(ctx context.Context, repoID string) error {
+	const q = `
+UPDATE symbols s
+   SET in_degree          = COALESCE(d.in_all, 0),
+       out_degree         = COALESCE(d.out_all, 0),
+       in_degree_non_test = COALESCE(d.in_non_test, 0)
+  FROM (
+        SELECT sy.id,
+               (SELECT count(*) FROM edges e WHERE e.callee_symbol_id = sy.id AND e.repo_id = $2)     AS in_all,
+               (SELECT count(*) FROM edges e WHERE e.caller_symbol_id = sy.id AND e.repo_id = $2)     AS out_all,
+               (SELECT count(*) FROM edges e WHERE e.callee_symbol_id = sy.id AND e.repo_id = $2
+                                              AND e.edge_type <> $1)                                  AS in_non_test
+          FROM symbols sy WHERE sy.repo_id = $2
+       ) d
+ WHERE s.id = d.id AND s.repo_id = $2
+   AND (s.in_degree, s.out_degree, s.in_degree_non_test)
+       IS DISTINCT FROM (COALESCE(d.in_all, 0)::int, COALESCE(d.out_all, 0)::int, COALESCE(d.in_non_test, 0)::int)`
+	if _, err := s.db.Exec(ctx, q, EdgeTypeTestsSource, repoID); err != nil {
+		return fmt.Errorf("recompute symbol degrees: %w", err)
+	}
+	return nil
 }

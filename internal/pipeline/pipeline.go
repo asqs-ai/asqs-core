@@ -16,16 +16,23 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator"
 	"github.com/asqs/asqs-core/internal/generator/contract"
+	"github.com/asqs/asqs-core/internal/generator/extendmerge"
+	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/llm"
+	"github.com/asqs/asqs-core/internal/llm/tokens"
 	"github.com/asqs/asqs-core/internal/overview"
 	"github.com/asqs/asqs-core/internal/runner"
+	"github.com/asqs/asqs-core/internal/storage/embeddings"
 	"github.com/asqs/asqs-core/internal/testbootstrap"
+	"github.com/asqs/asqs-core/internal/workspace"
 	csharpindexer "github.com/asqs/asqs-core/tools/csharp-indexer"
 	javaindexer "github.com/asqs/asqs-core/tools/java-indexer"
 	jstindexer "github.com/asqs/asqs-core/tools/js-ts-indexer"
@@ -41,6 +48,13 @@ type Options struct {
 	MaxGapsE2E   int    // e2e gaps cap (0 = skip e2e)
 	GenerateDocs bool   // also generate per-symbol docs (inserted above declarations)
 	Sandbox      string // "local" | "docker" (informational; sandbox built from cfg.Runner.Type)
+
+	// AuditLogPath, when non-empty, appends every audit step WITH its structured payload as JSONL
+	// to this file (see internal/audit). Empty = stderr step lines only, exactly as before.
+	AuditLogPath string
+	// AuditDumpPrompts restores full prompt/completion text in audit payloads (default: such
+	// fields are stored as {sha256, len} — see audit.RedactPayload).
+	AuditDumpPrompts bool
 }
 
 // GapOutcome is the per-gap result recorded in the summary.
@@ -74,21 +88,11 @@ func (s Summary) Stable() bool {
 	return s.ProjectStable && s.GapsGenerated > s.Discarded
 }
 
-// stdoutAuditor satisfies the (identical) Auditor interface declared by indexer / retrieval /
-// evaluator. It prints a compact line per step to stderr.
-type stdoutAuditor struct{}
-
-func (stdoutAuditor) Log(_ context.Context, step string, _ interface{}) {
-	fmt.Fprintf(os.Stderr, "  · %s\n", step)
-}
-func (stdoutAuditor) LogError(_ context.Context, step string, payload interface{}) {
-	fmt.Fprintf(os.Stderr, "  ✗ %s: %v\n", step, payload)
-}
-
 // Run executes the pipeline against opts.RepoPath (already a local working tree).
 func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error) {
 	var sum Summary
-	audit := stdoutAuditor{}
+	audit, closeAudit := buildRunAuditor(opts.AuditLogPath, opts.AuditDumpPrompts)
+	defer closeAudit()
 	repoAbs, err := filepath.Abs(opts.RepoPath)
 	if err != nil {
 		return sum, fmt.Errorf("resolve repo path: %w", err)
@@ -117,14 +121,24 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 
 	// --- LLM clients --------------------------------------------------------------------
-	chat, err := llm.NewChatCompleter(cfg)
+	// All step completers share ONE concurrency limiter (llm.max_concurrent, default
+	// model.DefaultLLMMaxConcurrent) so the overview goroutine plus per-symbol generation can
+	// never exceed the provider's safe in-flight cap. The per-gap loop itself stays sequential —
+	// the global limiter is the concurrency control (upstream deleted runner.gap_concurrency).
+	_, docChat, genChat, fixerChat, _, err := llm.BuildStepCompleters(cfg)
 	if err != nil {
 		return sum, fmt.Errorf("llm chat client: %w", err)
 	}
-	embedder, err := llm.NewEmbedder(cfg)
+	// The embedder is wrapped in the content-addressed memo: a second run over unchanged content
+	// issues zero embed calls. Every cache failure degrades to "embed it again".
+	embedder, err := llm.NewCachedEmbedder(cfg, emb, emb.Dimension())
 	if err != nil {
 		return sum, fmt.Errorf("llm embedder: %w", err)
 	}
+	// Prune the embedding memo on startup. ~6 KB per cached vector means 1M chunks is ~6 GB, so
+	// an unpruned cache is a slow-motion disk problem. Best-effort: a prune failure must never
+	// prevent a run.
+	pruneEmbeddingCache(emb, cfg.LLM.EmbeddingCacheRetentionDays)
 	if w := llm.DimensionMismatchWarning(cfg, cfg.Database.EmbeddingsDimension); w != "" {
 		fmt.Fprintf(os.Stderr, "pipeline: %s\n", w)
 	}
@@ -192,6 +206,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		return sum, fmt.Errorf("language indexer: %w", err)
 	}
 	runID := fmt.Sprintf("core_%d", time.Now().UnixNano())
+	// Join this run to the exact configuration that produced it (the A/B report groups on it).
+	// Best-effort: a run without a recorded revision still runs, it is just invisible to ab-report.
+	configRevisionID, crErr := ensureConfigRevisionForRun(ctx, meta, cfg.SourcePath)
+	if crErr != nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: record config revision: %v (run will not appear in ab-report)\n", crErr)
+	}
 	if _, err := indexer.Run(ctx, meta, emb, indexer.RunOptions{
 		CurrentFiles:      files,
 		RepoPath:          repoAbs,
@@ -204,17 +224,53 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		EmbeddingModel:    embedModel(cfg),
 		Audit:             audit,
 		IndexablePaths:    indexable,
+		ConfigRevisionID:  configRevisionID,
+		// Off by default: with it disabled the chunk counts are identical to before this existed.
+		// Reads only artifacts already on disk — no network, no subprocess.
+		DependencyDocs: indexer.DependencyDocOptions{
+			Enabled: cfg.Indexer.DependencyDocs.Enabled,
+			// FROZEN (CP37): the two chunk caps are left at zero so the indexer's own
+			// constants apply — 80 per dependency, 400 in total. They were pass-throughs for
+			// config keys no template ever set.
+			MavenRepoDir:     cfg.Indexer.DependencyDocs.MavenRepoDir,
+			NuGetPackagesDir: cfg.Indexer.DependencyDocs.NuGetPackagesDir,
+		},
 	}); err != nil {
 		return sum, fmt.Errorf("index: %w", err)
 	}
 
 	// --- Plan ---------------------------------------------------------------------------
-	planOpts := retrieval.PlanOptions{
-		Lang:       lang,
-		RepoID:     opts.RepoID,
-		MaxGaps:    orDefault(opts.MaxGaps, 10),
-		MaxGapsE2E: opts.MaxGapsE2E,
-		Audit:      audit,
+	// Between index and plan: the tree the run will work on is known, and nothing this run writes
+	// exists yet, so a duplicate found here is genuinely pre-existing.
+	reconcileDuplicateArtifacts(ctx, cfg, audit, repoAbs, lang, files)
+
+	planOpts := buildPlanOptions(cfg, lang, opts.RepoID)
+	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
+	planOpts.MaxGapsE2E = opts.MaxGapsE2E
+	planOpts.Audit = audit
+	// retrieval.failure_hint_file was reaching PlanOptions.FailureHintFile and stopping there —
+	// nothing ever opened the file, so FailureHint stayed empty and failure-localized retrieval was
+	// unreachable from configuration. Reading it here is what makes the key mean anything (CP36).
+	if rel := failureHintReadRelPath(cfg); rel != "" && strings.TrimSpace(planOpts.FailureHint) == "" {
+		if hint := loadFailureHintFromRepoFile(repoAbs, rel); hint != "" {
+			planOpts.FailureHint = hint
+			audit.Log(ctx, "plan.failure_hint_loaded", map[string]interface{}{
+				"message": fmt.Sprintf("Retrieval is localized by %s (%d bytes): planning weights chunks the last failure implicates.", rel, len(hint)),
+				"path":    rel,
+				"bytes":   len(hint),
+			})
+		}
+	}
+	// Detect the repository's unit-test naming convention once, from the indexed file list, and
+	// carry it to every item. The generator's built-in default is FooTest.java; plenty of
+	// repositories use FooTests.java, and on those every run wrote a sibling beside the file it
+	// should have extended — after which the redirect picks on sort order ("Test.java" precedes
+	// "Tests.java"), so the tool's own leftover shadows the real suite permanently. ASQS-authored
+	// files are excluded from the vote, or the tool would eventually vote its own mistake into the
+	// house style.
+	if conv := generator.DetectTestSuffixConvention(files, lang, genmanifest.LoadSet(repoAbs)); conv.Detected() {
+		planOpts.TestSuffixConvention = conv.Suffix
+		fmt.Fprintf(os.Stderr, "asqs-core: %s\n", conv.Describe())
 	}
 	plan, err := retrieval.CreateTestPlan(ctx, meta, meta, emb, planOpts)
 	if err != nil {
@@ -227,6 +283,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	if plan == nil || len(plan.Items) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test gaps found — nothing to generate.")
+		// Evaluation never ran: completed with stable/iterations untouched and metrics NULL — an
+		// absent metrics row means "not measured", which must stay distinguishable from zeroes.
+		completeRun(ctx, meta, runID, nil, nil, nil)
 		return sum, nil
 	}
 	sum.GapsPlanned = len(plan.Items)
@@ -238,11 +297,14 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	piCfg := cfg.EffectiveProjectIntel()
 	if piCfg.EffectiveEnabled() {
 		piIn := projectintel.Input{
-			RepoAbs:           repoAbs,
+			RepoAbs: repoAbs,
+			// RepoID scopes doc→symbol resolution; the metadata store satisfies SymbolResolver.
+			RepoID:            opts.RepoID,
+			SymbolResolver:    meta,
 			Lang:              lang,
 			CurrentFiles:      files,
 			ConfigFingerprint: piCfg.ConfigFingerprintHash(),
-			LLM:               chat,
+			LLM:               genChat,
 			Opts: projectintel.Options{
 				Enabled:             true,
 				MaxTotalRunes:       piCfg.EffectiveMaxTotalRunes(),
@@ -255,8 +317,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 				ExtraSkillGlobs:     piCfg.ExtraSkillGlobs,
 				CacheEnabled:        piCfg.EffectiveCacheEnabled(),
 				CachePath:           piCfg.EffectiveCachePath(),
-				ForceRefresh:        piCfg.ForceRefresh,
-				FingerprintMode:     piCfg.EffectiveFingerprintMode(),
+				// FROZEN (CP37, runner.policy.project_intel.force_refresh): a debug one-off that
+				// bypassed the cache for a single run. Deleting the cache file does the same thing
+				// without a permanent key inviting someone to leave it on.
+				ForceRefresh:    false,
+				FingerprintMode: piCfg.EffectiveFingerprintMode(),
 			},
 		}
 		if piCfg.UseEmbeddingsRank {
@@ -273,39 +338,135 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
-	rules := contract.ByLang(lang)
-	gen := &generator.LLMGenerator{
-		LLM:                    chat,
-		ContractRules:          &rules,
-		TwoPhaseTestGeneration: cfg.Runner.TwoPhaseTestGeneration,
-		RepoPath:               repoAbs,
+	applyRetrievalContextCompactToFormat(&cfg.Retrieval, &formatOpts)
+	formatOpts = resolvePromptBudget(cfg, formatOpts)
+	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
+	// same shrunken context and the cost is paid once per item.
+	compactPlanContexts(ctx, formatOpts, audit, plan)
+	// Real member signatures for the third-party types a diagnostic blames, read from the project's
+	// own build inputs. Nil for a language with no provider, which is the documented no-op: the
+	// prompt renders no block, exactly as before this existed. Honest degradation is the contract —
+	// never a wrong or empty surface.
+	// The one outbound path in this tool, resolved once and audited on every branch. The deny
+	// tokens are derived from the repository's own identity so its private names cannot leave the
+	// process inside a query.
+	webClient := buildWebClient(ctx, cfg, audit, repoAbs, queryDenyTokens(opts.RepoID, repoAbs))
+
+	apiSurface := apisurface.NewProviderForLang(lang)
+	if apiSurface == nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: no API-surface provider for %s; the fixer gets no member-signature block\n", lang)
 	}
-	fixer := &llmfix.Fixer{LLM: chat}
+
+	// The bootstrap contract's two halves have different authors: bootstrap states what it
+	// installed, running its toolchain in an ephemeral container, while the API-surface provider
+	// resolves this project's real compile classpath on the host. Only the second can tell Spring
+	// Boot 3 from Spring Boot 4, so it is filled in here — once per run, before the per-gap
+	// generation fan-out reads the contract, and BEFORE the audit so the audited payload is the one
+	// generation will actually see. Both calls are no-ops without a contract, which is the default.
+	generator.ResolveTestStackCanonicalImports(ctx, audit, apiSurface, repoAbs, lang)
+	generator.AuditTestStackContract(ctx, audit, repoAbs)
+
+	rules := contract.ByLang(lang)
+	// Token usage for the first-wave metrics: generation + fixes only, matching upstream's
+	// RunLLMUsage scope (the doc pass and overview deliberately stay untracked).
+	runUsage := &model.UsageAccumulator{}
+	trackedGen := model.NewUsageTrackingChatCompleter(genChat, runUsage)
+	trackedFixer := model.NewUsageTrackingChatCompleter(fixerChat, runUsage)
+	gen := &generator.LLMGenerator{
+		LLM:           trackedGen,
+		ContractRules: &rules,
+		// runner.disable_structured_generate_output was declared, documented and never passed to
+		// the generator, so setting it did nothing. (The inert-field lint matches by field name and
+		// LLMGenerator has an identically named field, which is why it read as wired.) It has to be
+		// right here in particular: the tool loop's structured-deferral audit below reports on the
+		// schema this flag decides, and reporting a deferral for a schema that was never sent is
+		// exactly the false claim that misdirected an upstream post-mortem.
+		DisableStructuredGenerateOutput: cfg.Runner.DisableStructuredGenerateOutput,
+		TwoPhaseTestGeneration:          cfg.Runner.TwoPhaseTestGeneration,
+		RepoPath:                        repoAbs,
+		Audit:                           audit,
+		// Generate-side member signatures, so an invented API is contradicted before the model
+		// writes it rather than by a containerised compile a round later.
+		APISurface: apiSurface,
+	}
+	// Give the model read-only access to the index during generation.
+	//
+	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
+	// upstream against a labelled suite it delivers about half the relevant chunks, and the model
+	// has no way to ask for the rest. The registry is what turns a retrieval miss into a lookup.
+	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
+		loop, reason := toolLoopFromConfig(cfg, trackedGen)
+		gen.Tools = reg
+		gen.ToolLoop = loop
+		auditToolMode(ctx, audit, loop.Mode,
+			appendStructuredDeferralNote(reason, trackedGen, !cfg.Runner.DisableStructuredGenerateOutput))
+	}
+	// With tools in play the prompt carries a high-precision core plus an INVENTORY of what can be
+	// fetched, rather than every dependency body inline.
+	//
+	// The gate is the RESOLVED loop mode, not the config flag: a run that asked for tools but fell
+	// back to one-shot — an incapable provider, no registry — must still get the inlined bodies,
+	// because nothing can fetch what an inventory merely names. Getting this backwards produces a
+	// context that promises lookups nobody can perform.
+	formatOpts.ToolsAvailable = generatorHasTools(gen)
+	// Resolved once, and recorded on every path — including the one that changes nothing, which
+	// used to be silent and left a post-mortem unable to tell configuration from downgrade.
+	fixerStructuredOff, fixerGrammarRisk := resolveFixerStructuredOutput(ctx, cfg, audit)
+	fixer := &llmfix.Fixer{
+		LLM:   trackedFixer,
+		Audit: audit,
+		// Two more documented keys the pipeline never passed on, so setting them did nothing —
+		// the same field-name collision that hid runner.disable_structured_generate_output from
+		// the inert-field lint (Fixer declares identically named fields). Neither changes default
+		// behaviour; they just make the keys work. disable_structured_fix_output in particular has
+		// to be right here, because the tool-mode audit below reports on the schema it decides.
+		// runner.disable_multi_turn_fixer is deliberately NOT wired: its default would flip
+		// MultiTurnRepair on, which is a behaviour change owned by the fixer-hardening wave.
+		DisableStructuredFixOutput:  fixerStructuredOff,
+		StructuredOutputGrammarRisk: fixerGrammarRisk,
+		StructuredUserMessage:       cfg.Runner.FixerStructuredUserMessage,
+	}
+	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
+	// toggled independently so a fix-quality comparison can move one without the other.
+	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
+		loop, reason := fixerToolLoopFromConfig(cfg, trackedFixer)
+		fixer.Tools = reg
+		fixer.ToolLoop = loop
+		auditFixerToolMode(ctx, audit, loop.Mode,
+			appendStructuredDeferralNote(reason, trackedFixer, !cfg.Runner.DisableStructuredFixOutput))
+	}
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
-	// Formatting (matches asqs-go): format generated tests post-generate and after each LLM fix so
-	// they satisfy the repo's style gates (e.g. `dotnet format --verify-no-changes`, .editorconfig
-	// treated as errors, analyzers). C# defaults to `dotnet format` when runner.format_command is empty.
-	formatCmd := runner.EffectivePostGenerateFormatCommand(lang, cfg.Runner.FormatCommand)
+	// Formatting: format generated tests post-generate and after each LLM fix so they satisfy the
+	// repo's style gates (e.g. `dotnet format --verify-no-changes`, .editorconfig treated as
+	// errors, analyzers).
 	formatTimeout := 2 * time.Minute
 	if d, derr := time.ParseDuration(cfg.Runner.Timeout); derr == nil && d > 0 {
 		formatTimeout = d
 	}
-	var formatAfterFixHook func(context.Context, string, []string) error
-	if formatCmd != "" {
-		formatAfterFixHook = func(ctx context.Context, repoPath string, updatedPaths []string) error {
-			err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoPath, lang, formatCmd, cfg.Runner.FormatOnlyAdded, updatedPaths, formatTimeout)
-			if err != nil && errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
-				return fmt.Errorf("%w: %v", evaluator.ErrFormatAfterFixSkipped, err)
-			}
-			return err
+	formatTarget := runner.TargetLocal
+	if strings.EqualFold(strings.TrimSpace(cfg.Runner.Type), string(runner.TargetDocker)) {
+		formatTarget = runner.TargetDocker
+	}
+	// Resolved per call, through the same resolver for every language and both targets (CP35).
+	// The old EffectivePostGenerateFormatCommand only defaulted for C#, so a Java repo with
+	// runner.format_command empty never wired this hook at all — the fixer's rewrite was never
+	// reformatted, the next compile failed on the formatter's own validate goal, and the fix loop
+	// spent its budget asking the LLM to hand-format Java. An unresolvable formatter is a no-op
+	// inside FormatAfterFixForSandbox, so there is no non-empty guard any more.
+	formatAfterFixHook := func(ctx context.Context, repoPath string, updatedPaths []string) error {
+		resolved := runner.ResolveFormatCommand(repoPath, lang, cfg.Runner.FormatCommand, cfg.Runner.BuildTool, cfg.Runner.FormatOnlyAdded, formatTarget)
+		err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoPath, lang, resolved, updatedPaths, formatTimeout)
+		if err != nil && errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
+			return fmt.Errorf("%w: %v", evaluator.ErrFormatAfterFixSkipped, err)
 		}
+		return err
 	}
 	var docGen *generator.LLMDocGenerator
 	var docFmt retrieval.FormatOptions
 	if opts.GenerateDocs {
-		docGen = &generator.LLMDocGenerator{LLM: chat}
+		docGen = &generator.LLMDocGenerator{LLM: docChat}
 		docFmt = retrieval.DefaultFormatOptions()
 		docFmt.DocGeneration = true
 	}
@@ -317,18 +478,54 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var overviewWG sync.WaitGroup
 	var overviewContent, overviewPath string
 	var overviewErr error
-	if opts.GenerateDocs {
+	if opts.GenerateDocs && !cfg.Indexer.DisableOverviewDocGeneration {
 		og := &overview.LLMOverviewDocGenerator{
-			LLM:                     chat,
-			Path:                    strings.TrimSpace(cfg.Indexer.OverviewDocPath),
-			MaxCompletionTokensFull: cfg.Indexer.OverviewMaxCompletionTokens,
+			LLM:  genChat,
+			Path: strings.TrimSpace(cfg.Indexer.OverviewDocPath),
+			// FROZEN (CP37, indexer.overview_max_completion_tokens): zero keeps the
+			// overview generator's own 8192 default for a full narrative.
+			MaxCompletionTokensFull: 0,
+			FullRewrite:             cfg.Indexer.OverviewFullRewrite,
 		}
 		overviewWG.Add(1)
 		go func() {
 			defer overviewWG.Done()
 			fmt.Fprintln(os.Stderr, "asqs-core: generating overview documentation (in parallel)…")
-			overviewContent, overviewPath, overviewErr = og.Generate(ctx, meta, lang, repoAbs, cfg.Indexer.OverviewMaxFilesPerSlice, cfg.Indexer.OverviewMaxIndexRunesPerSlice)
+			overviewContent, overviewPath, overviewErr = og.Generate(ctx, meta, opts.RepoID, lang, repoAbs, cfg.Indexer.OverviewMaxFilesPerSlice, cfg.Indexer.OverviewMaxIndexRunesPerSlice)
 		}()
+	}
+
+	// Baseline: was the tree already red BEFORE this run generated anything?
+	//
+	// Without this, a repository that could not compile at minute zero spends the entire fix budget
+	// on failures the run did not cause, and the audit attributes every one of them to the run.
+	// Ordering is the whole point: after the plan is built and before a single artifact is written,
+	// so nothing this run produces can be counted as inherited.
+	baseline := evaluator.CaptureBaselineFailures(ctx, sandbox, evaluator.EvalOptions{
+		RepoPath:       repoAbs,
+		Lang:           lang,
+		BuildTool:      cfg.Runner.BuildTool,
+		CompileCommand: cfg.Runner.CompileCommand,
+	})
+	switch {
+	case !baseline.Captured:
+		// Deliberately silent: an uncaptured baseline must never read as "the tree was clean".
+	case baseline.Clean:
+		audit.Log(ctx, "evaluator.baseline_compile", map[string]interface{}{
+			"message": "Baseline compiled before generation: every failure from here on was introduced by this run.",
+			"clean":   true,
+		})
+	default:
+		fmt.Fprintf(os.Stderr, "asqs-core: baseline did not compile before generation: %d file(s) were already failing\n", len(baseline.Paths))
+		audit.Log(ctx, "evaluator.baseline_compile", map[string]interface{}{
+			"message": fmt.Sprintf(
+				"Baseline did NOT compile before generation: %d file(s) were already failing. Repairing them is in scope; they are not regressions introduced by this run.",
+				len(baseline.Paths)),
+			"clean":             false,
+			"failing_paths":     baseline.Paths,
+			"failure_signature": baseline.Signature,
+			"summary":           baseline.Summary,
+		})
 	}
 
 	// Phase 1 — generate + write every gap's test (no per-gap evaluation). Collect the unique
@@ -340,12 +537,31 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	docInsertsByFile := map[string][]docInsert{} // collected per-symbol docs, applied per file after the loop
 	for _, item := range plan.Items {
 		out := GapOutcome{Symbol: planItemSymbol(item)}
-		ctxStr := retrieval.BuildLLMContextForGap(item, formatOpts)
+		// One budget per item. formatOpts is copied here, so items never share a budget.
+		itemFmt := formatOpts
+		budget := tokens.NewBudget(itemFmt.MaxContextTokens, itemFmt.CounterOrDefault())
+		itemFmt.LastBudget = budget
+		ctxStr := retrieval.BuildLLMContextForGap(item, itemFmt)
 		if piResult != nil {
-			if piMarkdown := strings.TrimSpace(piResult.Snapshot.Markdown); piMarkdown != "" {
+			if piMarkdown := strings.TrimSpace(projectIntelForGap(piResult, piCfg, item)); piMarkdown != "" {
 				ctxStr = piMarkdown + "\n\n" + ctxStr
 			}
 		}
+		// Extend-or-create, decided BEFORE generation because it changes what the model is asked
+		// for: a whole file, or only the new methods to splice into the one already on disk.
+		//
+		// Without this the run writes a sibling beside the file it should have extended, and once
+		// both exist the redirect picks on sort order — the tool's own leftover then shadows the
+		// repository's real suite permanently.
+		extendPath, existingBody, doExtend := resolveExtendTarget(item, gen, repoAbs, cfg.Runner.PreferDefaultTestSuffix)
+		if doExtend {
+			prefix := generator.ExtendExistingTestContextPrefix
+			if item.Context != nil && len(item.Context.ExistingTestPaths) > 0 {
+				prefix = fmt.Sprintf(generator.ExtendExistingRedirectPrefix, filepath.ToSlash(extendPath)) + prefix
+			}
+			ctxStr = prefix + existingBody + generator.ExtendExistingTestContextSuffix + ctxStr
+		}
+		auditPromptBudget(ctx, audit, out.Symbol, ctxStr, budget)
 		content, relPath, gerr := gen.Generate(ctx, item, ctxStr)
 		switch {
 		case gerr != nil:
@@ -353,9 +569,39 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		case strings.TrimSpace(content) == "" || strings.TrimSpace(relPath) == "":
 			out.Err = "empty generation"
 		default:
-			if werr := writeArtifact(repoAbs, relPath, content); werr != nil {
-				out.Err = "write: " + werr.Error()
-			} else {
+			// Under extend semantics the target is authoritative: it is the path whose bytes were
+			// read above, while the generator derives its own path from the suggester and would
+			// silently write a near-duplicate sibling.
+			writePath := relPath
+			if doExtend {
+				writePath = extendPath
+			}
+			wrote, written, skips := extendmerge.Write(repoAbs, []extendmerge.Item{{
+				Path:             writePath,
+				Content:          content,
+				ExtendExisting:   doExtend,
+				SourceSymbolFile: planItemSourceFile(item),
+			}})
+			for _, sk := range skips {
+				audit.Log(ctx, "generate.write_skipped", map[string]interface{}{
+					"message": "Generated artifact was not written: " + sk,
+					"symbol":  out.Symbol,
+				})
+			}
+			switch {
+			case wrote == 0:
+				out.Err = "write skipped"
+				if len(skips) > 0 {
+					out.Err = "write skipped: " + skips[0]
+				}
+			default:
+				relPath = written[0]
+				// Record provenance so the convention vote and the duplicate reconciler can tell
+				// this run's files from the repository's own. Best-effort: an unrecorded write
+				// degrades to "human-authored", which is the safe reading.
+				if _, rerr := genmanifest.Record(repoAbs, runID, written); rerr != nil {
+					fmt.Fprintf(os.Stderr, "asqs-core: record generated artifact provenance: %v\n", rerr)
+				}
 				out.Path = relPath
 				out.Generated = true
 				sum.GapsGenerated++
@@ -429,15 +675,16 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	if len(artifactPaths) == 0 {
 		fmt.Fprintln(os.Stderr, "asqs-core: no test files were generated — skipping evaluation.")
+		completeRun(ctx, meta, runID, nil, nil, nil)
 		return sum, nil
 	}
 
 	// Post-generate format: format the freshly written test files before evaluation so a style gate
 	// (dotnet format --verify-no-changes, .editorconfig-as-errors, analyzers) doesn't fail on layout.
 	// Best-effort: a formatter problem is logged but never aborts the run.
-	if formatCmd != "" {
-		fmt.Fprintf(os.Stderr, "asqs-core: formatting %d generated file(s) (%s)…\n", len(artifactPaths), formatCmd)
-		if err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoAbs, lang, formatCmd, cfg.Runner.FormatOnlyAdded, artifactPaths, formatTimeout); err != nil && !errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
+	if resolved := runner.ResolveFormatCommand(repoAbs, lang, cfg.Runner.FormatCommand, cfg.Runner.BuildTool, cfg.Runner.FormatOnlyAdded, formatTarget); resolved.Command != "" {
+		fmt.Fprintf(os.Stderr, "asqs-core: formatting %d generated file(s) (%s)…\n", len(artifactPaths), resolved.Command)
+		if err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoAbs, lang, resolved, artifactPaths, formatTimeout); err != nil && !errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
 			fmt.Fprintf(os.Stderr, "asqs-core: post-generate format: %v (continuing)\n", err)
 		}
 	}
@@ -446,14 +693,33 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// with a single fix loop across all generated files.
 	fmt.Fprintf(os.Stderr, "asqs-core: evaluating %d generated test file(s) (whole-project compile + test)…\n", len(artifactPaths))
 	evalRes, eerr := evaluator.RunEvaluation(ctx, sandbox, evaluator.EvalOptions{
-		RepoPath:           repoAbs,
-		Lang:               lang,
-		MaxFixIterations:   maxFix,
-		ArtifactPaths:      artifactPaths,
-		Fixer:              fixer,
-		RunE2ETestPass:     anyE2E,
-		CompileOncePerEval: true,
-		FormatAfterFix:     formatAfterFixHook,
+		RepoPath:         repoAbs,
+		Lang:             lang,
+		MaxFixIterations: maxFix,
+		ArtifactPaths:    artifactPaths,
+		Fixer:            fixer,
+		// The fixer may now repair inherited breakage on evidence rather than on a regex guess
+		// over each round's diagnostic.
+		BaselineFailingPaths: append([]string(nil), baseline.Paths...),
+		APISurfaceProvider:   apiSurface,
+		// Keep the evaluator's view of the flag in step with the Fixer's, or the audit payload
+		// (structured_user_message_config / _forced) contradicts what the fixer actually did.
+		FixerStructuredUserMessage: cfg.Runner.FixerStructuredUserMessage,
+		RunE2ETestPass:             anyE2E,
+		CompileOncePerEval:         true,
+		FormatAfterFix:             formatAfterFixHook,
+		// Fix-loop bounds. The breaker thresholds were hardcoded, leaving an operator watching a
+		// loop give up after three rounds with no lever at all.
+		FixLoopRepeatStopThreshold:     cfg.Runner.FixLoopRepeatStopThreshold,
+		FixLoopRecurrenceStopThreshold: cfg.Runner.FixLoopRecurrenceStopThreshold,
+		FixLoopNoProgressStopThreshold: cfg.Runner.FixLoopNoProgressStopThreshold,
+		FixContextRunesMax:             cfg.Runner.FixContextRunesMax,
+		BackoffBetweenFixAttempts:      fixBackoffDuration(cfg.Runner.FixBackoff),
+		// runner.disable_error_log_llm_summary was declared and documented but never passed on, so
+		// the summariser below could not be turned off — another key the inert-field lint could not
+		// see, because EvalOptions declares an identically named field.
+		DisableErrorLogLLMSummary: cfg.Runner.DisableErrorLogLLMSummary,
+		ErrorLogSummarizer:        errorLogSummarizer(cfg, fixerChat),
 	}, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)
@@ -480,6 +746,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// The project is green when the eval passed outright, or stayed stable after discarding.
 	sum.ProjectStable = evalRes.Stable || evalRes.EarlyExitStableAfterDiscard
+
+	// Close the loop the read half above opens: this run's failing output becomes the next run's
+	// planning hint, so a repository that keeps failing the same way gets retrieval steered at the
+	// failure instead of starting cold. A green run REMOVES the file — a hint describing a failure
+	// that no longer exists is worse than none, since it localizes on code already fixed. Placed
+	// after the discard pass so a run that went green by discarding writes no hint (CP36).
+	persistLastEvalFailureHint(repoAbs, cfg, sum.ProjectStable, evalRes.StepResults)
 	if sum.ProjectStable {
 		sum.GapsStable = sum.GapsGenerated - sum.Discarded
 		for i := range sum.Outcomes {
@@ -488,6 +761,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			}
 		}
 	}
+
+	// Terminal DB state: status + stable/iterations, plus the first-wave metrics that make this
+	// run comparable in `asqs-core ab-report`. On an evaluation error the metrics stay NULL.
+	stable := sum.ProjectStable
+	iters := evalRes.Iterations
+	completeRun(ctx, meta, runID, &stable, &iters, evalFirstWaveMetricsForDB(&evalRes, eerr, runUsage))
 	return sum, nil
 }
 
@@ -701,7 +980,7 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 	switch lang {
 	case "javascript", "typescript":
 		if strings.TrimSpace(cfg.Indexer.JSTIndexerPath) == "" {
-			return nil, nil, fmt.Errorf("indexer.jst_indexer_path is not set (build tools/js-ts-indexer and point config at dist/index.js)")
+			return nil, nil, fmt.Errorf("indexer.jsts.indexer_path is not set (build tools/js-ts-indexer and point config at dist/index.js)")
 		}
 		parsed, _, err := jstindexer.RunIndexer(ctx, repoAbs, cfg.Indexer.JSTIndexerPath, jstindexerRunConfig(cfg, 0))
 		if err != nil {
@@ -712,7 +991,7 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 	case "csharp":
 		dll := strings.TrimSpace(cfg.Indexer.CSharpIndexerDllPath)
 		if dll == "" {
-			return nil, nil, fmt.Errorf("indexer.csharp_indexer_dll_path is not set (dotnet publish tools/csharp-indexer)")
+			return nil, nil, fmt.Errorf("indexer.csharp.indexer_dll_path is not set (dotnet publish tools/csharp-indexer)")
 		}
 		parsed, err := csharpindexer.Run(ctx, repoAbs, dll, csharpindexerRunConfig(cfg, 0))
 		if err != nil {
@@ -779,4 +1058,220 @@ func planItemSymbol(item *retrieval.TestPlanItem) string {
 
 func isE2E(item *retrieval.TestPlanItem) bool {
 	return item != nil && strings.EqualFold(strings.TrimSpace(item.Layer), "e2e")
+}
+
+// projectIntelForGap returns the project-intel markdown for one gap: candidates re-ranked against
+// the gap's target embedding, with a boost for documents that explicitly NAME the target symbol or
+// its enclosing type (matched on FQ name — symbol ids churn on every reindex). Falls back to the
+// run-wide snapshot when candidates are absent (cache formats predating them) or the gap has no
+// embedded target chunk.
+func projectIntelForGap(pi *projectintel.Result, piCfg config.ProjectIntelConfig, item *retrieval.TestPlanItem) string {
+	if pi == nil {
+		return ""
+	}
+	fallback := strings.TrimSpace(pi.Snapshot.Markdown)
+	if len(pi.Candidates) == 0 || item == nil {
+		return fallback
+	}
+	var targetEmbedding []float32
+	if item.Context != nil && item.Context.TargetMethod != nil && item.Context.TargetMethod.Chunk != nil {
+		targetEmbedding = item.Context.TargetMethod.Chunk.Embedding
+	}
+	// A document that explicitly names the target symbol beats one that merely embeds similarly.
+	var boost projectintel.SymbolLinkBoost
+	if item.Gap != nil && item.Gap.Symbol != nil {
+		boost.TargetFQName = item.Gap.Symbol.FQName
+	}
+	if item.Context != nil && item.Context.TargetClass != nil && item.Context.TargetClass.Symbol != nil {
+		boost.ContainerFQName = item.Context.TargetClass.Symbol.FQName
+	}
+	return projectintel.SelectForGapWithLinks(pi.Candidates, targetEmbedding,
+		piCfg.EffectiveMaxDocFiles(), piCfg.EffectiveMaxSkillFiles(), piCfg.EffectiveMaxTotalRunes(),
+		fallback, boost)
+}
+
+// defaultEmbeddingCacheRetentionDays is used when llm.embedding_cache_retention_days is unset.
+const defaultEmbeddingCacheRetentionDays = 30
+
+// pruneEmbeddingCache removes cache rows unused for longer than the configured retention.
+// Best-effort by design: the cache is an optimization, and a failure to prune must not fail a run.
+func pruneEmbeddingCache(store *embeddings.Store, retentionDays int) {
+	if store == nil {
+		return
+	}
+	if retentionDays <= 0 {
+		retentionDays = defaultEmbeddingCacheRetentionDays
+	}
+	n, err := store.PruneEmbeddingCache(context.Background(), time.Duration(retentionDays)*24*time.Hour)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "asqs-core: embedding cache prune: %v (continuing)\n", err)
+		return
+	}
+	if n > 0 {
+		fmt.Fprintf(os.Stderr, "asqs-core: embedding cache: pruned %d row(s) unused for %d day(s)\n", n, retentionDays)
+	}
+}
+
+// buildPlanOptions maps config onto retrieval.PlanOptions — the config-reading half CP17 exists
+// for: these keys parsed, validated and documented while the planner ran on built-in defaults.
+//
+// The section budgets (max_similar_tests, max_dependency_chunks, max_fixtures) and the MMR lambda
+// are deliberately LEFT AT ZERO here: retrieval substitutes its Default* constants for a zero,
+// which is exactly what every shipped config resolved to, and upstream's config restructure froze
+// those keys pending an A/B. Wiring them now would promote unmeasured defaults (rule 10).
+func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval.PlanOptions {
+	lang := strings.TrimSpace(workflowLang)
+	if lang == "" {
+		lang = "java"
+	}
+	if cfg == nil {
+		return retrieval.PlanOptions{Lang: lang, RepoID: repoID}
+	}
+	p := retrieval.PlanOptions{
+		Lang:                      lang,
+		RepoID:                    repoID,
+		MaxGaps:                   cfg.Indexer.MaxGaps,
+		MaxGapsPerFile:            cfg.Indexer.MaxGapsPerFile,
+		MaxGapsE2E:                cfg.Indexer.MaxGapsE2E,
+		MaxGapsPerFileE2E:         cfg.Indexer.MaxGapsPerFileE2E,
+		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang),
+		CriticalModulePrefixes:    cfg.Indexer.CriticalModulePrefixes,
+		SkipPathPrefixes:          cfg.Indexer.SkipPathPrefixes,
+		DependencyMaxDepth:        cfg.Retrieval.DependencyMaxDepth,
+		Fusion:                    cfg.Retrieval.Fusion,
+		ProfileBudgets:            retrieval.NormalizeProfileBudgetsMap(cfg.Retrieval.ProfileBudgets),
+		RetrievalProfile:          cfg.Retrieval.Profile,
+		FailureHintFile:           strings.TrimSpace(cfg.Retrieval.FailureHintFile),
+		DisableHybridModuleFilter: cfg.Retrieval.DisableHybridModuleFilter,
+	}
+	if m, err := workspace.NormalizeMonoRepoWorkspace(cfg.Indexer.MonoRepoWorkspace); err == nil && m != "" {
+		p.MonoRepoGapPrefix = m
+	}
+	applyRetrievalAbstentionDefaults(&cfg.Retrieval, &p)
+	return p
+}
+
+// defaultRetrievalProfileE2E resolves the E2E retrieval profile: explicit profile_e2e, else the
+// unit profile, else a language default (http_api for backends, e2e_playwright otherwise).
+func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string {
+	if cfg == nil {
+		return string(retrieval.ProfileE2EPlaywright)
+	}
+	if s := strings.TrimSpace(cfg.Retrieval.ProfileE2E); s != "" {
+		return s
+	}
+	if s := strings.TrimSpace(cfg.Retrieval.Profile); s != "" {
+		return s
+	}
+	switch strings.ToLower(strings.TrimSpace(workflowLang)) {
+	case "java", "csharp", "cs":
+		return string(retrieval.ProfileHTTPAPI)
+	default:
+		return string(retrieval.ProfileE2EPlaywright)
+	}
+}
+
+// applyRetrievalAbstentionDefaults sets PlanOptions sufficiency fields from config.
+// When abstention_disabled is false (default), zero YAML/env values become meaningful defaults
+// (at least one similar-reference chunk; cosine ≥ 0.5 when target has an embedding).
+func applyRetrievalAbstentionDefaults(rc *config.RetrievalConfig, p *retrieval.PlanOptions) {
+	if rc == nil || p == nil {
+		return
+	}
+	if rc.AbstentionDisabled {
+		p.MinSimilarTestsForGeneration = 0
+		p.MinSimilarityCosine = 0
+		return
+	}
+	switch {
+	case rc.MinSimilarTestsForGeneration == -1:
+		p.MinSimilarTestsForGeneration = 0
+	case rc.MinSimilarTestsForGeneration <= 0:
+		p.MinSimilarTestsForGeneration = retrieval.DefaultAbstentionMinSimilarTests
+	default:
+		p.MinSimilarTestsForGeneration = rc.MinSimilarTestsForGeneration
+	}
+	if rc.MinSimilarityCosine < 0 {
+		p.MinSimilarityCosine = 0
+	} else if rc.MinSimilarityCosine == 0 {
+		p.MinSimilarityCosine = retrieval.DefaultAbstentionMinSimilarityCosine
+	} else {
+		p.MinSimilarityCosine = rc.MinSimilarityCosine
+	}
+}
+
+// applyRetrievalContextCompactToFormat copies retrieval.context_compact into
+// FormatOptions.ContextCompact. Everything except the on/off switch is frozen: the rune caps fall
+// through to retrieval's DefaultCompact* constants at zero, and the merge/dedupe behaviours stay
+// off until an A/B earns them a different default.
+func applyRetrievalContextCompactToFormat(rc *config.RetrievalConfig, fo *retrieval.FormatOptions) {
+	if rc == nil || fo == nil {
+		return
+	}
+	enabled := true
+	if rc.ContextCompact.Enabled != nil {
+		enabled = *rc.ContextCompact.Enabled
+	}
+	fo.ContextCompact = retrieval.ContextCompactOptions{Enabled: enabled}
+}
+
+// compactPlanContexts applies retrieval.CompactRetrievalContext to every plan item's context.
+//
+// This is the production call site for context compaction. Before it existed, the whole mechanism
+// — the deterministic merging/deduping/truncation, its tests, and the full YAML plumbing through
+// config.ContextCompactConfig — had ZERO production callers: FormatOptions.ContextCompact was
+// written and never read, so tuning retrieval.context_compact did nothing at all.
+//
+// It runs once per plan, after the unit and E2E plans are merged and before the generation
+// fan-out, so the cost is paid once per item, test generation and the doc pass see the same
+// compacted context, and the audit counters describe the whole run. The compaction never touches
+// the target method, the target class, or the failure hint — see context_compact.go.
+func compactPlanContexts(ctx context.Context, formatOpts retrieval.FormatOptions, audit interface {
+	Log(ctx context.Context, step string, payload interface{})
+}, plan *retrieval.TestPlan) {
+	if plan == nil || len(plan.Items) == 0 {
+		return
+	}
+	compactOpts := formatOpts.ContextCompact
+	if !compactOpts.Enabled {
+		return
+	}
+	var (
+		items          int
+		runesBefore    int64
+		runesAfter     int64
+		depsMerged     int
+		headersDeduped int
+		chunksTrimmed  int
+	)
+	for _, item := range plan.Items {
+		if item == nil || item.Context == nil {
+			continue
+		}
+		stats := retrieval.CompactRetrievalContext(item.Context, compactOpts)
+		items++
+		runesBefore += stats.InputContentRunes
+		runesAfter += stats.OutputContentRunes
+		depsMerged += stats.MergedDependencyFileGroups
+		headersDeduped += stats.DedupedBoilerplateChunks
+		chunksTrimmed += stats.TruncatedChunks
+	}
+	if audit != nil && items > 0 {
+		saved := runesBefore - runesAfter
+		var pct int64
+		if runesBefore > 0 {
+			pct = saved * 100 / runesBefore
+		}
+		audit.Log(ctx, "retrieve.context_compacted_total", map[string]interface{}{
+			"message":          "Compacted retrieval context before generation.",
+			"items":            items,
+			"runes_before":     runesBefore,
+			"runes_after":      runesAfter,
+			"runes_saved":      saved,
+			"percent_saved":    pct,
+			"chunks_merged":    depsMerged,
+			"headers_deduped":  headersDeduped,
+			"chunks_truncated": chunksTrimmed,
+		})
+	}
 }

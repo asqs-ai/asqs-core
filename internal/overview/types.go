@@ -14,6 +14,8 @@ type OverviewDocResult struct {
 // existing doc so the generator can append index deltas instead of rewriting the full narrative).
 type OverviewGenerateOpts struct {
 	RepoRoot string
+	// RepoID scopes every metadata read; the index is shared across repositories.
+	RepoID string
 }
 
 // OverviewDocGenerator produces the big-picture document (workflows and dependencies) from a prebuilt

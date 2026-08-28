@@ -5,16 +5,20 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	pgxvec "github.com/pgvector/pgvector-go/pgx"
+
+	"github.com/asqs/asqs-core/internal/sqlsplit"
 )
 
 //go:embed schema.sql
@@ -24,16 +28,28 @@ var vectorColumnDimRE = regexp.MustCompile(`(?i)\bvector\s*\(\s*(\d+)\s*\)`)
 
 const defaultDimension = 1536
 
+// ChunkTypeDependencyDoc marks chunks ingested from dependency documentation (Spec B55) rather
+// than the repository's own source. They are retrievable on request (explicit chunk_type or the
+// doc-fallback path) but must not displace repository chunks in similarity search, so the
+// search-side callers exclude them by default via ExcludeChunkType. The ingestion that produces
+// them arrives with the dependency-docs bundle; until then no chunk carries this type.
+const ChunkTypeDependencyDoc = "dependency_doc"
+
 // Store provides chunk + embedding storage and vector search for symbol-aware RAG.
 type Store struct {
 	pool *pgxpool.Pool
 	dim  int
+	// onANNWiden is notified when a filtered search under-returns and is retried at the ef_search
+	// ceiling. Installed via SetANNWidenHook; nil by default so the store stays audit-agnostic.
+	onANNWiden func(context.Context, ANNWidenEvent)
 }
 
 // Config configures the embeddings store.
 type Config struct {
 	ConnString string // Postgres connection string (same DB as metadata is fine)
 	Dimension  int    // embedding dimension; 0 = DefaultEmbeddingDim (1536)
+	// MaxConns caps the pool. 0 leaves pgxpool's default, which is max(4, NumCPU).
+	MaxConns int32
 }
 
 // Open creates a connection pool and registers pgvector types. Call InitSchema to create tables.
@@ -57,6 +73,9 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	config, err := pgxpool.ParseConfig(cfg.ConnString)
 	if err != nil {
 		return nil, fmt.Errorf("embeddings: parse config: %w", err)
+	}
+	if cfg.MaxConns > 0 {
+		config.MaxConns = cfg.MaxConns
 	}
 	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
 		return pgxvec.RegisterTypes(ctx, conn)
@@ -86,14 +105,16 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("embeddings: read schema: %w", err)
 	}
-	// Strip line comments before splitting on ';' — otherwise a semicolon inside "-- ...; ..." breaks statements
-	// (e.g. "instance; when" produced: syntax error at or near "when").
-	sql := stripSQLLineComments(string(b))
+	// sqlsplit understands string literals, dollar quotes and comments, so a semicolon inside any of
+	// them is no longer a statement boundary. The previous naive split on ';' had to be preceded by
+	// a line-comment stripper, and even then a semicolon inside a string literal would have broken
+	// the statement — e.g. "instance; when" produced: syntax error at or near "when".
+	sql := string(b)
 	// DDL defaults are OpenAI-sized (1536). Rewrite so fresh installs match this store's dimension.
 	sql = strings.ReplaceAll(sql, "vector(1536)", fmt.Sprintf("vector(%d)", s.dim))
 	sql = strings.ReplaceAll(sql, "DEFAULT 1536", fmt.Sprintf("DEFAULT %d", s.dim))
 	sql = strings.ReplaceAll(sql, "VALUES (1, '', '', 1536)", fmt.Sprintf("VALUES (1, '', '', %d)", s.dim))
-	for _, stmt := range splitSQL(sql) {
+	for _, stmt := range sqlsplit.Statements(sql) {
 		stmt = strings.TrimSpace(stmt)
 		if stmt == "" {
 			continue
@@ -123,9 +144,30 @@ func parseVectorColumnDim(pgFormatType string) int {
 	return d
 }
 
+// EnvAllowEmbeddingDimReset opts in to the destructive branch of alignChunksEmbeddingColumn.
+//
+// It is an environment variable rather than a config field on purpose: it is a break-glass switch
+// for a one-off operation, not a setting a deployment should carry, and putting it in YAML invites
+// someone to leave it enabled.
+const EnvAllowEmbeddingDimReset = "ASQS_ALLOW_EMBEDDING_DIM_RESET"
+
+// ErrEmbeddingDimMismatch is returned when the configured embedding dimension disagrees with a
+// corpus that already has rows.
+var ErrEmbeddingDimMismatch = errors.New("embeddings: configured dimension does not match the indexed corpus")
+
 // alignChunksEmbeddingColumn fixes chunks.embedding when an older schema used vector(1536) (or another size)
 // but this store expects s.dim. Existing vectors are incompatible after an embedding model/dimension change,
 // so rows are truncated before ALTER TYPE.
+//
+// The truncate is `TRUNCATE TABLE chunks` — EVERY repo in the database, not only the one being
+// indexed — and InitSchema runs on process start, so it fires before any command does its own work.
+// A single mistyped `-config` therefore destroyed the whole corpus silently: no prompt, no log, no
+// row count. That is not a theoretical footgun: configs commonly ship at both 768 (local Ollama
+// models) and 1536 (OpenAI), so indexing a second stack against an existing corpus hits it on the
+// first command.
+//
+// So: an empty table realigns freely (the legitimate "fresh database, changed the model" case), and
+// a populated one refuses unless the operator explicitly opts in via EnvAllowEmbeddingDimReset.
 func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 	var colType string
 	err := s.pool.QueryRow(ctx, `
@@ -148,6 +190,31 @@ func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 	cur := parseVectorColumnDim(colType)
 	if cur <= 0 || cur == s.dim {
 		return nil
+	}
+
+	// Count first. Realigning an empty table costs nothing and destroys nothing.
+	var rows int64
+	if err := s.pool.QueryRow(ctx, `SELECT count(*) FROM chunks`).Scan(&rows); err != nil {
+		return fmt.Errorf("embeddings: count chunks before dimension change: %w", err)
+	}
+	if rows > 0 && !embeddingDimResetAllowed() {
+		var repos string
+		if err := s.pool.QueryRow(ctx,
+			`SELECT COALESCE(string_agg(r, ', '), '') FROM (
+			   SELECT DISTINCT repo_id AS r FROM chunks WHERE repo_id <> '' ORDER BY 1 LIMIT 10) t`,
+		).Scan(&repos); err != nil {
+			repos = "(could not list)"
+		}
+		return fmt.Errorf("%w: column is vector(%d), config wants vector(%d), and %d chunk(s) are "+
+			"indexed across: %s.\nRealigning would TRUNCATE every chunk in this database — all repos, "+
+			"not just the one being indexed.\nEither point -config at a %d-dimension configuration, or "+
+			"use a separate database for the new dimension. To destroy this corpus deliberately, set %s=1",
+			ErrEmbeddingDimMismatch, cur, s.dim, rows, repos, cur, EnvAllowEmbeddingDimReset)
+	}
+	if rows > 0 {
+		// Opted in, but a destructive operation should still announce itself.
+		fmt.Fprintf(os.Stderr, "embeddings: %s set — TRUNCATING %d chunk(s) to change vector(%d) -> vector(%d)\n",
+			EnvAllowEmbeddingDimReset, rows, cur, s.dim)
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -175,30 +242,6 @@ func (s *Store) alignChunksEmbeddingColumn(ctx context.Context) error {
 		return fmt.Errorf("embeddings: migrate dimension commit: %w", err)
 	}
 	return nil
-}
-
-func splitSQL(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ";") {
-		if t := strings.TrimSpace(part); t != "" {
-			out = append(out, part)
-		}
-	}
-	return out
-}
-
-// stripSQLLineComments removes PostgreSQL line comments (-- …) from each line before splitSQL runs.
-// DDL here does not use '--' inside string literals; this avoids semicolons inside comments splitting statements.
-func stripSQLLineComments(s string) string {
-	var b strings.Builder
-	for _, line := range strings.Split(s, "\n") {
-		if i := strings.Index(line, "--"); i >= 0 {
-			line = line[:i]
-		}
-		b.WriteString(strings.TrimRight(line, " \t\r"))
-		b.WriteByte('\n')
-	}
-	return b.String()
 }
 
 // Dimension returns the embedding dimension expected by this store.
@@ -231,46 +274,70 @@ func (s *Store) InsertChunk(ctx context.Context, c *Chunk) (id string, err error
 	return id, err
 }
 
-// InsertChunks inserts multiple chunks in one transaction. Returns the list of assigned IDs in order.
+// InsertChunks inserts multiple chunks in one COPY. Returns the list of assigned IDs in order.
 func (s *Store) InsertChunks(ctx context.Context, chunks []*Chunk) (ids []string, err error) {
 	if len(chunks) == 0 {
 		return nil, nil
 	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+
+	// COPY, not one INSERT per chunk. Indexing is round-trip bound: a large repository produced one
+	// query per chunk, sequentially, which is minutes of pure latency against a networked Postgres.
+	//
+	// Ids are generated here rather than by the column's gen_random_uuid() default, because COPY
+	// cannot return them and the method's contract is to hand them back. Both are random v4 UUIDs,
+	// so nothing about the stored value changes.
+	//
+	// Two things COPY could have silently broken, both checked:
+	//   - Generated columns are computed for COPY exactly as for INSERT, and must be left out of
+	//     the column list (the lexical channel's content_tsv relies on this when it arrives).
+	//   - CopyFrom is one statement, so it is all-or-nothing on its own. The explicit transaction
+	//     the per-row loop needed is therefore gone, not merely moved.
 	ids = make([]string, 0, len(chunks))
+	rows := make([][]any, 0, len(chunks))
 	for _, c := range chunks {
 		if len(c.Embedding) != s.dim {
 			return nil, fmt.Errorf("embeddings: embedding length %d != store dimension %d", len(c.Embedding), s.dim)
 		}
-		vec := pgvector.NewVector(c.Embedding)
-		symbolID := nullUUID(c.SymbolID)
 		chunkType := c.ChunkType
 		if chunkType == "" {
 			chunkType = "definition"
 		}
-		var id string
-		metaArg := any(nil)
+		var metaArg any
 		if len(c.MetadataJSON) > 0 {
 			metaArg = c.MetadataJSON
 		}
-		parentID := nullUUID(c.ParentSymbolID)
-		err = tx.QueryRow(ctx, `
-			INSERT INTO chunks (content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			RETURNING id`,
-			sanitizeTextForPostgres(c.Content), vec, symbolID, sanitizeTextForPostgres(c.File), sanitizeTextForPostgres(c.Lang),
-			sanitizeTextForPostgres(chunkType), c.StartLine, c.EndLine, sanitizeTextForPostgres(c.RepoID), metaArg, parentID,
-		).Scan(&id)
-		if err != nil {
-			return nil, err
-		}
+		id := uuid.NewString()
 		ids = append(ids, id)
+		rows = append(rows, []any{
+			id,
+			sanitizeTextForPostgres(c.Content),
+			pgvector.NewVector(c.Embedding),
+			nullUUID(c.SymbolID),
+			sanitizeTextForPostgres(c.File),
+			sanitizeTextForPostgres(c.Lang),
+			sanitizeTextForPostgres(chunkType),
+			c.StartLine,
+			c.EndLine,
+			sanitizeTextForPostgres(c.RepoID),
+			metaArg,
+			nullUUID(c.ParentSymbolID),
+		})
 	}
-	return ids, tx.Commit(ctx)
+
+	n, err := s.pool.CopyFrom(ctx, pgx.Identifier{"chunks"}, chunkCopyColumns, pgx.CopyFromRows(rows))
+	if err != nil {
+		return nil, fmt.Errorf("embeddings: copy chunks: %w", err)
+	}
+	if int(n) != len(rows) {
+		return nil, fmt.Errorf("embeddings: copy chunks: wrote %d of %d rows", n, len(rows))
+	}
+	return ids, nil
+}
+
+// chunkCopyColumns is the column list InsertChunks copies into, in row order.
+var chunkCopyColumns = []string{
+	"id", "content", "embedding", "symbol_id", "file", "lang", "chunk_type",
+	"start_line", "end_line", "repo_id", "chunk_metadata", "parent_symbol_id",
 }
 
 // GetByID returns the chunk with the given ID, or nil if not found.
@@ -315,10 +382,27 @@ type SearchOptions struct {
 	ParentSymbolID string // filter by parent_symbol_id (container symbol)
 	RepoID         string // filter by repo_id
 	ChunkType      string // filter by chunk_type
+	// ExcludeChunkType drops one chunk_type from results. Ignored when ChunkType is set (an exact
+	// filter already excludes everything else). Exists so dependency_doc chunks (B55) stay OUT of
+	// every search that did not ask for them: retrieval quality was tuned on repository chunks,
+	// and tens of thousands of library-doc chunks outranking repository code for a "find a similar
+	// test" query is the failure mode the B55 review focus names.
+	ExcludeChunkType string
 	// Module filters chunk_metadata->>'module' (exact). Empty = no filter. Populated by indexer chunk metadata.
 	Module string
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (PostgreSQL @>). Empty = no filter.
 	MetadataContains []byte
+	// OmitEmbedding skips selecting and decoding the embedding column. Every result row otherwise
+	// carries a full vector — ~6 KB at 1536 dims — most of it discarded by callers that only
+	// render content.
+	//
+	// Set it on any caller that does not feed MMR (which needs pairwise cosines): plain listings
+	// and fixture/config lookups. Leave it false when the results reach
+	// maximalMarginalRelevance — a nil embedding there degrades silently to the
+	// 1/(1+Distance) relevance fallback rather than erroring.
+	//
+	// Default false preserves the previous behaviour for every existing caller.
+	OmitEmbedding bool
 }
 
 // Search returns chunks ordered by L2 distance to the query vector (nearest first). Optional filters apply.
@@ -364,6 +448,11 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 		where = append(where, fmt.Sprintf("repo_id = $%d", argNum))
 		args = append(args, opts.RepoID)
 	}
+	if opts.ChunkType == "" && opts.ExcludeChunkType != "" {
+		argNum++
+		where = append(where, fmt.Sprintf("chunk_type <> $%d", argNum))
+		args = append(args, opts.ExcludeChunkType)
+	}
 	if opts.ChunkType != "" {
 		argNum++
 		where = append(where, fmt.Sprintf("chunk_type = $%d", argNum))
@@ -389,13 +478,59 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 	if len(where) > 0 {
 		whereClause = " WHERE " + strings.Join(where, " AND ")
 	}
+	embeddingCol := "embedding, "
+	if opts.OmitEmbedding {
+		embeddingCol = ""
+	}
 	q := fmt.Sprintf(`
-		SELECT id, content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id,
+		SELECT id, content, %ssymbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id,
 		       embedding <-> $1 AS distance
 		FROM chunks %s
 		ORDER BY embedding <-> $1
-		LIMIT $%d`, whereClause, argNum)
-	rows, err := s.pool.Query(ctx, q, args...)
+		LIMIT $%d`, embeddingCol, whereClause, argNum)
+
+	// pgvector walks the HNSW graph collecting roughly ef_search candidates and only then applies
+	// the WHERE clause. With the default ef_search of 40 and a conjunction of several selective
+	// predicates (repo_id AND lang AND chunk_type AND module AND file prefix), most of those 40 are
+	// discarded and the query silently returns far fewer rows than LIMIT — sometimes zero — even
+	// though thousands of matching rows exist. There is no error and no signal; retrieval just
+	// falls through to an unranked listing. This is the most likely explanation for a "similar
+	// tests section is empty on a repo that obviously has similar tests" report.
+	//
+	// SET LOCAL needs an explicit transaction or a pinned connection, hence Acquire rather than
+	// s.pool.Query, which would take an arbitrary pooled conn and lose the setting.
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Release()
+
+	ef := efSearchFor(limit)
+	results, err := s.searchWithEF(ctx, conn, q, args, opts, ef)
+	if err != nil {
+		return nil, err
+	}
+	// Filtered-recall guard: a materially short result set under a selective conjunction almost
+	// always means post-filtering discarded most of the ef_search candidates rather than that the
+	// corpus is genuinely small. Retry once at the ceiling before the caller falls through to an
+	// unranked listing. Emitting the widen event is how the real hit rate becomes measurable —
+	// today the shortfall is completely invisible.
+	if len(results) < limit/2 && ef < maxEFSearch {
+		widened, werr := s.searchWithEF(ctx, conn, q, args, opts, maxEFSearch)
+		if werr == nil && len(widened) > len(results) {
+			s.noteANNWidened(ctx, limit, len(results), len(widened))
+			return widened, nil
+		}
+	}
+	return results, nil
+}
+
+// searchWithEF runs the prepared search on conn with hnsw.ef_search set to ef.
+func (s *Store) searchWithEF(ctx context.Context, conn pooledConn, q string, args []interface{}, opts SearchOptions, ef int) ([]SearchResult, error) {
+	if err := setEFSearch(ctx, conn, ef); err != nil {
+		return nil, err
+	}
+	rows, err := conn.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -407,11 +542,18 @@ func (s *Store) Search(ctx context.Context, queryEmbedding []float32, opts Searc
 		var symbolID *string
 		var meta []byte
 		var parentID *string
-		err := rows.Scan(&r.ID, &r.Content, &vec, &symbolID, &r.File, &r.Lang, &r.ChunkType, &r.StartLine, &r.EndLine, &r.RepoID, &meta, &parentID, &r.Distance)
-		if err != nil {
+		scanTargets := []any{&r.ID, &r.Content}
+		if !opts.OmitEmbedding {
+			scanTargets = append(scanTargets, &vec)
+		}
+		scanTargets = append(scanTargets, &symbolID, &r.File, &r.Lang, &r.ChunkType,
+			&r.StartLine, &r.EndLine, &r.RepoID, &meta, &parentID, &r.Distance)
+		if err := rows.Scan(scanTargets...); err != nil {
 			return nil, err
 		}
-		r.Embedding = vec.Slice()
+		if !opts.OmitEmbedding {
+			r.Embedding = vec.Slice()
+		}
 		if symbolID != nil {
 			r.SymbolID = *symbolID
 		}
@@ -434,11 +576,17 @@ type ListOptions struct {
 	ParentSymbolID string // return only chunks whose parent_symbol_id matches (container symbol)
 	RepoID         string // return only chunks for this repo
 	ChunkType      string // e.g. "test", "fixture", "definition"
-	Lang           string // e.g. "java", "csharp"
-	Limit          int    // max results; 0 = no limit (use with care)
-	Module         string // chunk_metadata->>'module' exact match; empty = no filter
+	// ExcludeChunkType drops one chunk_type; ignored when ChunkType is set. See SearchOptions.
+	ExcludeChunkType string
+	Lang             string // e.g. "java", "csharp"
+	Limit            int    // max results; 0 = no limit (use with care)
+	Module           string // chunk_metadata->>'module' exact match; empty = no filter
 	// MetadataContains is a JSON object that must be contained in chunk_metadata (@>).
 	MetadataContains []byte
+	// OmitEmbedding skips selecting and decoding the embedding column (~6 KB/row at 1536 dims).
+	// See SearchOptions.OmitEmbedding for when it is safe: not for anything that reaches MMR or
+	// the abstention gate.
+	OmitEmbedding bool
 }
 
 // List returns chunks matching the filters, ordered by file and start_line. Use for fetching context by file/symbol.
@@ -470,6 +618,11 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 		where = append(where, fmt.Sprintf("repo_id = $%d", argNum))
 		args = append(args, opts.RepoID)
 	}
+	if opts.ChunkType == "" && opts.ExcludeChunkType != "" {
+		argNum++
+		where = append(where, fmt.Sprintf("chunk_type <> $%d", argNum))
+		args = append(args, opts.ExcludeChunkType)
+	}
 	if opts.ChunkType != "" {
 		argNum++
 		where = append(where, fmt.Sprintf("chunk_type = $%d", argNum))
@@ -498,7 +651,11 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 	if len(where) > 0 {
 		whereClause = " WHERE " + strings.Join(where, " AND ")
 	}
-	q := "SELECT id, content, embedding, symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id FROM chunks " + whereClause + " ORDER BY file, start_line"
+	listEmbeddingCol := "embedding, "
+	if opts.OmitEmbedding {
+		listEmbeddingCol = ""
+	}
+	q := "SELECT id, content, " + listEmbeddingCol + "symbol_id, file, lang, chunk_type, start_line, end_line, repo_id, chunk_metadata, parent_symbol_id FROM chunks " + whereClause + " ORDER BY file, start_line"
 	if opts.Limit > 0 {
 		argNum++
 		q += fmt.Sprintf(" LIMIT $%d", argNum)
@@ -516,10 +673,18 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 		var symbolID *string
 		var meta []byte
 		var parentID *string
-		if err := rows.Scan(&c.ID, &c.Content, &vec, &symbolID, &c.File, &c.Lang, &c.ChunkType, &c.StartLine, &c.EndLine, &c.RepoID, &meta, &parentID); err != nil {
+		listTargets := []any{&c.ID, &c.Content}
+		if !opts.OmitEmbedding {
+			listTargets = append(listTargets, &vec)
+		}
+		listTargets = append(listTargets, &symbolID, &c.File, &c.Lang, &c.ChunkType,
+			&c.StartLine, &c.EndLine, &c.RepoID, &meta, &parentID)
+		if err := rows.Scan(listTargets...); err != nil {
 			return nil, err
 		}
-		c.Embedding = vec.Slice()
+		if !opts.OmitEmbedding {
+			c.Embedding = vec.Slice()
+		}
 		if symbolID != nil {
 			c.SymbolID = *symbolID
 		}
@@ -534,9 +699,17 @@ func (s *Store) List(ctx context.Context, opts ListOptions) ([]Chunk, error) {
 	return list, rows.Err()
 }
 
-// DeleteByFile removes all chunks for the given file (e.g. before re-indexing).
-func (s *Store) DeleteByFile(ctx context.Context, file string) (deleted int64, err error) {
-	res, err := s.pool.Exec(ctx, "DELETE FROM chunks WHERE file = $1", file)
+// DeleteByFile removes a file's chunks for ONE repository (e.g. before re-indexing that file).
+//
+// The repoID argument is load-bearing. This was `DELETE FROM chunks WHERE file = $1`, called by the
+// indexer once per changed or removed file, so indexing repo B deleted repo A's chunks for every
+// shared path.
+//
+// An empty repoID matches rows whose repo_id is empty — exactly, not as a wildcard — so an unscoped
+// run cannot delete a scoped repository's chunks.
+func (s *Store) DeleteByFile(ctx context.Context, repoID, file string) (deleted int64, err error) {
+	res, err := s.pool.Exec(ctx, "DELETE FROM chunks WHERE file = $1 AND repo_id = $2",
+		file, strings.TrimSpace(repoID))
 	if err != nil {
 		return 0, err
 	}
@@ -614,4 +787,15 @@ func nullUUID(s string) interface{} {
 
 func isNoRows(err error) bool {
 	return errors.Is(err, pgx.ErrNoRows)
+}
+
+// embeddingDimResetAllowed reports whether the operator has opted in to destroying an indexed
+// corpus in order to change the embedding dimension.
+func embeddingDimResetAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(EnvAllowEmbeddingDimReset))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }

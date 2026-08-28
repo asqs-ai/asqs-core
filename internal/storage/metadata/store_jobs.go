@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RunJobRow is one claimed or pending scheduled run job.
@@ -19,15 +21,15 @@ type RunJobRow struct {
 // ClaimDueRunJob atomically picks the oldest due pending job and sets status to 'running'.
 // Returns (nil, nil) when no job is available. Uses FOR UPDATE SKIP LOCKED for safe concurrency.
 func (s *Store) ClaimDueRunJob(ctx context.Context) (*RunJobRow, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var id, revID, projID string
 	var cronExpr sql.NullString
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRow(ctx, `
 UPDATE run_jobs j
 SET status = 'running'
 FROM (
@@ -40,13 +42,13 @@ FROM (
 WHERE j.id = sub.id
 RETURNING j.id::text, j.config_revision_id::text, j.project_id::text, j.cron_expression
 `).Scan(&id, &revID, &projID, &cronExpr)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	row := &RunJobRow{ID: id, ConfigRevisionID: revID, ProjectID: projID}
@@ -63,7 +65,7 @@ func (s *Store) ProjectHasActiveRun(ctx context.Context, projectID string) (bool
 		return false, fmt.Errorf("project_id required")
 	}
 	var exists bool
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRow(ctx, `
 SELECT EXISTS (
   SELECT 1 FROM index_runs
   WHERE project_id = $1::uuid AND status = 'running'
@@ -81,12 +83,12 @@ func (s *Store) RescheduleRecurringRunJob(ctx context.Context, jobID string, nex
 	if createdRunID != nil && strings.TrimSpace(*createdRunID) != "" {
 		runID := strings.TrimSpace(*createdRunID)
 		var one int
-		err := s.db.QueryRowContext(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
+		err := s.db.QueryRow(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
 		if err == nil {
 			link = sql.NullString{String: runID, Valid: true}
 		}
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.Exec(ctx, `
 UPDATE run_jobs
 SET status = 'pending', run_at = $2, created_run_id = COALESCE($3, created_run_id)
 WHERE id = $1::uuid AND status = 'running'`,
@@ -94,7 +96,7 @@ WHERE id = $1::uuid AND status = 'running'`,
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	if err != nil {
 		return err
 	}
@@ -113,19 +115,19 @@ func (s *Store) CompleteRunJob(ctx context.Context, jobID, runID string, runErr 
 	var link sql.NullString
 	if strings.TrimSpace(runID) != "" {
 		var one int
-		err := s.db.QueryRowContext(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
+		err := s.db.QueryRow(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
 		if err == nil {
 			link = sql.NullString{String: runID, Valid: true}
 		}
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE run_jobs SET status = $1, created_run_id = $2 WHERE id = $3::uuid AND status = 'running'`,
 		st, link, jobID,
 	)
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	if err != nil {
 		return err
 	}

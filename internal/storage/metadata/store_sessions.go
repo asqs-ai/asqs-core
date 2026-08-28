@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RunSessionRow mirrors one row of the run_sessions table.
@@ -117,7 +119,7 @@ INSERT INTO run_sessions (
     discard_paths = EXCLUDED.discard_paths,
     updated_at = EXCLUDED.updated_at,
     finished_at = EXCLUDED.finished_at`
-	_, err := s.db.ExecContext(ctx, q,
+	_, err := s.db.Exec(ctx, q,
 		row.ID, row.RunID, nullOrStr(row.ProjectID), row.RepoID, row.CommitSHA,
 		row.TaskKind, row.Goal, row.State,
 		row.CurrentIteration, row.MaxIteration, nullOrInt64(row.ScheduledRerunAt),
@@ -152,7 +154,7 @@ INSERT INTO gap_sessions (
     abstain_reason = EXCLUDED.abstain_reason,
     updated_at = EXCLUDED.updated_at,
     finished_at = EXCLUDED.finished_at`
-	_, err := s.db.ExecContext(ctx, q,
+	_, err := s.db.Exec(ctx, q,
 		row.ID, row.RunSessionID, row.SymbolFQName, row.SourceFile, row.Layer, row.Kind, row.RetrievalProfile,
 		row.State, row.CurrentStep, row.LastError, row.IterationsUsed, row.IterationBudget,
 		nullOrJSON(row.ArtifactPathsJSON), nullOrJSON(row.DiscardedPathsJSON),
@@ -177,7 +179,7 @@ INSERT INTO session_attempts (
     run_session_id, gap_session_id, idx, tool, step,
     input_summary, output_summary, duration_ms, ok, created_at
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`
-		_, err := s.db.ExecContext(ctx, q,
+		_, err := s.db.Exec(ctx, q,
 			r.RunSessionID, nullOrStr(r.GapSessionID), r.Idx, r.Tool, r.Step,
 			nullOrJSON(r.InputSummaryJSON), nullOrJSON(r.OutputSummaryJSON),
 			r.DurationMs, r.OK, r.CreatedAt,
@@ -200,7 +202,7 @@ INSERT INTO session_feedback (
     run_session_id, gap_session_id, kind, subkind, owner_artifact_path, file, symbol, line,
     message, suggested_action, raw_excerpt, payload, created_at
 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`
-		_, err := s.db.ExecContext(ctx, q,
+		_, err := s.db.Exec(ctx, q,
 			r.RunSessionID, nullOrStr(r.GapSessionID), r.Kind, r.Subkind,
 			r.OwnerArtifactPath, r.File, r.Symbol, r.Line,
 			r.Message, r.SuggestedAction, r.RawExcerpt,
@@ -262,7 +264,7 @@ func (s *Store) ListRunSessions(ctx context.Context, opts ListRunSessionsOptions
 	}
 	whereSQL := strings.Join(where, " AND ")
 	var total int64
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM run_sessions WHERE "+whereSQL, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, "SELECT COUNT(*) FROM run_sessions WHERE "+whereSQL, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("count run_sessions: %w", err)
 	}
 	q := fmt.Sprintf(`
@@ -272,7 +274,7 @@ SELECT id, run_id, project_id, repo_id, commit_sha, task_kind, goal, state,
        discard_paths::text, started_at, updated_at, finished_at
 FROM run_sessions WHERE %s ORDER BY started_at DESC LIMIT $%d OFFSET $%d`, whereSQL, n+1, n+2)
 	args = append(args, limit, offset)
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		return nil, 0, fmt.Errorf("query run_sessions: %w", err)
 	}
@@ -293,7 +295,7 @@ FROM run_sessions WHERE %s ORDER BY started_at DESC LIMIT $%d OFFSET $%d`, where
 	return out, total, rows.Err()
 }
 
-// GetRunSession returns one run_sessions row by id (nil, sql.ErrNoRows when missing).
+// GetRunSession returns one run_sessions row by id (nil, pgx.ErrNoRows when missing).
 func (s *Store) GetRunSession(ctx context.Context, id string) (*RunSessionRow, error) {
 	const q = `
 SELECT id, run_id, project_id, repo_id, commit_sha, task_kind, goal, state,
@@ -302,7 +304,7 @@ SELECT id, run_id, project_id, repo_id, commit_sha, task_kind, goal, state,
        discard_paths::text, started_at, updated_at, finished_at
 FROM run_sessions WHERE id = $1`
 	var r RunSessionRow
-	err := s.db.QueryRowContext(ctx, q, id).Scan(
+	err := s.db.QueryRow(ctx, q, id).Scan(
 		&r.ID, &r.RunID, &r.ProjectID, &r.RepoID, &r.CommitSHA, &r.TaskKind, &r.Goal, &r.State,
 		&r.CurrentIteration, &r.MaxIteration, &r.ScheduledRerunAt,
 		&r.BootstrapJSON, &r.IndexDeltaJSON, &r.PlanSummaryJSON, &r.SeamNotesJSON, &r.OverviewPath,
@@ -322,7 +324,7 @@ SELECT id, run_session_id, symbol_fq_name, source_file, layer, kind, retrieval_p
        artifact_paths::text, discarded_paths::text,
        fingerprint, abstain_reason, started_at, updated_at, finished_at
 FROM gap_sessions WHERE run_session_id = $1 ORDER BY started_at ASC, id ASC`
-	rows, err := s.db.QueryContext(ctx, q, runSessionID)
+	rows, err := s.db.Query(ctx, q, runSessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +354,7 @@ SELECT id, run_session_id, symbol_fq_name, source_file, layer, kind, retrieval_p
        fingerprint, abstain_reason, started_at, updated_at, finished_at
 FROM gap_sessions WHERE id = $1`
 	var r GapSessionRow
-	if err := s.db.QueryRowContext(ctx, q, id).Scan(
+	if err := s.db.QueryRow(ctx, q, id).Scan(
 		&r.ID, &r.RunSessionID, &r.SymbolFQName, &r.SourceFile, &r.Layer, &r.Kind, &r.RetrievalProfile,
 		&r.State, &r.CurrentStep, &r.LastError, &r.IterationsUsed, &r.IterationBudget,
 		&r.ArtifactPathsJSON, &r.DiscardedPathsJSON,
@@ -384,7 +386,7 @@ FROM session_attempts WHERE run_session_id = $1 AND gap_session_id = $2
 ORDER BY created_at ASC, id ASC`
 		args = []interface{}{runSessionID, gapSessionID}
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +425,7 @@ FROM session_feedback WHERE run_session_id = $1 AND gap_session_id = $2
 ORDER BY created_at ASC, id ASC`
 		args = []interface{}{runSessionID, gapSessionID}
 	}
-	rows, err := s.db.QueryContext(ctx, q, args...)
+	rows, err := s.db.Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -506,8 +508,8 @@ func (s *Store) GetLatestGapOutcomesForRepo(ctx context.Context, repoID, project
 	}
 	q := `SELECT rs.id FROM run_sessions rs WHERE ` + where + ` ORDER BY rs.started_at DESC LIMIT 1`
 	var runSessionID string
-	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&runSessionID); err != nil {
-		if err == sql.ErrNoRows {
+	if err := s.db.QueryRow(ctx, q, args...).Scan(&runSessionID); err != nil {
+		if err == pgx.ErrNoRows {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("find latest run_session: %w", err)

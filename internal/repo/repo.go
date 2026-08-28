@@ -95,6 +95,21 @@ func Open(path string) (*Repo, error) {
 	return &Repo{Path: abs, repo: r}, nil
 }
 
+// HeadSHA returns the commit the working tree is at.
+//
+// This is the ONLY source of the commit for symbol history, and deliberately so. Upstream read the
+// SHA from an optional trigger field that was empty on every ordinary run, so `symbol_versions`
+// accumulated nothing for weeks while looking like it worked — every row carried the same empty
+// commit, and churn is `count(DISTINCT body_hash)` per commit window. Reading it from the checkout
+// cannot be empty when there is a checkout, and a source guard pins the wiring.
+func (r *Repo) HeadSHA() (string, error) {
+	ref, err := r.repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("repo: head: %w", err)
+	}
+	return ref.Hash().String(), nil
+}
+
 // CurrentBranch returns the short name of the current branch (e.g. "main").
 func (r *Repo) CurrentBranch() (string, error) {
 	ref, err := r.repo.Head()

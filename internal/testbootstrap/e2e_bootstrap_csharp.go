@@ -60,7 +60,7 @@ func applyPlaywrightDotNetBootstrap(ctx context.Context, p E2EParams, audit Audi
 		addCSharpTestProjectToSolutions(ctx, ed, repo, csproj, audit)
 	}
 
-	xuFiles, err := applyCSharpXUnit(repo, csproj, gitRoot)
+	xuFiles, _, err := applyCSharpTestPackages(repo, csproj, gitRoot, csharpRunnerOnlyProfile(CSharpTestXunit))
 	if err != nil {
 		logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
 			"message": fmt.Sprintf("Ensure xUnit / test SDK: %v", err), "step": "csproj_xunit", "error": err.Error(),

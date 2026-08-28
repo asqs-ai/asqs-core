@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
@@ -34,17 +35,23 @@ type TestGap struct {
 	Kind     GapKind
 	Reason   string
 	Priority int
+	// TestabilityScore is the positive behaviour signal added into Priority (see testability.go).
+	// Kept separately so audits can show why a gap ranked where it did.
+	TestabilityScore int
+	// BranchIntents is the shortlist-stage branch analysis, reused instead of recomputing it from
+	// the same chunk.
+	BranchIntents []string
 }
 
 // GapMetaReader is the subset of metadata needed to list gaps (symbols, files, edges for centrality).
 type GapMetaReader interface {
-	ListSymbolsInNonTestFiles(ctx context.Context, lang, kind string) ([]*metadata.Symbol, error)
-	ListSymbolsInTestFiles(ctx context.Context, lang, kind string) ([]*metadata.Symbol, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	GetSymbolByID(ctx context.Context, id string) (*metadata.Symbol, error)
-	GetEdgesFrom(ctx context.Context, callerSymbolID string) ([]*metadata.Edge, error)
-	GetEdgesTo(ctx context.Context, calleeSymbolID string) ([]*metadata.Edge, error)
+	ListSymbolsInNonTestFiles(ctx context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error)
+	ListSymbolsInTestFiles(ctx context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	GetSymbolByID(ctx context.Context, repoID, id string) (*metadata.Symbol, error)
+	GetEdgesFrom(ctx context.Context, repoID, callerSymbolID string) ([]*metadata.Edge, error)
+	GetEdgesTo(ctx context.Context, repoID, calleeSymbolID string) ([]*metadata.Edge, error)
 }
 
 // TestPlanItem is one test-gap candidate with its symbol-aware retrieval context.
@@ -73,15 +80,22 @@ type PlanOptions struct {
 	Lang                   string
 	RepoID                 string
 	CriticalModulePrefixes []string
-	SkipPathPrefixes       []string // repo-relative path prefixes to exclude from gaps (e.g. "app/lib"); matches path and FQName-style (dots).
-	MaxGaps                int
-	MaxGapsPerFile         int // max gaps to select per source file (0 = no cap). Use 1–2 to spread selection across files so the same files are not picked every run.
-	MaxDependencyChunks    int
-	MaxSimilarTests        int
-	MaxFixtures            int
-	MaxConfigChunks        int
-	MaxContextChunks       int
-	DependencyMaxDepth     int
+	// ChurnWeight scales the churn signal (CP13): Priority += ChurnWeight * min(distinctHashes-1, 5),
+	// where distinctHashes counts a symbol's distinct body hashes over the last 90 days.
+	//
+	// It ships at 0, meaning the term is ABSENT. A ranking default has to earn its value through a
+	// measured comparison (CP16), and defaulting it on would change every plan on the strength of a
+	// plausible story. Requires a store implementing SymbolChurn; silently off otherwise.
+	ChurnWeight         int
+	SkipPathPrefixes    []string // repo-relative path prefixes to exclude from gaps (e.g. "app/lib"); matches path and FQName-style (dots).
+	MaxGaps             int
+	MaxGapsPerFile      int // max gaps to select per source file (0 = no cap). Use 1–2 to spread selection across files so the same files are not picked every run.
+	MaxDependencyChunks int
+	MaxSimilarTests     int
+	MaxFixtures         int
+	MaxConfigChunks     int
+	MaxContextChunks    int
+	DependencyMaxDepth  int
 	// ProfileBudgets optional per-profile caps (canonical keys). Nil = use globals + built-in defaults only.
 	ProfileBudgets map[string]config.RetrievalProfileBudget
 	// SimilarMMRLambda: see ContextRequest.SimilarMMRLambda (0 = default 0.5 in Retrieve).
@@ -92,6 +106,11 @@ type PlanOptions struct {
 	MaxGapsE2E int
 	// MaxGapsPerFileE2E caps E2E gaps per file (0 = default 2).
 	MaxGapsPerFileE2E int
+	// MinGapTestabilityScore drops candidates whose positive testability score is below this
+	// value. Default 0 = rank only, never drop: low-value symbols sink instead of disappearing, so
+	// a repo of getters still produces a plan rather than an empty run. Raise it to make the
+	// planner abstain on genuinely untestable candidates.
+	MinGapTestabilityScore int
 	// RetrievalProfileE2E selects retrieval profile for E2E items. Empty in PlanOptions is unusual (orchestrator sets DefaultRetrievalProfileE2E: http_api for Java/C#, e2e_playwright for JS/TS when config omits both profile fields).
 	RetrievalProfileE2E string
 	// E2EFramework is the detected stack for audit/context hints (playwright, cypress, playwright-java, playwright-dotnet, selenium, …).
@@ -105,12 +124,19 @@ type PlanOptions struct {
 	// when the default is XTest.java, or x.spec.ts in a jest repo). Empty / nil keeps legacy
 	// behaviour (always emit SuggestedTestPath).
 	ExistingTestPathsBySource map[string][]string
+	// TestSuffixConvention is the repository's detected unit-test naming convention as a bare token
+	// ("Test"/"Tests", ".test."/".spec."), or empty when undetected. Detected once per run by the
+	// caller (generator.DetectTestSuffixConvention) and copied onto every item's RetrievalContext,
+	// because the generator resolves each item's default path with no view of the repo's file list.
+	TestSuffixConvention string
 	// FailureHint is optional stderr/test output passed to every Retrieve (e.g. prior run or WorkflowInput). See applyFailureLocalizedRetrieval.
 	FailureHint string
 	// FailureHintFile is an optional repo-relative path the orchestrator reads when FailureHint is empty (see config retrieval.failure_hint_file).
 	FailureHintFile string
 	// DisableHybridModuleFilter when true, disables structured module filter on similar-chunk retrieval (see ContextRequest).
 	DisableHybridModuleFilter bool
+	// Fusion selects candidate-list combination: "dense" (default) or "rrf". From retrieval.fusion.
+	Fusion string
 	// MinSimilarTestsForGeneration when > 0: skip adding a gap to the plan (abstain) if len(SimilarTests) is below this after Retrieve. 0 = disabled. See AssessSimilarReferenceSufficiency.
 	MinSimilarTestsForGeneration int
 	// MinSimilarityCosine when > 0: abstain when the target chunk has an embedding, at least one similar-reference chunk exists, and max cosine to any similar chunk is below this (clamped to [0,1]). 0 = disabled. When there are no similar chunks (greenfield) or the target has no embedding, this criterion is not applied.
@@ -178,12 +204,48 @@ func isPrivateJavaMethod(sym *metadata.Symbol) bool {
 // ListGaps returns a small set of test-gap candidates: public methods (or functions for JS/TS) with no tests, optionally
 // prioritized by business-critical modules (payment, auth, …) and central dependencies (many callers).
 // Private Java methods are excluded (we do not test private members). Metadata calls (GetFile, GetEdgesTo) run concurrently with bounded concurrency.
+// symbolChurnReader is the optional store capability behind the CP13 churn term.
+type symbolChurnReader interface {
+	SymbolChurn(ctx context.Context, repoID string, since time.Time) (map[string]int, error)
+}
+
+// churnWindow is the lookback for the churn signal — "changed recently".
+const churnWindow = 90 * 24 * time.Hour
+
+// churnCap bounds one symbol's contribution, so a single hot file cannot monopolize the plan.
+const churnCap = 5
+
 func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*TestGap, error) {
+	return ListGapsWithChunks(ctx, meta, nil, opts)
+}
+
+// ListGapsWithChunks is ListGaps with an optional chunk reader enabling the second scoring stage.
+//
+// Stage 1 scores every candidate from data already in hand (span, arity, outbound call edges) and
+// applies the eligibility filter. Stage 2 takes only the top 4×MaxGaps and fetches each one's chunk
+// to add branch-intent evidence. Two stages because a chunk fetch per candidate is unaffordable on
+// a large repo (tens of thousands of symbols) while ~40 fetches at concurrency 16 is ~3 round-trip
+// batches.
+//
+// chunks may be nil (ListGaps, and any caller without a chunk store): stage 2 is then skipped and
+// stage-1 scoring stands. That is the back-compat seam.
+func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkReader, opts PlanOptions) ([]*TestGap, error) {
 	if opts.Lang == "" {
 		opts.Lang = "java"
 	}
 	if opts.MaxGaps <= 0 {
 		opts.MaxGaps = 10
+	}
+	// Churn map, fetched ONCE per plan rather than per candidate, and only when the weight is on and
+	// the store can answer. Failure degrades to structural scoring with an empty map — churn is a
+	// bonus signal, never a gate.
+	churnBySymbol := map[string]int{}
+	if opts.ChurnWeight > 0 {
+		if cr, ok := meta.(symbolChurnReader); ok {
+			if m, err := cr.SymbolChurn(ctx, opts.RepoID, time.Now().Add(-churnWindow)); err == nil {
+				churnBySymbol = m
+			}
+		}
 	}
 	maxPerFile := opts.MaxGapsPerFile
 	if maxPerFile < 0 {
@@ -203,7 +265,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {
-			symbols, err := meta.ListSymbolsInNonTestFiles(ctx, lang, kind)
+			symbols, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, lang, kind)
 			if err != nil {
 				return nil, err
 			}
@@ -224,6 +286,11 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 	g.SetLimit(maxConcurrencyListGaps)
 	var mu sync.Mutex
 	var list []*TestGap
+	// filtered keeps ineligible candidates so an over-aggressive filter can never produce an empty
+	// plan: if nothing survives, we fall back to the unfiltered ranking and say so loudly.
+	var filtered []*TestGap
+	filteredByReason := map[string]int{}
+	enclosingCache := &sync.Map{}
 	for _, sym := range allSymbols {
 		sym := sym
 		g.Go(func() error {
@@ -236,7 +303,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 			if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
 				return nil
 			}
-			f, err := meta.GetFile(gctx, sym.File)
+			f, err := meta.GetFile(gctx, opts.RepoID, sym.File)
 			if err != nil || f == nil {
 				return nil
 			}
@@ -251,14 +318,57 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 				gap.Reason = "business-critical module"
 				gap.Priority += 30 // highest band: critical beats "no tests" and "has tests"
 			}
-			edgesToRaw, _ := meta.GetEdgesTo(gctx, sym.ID)
-			edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
-			if len(edgesToCentrality) >= 3 {
+			// Churn (CP13): distinct body hashes in the window minus one is "times changed", capped
+			// so a hot file cannot monopolize the plan. Weight 0 means the term is absent entirely —
+			// no lookup, no reason text, no priority change.
+			if opts.ChurnWeight > 0 {
+				if changes := churnBySymbol[sym.ID] - 1; changes > 0 {
+					c := changes
+					if c > churnCap {
+						c = churnCap
+					}
+					gap.Priority += opts.ChurnWeight * c
+					gap.Reason += fmt.Sprintf("; changed %dx in 90d", changes)
+				}
+			}
+			// Resolve the declaring type ONCE and share it between the eligibility filter and
+			// the TESTS_SOURCE trace lookup (which used to fetch and discard it). Net new DB
+			// calls for the filter: zero.
+			enclosing := enclosingTypeSymbol(gctx, meta, opts.RepoID, sym, enclosingCache)
+			edgesFromRaw, _ := meta.GetEdgesFrom(gctx, opts.RepoID, sym.ID)
+			outboundCalls := len(edgesExcludingTypes(edgesFromRaw, "IMPORTS"))
+			if eligible, reason := gapEligibility(sym, enclosing, outboundCalls); !eligible {
+				mu.Lock()
+				filtered = append(filtered, gap)
+				filteredByReason[reason]++
+				mu.Unlock()
+				return nil
+			}
+			gap.TestabilityScore = TestabilityScore(sym, outboundCalls, nil)
+			gap.Priority += gap.TestabilityScore
+			// Inbound-edge count for the centrality signal, read from the materialized column
+			// rather than one GetEdgesTo per candidate — on a 30k-symbol repository that was 30k
+			// queries per run.
+			//
+			// InDegreeNonTest excludes TESTS_SOURCE, matching what the old edgesExcludingTypes call
+			// computed. That exclusion is the signal, not a detail: counting a symbol's own test
+			// coverage would mark well-tested symbols as "central dependency, under-tested".
+			//
+			// Degrees are recomputed at the end of an index run, so a symbol indexed before this
+			// column existed reads 0 until the next run. Falling back to the query when the column
+			// is 0 keeps behaviour identical on a stale corpus at the cost of one query for
+			// genuinely-unreferenced symbols, which are the cheap case.
+			centrality := sym.InDegreeNonTest
+			if centrality == 0 {
+				edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
+				centrality = len(edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource))
+			}
+			if centrality >= 3 {
 				if gap.Priority < 30 {
 					gap.Kind = GapLowCoverageCentral
 					gap.Reason = "central dependency, under-tested"
 				}
-				gap.Priority += len(edgesToCentrality)
+				gap.Priority += centrality
 			}
 			// Priority order: 1) critical, 2) modules without tests, 3) modules with tests. Deprioritize "has existing test" only so they sort last.
 			if hasExistingTest {
@@ -267,7 +377,7 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 					gap.Reason = "extend existing test file (add test for this symbol)"
 				}
 			}
-			if hasInboundTestsSourceTrace(gctx, meta, sym) {
+			if hasInboundTestsSourceTraceWithType(gctx, meta, opts.RepoID, sym, enclosing) {
 				gap.Priority -= 38
 				if gap.Reason == "no tests detected" {
 					gap.Reason = "traceability: tests link to this symbol (TESTS_SOURCE)"
@@ -283,7 +393,32 @@ func ListGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*Tes
 		return nil, err
 	}
 
+	if opts.MinGapTestabilityScore > 0 {
+		kept := list[:0]
+		for _, g := range list {
+			if g.TestabilityScore >= opts.MinGapTestabilityScore {
+				kept = append(kept, g)
+				continue
+			}
+			filtered = append(filtered, g)
+			filteredByReason["below_min_testability_score"]++
+		}
+		list = kept
+	}
+
+	totalCandidates := len(list) + len(filtered)
+	if len(list) == 0 && len(filtered) > 0 {
+		// Never hand back an empty plan because the filter was too eager. Ranking still applies —
+		// the low-value candidates simply sink — but the run produces output and the audit says
+		// exactly what happened.
+		auditGapFilterFallback(ctx, opts, filteredByReason, totalCandidates)
+		list = filtered
+	} else {
+		auditGapFilter(ctx, opts, filteredByReason, totalCandidates, len(list))
+	}
+
 	list = sortByPriority(list)
+	list = refineShortlistWithBranchIntents(ctx, chunks, opts, list)
 	list = selectGapsWithDiversity(list, opts.MaxGaps, maxPerFile)
 	return list, nil
 }
@@ -448,11 +583,11 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 			if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(route.File, opts.SkipPathPrefixes) {
 				return nil
 			}
-			f, err := meta.GetFile(gctx, route.File)
+			f, err := meta.GetFile(gctx, opts.RepoID, route.File)
 			if err != nil || f == nil {
 				return nil
 			}
-			edgesTo, err := meta.GetEdgesTo(gctx, route.ID)
+			edgesTo, err := meta.GetEdgesTo(gctx, opts.RepoID, route.ID)
 			if err != nil {
 				return nil
 			}
@@ -461,11 +596,11 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 				if e == nil || strings.TrimSpace(e.EdgeType) != "TARGETS_API_ROUTE" {
 					continue
 				}
-				caller, err := meta.GetSymbolByID(gctx, e.CallerSymbolID)
+				caller, err := meta.GetSymbolByID(gctx, opts.RepoID, e.CallerSymbolID)
 				if err != nil || caller == nil || caller.File == "" {
 					continue
 				}
-				cf, err := meta.GetFile(gctx, caller.File)
+				cf, err := meta.GetFile(gctx, opts.RepoID, caller.File)
 				if err != nil || cf == nil {
 					continue
 				}
@@ -485,7 +620,7 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 				tg.Priority += 30
 			}
 			// Outbound ROUTE_TO_HANDLER (and similar): central entrypoints bubble up.
-			edgesFrom, _ := meta.GetEdgesFrom(gctx, route.ID)
+			edgesFrom, _ := meta.GetEdgesFrom(gctx, opts.RepoID, route.ID)
 			if len(edgesFrom) >= 1 {
 				tg.Priority += len(edgesFrom)
 			}
@@ -522,6 +657,138 @@ func listUncoveredAPIRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts 
 // Java fallback without API_ROUTE: PAGE_OBJECT, USER_FLOW, E2E_SPEC in test files.
 //
 // Requires MaxGapsE2E > 0; uses skip/critical heuristics and diversity caps.
+// uncoveredAPIRouteLangs maps the workflow language to the backend language whose API routes anchor
+// E2E gaps, or nothing when the language does not use that model.
+func uncoveredAPIRouteLangs(workflowLang string) []string {
+	switch workflowLang {
+	case "java":
+		return []string{"java"}
+	case "csharp", "cs":
+		return []string{"csharp"}
+	}
+	return nil
+}
+
+// uncoveredAPIRouteE2EGapsForLang returns the E2E gaps derived from API routes that no test targets.
+//
+// The bool is the control flow the caller needs and the reason this cannot be a plain helper: when
+// routes exist, this phase DECIDES the outcome. Either some route is uncovered — those are the gaps,
+// and nothing else is considered — or every route is covered, in which case a pure Java/C# E2E
+// profile yields no gaps at all, while a full-stack or Playwright profile falls through so indexed
+// JS/TS can still contribute PAGE_ROUTE and E2E_SPEC anchors.
+//
+// decided=false means "this phase has no opinion": either the language has no indexed API routes, or
+// every route is covered and the profile wants the JS/TS supplement.
+
+// uncoveredAPIRouteE2EGapsForLang returns the E2E gaps derived from API routes that no test targets.
+//
+// The bool is the control flow the caller needs and the reason this cannot be a plain helper: when
+// routes exist, this phase DECIDES the outcome. Either some route is uncovered — those are the gaps,
+// and nothing else is considered — or every route is covered, in which case a pure Java/C# E2E
+// profile yields no gaps at all, while a full-stack or Playwright profile falls through so indexed
+// JS/TS can still contribute PAGE_ROUTE and E2E_SPEC anchors.
+//
+// decided=false means "this phase has no opinion": either the language has no indexed API routes, or
+// every route is covered and the profile wants the JS/TS supplement.
+func uncoveredAPIRouteE2EGapsForLang(
+	ctx context.Context,
+	meta GapMetaReader,
+	opts PlanOptions,
+	lang string,
+	maxPerFile int,
+) (gaps []*TestGap, decided bool, err error) {
+	routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, lang, "API_ROUTE")
+	if err != nil {
+		return nil, false, err
+	}
+	routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
+	if len(routes) == 0 {
+		return nil, false, nil
+	}
+	list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(list) > 0 {
+		list = sortByPriority(list)
+		return selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile), true, nil
+	}
+	if !e2eProfileWantsJSTSSupplement(opts) {
+		// Every API route is targeted from a test and the profile is backend-only: no gaps, and no
+		// "extend an existing spec" anchors either.
+		return nil, true, nil
+	}
+	return nil, false, nil
+}
+
+// appendPageRouteE2EGaps adds UI-route anchors (React Router, Angular, …) for JS/TS, unless
+// profile_e2e is explicitly java_unit-shaped.
+//
+// Separate from the pass above because these come from NON-test files: they are production routes
+// that no spec targets, whereas the main pass walks symbols already living in test files.
+
+// appendPageRouteE2EGaps adds UI-route anchors (React Router, Angular, …) for JS/TS, unless
+// profile_e2e is explicitly java_unit-shaped.
+//
+// Separate from the pass above because these come from NON-test files: they are production routes
+// that no spec targets, whereas the main pass walks symbols already living in test files.
+func appendPageRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions, list []*TestGap) ([]*TestGap, error) {
+	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
+	if pageRouteE2EGapsEnabledJS(opts) {
+		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
+			seenID := make(map[string]bool)
+			for _, g := range list {
+				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
+					seenID[g.Symbol.ID] = true
+				}
+			}
+			for _, l := range langs {
+				pages, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
+				if err != nil {
+					return nil, err
+				}
+				for _, sym := range pages {
+					if sym == nil || sym.ID == "" || seenID[sym.ID] {
+						continue
+					}
+					if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {
+						continue
+					}
+					if indexer.IsTypeScriptDeclarationPath(sym.File) {
+						continue
+					}
+					if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
+						continue
+					}
+					f, err := meta.GetFile(ctx, opts.RepoID, sym.File)
+					if err != nil || f == nil {
+						continue
+					}
+					gap := &TestGap{
+						Symbol: sym, Module: f.Module, Kind: GapNoTests,
+						Reason: e2eGapBaseReasonForSymbolKind("PAGE_ROUTE"), Priority: 3,
+					}
+					if isCritical(sym.File, f.Module, opts.CriticalModulePrefixes) {
+						gap.Kind = GapBusinessCritical
+						gap.Reason = "business-critical UI route — add or extend E2E coverage"
+						gap.Priority += 30
+					}
+					edgesToRaw, _ := meta.GetEdgesTo(ctx, opts.RepoID, sym.ID)
+					edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
+					if len(edgesToCentrality) >= 2 && gap.Kind == GapNoTests {
+						gap.Kind = GapLowCoverageCentral
+						gap.Reason = "UI route linked to many graph symbols — prioritize E2E"
+						gap.Priority += len(edgesToCentrality)
+					}
+					seenID[sym.ID] = true
+					list = append(list, gap)
+				}
+			}
+		}
+	}
+	return list, nil
+}
+
 func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*TestGap, error) {
 	if opts.MaxGapsE2E <= 0 {
 		return nil, nil
@@ -537,50 +804,16 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		maxPerFile = 2
 	}
 	wl := strings.ToLower(strings.TrimSpace(opts.Lang))
-	if wl == "java" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, "java", "API_ROUTE")
+	// Java and C# use the same model: if any API route is not targeted from a test, those routes ARE
+	// the E2E gaps and nothing else is considered. They were two near-identical 20-line blocks
+	// differing only in the language literal and a comment.
+	for _, lang := range uncoveredAPIRouteLangs(wl) {
+		gaps, decided, err := uncoveredAPIRouteE2EGapsForLang(ctx, meta, opts, lang, maxPerFile)
 		if err != nil {
 			return nil, err
 		}
-		routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
-		if len(routes) > 0 {
-			list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
-			if err != nil {
-				return nil, err
-			}
-			if len(list) > 0 {
-				list = sortByPriority(list)
-				return selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile), nil
-			}
-			if !e2eProfileWantsJSTSSupplement(opts) {
-				// Pure Java E2E: no "extend spec" gaps when every API route is targeted from tests.
-				return nil, nil
-			}
-			// Monorepo: fall through so indexed JS/TS (React/Node) can still yield PAGE_ROUTE / E2E_SPEC when profile_e2e is full_stack / react / e2e_playwright.
-		}
-	}
-
-	// C# ASP.NET Core: same uncovered API_ROUTE model as Java; same e2e_playwright / full_stack fallthrough when all covered.
-	if wl == "csharp" || wl == "cs" {
-		routes, err := meta.ListSymbolsInNonTestFiles(ctx, "csharp", "API_ROUTE")
-		if err != nil {
-			return nil, err
-		}
-		routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
-		if len(routes) > 0 {
-			apiList, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, routes)
-			if err != nil {
-				return nil, err
-			}
-			if len(apiList) > 0 {
-				apiList = sortByPriority(apiList)
-				return selectGapsWithDiversity(apiList, opts.MaxGapsE2E, maxPerFile), nil
-			}
-			if !e2eProfileWantsJSTSSupplement(opts) {
-				// http_api-style E2E: no further anchors when every API route is targeted from tests.
-				return nil, nil
-			}
-			// e2e_playwright / full_stack / react_feature: fall through to csharp E2E_SPEC + JS/TS supplement.
+		if decided {
+			return gaps, nil
 		}
 	}
 
@@ -589,7 +822,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		seenR := make(map[string]bool)
 		var apiRoutes []*metadata.Symbol
 		for _, l := range langs {
-			routes, err := meta.ListSymbolsInNonTestFiles(ctx, l, "API_ROUTE")
+			routes, err := meta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "API_ROUTE")
 			if err != nil {
 				return nil, err
 			}
@@ -622,7 +855,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	var allSymbols []*metadata.Symbol
 	seenID := make(map[string]bool)
 	for _, q := range queries {
-		symbols, err := meta.ListSymbolsInTestFiles(ctx, q.lang, q.kind)
+		symbols, err := meta.ListSymbolsInTestFiles(ctx, opts.RepoID, q.lang, q.kind)
 		if err != nil {
 			return nil, err
 		}
@@ -645,7 +878,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 				if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
 					return nil
 				}
-				f, err := meta.GetFile(gctx, sym.File)
+				f, err := meta.GetFile(gctx, opts.RepoID, sym.File)
 				if err != nil || f == nil {
 					return nil
 				}
@@ -656,7 +889,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 					gap.Reason = "business-critical e2e coverage"
 					gap.Priority += 30
 				}
-				edgesToRaw, _ := meta.GetEdgesTo(gctx, sym.ID)
+				edgesToRaw, _ := meta.GetEdgesTo(gctx, opts.RepoID, sym.ID)
 				edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
 				if len(edgesToCentrality) >= 2 {
 					gap.Priority += len(edgesToCentrality)
@@ -682,58 +915,9 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 		}
 	}
 
-	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
-	if pageRouteE2EGapsEnabledJS(opts) {
-		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
-			seenID := make(map[string]bool)
-			for _, g := range list {
-				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
-					seenID[g.Symbol.ID] = true
-				}
-			}
-			for _, l := range langs {
-				pages, err := meta.ListSymbolsInNonTestFiles(ctx, l, "PAGE_ROUTE")
-				if err != nil {
-					return nil, err
-				}
-				for _, sym := range pages {
-					if sym == nil || sym.ID == "" || seenID[sym.ID] {
-						continue
-					}
-					if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {
-						continue
-					}
-					if indexer.IsTypeScriptDeclarationPath(sym.File) {
-						continue
-					}
-					if len(opts.SkipPathPrefixes) > 0 && indexer.PathMatchesSkipPrefix(sym.File, opts.SkipPathPrefixes) {
-						continue
-					}
-					f, err := meta.GetFile(ctx, sym.File)
-					if err != nil || f == nil {
-						continue
-					}
-					gap := &TestGap{
-						Symbol: sym, Module: f.Module, Kind: GapNoTests,
-						Reason: e2eGapBaseReasonForSymbolKind("PAGE_ROUTE"), Priority: 3,
-					}
-					if isCritical(sym.File, f.Module, opts.CriticalModulePrefixes) {
-						gap.Kind = GapBusinessCritical
-						gap.Reason = "business-critical UI route — add or extend E2E coverage"
-						gap.Priority += 30
-					}
-					edgesToRaw, _ := meta.GetEdgesTo(ctx, sym.ID)
-					edgesToCentrality := edgesExcludingTypes(edgesToRaw, metadata.EdgeTypeTestsSource)
-					if len(edgesToCentrality) >= 2 && gap.Kind == GapNoTests {
-						gap.Kind = GapLowCoverageCentral
-						gap.Reason = "UI route linked to many graph symbols — prioritize E2E"
-						gap.Priority += len(edgesToCentrality)
-					}
-					seenID[sym.ID] = true
-					list = append(list, gap)
-				}
-			}
-		}
+	list, perr := appendPageRouteE2EGaps(ctx, meta, opts, list)
+	if perr != nil {
+		return nil, perr
 	}
 
 	if len(list) == 0 {
@@ -743,7 +927,6 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	list = selectGapsWithDiversity(list, opts.MaxGapsE2E, maxPerFile)
 	return list, nil
 }
-
 func isCritical(filePath, module string, prefixes []string) bool {
 	lower := strings.ToLower(filePath + " " + module)
 	for _, p := range prefixes {
@@ -757,19 +940,30 @@ func isCritical(filePath, module string, prefixes []string) bool {
 	return false
 }
 
+// sortByPriority orders gaps by Priority descending with a TOTAL, reindex-stable tie-break.
+//
+// The previous implementation was a hand-written insertion sort — O(n²) over every non-test method
+// in the repository — whose tie-break was Symbol.ID, a UUID regenerated on every reindex. Two
+// consecutive runs on an UNCHANGED repository could therefore select disjoint gap sets, which
+// breaks incremental improvement and makes any A/B comparison meaningless.
 func sortByPriority(list []*TestGap) []*TestGap {
-	// Sort by Priority descending; break ties by Symbol.ID for stable, deterministic order.
-	for i := 1; i < len(list); i++ {
-		for j := i; j > 0; j-- {
-			higher := list[j].Priority > list[j-1].Priority
-			tie := list[j].Priority == list[j-1].Priority && list[j].Symbol != nil && list[j-1].Symbol != nil && list[j].Symbol.ID < list[j-1].Symbol.ID
-			if higher || tie {
-				list[j], list[j-1] = list[j-1], list[j]
-			} else {
-				break
-			}
+	sort.SliceStable(list, func(i, j int) bool {
+		if list[i].Priority != list[j].Priority {
+			return list[i].Priority > list[j].Priority
 		}
-	}
+		a, b := list[i].Symbol, list[j].Symbol
+		if a == nil || b == nil {
+			// Nil symbols sort last, deterministically.
+			return b == nil && a != nil
+		}
+		if a.FQName != b.FQName {
+			return a.FQName < b.FQName
+		}
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		return a.StartLine < b.StartLine
+	})
 	return list
 }
 
@@ -820,7 +1014,7 @@ type testPlanBuildParams struct {
 // similar tests, fixtures, config. Retrieve runs concurrently with bounded concurrency; results
 // are assembled in gap order for stable audit and plan.Items.
 func CreateTestPlan(ctx context.Context, gapMeta GapMetaReader, retrievalMeta MetaReader, chunks ChunkReader, opts PlanOptions) (*TestPlan, error) {
-	gapList, err := ListGaps(ctx, gapMeta, opts)
+	gapList, err := ListGapsWithChunks(ctx, gapMeta, chunks, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -852,22 +1046,22 @@ func CreateE2ETestPlan(ctx context.Context, gapMeta GapMetaReader, retrievalMeta
 			}
 			wl := strings.ToLower(strings.TrimSpace(opts.Lang))
 			if wl == "csharp" || wl == "cs" {
-				routes, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, "csharp", "API_ROUTE")
+				routes, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, "csharp", "API_ROUTE")
 				fields["indexed_csharp_api_route_count"] = len(routes)
-				if specs, err := gapMeta.ListSymbolsInTestFiles(ctx, "csharp", "E2E_SPEC"); err == nil {
+				if specs, err := gapMeta.ListSymbolsInTestFiles(ctx, opts.RepoID, "csharp", "E2E_SPEC"); err == nil {
 					fields["indexed_csharp_e2e_spec_count"] = len(specs)
 				}
 			}
 			if wl == "javascript" || wl == "typescript" || wl == "js" || wl == "ts" {
 				pr := 0
 				for _, l := range []string{"typescript", "javascript"} {
-					syms, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, l, "PAGE_ROUTE")
+					syms, _ := gapMeta.ListSymbolsInNonTestFiles(ctx, opts.RepoID, l, "PAGE_ROUTE")
 					pr += len(syms)
 				}
 				fields["indexed_page_route_non_test_count"] = pr
 				e2eN := 0
 				for _, l := range []string{"typescript", "javascript"} {
-					syms, _ := gapMeta.ListSymbolsInTestFiles(ctx, l, "E2E_SPEC")
+					syms, _ := gapMeta.ListSymbolsInTestFiles(ctx, opts.RepoID, l, "E2E_SPEC")
 					e2eN += len(syms)
 				}
 				fields["indexed_e2e_spec_count"] = e2eN
@@ -940,6 +1134,10 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 				SimilarMMRLambda:          opts.SimilarMMRLambda,
 				FailureHint:               opts.FailureHint,
 				DisableHybridModuleFilter: opts.DisableHybridModuleFilter,
+				Fusion:                    opts.Fusion,
+				// The lexical channel has no user query to work with; it is synthesized from
+				// what the target IS. Empty (no symbol) disables the channel for that gap.
+				LexicalQuery: LexicalQueryForTarget(gap.Symbol, typeNamesFromSignature(gap.Symbol)),
 			}
 			normReq := normalizeContextRequestForRetrieveKey(req)
 			cacheKey := retrievalCacheKey(normReq)
@@ -991,7 +1189,7 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 		}
 		symFileNorm := filepath.ToSlash(strings.TrimSpace(r.item.Gap.Symbol.File))
 		_, hasExistingTests := opts.SourceFilesWithExistingTest[symFileNorm]
-		r.item.Context.ExistingTestCoverage = buildExistingTestCoverageHint(r.item.Context, hasExistingTests)
+		r.item.Context.ExistingTestCoverage = buildExistingTestCoverageHintForGap(r.item.Context, hasExistingTests, r.item.Gap)
 		if paths := opts.ExistingTestPathsBySource[symFileNorm]; len(paths) > 0 {
 			// Copy + normalise so downstream sees slash-separated, sorted, dedup'd repo-relative paths.
 			seen := make(map[string]struct{}, len(paths))
@@ -1010,6 +1208,7 @@ func createTestPlanFromGaps(ctx context.Context, gapMeta GapMetaReader, retrieva
 			sort.Strings(cleaned)
 			r.item.Context.ExistingTestPaths = cleaned
 		}
+		r.item.Context.TestSuffixConvention = opts.TestSuffixConvention
 		if opts.Audit != nil {
 			prof := string(profileForRetrieve)
 			payload := retrievalContextAuditSummary(r.item.Context, prof)

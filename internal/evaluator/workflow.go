@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -57,6 +58,11 @@ const errorLogLLMSummaryMinRunes = 8000
 // ErrFormatAfterFixSkipped is returned (wrapped with fmt.Errorf("%w", ...)) when FormatAfterFix did not run
 // on the host because a formatter such as dotnet was not on PATH (local sandbox only; docker sandboxes run format in the toolchain container).
 var ErrFormatAfterFixSkipped = errors.New("format after fix skipped (formatter not on PATH)")
+
+// ErrFixArtifactTooLarge means every artifact in scope exceeds the full-file prompt ceiling, so
+// there is nothing the fixer can be asked to rewrite. Not retryable: the file will be the same size
+// next round.
+var ErrFixArtifactTooLarge = errors.New("fixer artifact exceeds full-file prompt ceiling")
 
 // EvalOptions configures the evaluation workflow (which steps to run, max fix iterations).
 type EvalOptions struct {
@@ -113,6 +119,40 @@ type EvalOptions struct {
 	// Default false = every file keeps its full body (existing behaviour). Runner flag:
 	// `runner.fixer_dependency_signature_only`; env RUNNER_FIXER_DEPENDENCY_SIGNATURE_ONLY.
 	FixerDependencySignatureOnly bool
+	// FixContextRunesMax caps the total size of the fix context. 0 = uncapped (previous behaviour).
+	// Read-only dependency files are shed largest-first until the budget fits; writable artifacts
+	// are never shed, because a fix round without the file it must rewrite is useless and a
+	// truncated artifact yields a corrupt rewrite.
+	FixContextRunesMax int
+	// BackoffBetweenFixAttempts sleeps before every fix attempt after the first. 0 = no sleep.
+	// The provider clients' own retry backoff paces retries WITHIN a single failed LLM call; this
+	// paces the evaluator's own fix rounds, which is what an operator setting a backoff against a
+	// rate-limited provider is asking for.
+	BackoffBetweenFixAttempts time.Duration
+	// FixLoopRepeatStopThreshold / FixLoopRecurrenceStopThreshold / FixLoopNoProgressStopThreshold
+	// override the package defaults of the same name. A non-positive value means "unset", never
+	// "disable the breaker" — a disabled breaker is how a loop burns its whole budget on one
+	// unfixable error. They were hardcoded, which left an operator watching a loop give up after
+	// three rounds with no lever at all.
+	FixLoopRepeatStopThreshold     int
+	FixLoopRecurrenceStopThreshold int
+	FixLoopNoProgressStopThreshold int
+	// APISurfaceProvider, when set, extracts real member signatures for the third-party types a
+	// diagnostic blames, read from the project's compile classpath. Optional: a nil provider, an
+	// unresolvable classpath, or a lookup error all degrade to "no API block" — audited, never
+	// fatal. See fix_api_surface.go for why the fixer needs this at all.
+	APISurfaceProvider apisurface.Provider
+	// BaselineFailingPaths are repo-relative test files that were ALREADY failing before this run
+	// generated anything, captured by one pre-generation compile. They are adopted into the fixer's
+	// writable set as a known input rather than being re-derived from each round's diagnostic by
+	// regex, which is what the derived-path fallback below has to do without them.
+	BaselineFailingPaths []string
+	// AllowFixCoverageReduction (escape hatch, default false) lets a fixer write through even when
+	// it reduces the number of test methods in a file. Off by default because the observed failure
+	// mode was the fixer "repairing" a compile error by deleting the tests and the round being
+	// recorded as a success. Set it only for a repo where a test genuinely has to go, and expect
+	// evaluator.fix_coverage_regression_allowed in the audit every time it is used.
+	AllowFixCoverageReduction bool
 	// FixerStructuredUserMessage (Phase 3 opt-in) when true, the fixer emits its user message as
 	// tagged `<error>` / `<file role=… writable=…>` XML-like blocks instead of the legacy
 	// `--- path ---` layout, giving the model explicit section boundaries. Default false keeps
@@ -259,8 +299,13 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 		}
 		out.StepResults = append(out.StepResults[:0], compileRes)
 		if !compileRes.OK {
-			unitFailStreak, e2eFailStreak = 0, 0
-			unitFailFP, e2eFailFP = "", ""
+			// The repeated-test-failure streaks are deliberately NOT reset here. This iteration's
+			// test step never runs, so there is no fingerprint to compare — the streak PAUSES.
+			// Resetting it makes the early-exit discard unreachable whenever a fixer's own
+			// test-step writes break compilation between two identical test failures: the file
+			// shields itself from discard by breaking the build. A compile break that genuinely
+			// changes WHICH files fail still resets naturally in maybeExitOnRepeatedTestFailure,
+			// via the fingerprint mismatch.
 			out.LastFixAction = FixImportsMocks
 			if audit != nil {
 				audit.LogError(ctx, "evaluator.compile_failed", map[string]interface{}{
@@ -339,7 +384,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 					failingFeeds := sortedSet(failingNuGetFeedURLs(compileRes.Output))
 					if audit != nil {
 						audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
-							"message":           "LLM compile fix rejected: compile failure is a NuGet restore symptom (NU1301/NU1101/NU1102/NU1103/NU1403/NU5036). Code-level edits cannot repair authentication or feed-reachability issues — fix credentials (vcs.azure_devops.token / runner.azure_devops_nuget_feed_endpoints / runner.private_registry_credentials) and re-run.",
+							"message":           "LLM compile fix rejected: compile failure is a NuGet restore symptom (NU1301/NU1101/NU1102/NU1103/NU1403/NU5036). Code-level edits cannot repair authentication or feed-reachability issues — fix credentials (general.git.azure_devops.token / general.sandbox.registries.azure_devops_nuget_feed_endpoints / general.sandbox.registries.credentials) and re-run.",
 							"step":              StepCompile,
 							"reason":            "nuget_restore_failure",
 							"failing_feed_urls": failingFeeds,
@@ -361,7 +406,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 					continue
 				}
 				if opts.Fixer != nil && compileFixAttempts < maxCompileFix {
-					if applied, touched := applyLLMFix(ctx, opts, StepCompile, compileRes.Output, audit, &compileFixAttempts, maxCompileFix, &compileFixState, ""); applied {
+					if applied, touched, _ := applyLLMFix(ctx, opts, StepCompile, compileRes.Output, audit, &compileFixAttempts, maxCompileFix, &compileFixState, ""); applied {
 						if len(touched) > 0 {
 							out.IterationArtifacts = append(out.IterationArtifacts, touched)
 						}
@@ -407,7 +452,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 				continue
 			}
 			if opts.Fixer != nil && testFixAttempts < maxTestFix {
-				if applied, touched := applyLLMFix(ctx, opts, StepTest, testRes.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraKind); applied {
+				if applied, touched, _ := applyLLMFix(ctx, opts, StepTest, testRes.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraKind); applied {
 					if len(touched) > 0 {
 						out.IterationArtifacts = append(out.IterationArtifacts, touched)
 					}
@@ -470,7 +515,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 						continue
 					}
 					if opts.Fixer != nil && testFixAttempts < maxTestFix {
-						if applied, touched := applyLLMFix(ctx, opts, StepTestE2E, testE2E.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraE2E); applied {
+						if applied, touched, _ := applyLLMFix(ctx, opts, StepTestE2E, testE2E.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraE2E); applied {
 							if len(touched) > 0 {
 								out.IterationArtifacts = append(out.IterationArtifacts, touched)
 							}
@@ -1193,6 +1238,9 @@ type FixLoopState struct {
 	// will already have seen *attemptCounter == maxAttempts and stopped, but this guards nested or
 	// reentrant call paths).
 	tripped bool
+	// trippedReason is the FixSkip* constant for the breaker that fired, so the sticky no-op path
+	// reports the same cause as the round that actually tripped rather than a generic label.
+	trippedReason string
 	// seen counts how many times each canonical signature has appeared this loop; recurrences counts
 	// signatures that reappeared after the model had moved to a different one (the hallmark of an
 	// oscillation that the consecutive-streak counter alone never catches).
@@ -1204,6 +1252,16 @@ type FixLoopState struct {
 	bestMagnitude    int
 	magnitudeKnown   bool
 	noProgressStreak int
+	// attempts is the compacted memory of rounds already completed for this step. It lives here
+	// rather than in the Fixer because llmfix's conversation retention cannot hold a real fix
+	// prompt (141-147k runes against a 64k budget upstream measured), so raw multi-turn history is
+	// wiped after every round. FixLoopState is already scoped to exactly (step, loop) and threaded
+	// through every applyLLMFix call site, which is the scope this memory needs.
+	attempts []FixAttemptRecord
+	// lastFileDiagnostics is the per-file diagnostic fingerprint of the failure the PREVIOUS round
+	// was handed, so the next round can tell which of that round's writes moved nothing. See
+	// FileDiagnostics.
+	lastFileDiagnostics map[string]string
 }
 
 // FixLoopRepeatStopThreshold is the number of consecutive applyLLMFix calls sharing the same
@@ -1212,6 +1270,29 @@ type FixLoopState struct {
 // without letting a truly stuck loop burn the full attempt budget. Keep in sync with DOCUMENTATION.md
 // ("Automatic context-hygiene escalation" + "Repeat-failure circuit-breaker" subsections).
 const FixLoopRepeatStopThreshold = 3
+
+// Effective breaker thresholds for one evaluation: the configured value when positive, else the
+// package default. A non-positive config value means "unset", never "disable the breaker".
+func (o EvalOptions) repeatStopThreshold() int {
+	if o.FixLoopRepeatStopThreshold > 0 {
+		return o.FixLoopRepeatStopThreshold
+	}
+	return FixLoopRepeatStopThreshold
+}
+
+func (o EvalOptions) recurrenceStopThreshold() int {
+	if o.FixLoopRecurrenceStopThreshold > 0 {
+		return o.FixLoopRecurrenceStopThreshold
+	}
+	return FixLoopRecurrenceStopThreshold
+}
+
+func (o EvalOptions) noProgressStopThreshold() int {
+	if o.FixLoopNoProgressStopThreshold > 0 {
+		return o.FixLoopNoProgressStopThreshold
+	}
+	return FixLoopNoProgressStopThreshold
+}
 
 // FixLoopRecurrenceStopThreshold is how many times a previously-seen signature may reappear (after the
 // fixer had moved to a different one) before the loop gives up. Two reappearances is enough to confirm
@@ -1256,6 +1337,130 @@ func fixLoopErrorMagnitude(canonicalErr string) int {
 	return n
 }
 
+// checkFixLoopBreakers runs the three circuit-breakers and reports whether the loop must stop.
+//
+// Extracted from applyLLMFix, which was one function doing detection, prompting, writing and
+// stopping. Detection is now separable — and testable — from everything that happens after it. It
+// owns all mutation of loopState (streaks, recurrences, magnitude tracking, the sticky trip).
+//
+// Called BEFORE files are read or the LLM is invoked, so a truly stuck loop wastes no further
+// work. The returned reason names the breaker that actually fired, so the audit line and the
+// caller's label cannot disagree.
+func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxStep, errorOutput, roundSignature string, pathsToRead []string, errorOutputSanitized bool, audit Auditor, attemptCounter *int, maxAttempts int, loopState *FixLoopState) (stop bool, reason string) {
+	if loopState == nil {
+		return false, ""
+	}
+	// Sticky breaker: once tripped, subsequent calls are immediate no-ops regardless of whether
+	// the outer loop honoured the counter bump (defensive against reentrancy / tests). The reason
+	// is sticky too, so the no-op path reports the same cause as the round that actually tripped.
+	if loopState.tripped {
+		*attemptCounter = maxAttempts
+		if loopState.trippedReason != "" {
+			return true, loopState.trippedReason
+		}
+		return true, FixSkipLoopRepeat
+	}
+	sig := roundSignature
+	mag := fixLoopErrorMagnitude(errorOutput)
+	if loopState.seen == nil {
+		loopState.seen = make(map[string]int)
+	}
+	// (a) consecutive-identical streak. (b) non-consecutive recurrence: the signature reset
+	// (sig != lastSignature) but we have seen this exact sig earlier in the loop — the model is
+	// cycling back through error states it already produced (oscillation).
+	if sig == loopState.lastSignature {
+		loopState.streak++
+	} else {
+		if loopState.seen[sig] > 0 {
+			loopState.recurrences++
+		}
+		loopState.streak = 1
+		loopState.lastSignature = sig
+	}
+	loopState.seen[sig]++
+	// (c) no-progress: track the smallest error magnitude seen and count consecutive attempts that
+	// fail to beat it. A converging fixer drives the magnitude down (resetting the streak); a
+	// moving-target fixer that swaps one error for another keeps it flat and trips this backstop.
+	//
+	// A round whose primary diagnostic is a PARSE failure is excluded entirely — neither the
+	// baseline nor the streak moves. A file that does not parse aborts the compiler before
+	// attribution, so most of the tree's real errors vanish from the output and the magnitude
+	// measures the MASKING, not progress. Upstream measured this: three parse-corrupted rounds
+	// shrank the output from 17 diagnostic lines to 3 and locked bestMagnitude at 3; every healthy
+	// round after — including one that eliminated all five of a file's errors — read as "no
+	// progress", and the breaker tripped with more than half the budget unused on a loop that was
+	// demonstrably converging. The repeat and oscillation breakers still see these rounds through
+	// their signatures, so a fixer stuck INSIDE a parse-broken state remains bounded.
+	if !ParsePrimaryFailureSite(errorOutput).ParseFailure {
+		if !loopState.magnitudeKnown || mag < loopState.bestMagnitude {
+			loopState.bestMagnitude = mag
+			loopState.magnitudeKnown = true
+			loopState.noProgressStreak = 0
+		} else {
+			loopState.noProgressStreak++
+		}
+	}
+	tripReason := ""
+	// effectiveThreshold is the limit that actually fired, so the audit reports the number the
+	// operator can change rather than always reporting the repeat threshold. The two disagreed
+	// whenever oscillation or no-progress tripped, which made the event read as self-contradictory
+	// ("reappeared 2 time(s)" beside "threshold: 3").
+	effectiveThreshold := 0
+	switch {
+	case loopState.streak >= opts.repeatStopThreshold():
+		tripReason, effectiveThreshold = FixSkipLoopRepeat, opts.repeatStopThreshold()
+	case loopState.recurrences >= opts.recurrenceStopThreshold():
+		tripReason, effectiveThreshold = FixSkipLoopOscillation, opts.recurrenceStopThreshold()
+	case loopState.noProgressStreak >= opts.noProgressStopThreshold():
+		tripReason, effectiveThreshold = FixSkipLoopNoProgress, opts.noProgressStopThreshold()
+	}
+	if tripReason == "" {
+		return false, ""
+	}
+	loopState.tripped = true
+	loopState.trippedReason = tripReason
+	if audit != nil {
+		sortedPaths := append([]string(nil), pathsToRead...)
+		for i, p := range sortedPaths {
+			sortedPaths[i] = normalizePathForFix(p)
+		}
+		sort.Strings(sortedPaths)
+		var msg string
+		switch tripReason {
+		case FixSkipLoopOscillation:
+			msg = fmt.Sprintf("Fix loop oscillating: previously-seen error signatures reappeared %d time(s) for step %s (the fixer is cycling through the same error states). Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.recurrences, step, maxAttempts-*attemptCounter, maxAttempts)
+		case FixSkipLoopNoProgress:
+			msg = fmt.Sprintf("Fix loop not converging: error magnitude failed to improve for %d consecutive attempt(s) on step %s (best=%d, current=%d) — each fix swaps one error for another. Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.noProgressStreak, step, loopState.bestMagnitude, mag, maxAttempts-*attemptCounter, maxAttempts)
+		default:
+			msg = fmt.Sprintf("Fix loop saturated: the same (step, artifact_paths, error_output) signature arrived %d times in a row for step %s. Skipping further fix attempts for this step so the remaining %d of %d attempts are not burned on the same prompt.", loopState.streak, step, maxAttempts-*attemptCounter, maxAttempts)
+		}
+		// Every counter that could have tripped is reported alongside the one that did, so a
+		// post-mortem reads the loop's state off the event instead of re-deriving it.
+		audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
+			"message":                msg,
+			"rejection_class":        "breaker",
+			"step":                   step,
+			"reason":                 tripReason,
+			"fix_attempt":            *attemptCounter + 1,
+			"max_fix_attempt":        maxAttempts,
+			"streak":                 loopState.streak,
+			"recurrences":            loopState.recurrences,
+			"no_progress_streak":     loopState.noProgressStreak,
+			"error_magnitude":        mag,
+			"best_error_magnitude":   loopState.bestMagnitude,
+			"threshold":              effectiveThreshold,
+			"threshold_name":         tripReason,
+			"signature":              sig,
+			"artifact_paths":         sortedPaths,
+			"error_output_sanitized": errorOutputSanitized,
+		})
+	}
+	// Consume the remaining attempt budget so the outer loop's guard trips and no further
+	// applyLLMFix call is issued for this step.
+	*attemptCounter = maxAttempts
+	return true, tripReason
+}
+
 // fixLoopSignature returns a short, stable fingerprint for the (step, artifact_paths, error_output)
 // tuple. The artifact list is sorted so ordering noise doesn't reset the streak; the error body
 // must be canonical (errout.CanonicalForFixLoop: Maven sanitize + csharp duplicate-line collapse) so
@@ -1278,7 +1483,24 @@ func fixLoopSignature(step SandboxStep, artifactPaths []string, canonicalError s
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-func mergeFixRequestAuditErrorOutput(ctx context.Context, opts EvalOptions, canonicalErr string, errorOutputRaw string, dedupApplied bool, errorOutputSanitized bool) map[string]interface{} {
+// computeErrorLogLLMSummary summarises a large canonical error log, or returns "" when the feature
+// is off, unwired, or the log is small enough to read as-is.
+//
+// Computed by the caller rather than inside the audit merge so the identical text reaches BOTH the
+// audit row and the fixer prompt (FixRequest.ErrorSummary), instead of being derived for audit eyes
+// only while the model works from a head+tail gist that dropped the failures the summary names.
+func computeErrorLogLLMSummary(ctx context.Context, opts EvalOptions, canonicalErr string) string {
+	if opts.DisableErrorLogLLMSummary || opts.ErrorLogSummarizer == nil || len([]rune(canonicalErr)) < errorLogLLMSummaryMinRunes {
+		return ""
+	}
+	sum, err := opts.ErrorLogSummarizer(ctx, canonicalErr)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(sum)
+}
+
+func mergeFixRequestAuditErrorOutput(canonicalErr string, errorOutputRaw string, dedupApplied bool, errorOutputSanitized bool, llmSummary string) map[string]interface{} {
 	h := sha256.Sum256([]byte(canonicalErr))
 	shaHex := hex.EncodeToString(h[:])
 	display := canonicalErr
@@ -1291,15 +1513,12 @@ func mergeFixRequestAuditErrorOutput(ctx context.Context, opts EvalOptions, cano
 	if comp == errout.CompressionHeadTail {
 		compression = errout.CompressionHeadTail
 	}
-	llmUsed := false
-	if !opts.DisableErrorLogLLMSummary && opts.ErrorLogSummarizer != nil && len([]rune(canonicalErr)) >= errorLogLLMSummaryMinRunes {
-		if sum, err := opts.ErrorLogSummarizer(ctx, canonicalErr); err == nil && strings.TrimSpace(sum) != "" {
-			display = strings.TrimSpace(sum)
-			compression = errout.CompressionLLMSummary
-			llmUsed = true
-		}
-	}
-	return map[string]interface{}{
+	// The LLM summary is attached BESIDE the compiler text, never in place of it. It used to
+	// replace error_output outright, which makes a post-mortem impossible without re-running — and
+	// worse than impossible when the prose is wrong: upstream measured a summary that diagnosed
+	// "missing Spring Boot test dependencies" for a package that had merely moved, and that
+	// misdiagnosis was the only error text the audit rows carried for four rounds.
+	out := map[string]interface{}{
 		"error_output":                  display,
 		"error_output_runes":            len([]rune(display)),
 		"error_output_canonical_runes":  len([]rune(canonicalErr)),
@@ -1308,8 +1527,12 @@ func mergeFixRequestAuditErrorOutput(ctx context.Context, opts EvalOptions, cano
 		"error_output_sha256":           shaHex,
 		"error_output_compression":      compression,
 		"error_output_deduplicated":     dedupApplied,
-		"error_output_llm_summary_used": llmUsed,
+		"error_output_llm_summary_used": llmSummary != "",
 	}
+	if llmSummary != "" {
+		out["error_output_llm_summary"] = llmSummary
+	}
+	return out
 }
 
 // applyLLMFix reads artifact files and their dependency files (source under test), plus dependency manifests (package.json, pom.xml, etc.), calls Fixer.Fix with the failed step and error output, writes back fixed content, and increments the step-specific attempt counter. Returns true only when at least one allowed path was written.
@@ -1324,7 +1547,10 @@ func mergeFixRequestAuditErrorOutput(ctx context.Context, opts EvalOptions, cano
 // gating, low-value rejection). Both values are read by the outer fix loop to (1) decide
 // whether to re-run the step and (2) record per-iteration artifact deltas in
 // EvalWorkflowResult.IterationArtifacts (A.5 — per-gap iteration tracking).
-func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorOutput string, audit Auditor, attemptCounter *int, maxAttempts int, loopState *FixLoopState, infrastructureFailureKind string) (bool, []string) {
+// The third return value is the FixSkip* reason when nothing was written, empty on success. It
+// distinguishes a bad model turn (retryable — a fresh turn may well succeed) from an exhausted
+// fixer (terminal). Collapsing the two ended a run on a single unparseable JSON response.
+func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorOutput string, audit Auditor, attemptCounter *int, maxAttempts int, loopState *FixLoopState, infrastructureFailureKind string) (bool, []string, string) {
 	// Sanitize + dedupe (csharp) into canonical error text for fix-loop signatures and fixer input.
 	errorOutputRaw := errorOutput
 	sanitizedOnly := errout.Sanitize(opts.Lang, errorOutputRaw)
@@ -1352,96 +1578,55 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 		}
 	}
+	// Baseline failures are adopted on EVIDENCE rather than on a regex over the current diagnostic:
+	// one pre-generation compile already established these files were broken before the run started,
+	// so repairing them is in scope and they must be writable for the model to return them.
+	//
+	// Same bounds as the derived paths above, plus one more: only a baseline failure the CURRENT
+	// diagnostic still implicates is adopted. A file that was broken before and is not in this
+	// error output is not this round's problem, and widening scope to it would spend the budget on
+	// something nothing is asking about. Applies to every step — a compile round is exactly where
+	// inherited breakage surfaces.
+	if len(opts.BaselineFailingPaths) > 0 && strings.TrimSpace(errorOutput) != "" {
+		seen := make(map[string]bool, len(pathsToRead))
+		for _, p := range pathsToRead {
+			seen[normalizePathForFix(p)] = true
+		}
+		for _, p := range opts.BaselineFailingPaths {
+			rel := normalizePathForFix(strings.TrimSpace(p))
+			if rel == "" || seen[rel] || !pathLooksLikeTestArtifact(rel, opts.Lang) {
+				continue
+			}
+			if !strings.Contains(errorOutput, filepath.Base(rel)) {
+				continue
+			}
+			if st, err := os.Stat(filepath.Join(opts.RepoPath, filepath.FromSlash(rel))); err != nil || st.IsDir() {
+				continue
+			}
+			seen[rel] = true
+			pathsToRead = append(pathsToRead, rel)
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_baseline_adopted", map[string]interface{}{
+					"message": fmt.Sprintf("Adopted %s into the fixer's writable set: it was already failing before this run generated anything, and this round's diagnostic still names it.", rel),
+					"path":    rel,
+					"step":    step,
+				})
+			}
+		}
+	}
 	if len(pathsToRead) == 0 {
-		return false, nil
+		return false, nil, FixSkipNoWritableArtifacts
 	}
 	// Repeat-failure circuit-breaker. Compute the signature now that errorOutput is sanitised and
 	// pathsToRead is finalised (includes any FailingTestCandidatePaths additions for test steps).
 	// We check BEFORE reading files / calling the LLM so a truly stuck loop wastes no further work.
-	if loopState != nil {
-		// Sticky breaker: once tripped, subsequent calls are immediate no-ops regardless of whether
-		// the outer loop honoured the counter bump (defensive against reentrancy / tests).
-		if loopState.tripped {
-			*attemptCounter = maxAttempts
-			return false, nil
-		}
-		sig := fixLoopSignature(step, pathsToRead, errorOutput)
-		mag := fixLoopErrorMagnitude(errorOutput)
-		if loopState.seen == nil {
-			loopState.seen = make(map[string]int)
-		}
-		// (a) consecutive-identical streak (original behaviour). (b) non-consecutive recurrence: the
-		// signature reset (sig != lastSignature) but we have seen this exact sig earlier in the loop —
-		// the model is cycling back through error states it already produced (oscillation).
-		if sig == loopState.lastSignature {
-			loopState.streak++
-		} else {
-			if loopState.seen[sig] > 0 {
-				loopState.recurrences++
-			}
-			loopState.streak = 1
-			loopState.lastSignature = sig
-		}
-		loopState.seen[sig]++
-		// (c) no-progress: track the smallest error magnitude seen and count consecutive attempts that
-		// fail to beat it. A converging fixer drives the magnitude down (resetting the streak); a
-		// moving-target fixer that swaps one error for another keeps it flat and trips this backstop.
-		if !loopState.magnitudeKnown || mag < loopState.bestMagnitude {
-			loopState.bestMagnitude = mag
-			loopState.magnitudeKnown = true
-			loopState.noProgressStreak = 0
-		} else {
-			loopState.noProgressStreak++
-		}
-		tripReason := ""
-		switch {
-		case loopState.streak >= FixLoopRepeatStopThreshold:
-			tripReason = "fix_loop_repeat"
-		case loopState.recurrences >= FixLoopRecurrenceStopThreshold:
-			tripReason = "fix_loop_oscillation"
-		case loopState.noProgressStreak >= FixLoopNoProgressStopThreshold:
-			tripReason = "fix_loop_no_progress"
-		}
-		if tripReason != "" {
-			loopState.tripped = true
-			if audit != nil {
-				sortedPaths := append([]string(nil), pathsToRead...)
-				for i, p := range sortedPaths {
-					sortedPaths[i] = normalizePathForFix(p)
-				}
-				sort.Strings(sortedPaths)
-				var msg string
-				switch tripReason {
-				case "fix_loop_oscillation":
-					msg = fmt.Sprintf("Fix loop oscillating: previously-seen error signatures reappeared %d time(s) for step %s (the fixer is cycling through the same error states). Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.recurrences, step, maxAttempts-*attemptCounter, maxAttempts)
-				case "fix_loop_no_progress":
-					msg = fmt.Sprintf("Fix loop not converging: error magnitude failed to improve for %d consecutive attempt(s) on step %s (best=%d, current=%d) — each fix swaps one error for another. Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.noProgressStreak, step, loopState.bestMagnitude, mag, maxAttempts-*attemptCounter, maxAttempts)
-				default:
-					msg = fmt.Sprintf("Fix loop saturated: the same (step, artifact_paths, error_output) signature arrived %d times in a row for step %s. Skipping further fix attempts for this step so the remaining %d of %d attempts are not burned on the same prompt.", loopState.streak, step, maxAttempts-*attemptCounter, maxAttempts)
-				}
-				audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
-					"message":                msg,
-					"step":                   step,
-					"reason":                 tripReason,
-					"fix_attempt":            *attemptCounter + 1,
-					"max_fix_attempt":        maxAttempts,
-					"streak":                 loopState.streak,
-					"recurrences":            loopState.recurrences,
-					"no_progress_streak":     loopState.noProgressStreak,
-					"error_magnitude":        mag,
-					"best_error_magnitude":   loopState.bestMagnitude,
-					"threshold":              FixLoopRepeatStopThreshold,
-					"signature":              sig,
-					"artifact_paths":         sortedPaths,
-					"error_output_sanitized": errorOutputSanitized,
-				})
-			}
-			// Consume the remaining attempt budget so the outer loop's `*FixAttempts < max*Fix`
-			// guard trips and no further applyLLMFix call is issued for this step. Returning
-			// false without bumping the counter would leave the loop free to keep calling us.
-			*attemptCounter = maxAttempts
-			return false, nil
-		}
+	//
+	// The signature is computed once at function scope: the breaker below consumes it, and so does
+	// the per-round memory recorded at every exit, which must name the failure this round was
+	// handed rather than recomputing a possibly different one later.
+	roundSignature := fixLoopSignature(step, pathsToRead, errorOutput)
+	if stop, why := checkFixLoopBreakers(ctx, opts, step, errorOutput, roundSignature, pathsToRead, errorOutputSanitized, audit, attemptCounter, maxAttempts, loopState); stop {
+		return false, nil, why
 	}
 	artifactKeySet := make(map[string]bool)
 	for _, p := range opts.ArtifactPaths {
@@ -1609,7 +1794,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		manifests[rel] = string(body)
 	}
 	if len(files) == 0 {
-		return false, nil
+		return false, nil, FixSkipNoWritableArtifacts
 	}
 	// Compute the current fix attempt before the context-hygiene branches so automatic
 	// escalation can flip opt-in flags on repeat failures. The canonical `attempt` variable
@@ -1731,7 +1916,26 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	}
 	scopeNarrowed := false
 	var scopedAuditPaths []string
-	if (step == StepTest || step == StepTestE2E) && len(opts.ArtifactPaths) > 0 && strings.TrimSpace(errorOutput) != "" {
+	// preNarrowAuditPaths is the writable candidate set BEFORE narrowing, recorded for audit.
+	// `artifact_paths_all` used to report opts.ArtifactPaths, which understates the set once
+	// adoption is in play — the adopted paths appeared in no field near the narrowing decision,
+	// which is what makes a multi-round stall unreadable after the fact.
+	preNarrowAuditPaths := append([]string(nil), writableArtifacts...)
+	// The intersection basis is `writableArtifacts` as computed above — this run's own artifacts
+	// PLUS the failing test files adopted from the diagnostic — and NOT `opts.ArtifactPaths`.
+	// Iterating opts.ArtifactPaths here silently undid adoption: the block above adds the adopted
+	// paths so they become writable, and this one then rebuilt the writable set from the run's own
+	// artifacts alone. The cost upstream measured was a run whose first compile error named a file
+	// left behind by a previous run, in all six rounds, while the fixer rewrote healthy files: the
+	// write gate already permitted that path, but FixRequest.ArtifactPaths never told the model it
+	// could touch it, so the model never returned it. Narrowing must be able to shrink the writable
+	// set, never to remove a file the run deliberately took ownership of.
+	//
+	// Widening the basis cannot make production source writable: pathsToRead only ever gains
+	// FailingTestCandidatePaths matches, which require an on-disk test-shaped path under RepoPath.
+	// Dependency and source files reach the prompt through opts.ArtifactDependencies, never
+	// pathsToRead.
+	if (step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
 		cited := errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath))
 		if len(cited) > 0 {
 			citedSet := make(map[string]bool, len(cited))
@@ -1740,11 +1944,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 			// Scoped set must also dedupe: if opts.ArtifactPaths arrived with dups AND the
 			// error cited the same path, we'd otherwise carry the dup through.
-			scoped := make([]string, 0, len(opts.ArtifactPaths))
-			scopedSeen := make(map[string]bool, len(opts.ArtifactPaths))
+			scoped := make([]string, 0, len(writableArtifacts))
+			scopedSeen := make(map[string]bool, len(writableArtifacts))
 			uniqueArtifactCount := 0
-			seenArtifact := make(map[string]bool, len(opts.ArtifactPaths))
-			for _, a := range opts.ArtifactPaths {
+			seenArtifact := make(map[string]bool, len(writableArtifacts))
+			for _, a := range writableArtifacts {
 				key := normalizePathForFix(a)
 				if !seenArtifact[key] {
 					seenArtifact[key] = true
@@ -1786,9 +1990,10 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	sort.Strings(droppedArtifactCtxPaths)
 	if scopeNarrowed && audit != nil {
 		audit.Log(ctx, "evaluator.fix_scope_narrowed", map[string]interface{}{
-			"message":                        fmt.Sprintf("Narrowed writable-artifact scope for step %s from %d to %d path(s) based on error output (dropped %d artifact-context entr(ies), %d runes).", step, len(opts.ArtifactPaths), len(scopedAuditPaths), len(droppedArtifactCtxPaths), droppedArtifactCtxRunes),
+			"message":                        fmt.Sprintf("Narrowed writable-artifact scope for step %s from %d to %d path(s) based on error output (dropped %d artifact-context entr(ies), %d runes).", step, len(preNarrowAuditPaths), len(scopedAuditPaths), len(droppedArtifactCtxPaths), droppedArtifactCtxRunes),
 			"step":                           step,
-			"artifact_paths_all":             append([]string(nil), opts.ArtifactPaths...),
+			"artifact_paths_all":             preNarrowAuditPaths,
+			"artifact_paths_generated":       append([]string(nil), opts.ArtifactPaths...),
 			"artifact_paths_scoped":          scopedAuditPaths,
 			"reason":                         "error_cited_subset",
 			"error_output_sanitized":         errorOutputSanitized,
@@ -1858,6 +2063,52 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		}
 	}
 
+	// Which of the PREVIOUS round's writes achieved nothing.
+	//
+	// Computed here, before the request is built, so the finding reaches this round's prompt rather
+	// than only the audit. It compares per-file diagnostics across the two failures and consults
+	// the paths that actually landed on disk last round, which is what recordFixAttempt stores.
+	if loopState != nil {
+		nowDiagnostics := FileDiagnostics(errorOutput)
+		if n := len(loopState.attempts); n > 0 {
+			prev := loopState.attempts[n-1]
+			written := make([]string, 0, len(prev.Changes))
+			for p := range prev.Changes {
+				written = append(written, p)
+			}
+			sort.Strings(written)
+			if stalled := stalledFiles(loopState.lastFileDiagnostics, nowDiagnostics, written); len(stalled) > 0 {
+				noteFileNoProgress(loopState, stalled)
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_file_no_progress", map[string]interface{}{
+						"message": fmt.Sprintf(
+							"Previous round wrote %d file(s) whose diagnostics came back identical: %s. The edits landed but changed nothing the compiler can see; this round's prompt says so per file.",
+							len(stalled), strings.Join(stalled, ", ")),
+						"step":    step,
+						"paths":   stalled,
+						"attempt": currentAttempt,
+					})
+				}
+			}
+		}
+		loopState.lastFileDiagnostics = nowDiagnostics
+	}
+
+	// Real API signatures for the third-party types this diagnostic blames, read from the compile
+	// classpath — so the model is told what a member list actually contains instead of inferring it
+	// from a manifest that names artifacts but not their members. The fixer's success rate
+	// partitioned exactly on this: every missing-import error was fixed, and every
+	// wrong-third-party-API error was re-emitted unchanged for four rounds.
+	apiSurface, absentSymbols := lookupAPISurface(ctx, opts, errorOutput, files, step, audit)
+	// The owned-type counterpart: FilterOwnedTypes drops repo types from that lookup, so their
+	// "cannot find symbol: method" misses are answered here from source instead.
+	memberFacts := missingMemberFacts(ctx, opts, errorOutput, files, writableArtifacts, audit)
+	// Runtime counterpart to the compile-side facts: Mockito-misuse statements proved from the
+	// failure's own stack frames plus the generated test's source. Deterministic — nothing here is
+	// inferred — so the model is told what IS rather than what might be.
+	testFacts := testFailureFacts(ctx, step, errorOutput, files, writableArtifacts, audit)
+	// One summarisation per round, shared by the prompt and the audit row.
+	errorLogLLMSummary := computeErrorLogLLMSummary(ctx, opts, errorOutput)
 	attempt := currentAttempt
 	req := FixRequest{
 		Step:                      step,
@@ -1872,10 +2123,27 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		CompileCommand:            opts.CompileCommand,
 		TestCommand:               testCommandForFixStep(opts, step),
 		Manifests:                 manifests,
+		ErrorSummary:              errorLogLLMSummary,
+		APISurface:                apiSurface,
+		AbsentSymbols:             absentSymbols,
+		MissingMemberFacts:        memberFacts,
+		TestFailureFacts:          testFacts,
+		PriorAttempts:             priorAttempts(loopState),
 		FixAttempt:                attempt,
 		MaxFixAttempt:             maxAttempts,
 		InfrastructureFailureKind: strings.TrimSpace(infrastructureFailureKind),
 		GapSessionID:              strings.TrimSpace(opts.GapSessionID),
+	}
+	// Honour the context budget BEFORE any of the audit path lists below are derived from `files`:
+	// they all enumerate the map, so shedding afterwards would advertise dependency files the model
+	// never received. req.Files aliases this map, so the request shrinks with it.
+	if shed := clampFixContextRunes(files, writableArtifacts, opts.FixContextRunesMax); len(shed) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_context_clamped", map[string]interface{}{
+			"message":         fmt.Sprintf("Dropped %d read-only dependency file(s) to fit the fix context budget of %d runes.", len(shed), opts.FixContextRunesMax),
+			"budget_runes":    opts.FixContextRunesMax,
+			"dropped_paths":   shed,
+			"remaining_files": len(files),
+		})
 	}
 	filePaths := make([]string, 0, len(files))
 	for p := range files {
@@ -1928,7 +2196,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			"dependency_signature_only":       effectiveSignatureOnly,
 			"auto_escalated":                  autoEscalate,
 		}
-		for k, v := range mergeFixRequestAuditErrorOutput(ctx, opts, errorOutput, errorOutputRaw, dedupApplied, errorOutputSanitized) {
+		for k, v := range mergeFixRequestAuditErrorOutput(errorOutput, errorOutputRaw, dedupApplied, errorOutputSanitized, errorLogLLMSummary) {
 			payload[k] = v
 		}
 		// Pre-set structured_user_message to the auto-escalated resolution so it wins over the
@@ -1963,6 +2231,9 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		}
 		audit.Log(ctx, "evaluator.fix_request", payload)
 	}
+	if err := sleepBetweenFixAttempts(ctx, opts.BackoffBetweenFixAttempts, attempt, audit); err != nil {
+		return false, nil, FixSkipNoWritableArtifacts
+	}
 	resp, err := opts.Fixer.Fix(ctx, req)
 	if err != nil {
 		if audit != nil {
@@ -1971,7 +2242,47 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"error":   err.Error(), "context_dump": contextDump, "context_dump_length": len(contextDump),
 			})
 		}
-		return false, nil
+		// Bank the round before returning. This return sits far above recordFixAttempt, so the
+		// round would otherwise be erased from the memory the NEXT prompt is built from — and an
+		// unusable reply is exactly what the model needs to be told it produced.
+		recordFixRoundFailure(loopState, currentAttempt-1, roundSignature,
+			"Your reply could not be used at all (the response was not valid output for this contract). Return the required JSON shape, and keep the reply small enough to finish — prefer targeted edits over whole files.")
+		return false, nil, FixSkipResponseUnusable
+	}
+	// Targeted edits are resolved to whole-file content HERE, so everything downstream — path
+	// gating, low-value rejection, the coverage gate, the write, the applied-change record — is
+	// exactly the code that already runs for a whole-file response. The edit contract changes how a
+	// repair is EXPRESSED, not how it is validated.
+	var editRefusals map[string]string
+	if len(resp.Edits) > 0 {
+		resolved, editAudit, refusals := resolveFixEdits(opts, resp.Edits)
+		editRefusals = refusals
+		if audit != nil && len(editAudit) > 0 {
+			audit.Log(ctx, "evaluator.fix_edits_applied", map[string]interface{}{
+				"message": fmt.Sprintf("Model returned targeted edits for %d file(s).", len(resp.Edits)),
+				"step":    step,
+				"files":   editAudit,
+			})
+		}
+		if len(resolved) == 0 {
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_edits_none_applied", map[string]interface{}{
+					"message": "Every targeted edit was refused (anchors not found or ambiguous); nothing was written. " +
+						"The model is editing a version of the file that does not exist.",
+					"step":  step,
+					"files": editAudit,
+				})
+			}
+			recordFixAttempt(loopState, currentAttempt-1, roundSignature, nil, editRefusals)
+			return false, nil, FixSkipResponseUnusable
+		}
+		// Whole-file entries for paths the edits did not cover are still honoured.
+		if resp.Files == nil {
+			resp.Files = map[string]string{}
+		}
+		for rel, content := range resolved {
+			resp.Files[rel] = content
+		}
 	}
 	if len(resp.Files) == 0 {
 		if audit != nil {
@@ -1980,7 +2291,9 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"step":    step,
 			})
 		}
-		return false, nil
+		recordFixRoundFailure(loopState, currentAttempt-1, roundSignature,
+			"Your reply contained no file to apply. Return the required JSON shape with at least one file.")
+		return false, nil, FixSkipResponseUnusable
 	}
 	// Basename remap targets **generated artifacts only** (not dependency/source paths in pathsToRead),
 	// so e.g. lifecycles.ts from the LLM cannot steal writes from lifecycles.test.ts.
@@ -1996,7 +2309,15 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		base := filepath.Base(norm)
 		artifactBaseToPaths[base] = append(artifactBaseToPaths[base], norm)
 	}
+	// The site the first diagnostic blames, and whether this round acted on it. Reported here;
+	// the streak that ENFORCES scope onto the blamed file arrives with CP52's breakers.
+	primarySite := ParsePrimaryFailureSite(errorOutput)
+	primarySiteKnown, primarySiteTouched := false, false
 	pathsUpdated := make([]string, 0, len(resp.Files))
+	// Per-round memory: what actually landed, and what was refused and why. Both feed
+	// recordFixAttempt below so the NEXT round's prompt can say "you already tried this".
+	appliedChanges := make(map[string]string, len(resp.Files))
+	skippedPaths := make(map[string]string, len(resp.Files))
 	for rel, content := range resp.Files {
 		relClean := normalizePathForFix(rel)
 		// If LLM returned a path not in pathsToRead, try to match by base name to a **generated** artifact only.
@@ -2030,6 +2351,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"step":    step,
 				})
 			}
+			skippedPaths[relClean] = "not a writable artifact path in this round's scope"
 			continue
 		}
 		if strings.TrimSpace(content) == "" {
@@ -2040,6 +2362,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"step":    step,
 				})
 			}
+			skippedPaths[relClean] = "returned empty content, which would erase the file"
 			continue
 		}
 		// Absolute gate: never accept a test file that has no test methods — even if the previous on-disk body
@@ -2055,6 +2378,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
 		}
 		// Absolute structural gate: reject files with obvious syntactic garbage (markdown fences
@@ -2074,7 +2398,43 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
+		}
+		// Refuse a "fix" that makes the compiler happy by removing the tests. The system prompt
+		// already forbids it; this is the check that makes the instruction binding.
+		if reason := coverageRegressionReason(relClean, files[relClean], content); reason != "" {
+			if !opts.AllowFixCoverageReduction {
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_rejected_coverage_regression", map[string]interface{}{
+						"message": fmt.Sprintf("LLM fix rejected for %s: %s. Deleting tests to satisfy the compiler makes the round worse than doing nothing; the file on disk is unchanged.", relClean, reason),
+						"path":    relClean,
+						"step":    step,
+						"reason":  reason,
+					})
+				}
+				skippedPaths[relClean] = "would delete tests"
+				continue
+			}
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_coverage_regression_allowed", map[string]interface{}{
+					"message": fmt.Sprintf("LLM fix for %s reduces test coverage (%s) but the coverage-reduction escape hatch is set, so it was applied.", relClean, reason),
+					"path":    relClean,
+					"step":    step,
+					"reason":  reason,
+				})
+			}
+		}
+		// Unused-import residue is the visible signature of a deletion-shaped fix. Reported, not
+		// blocked: a simple textual scan cannot see fully-qualified or reflective uses, so blocking
+		// would reject correct fixes.
+		if reason := unusedImportResidueReason(relClean, files[relClean], content); reason != "" && audit != nil {
+			audit.Log(ctx, "evaluator.fix_unused_import_residue", map[string]interface{}{
+				"message": fmt.Sprintf("LLM fix for %s %s. Often means the fix removed the code that used them.", relClean, reason),
+				"path":    relClean,
+				"step":    step,
+				"reason":  reason,
+			})
 		}
 		if reason := introducedLowValueFixReason(relClean, files[relClean], content); reason != "" {
 			if audit != nil {
@@ -2085,6 +2445,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"reason":  reason,
 				})
 			}
+			skippedPaths[relClean] = reason
 			continue
 		}
 		full := filepath.Join(opts.RepoPath, relForWrite)
@@ -2095,6 +2456,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"path":    full, "error": err.Error(),
 				})
 			}
+			skippedPaths[relClean] = "could not create its directory on disk"
 			continue
 		}
 		if err := os.WriteFile(full, []byte(content), 0644); err != nil {
@@ -2104,6 +2466,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					"path":    relForWrite, "error": err.Error(),
 				})
 			}
+			skippedPaths[relClean] = "could not be written to disk"
 			continue
 		}
 		if audit != nil {
@@ -2112,7 +2475,23 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				"path":    relClean, "step": step,
 			})
 		}
+		if touched, known := TouchedPrimarySite(primarySite, relClean, files[relClean], content); known {
+			primarySiteKnown = true
+			primarySiteTouched = primarySiteTouched || touched
+		}
 		pathsUpdated = append(pathsUpdated, relClean)
+		appliedChanges[relClean] = summarizeAppliedChange(files[relClean], content)
+	}
+	if primarySite.OK && primarySiteKnown && !primarySiteTouched && len(pathsUpdated) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_primary_site_untouched", map[string]interface{}{
+			"message": fmt.Sprintf(
+				"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely.",
+				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line),
+			"step":         step,
+			"primary_path": primarySite.Path,
+			"primary_line": primarySite.Line,
+			"paths":        pathsUpdated,
+		})
 	}
 	if audit != nil && len(pathsUpdated) > 0 {
 		audit.Log(ctx, "evaluator.fix_response", map[string]interface{}{
@@ -2141,11 +2520,20 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			audit.Log(ctx, "evaluator.format_after_fix", map[string]interface{}{"message": "Format applied after LLM fix."})
 		}
 	}
+	// Bank the round before returning, on BOTH paths. A round that wrote nothing is exactly the
+	// round the next prompt most needs to know about — it is what stops the model re-sending a
+	// refused change — so the skip reasons are recorded even though nothing landed.
+	for rel, why := range editRefusals {
+		if _, taken := skippedPaths[rel]; !taken {
+			skippedPaths[rel] = why
+		}
+	}
+	recordFixAttempt(loopState, currentAttempt-1, roundSignature, appliedChanges, skippedPaths)
 	if len(pathsUpdated) == 0 {
-		return false, nil
+		return false, nil, FixSkipNoAcceptedWrites
 	}
 	*attemptCounter++
-	return true, append([]string(nil), pathsUpdated...)
+	return true, append([]string(nil), pathsUpdated...), ""
 }
 
 // chooseArtifactAmongBasenameMatches picks one repo-relative path when several generated artifacts share the same file name.
@@ -2243,4 +2631,86 @@ func compileErrorTouchesArtifactScope(errorOutput string, opts EvalOptions) bool
 		}
 	}
 	return false
+}
+
+// clampFixContextRunes enforces EvalOptions.FixContextRunesMax on the file map about to be shipped
+// to the fixer, deleting entries from files in place and returning the paths it dropped (sorted).
+//
+// Only read-only dependency files are eligible. Writable artifacts are exempt because the fixer's
+// contract is to return their full replacement content: shipping a truncated artifact invites the
+// model to "complete" it from a fragment, which silently deletes working code. When the artifacts
+// alone already exceed the budget the function shreds every dependency and stops — an over-budget
+// prompt beats an unusable one.
+//
+// Largest-first is deliberate: it reaches the budget in the fewest drops, so the model keeps the
+// most distinct pieces of context. Ties break on path so the choice is deterministic across runs
+// (map iteration order is not) and two identical runs produce identical prompts.
+func clampFixContextRunes(files map[string]string, writableArtifacts []string, maxRunes int) []string {
+	if maxRunes <= 0 || len(files) == 0 {
+		return nil
+	}
+	total := 0
+	for _, c := range files {
+		total += len([]rune(c))
+	}
+	if total <= maxRunes {
+		return nil
+	}
+	protected := make(map[string]bool, len(writableArtifacts))
+	for _, p := range writableArtifacts {
+		protected[normalizePathForFix(p)] = true
+	}
+	type entry struct {
+		path  string
+		runes int
+	}
+	candidates := make([]entry, 0, len(files))
+	for p, c := range files {
+		if protected[normalizePathForFix(p)] {
+			continue
+		}
+		candidates = append(candidates, entry{path: p, runes: len([]rune(c))})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].runes != candidates[j].runes {
+			return candidates[i].runes > candidates[j].runes
+		}
+		return candidates[i].path < candidates[j].path
+	})
+	var dropped []string
+	for _, e := range candidates {
+		if total <= maxRunes {
+			break
+		}
+		delete(files, e.path)
+		total -= e.runes
+		dropped = append(dropped, e.path)
+	}
+	sort.Strings(dropped)
+	return dropped
+}
+
+// sleepBetweenFixAttempts waits d before fix attempts after the first, so an operator who set
+// fixer.policy.fix_backoff gets the pacing they asked for between rounds. Attempt 1 never sleeps — the delay is
+// BETWEEN attempts, and charging it up front would add latency to every single-round repair.
+// Returns ctx.Err() if the run is cancelled while waiting, so a shutdown is not held hostage.
+func sleepBetweenFixAttempts(ctx context.Context, d time.Duration, attempt int, audit Auditor) error {
+	if d <= 0 || attempt <= 1 {
+		return nil
+	}
+	if audit != nil {
+		audit.Log(ctx, "evaluator.fix_backoff", map[string]interface{}{
+			"message":     fmt.Sprintf("Waiting %s before fix attempt %d (fixer.policy.fix_backoff).", d, attempt),
+			"backoff":     d.String(),
+			"fix_attempt": attempt,
+		})
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }

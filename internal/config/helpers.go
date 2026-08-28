@@ -22,7 +22,28 @@ func (c *Config) EmbeddingsStoreConfig() embeddings.Config {
 	return embeddings.Config{
 		ConnString: c.Database.EmbeddingsURL,
 		Dimension:  c.Database.EmbeddingsDimension,
+		MaxConns:   c.poolMaxConns(),
 	}
+}
+
+// MetadataStoreConfig returns pool configuration for the metadata store.
+func (c *Config) MetadataStoreConfig() metadata.Config {
+	return metadata.Config{
+		ConnString: c.MetadataStoreConnString(),
+		MaxConns:   c.poolMaxConns(),
+	}
+}
+
+// poolMaxConns is the per-pool connection ceiling: database.max_open_conns when set, otherwise 0,
+// which leaves pgxpool's own default of max(4, NumCPU). asqs-core's gap loop is sequential, so
+// that default is comfortably above what a run holds concurrently; the upstream derivation from
+// the gap worker count returns if the loop ever goes concurrent. Note both stores size from this,
+// so two pools per process can hold up to twice the configured value.
+func (c *Config) poolMaxConns() int32 {
+	if c.Database.MaxOpenConns > 0 {
+		return int32(c.Database.MaxOpenConns)
+	}
+	return 0
 }
 
 // GitHubClient returns a GitHub client using config. Token and default owner/repo come from config.
@@ -69,7 +90,7 @@ func (c *Config) AzureDevOpsClient() *azuredevops.Client {
 
 // OpenMetadataStore opens the metadata Postgres store using this config.
 func (c *Config) OpenMetadataStore() (*metadata.Store, error) {
-	return metadata.Open(c.MetadataStoreConnString())
+	return metadata.OpenWithConfig(context.Background(), c.MetadataStoreConfig())
 }
 
 // OpenEmbeddingsStore opens the embeddings (pgvector) store using this config.

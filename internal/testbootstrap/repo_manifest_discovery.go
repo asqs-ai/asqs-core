@@ -27,6 +27,19 @@ func bootstrapSkipDir(name string) bool {
 	}
 }
 
+// jsBootstrapSkipDir is bootstrapSkipDir minus "packages".
+//
+// `packages` is in the shared skip list because legacy NuGet restore writes a `packages/` directory
+// next to a .sln. For JavaScript it is the opposite: `packages/*` is THE conventional layout for npm,
+// pnpm and Yarn workspaces, so skipping it made every such monorepo invisible — bootstrap reported
+// "no package.json under repo" and the whole run stopped.
+func jsBootstrapSkipDir(name string) bool {
+	if strings.EqualFold(name, "packages") {
+		return false
+	}
+	return bootstrapSkipDir(name)
+}
+
 func repoRelDepth(repo, absPath string) int {
 	repo = filepath.Clean(repo)
 	absPath = filepath.Clean(absPath)
@@ -428,7 +441,7 @@ func discoverPackageJSONDirs(repo string) ([]string, error) {
 			if path == repo {
 				return nil
 			}
-			if bootstrapSkipDir(d.Name()) {
+			if jsBootstrapSkipDir(d.Name()) {
 				return fs.SkipDir
 			}
 			if repoRelDepth(repo, path) > maxBootstrapWalkDepth {

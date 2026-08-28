@@ -8,7 +8,7 @@ const staleNoHeartbeatMsg = "stale: no heartbeat"
 
 // UpdateIndexRunHeartbeat sets last_heartbeat_at (epoch ms) for a running workflow row.
 func (s *Store) UpdateIndexRunHeartbeat(ctx context.Context, runID string, atMs int64) error {
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		`UPDATE index_runs SET last_heartbeat_at = $1 WHERE run_id = $2 AND status = 'running'`,
 		atMs, runID)
 	return err
@@ -18,7 +18,7 @@ func (s *Store) UpdateIndexRunHeartbeat(ctx context.Context, runID string, atMs 
 // "running" with no workflow_error and whose effective heartbeat (last_heartbeat_at if non-zero, else started_at)
 // is strictly before heartbeatBeforeMs. Returns the number of rows updated.
 func (s *Store) ReapStaleRunningRuns(ctx context.Context, finishedAtMs, heartbeatBeforeMs int64) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.Exec(ctx, `
 UPDATE index_runs
 SET status = 'completed',
     finished_at = $1,
@@ -30,12 +30,12 @@ WHERE status = 'running'
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	return res.RowsAffected(), nil
 }
 
 // CountAuditLines returns the number of audit_log rows for run_id.
 func (s *Store) CountAuditLines(ctx context.Context, runID string) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_log WHERE run_id = $1`, runID).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM audit_log WHERE run_id = $1`, runID).Scan(&n)
 	return n, err
 }

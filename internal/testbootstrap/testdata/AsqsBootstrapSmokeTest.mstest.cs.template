@@ -1,0 +1,34 @@
+using System;
+
+using FluentAssertions;
+using Moq;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+namespace Asqs.Bootstrap
+{
+    /// <summary>
+    /// ASQS test_framework_bootstrap smoke test.
+    ///
+    /// Proves the three libraries generated tests reach for — the test runner, Moq and
+    /// FluentAssertions — restore, compile AND execute in this project. Bootstrap fails when this
+    /// test does: a missing PackageReference is repaired in the .csproj, and the fix loop is never
+    /// allowed to write project files.
+    ///
+    /// Safe to delete.
+    /// </summary>
+    [TestClass]
+    public class AsqsBootstrapSmokeTest
+    {
+        [TestMethod]
+        public void RunnerMoqAndFluentAssertionsAreAllReferenced()
+        {
+            var provider = new Mock<IFormatProvider>();
+            provider.Setup(p => p.GetFormat(typeof(string))).Returns("asqs");
+
+            object format = provider.Object.GetFormat(typeof(string));
+
+            format.Should().Be("asqs");
+            provider.Verify(p => p.GetFormat(typeof(string)), Times.Once());
+        }
+    }
+}

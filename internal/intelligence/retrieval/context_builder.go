@@ -8,6 +8,8 @@ import (
 
 	"github.com/asqs/asqs-core/internal/storage/embeddings"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
+
+	"github.com/asqs/asqs-core/internal/llm/tokens"
 )
 
 // FormatOptions control how retrieval context is rendered for the LLM.
@@ -37,6 +39,43 @@ type FormatOptions struct {
 	UseStructuredTestJSON bool
 	// ContextCompact is populated from config (retrieval.context_compact) by the orchestrator. When Enabled (default on when enabled key omitted in YAML), the workflow compacts each item's RetrievalContext once before parallel test/doc generation.
 	ContextCompact ContextCompactOptions
+	// ToolsAvailable switches the context to a high-precision core plus an INVENTORY: dependencies
+	// are listed with enough identity to fetch them, and their bodies are left for the model to
+	// request via get_symbol.
+	//
+	// The arithmetic is the point. A symbol table row costs roughly 15 tokens; a symbol body costs
+	// 300-1500. Listing 40 and fetching 4 is dramatically cheaper than inlining 15 and hoping the
+	// right ones were chosen. Over-retrieval is currently the only defence against missing context,
+	// and it is what exhausts the budget.
+	ToolsAvailable bool
+	// MaxContextTokens caps the whole rendered context. 0 = unbounded (previous behaviour).
+	// The pipeline resolves it from the model window minus the output reservation and a safety
+	// margin, further capped by retrieval.max_context_tokens.
+	MaxContextTokens int
+	// TokenCounter estimates token counts. Nil = tokens.For("", "") (the calibrated heuristic).
+	TokenCounter tokens.Counter
+	// LastBudget is written by BuildLLMContext with the per-section spend of the most recent call,
+	// so the caller can emit prompt_tokens telemetry without re-counting. Not safe for concurrent
+	// use across goroutines sharing one FormatOptions value — callers copy FormatOptions per item
+	// before rendering.
+	LastBudget *tokens.Budget
+}
+
+// counter returns the configured token counter, or the default heuristic.
+func (o *FormatOptions) counter() tokens.Counter {
+	if o.TokenCounter != nil {
+		return o.TokenCounter
+	}
+	return tokens.For("", "")
+}
+
+// CounterOrDefault returns the configured token counter, or the default heuristic. Exported so a
+// caller can build a budget with the same counter the renderer will use.
+func (o FormatOptions) CounterOrDefault() tokens.Counter { return o.counter() }
+
+// newBudget builds the budget for one render.
+func (o *FormatOptions) newBudget() *tokens.Budget {
+	return tokens.NewBudget(o.MaxContextTokens, o.counter())
 }
 
 // DefaultFormatOptions returns options that include all sections with markdown headers.
@@ -172,6 +211,16 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 		opts.SectionPrefix = "## "
 	}
 
+	// One budget per render. Sections spend from it in emission order, and a section that spends
+	// less than its share releases the remainder to later ones (see tokens.Budget). When
+	// MaxContextTokens is 0 the budget is unbounded and every clamp is a no-op, so behaviour is
+	// byte-identical to before token accounting existed.
+	budget := opts.newBudget()
+	if opts.LastBudget != nil {
+		// Caller supplied a budget to be filled in; use theirs so they can read the breakdown.
+		budget = opts.LastBudget
+	}
+
 	var b strings.Builder
 
 	// Execution-feedback grounding (optional): stderr / test output with file:line — see failure_localize.go and DOCUMENTATION.md.
@@ -198,7 +247,7 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 		}
 		b.WriteString(symbolTableRowWithSignature(rc.TargetMethod.Symbol))
 		b.WriteString("\n\n")
-		b.WriteString(chunkBlock(rc.TargetMethod.Chunk, opts.MaxChunkChars))
+		b.WriteString(chunkBlock(rc.TargetMethod.Chunk, opts.MaxChunkChars, budget, tokens.SectionTarget))
 		b.WriteString("\n\n")
 	}
 
@@ -209,13 +258,18 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 		b.WriteString(symbolTableRow(rc.TargetClass.Symbol))
 		b.WriteString("\n\n")
 		if rc.TargetClass.Chunk != nil {
-			b.WriteString(chunkBlock(rc.TargetClass.Chunk, opts.MaxChunkChars))
+			b.WriteString(chunkBlock(rc.TargetClass.Chunk, opts.MaxChunkChars, budget, tokens.SectionTargetClass))
 			b.WriteString("\n\n")
 		}
 	}
 
 	// --- Dependency graph: callees with edge types + code ---
-	if opts.IncludeDependencies && len(rc.Dependencies) > 0 {
+	// --- Available context: an inventory the model can fetch from (tools enabled) ---
+	if opts.ToolsAvailable && opts.IncludeDependencies && len(rc.Dependencies) > 0 {
+		b.WriteString(writeAvailableContext(rc, opts))
+	}
+
+	if !opts.ToolsAvailable && opts.IncludeDependencies && len(rc.Dependencies) > 0 {
 		b.WriteString(opts.SectionPrefix)
 		b.WriteString("Dependency graph (symbols used by the target method)\n\n")
 		for _, dep := range rc.Dependencies {
@@ -237,7 +291,9 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 			b.WriteString(symbolTableRowWithSignature(dep.Symbol))
 			if dep.Chunk != nil {
 				b.WriteString("\n")
-				b.WriteString(chunkBlock(dep.Chunk, opts.MaxChunkChars))
+				b.WriteString(chunkBlock(dep.Chunk, opts.MaxChunkChars, budget, tokens.SectionDependencies))
+			} else if len(dep.Members) > 0 {
+				b.WriteString(memberListBlock(dep.Members, budget, tokens.SectionDependencies))
 			}
 			b.WriteString("\n\n")
 		}
@@ -275,7 +331,9 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 				b.WriteString(symbolTableRowWithSignature(dm.Symbol))
 				if dm.Chunk != nil {
 					b.WriteString("\n")
-					b.WriteString(chunkBlock(dm.Chunk, opts.MaxChunkChars))
+					b.WriteString(chunkBlock(dm.Chunk, opts.MaxChunkChars, budget, tokens.SectionDomain))
+				} else if len(dm.Members) > 0 {
+					b.WriteString(memberListBlock(dm.Members, budget, tokens.SectionDomain))
 				}
 				b.WriteString("\n\n")
 			}
@@ -326,7 +384,7 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 			b.WriteString("Similar reference chunks (tests / routes / contracts per retrieval profile)\n\n")
 		}
 		for _, c := range rc.SimilarTests {
-			b.WriteString(chunkBlock(c, opts.MaxChunkChars))
+			b.WriteString(chunkBlock(c, opts.MaxChunkChars, budget, tokens.SectionSimilar))
 			b.WriteString("\n\n")
 		}
 	}
@@ -336,7 +394,7 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 		b.WriteString(opts.SectionPrefix)
 		b.WriteString("Related API / client snippets\n\n")
 		for _, c := range rc.RelatedChunks {
-			b.WriteString(chunkBlock(c, opts.MaxChunkChars))
+			b.WriteString(chunkBlock(c, opts.MaxChunkChars, budget, tokens.SectionSimilar))
 			b.WriteString("\n\n")
 		}
 	}
@@ -353,7 +411,7 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 			if src, reason := chunkRetrievalProvenance(c); src != "" || reason != "" {
 				b.WriteString(fmt.Sprintf("- provenance: %s | %s\n", src, reason))
 			}
-			b.WriteString(chunkBlock(c, opts.MaxChunkChars))
+			b.WriteString(chunkBlock(c, opts.MaxChunkChars, budget, tokens.SectionFixtures))
 			b.WriteString("\n\n")
 		}
 	}
@@ -370,7 +428,7 @@ func BuildLLMContext(rc *RetrievalContext, opts FormatOptions) string {
 			if src, reason := chunkRetrievalProvenance(c); src != "" || reason != "" {
 				b.WriteString(fmt.Sprintf("- provenance: %s | %s\n", src, reason))
 			}
-			b.WriteString(chunkBlock(c, opts.MaxChunkChars))
+			b.WriteString(chunkBlock(c, opts.MaxChunkChars, budget, tokens.SectionFixtures))
 			b.WriteString("\n\n")
 		}
 	}
@@ -454,18 +512,80 @@ func symbolTableRowWithSignature(s *metadata.Symbol) string {
 	return out
 }
 
-func chunkBlock(c *embeddings.Chunk, maxChars int) string {
-	if c == nil {
+// chunkBlock renders a chunk for a section, clamped to what the budget still allows.
+//
+// maxChunkChars is the legacy per-chunk character cap (FormatOptions.MaxChunkChars). It is
+// converted to a token allowance so there is a single clamping path; when both it and the budget
+// are set, the tighter one wins.
+func chunkBlock(c *embeddings.Chunk, maxChunkChars int, b *tokens.Budget, kind tokens.SectionKind) string {
+	if c == nil || c.Content == "" {
 		return ""
 	}
-	content := c.Content
-	if maxChars > 0 && len(content) > maxChars {
-		content = content[:maxChars] + "\n... (truncated)"
+	tc := budgetCounter(b)
+	allow := 0
+	if b != nil && !b.Unbounded() && b.Truncatable(kind) {
+		allow = b.Remaining(kind)
 	}
-	if content == "" {
+	if maxChunkChars > 0 {
+		charAllow := tc.Count(strings.Repeat("x", maxChunkChars))
+		if allow == 0 || charAllow < allow {
+			allow = charAllow
+		}
+	}
+	out := renderChunkBlock(c, allow, tc)
+	if b != nil {
+		b.Spend(kind, out)
+	}
+	return out
+}
+
+// budgetCounter returns b's counter, or the default heuristic when b is nil.
+func budgetCounter(b *tokens.Budget) tokens.Counter {
+	if b == nil {
+		return tokens.For("", "")
+	}
+	return b.Counter()
+}
+
+// memberListBlock renders the index-derived member list used when no source chunk resolved for a
+// type. The wording is deliberately absolute ("the only members that exist"): a soft phrasing
+// leaves the model free to assume the list is a sample and invent the member it expected to find,
+// which is the exact failure this block exists to prevent.
+//
+// Spends from the same section budget as chunkBlock so the list participates in clamping instead
+// of silently pushing other sections out.
+func memberListBlock(members []string, b *tokens.Budget, kind tokens.SectionKind) string {
+	if len(members) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("```\n%s\n```", content)
+	var sb strings.Builder
+	sb.WriteString("\n  Members (from the index — these are the only members that exist):\n")
+	for _, m := range members {
+		sb.WriteString("    - ")
+		sb.WriteString(strings.TrimSpace(m))
+		sb.WriteString("\n")
+	}
+	out := sb.String()
+
+	// Mirror chunkBlock's budgeting exactly: clamp the whole block to the section's remaining
+	// allowance, then spend what was actually emitted. Spending per line without checking
+	// Truncatable lets a member list overrun a tight budget one line at a time.
+	tc := budgetCounter(b)
+	if b != nil && !b.Unbounded() && b.Truncatable(kind) {
+		allow := b.Remaining(kind)
+		if allow <= 0 {
+			return ""
+		}
+		clamped, elided := tokens.ClampToTokens(out, allow, tc)
+		if elided > 0 {
+			clamped += "    - … member list truncated to fit the context budget\n"
+		}
+		out = clamped
+	}
+	if b != nil {
+		b.Spend(kind, out)
+	}
+	return out
 }
 
 func chunkRetrievalProvenance(c *embeddings.Chunk) (sourceKind, reason string) {

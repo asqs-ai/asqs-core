@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/config"
+	"github.com/asqs/asqs-core/internal/intelligence/indexer"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
@@ -29,25 +31,33 @@ const (
 	ProfileFullStack RetrievalProfile = "full_stack"
 )
 
-// NormalizeRetrievalProfile maps aliases and defaults empty to java_unit.
+// ParseRetrievalProfile maps aliases to canonical profiles, returning an error for anything
+// unrecognized. Empty is the documented default (java_unit) and is NOT an error.
+//
+// The alias table itself lives in internal/config (this package imports config, so it cannot be the
+// other way round) and is shared with config.Validate, which rejects a bad value at startup rather
+// than letting it silently degrade every run.
+func ParseRetrievalProfile(p RetrievalProfile) (RetrievalProfile, error) {
+	name, err := config.NormalizeRetrievalProfileName(string(p))
+	if err != nil {
+		return "", err
+	}
+	return RetrievalProfile(name), nil
+}
+
+// NormalizeRetrievalProfile maps aliases to canonical profiles.
+//
+// Infallible by design: internal call sites hold a value that config validation already accepted
+// via ParseRetrievalProfile, so re-checking at every use would only add noise. Configuration input
+// must go through ParseRetrievalProfile (or config.Validate) instead — this function still falls
+// back to java_unit for an unrecognized value, which is safe only because validation rejects those
+// before they reach here.
 func NormalizeRetrievalProfile(p RetrievalProfile) RetrievalProfile {
-	s := strings.ToLower(strings.TrimSpace(string(p)))
-	switch s {
-	case "", "java", "java_unit", "java-unit", "unit":
-		return ProfileJavaUnit
-	case "http_api", "http-api", "api", "backend", "nest_api", "spring":
-		return ProfileHTTPAPI
-	case "e2e_playwright", "e2e-playwright", "e2e", "playwright", "ui_test":
-		return ProfileE2EPlaywright
-	case "react_feature", "react-feature", "react", "frontend":
-		return ProfileReactFeature
-	case "nest_module", "nest-module", "nest", "wiring":
-		return ProfileNestModule
-	case "full_stack", "full-stack", "fullstack", "react_http_api", "react-http-api", "ui_and_api":
-		return ProfileFullStack
-	default:
+	out, err := ParseRetrievalProfile(p)
+	if err != nil {
 		return ProfileJavaUnit
 	}
+	return out
 }
 
 func profileUsesInboundExpansion(p RetrievalProfile) bool {
@@ -231,11 +241,11 @@ func isEnclosingContainerKind(kind string) bool {
 // enclosingContainer returns the innermost symbol in the same file that spatially contains sym
 // (class/interface/struct/record or common JS/TS/Nest container kinds).
 // If line spans are missing or wrong, falls back to an incoming CONTAINS edge (caller in the same file).
-func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symbol) *metadata.Symbol {
+func enclosingContainer(ctx context.Context, meta MetaReader, repoID string, sym *metadata.Symbol) *metadata.Symbol {
 	if sym == nil {
 		return nil
 	}
-	syms, err := meta.ListSymbolsByFile(ctx, sym.File)
+	syms, err := meta.ListSymbolsByFile(ctx, repoID, sym.File)
 	if err != nil || len(syms) == 0 {
 		return nil
 	}
@@ -254,7 +264,7 @@ func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symb
 		return best
 	}
 	// Graph fallback: CONTAINS edges point parent (caller) → child (callee); callee = sym.
-	edges, err := meta.GetEdgesTo(ctx, sym.ID)
+	edges, err := meta.GetEdgesTo(ctx, repoID, sym.ID)
 	if err != nil || len(edges) == 0 {
 		return nil
 	}
@@ -264,7 +274,7 @@ func enclosingContainer(ctx context.Context, meta MetaReader, sym *metadata.Symb
 		if strings.ToUpper(strings.TrimSpace(e.EdgeType)) != "CONTAINS" {
 			continue
 		}
-		caller, _ := meta.GetSymbolByID(ctx, e.CallerSymbolID)
+		caller, _ := meta.GetSymbolByID(ctx, repoID, e.CallerSymbolID)
 		if caller == nil || !isEnclosingContainerKind(caller.Kind) {
 			continue
 		}
@@ -293,7 +303,7 @@ type graphWalkNode struct {
 	path     []string
 }
 
-func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, profile RetrievalProfile, maxDepth int) []graphEdge {
+func collectGraphEdges(ctx context.Context, meta MetaReader, repoID, targetID string, profile RetrievalProfile, maxDepth int) []graphEdge {
 	if strings.TrimSpace(targetID) == "" {
 		return nil
 	}
@@ -311,7 +321,7 @@ func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, pr
 			continue
 		}
 		nextDepth := n.depth + 1
-		direct := collectDirectGraphEdges(ctx, meta, n.symbolID, profile)
+		direct := collectDirectGraphEdges(ctx, meta, repoID, n.symbolID, profile)
 		if len(direct) == 0 {
 			continue
 		}
@@ -366,15 +376,15 @@ func collectGraphEdges(ctx context.Context, meta MetaReader, targetID string, pr
 	return out
 }
 
-func collectDirectGraphEdges(ctx context.Context, meta MetaReader, symbolID string, profile RetrievalProfile) []graphEdge {
+func collectDirectGraphEdges(ctx context.Context, meta MetaReader, repoID, symbolID string, profile RetrievalProfile) []graphEdge {
 	var raw []graphEdge
-	if out, _ := meta.GetEdgesFrom(ctx, symbolID); out != nil {
+	if out, _ := meta.GetEdgesFrom(ctx, repoID, symbolID); out != nil {
 		for _, e := range out {
 			raw = append(raw, graphEdge{otherID: e.CalleeSymbolID, edgeType: e.EdgeType, inbound: false})
 		}
 	}
 	if profileUsesInboundExpansion(profile) {
-		if in, _ := meta.GetEdgesTo(ctx, symbolID); in != nil {
+		if in, _ := meta.GetEdgesTo(ctx, repoID, symbolID); in != nil {
 			for _, e := range in {
 				raw = append(raw, graphEdge{otherID: e.CallerSymbolID, edgeType: e.EdgeType, inbound: true})
 			}
@@ -424,36 +434,12 @@ func sortGraphEdges(raw []graphEdge, profile RetrievalProfile) {
 	})
 }
 
-// dependencyEdgeConfidence returns a rough confidence rank (higher = more reliable signal).
-// Semantic, behavior-coupled edges rank above broad structural/import-only edges.
+// dependencyEdgeConfidence ranks a dependency edge for retrieval.
+//
+// The bands used to be a switch here, which meant the list of edge types existed in two places (this
+// file and the producers) and agreed by hand. An edge type absent from the switch silently fell to
+// the default band, so a producer typo and a deliberately-weak edge were indistinguishable. The
+// registry in the indexer package is now the single list; this reads it.
 func dependencyEdgeConfidence(edgeType string) int {
-	switch strings.ToUpper(strings.TrimSpace(edgeType)) {
-	case "CALLS", "INJECTS", "INJECTS_NAMED",
-		"ROUTE_TO_HANDLER", "HANDLER_USES_DTO", "USES_GUARD", "USES_PIPE", "USES_INTERCEPTOR",
-		"TARGETS_API_ROUTE", "CALLS_API", "USES_SELECTOR",
-		"RENDERS", "USES_HOOK", "ACCEPTS_PROPS_TYPE",
-		"IMPLEMENTS_SERVICE", "REGISTERS_SERVICE":
-		return 3
-	case "EXTENDS", "IMPLEMENTS", "CONTAINS", "DECLARES",
-		"MODULE_IMPORTS", "MODULE_EXPORTS", "MODULE_PROVIDERS", "MODULE_REGISTERS":
-		return 2
-	case "IMPORTS", "DEPENDS_ON", "DEPENDS_ON_DEV",
-		"PACKAGE_MAIN", "PACKAGE_MODULE", "PACKAGE_EXPORT", "PACKAGE_ENTRY", "PACKAGE_BIN":
-		return 1
-	default:
-		return 2
-	}
-}
-
-func dedupeGraphEdges(raw []graphEdge) []graphEdge {
-	seen := make(map[string]bool)
-	var out []graphEdge
-	for _, g := range raw {
-		if g.otherID == "" || seen[g.otherID] {
-			continue
-		}
-		seen[g.otherID] = true
-		out = append(out, g)
-	}
-	return out
+	return indexer.EdgeTypeConfidence(edgeType)
 }

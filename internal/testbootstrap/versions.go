@@ -1,11 +1,21 @@
 package testbootstrap
 
+import "strconv"
+
 // Pinned dependency versions for reproducible Jest bootstrap (update periodically).
 const (
 	VersionJest      = "29.7.0"
-	VersionTSJest    = "29.2.5"
+	VersionTSJest    = "29.4.12" // peer jest ^29 || ^30, so one pin serves both Jest lines
 	VersionTypesJest = "29.5.14"
 	VersionTypesNode = "22.10.0"
+	// VersionJest30 is required by jest-preset-angular >= 15 (Angular 18+); the Angular profile
+	// selects it, everything else stays on the proven 29 line.
+	VersionJest30      = "30.4.2"
+	VersionTypesJest30 = "30.0.0"
+	// jest-environment-jsdom ships in lockstep with Jest: a jsdom environment from the wrong major
+	// fails at runtime with an unhelpful "Test environment not found".
+	VersionJestEnvironmentJsdom   = "29.7.0"
+	VersionJestEnvironmentJsdom30 = "30.4.1"
 	// @playwright/test (pin for e2e_framework_bootstrap).
 	VersionPlaywrightTest = "1.49.1"
 	// DefaultPlaywrightDockerImage is mcr.microsoft.com/playwright for JS/TS E2E bootstrap in Docker (keep patch in sync with VersionPlaywrightTest).
@@ -26,6 +36,94 @@ const (
 	DefaultPlaywrightJavaDockerImage = "mcr.microsoft.com/playwright/java:v1.49.0-jammy"
 )
 
+// Vitest lines. Vitest carries Vite as a dependency, so it also works in repos with no Vite at all,
+// but v4 additionally declares Vite as a PEER (^6 || ^7 || ^8) — installing it beside Vite 5 breaks.
+// The profile picks the line from the repo's Vite major.
+const (
+	VersionVitest4 = "4.1.11" // Vite 6+
+	VersionVitest3 = "3.2.4"  // Vite 5, or no Vite at all (self-contained)
+	VersionVitest1 = "1.6.1"  // Vite 4 and older
+	VersionJsdom   = "30.0.1"
+)
+
+// Vue and Svelte component-testing libraries.
+//
+// @vue/test-utils is hard-split by Vue major: the 2 line declares peer vue 3.x, the 1 line declares
+// 2.x. @testing-library/svelte 5 declares svelte ^3 || ^4 || ^5, so one pin covers every current
+// Svelte line.
+const (
+	VersionVueTestUtils         = "2.4.11" // Vue 3
+	VersionVueTestUtilsLegacy   = "1.3.6"  // Vue 2
+	VersionTestingLibrarySvelte = "5.4.2"
+)
+
+// React Testing Library tracks the React major: the 16 line declares react ^18 || ^19, the 12 line
+// declares react <18. Installing 16 beside React 17 fails peer resolution.
+const (
+	VersionTestingLibraryReact       = "16.3.2"
+	VersionTestingLibraryReactLegacy = "12.1.5"
+	VersionTestingLibraryJestDom     = "7.0.1"
+)
+
+// jestPresetAngularForMajor maps an Angular major to a jest-preset-angular release, plus the Jest
+// major that release requires.
+//
+// It deliberately does NOT pick the newest preset. @angular-devkit/build-angular — present in every
+// Angular CLI project — declares a peerOptional on Jest, and through Angular 19 that peer is
+// `^29.5.0` only. Installing jest-preset-angular 15/16 there pulls Jest 30 and npm fails the whole
+// install with ERESOLVE, which is exactly what an Angular 19 fixture did before this mapping was
+// derived from the registry:
+//
+//	build-angular 16.x-19.x  jest ^29.5.0
+//	build-angular 20.x       jest ^29.5.0 || ^30.2.0
+//	build-angular 21.x       jest ^30.2.0
+//
+// So the Jest 29 preset line (14.6.2, @angular/core >=15 <21) is used for as long as it covers the
+// Angular major, and only Angular 21+ moves to the Jest 30 line.
+func jestPresetAngularForMajor(ngMajor int) (preset string, jestMajor int) {
+	switch {
+	case ngMajor >= 21:
+		return "17.0.0", 30
+	case ngMajor >= 15:
+		return "14.6.2", 29
+	default:
+		// Older Angular is outside every current preset's peer range; the caller declines instead.
+		return "", 0
+	}
+}
+
+// nestTestingForMajor maps a @nestjs/core major to the matching @nestjs/testing release. They are
+// released together and a mismatched pair fails at module-resolution time.
+func nestTestingForMajor(major int) string {
+	switch major {
+	case 8:
+		return "8.4.7"
+	case 9:
+		return "9.4.3"
+	case 10:
+		return "10.4.22"
+	case 11:
+		return "11.2.1"
+	default:
+		if major > 11 {
+			return strconv.Itoa(major) + ".0.0"
+		}
+		return ""
+	}
+}
+
+// Pinned standalone Java test libraries. These are deliberately NOT framework-coupled: Mockito and
+// AssertJ ship independently of Spring Boot / Quarkus / Micronaut, so pinning them is safe where
+// pinning spring-test or quarkus-junit5 would silently mismatch the app's framework major.
+const (
+	// VersionMockito requires Java 11+.
+	VersionMockito = "5.14.2"
+	// VersionMockitoJava8 is the last Mockito line that loads on Java 8; Mockito 5 fails there with
+	// an UnsupportedClassVersionError that looks nothing like a dependency problem.
+	VersionMockitoJava8 = "4.11.0"
+	VersionAssertJ      = "3.26.3"
+)
+
 // Microsoft.Playwright NuGet (e2e_framework_bootstrap for .NET). Keep aligned with runner.DefaultPlaywrightDotnetDockerImage tag.
 const VersionMicrosoftPlaywrightNuGet = "1.49.0"
 
@@ -34,4 +132,35 @@ const (
 	VersionDotNetTestSDK = "17.12.0"
 	VersionXunit         = "2.9.2"
 	VersionXunitRunnerVS = "2.8.2"
+	// NUnit / MSTest pins are fallbacks: those branches are only reached on repos that already use
+	// them, so the framework packages are normally present and only the adapter can be missing.
+	VersionNUnit             = "4.6.1"
+	VersionNUnitTestAdapter  = "6.2.0"
+	VersionMSTestFramework   = "4.3.3"
+	VersionMSTestTestAdapter = "4.3.3"
 )
+
+// Standalone .NET test libraries — not coupled to the app's TargetFramework, so pinning is safe.
+const (
+	// VersionMoq is BSD-3-Clause. Keep at or above 4.20.2: 4.20.0/4.20.1 shipped SponsorLink, which
+	// harvested developer email addresses at build time.
+	VersionMoq = "4.20.72"
+	// VersionFluentAssertions MUST STAY ON THE 7.x LINE.
+	//
+	// 7.2.2 declares `<license type="expression">Apache-2.0</license>`. FluentAssertions 8.0.0
+	// switched to a custom licence file (Xceed) that requires a PAID licence for commercial use.
+	// ASQS writes this PackageReference into customer repositories, so bumping this to 8.x would
+	// impose a commercial licensing obligation on every client the bootstrap touches.
+	VersionFluentAssertions = "7.2.2"
+)
+
+// csharpFrameworkCoupledVersions maps a .NET major to the matching version of packages that ship in
+// lockstep with the runtime. Microsoft.AspNetCore.Mvc.Testing 10.x simply cannot be referenced from
+// a net8.0 project, so these are chosen from the TargetFramework rather than pinned globally.
+var csharpFrameworkCoupledVersions = map[int]string{
+	6:  "6.0.36",
+	7:  "7.0.20",
+	8:  "8.0.30",
+	9:  "9.0.19",
+	10: "10.0.11",
+}

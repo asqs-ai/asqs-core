@@ -14,6 +14,7 @@ import (
 	llembed "github.com/asqs/asqs-core/internal/llm/embeddings"
 	"github.com/asqs/asqs-core/internal/llm/ollama"
 	"github.com/asqs/asqs-core/internal/llm/openai"
+	"github.com/asqs/asqs-core/internal/storage/embeddings"
 )
 
 // StepDoc is the config step name for doc generation.
@@ -134,14 +135,99 @@ func NewChatCompleterForStep(cfg *config.Config, step string) (model.ChatComplet
 	}
 }
 
+// EffectiveProviderForStep reports the lowercased provider name a step resolves to after the
+// per-step override / default-provider fallback — the same resolution NewChatCompleterForStep
+// applies. Exported so orchestration can make provider-aware decisions (notably: whether the fixer's
+// provider enforces a JSON schema as a grammar) without re-deriving the fallback chain.
+func EffectiveProviderForStep(cfg *config.Config, step string) string {
+	if cfg == nil {
+		return ""
+	}
+	return resolveStepConfig(cfg, step).Provider
+}
+
 // NewChatCompleter returns a ChatCompleter for the configured default provider and model. Returns (nil, nil) when cfg.LLM.Provider is empty.
 func NewChatCompleter(cfg *config.Config) (model.ChatCompleter, error) {
 	return NewChatCompleterForStep(cfg, "")
 }
 
+// BuildStepCompleters builds the per-step chat completers (base/default, doc, generation, fixer)
+// and wraps every one with a SINGLE shared concurrency limiter sized by cfg.LLM.MaxConcurrent
+// (default model.DefaultLLMMaxConcurrent). Sharing one limiter across the steps yields a global
+// in-flight LLM-request cap, so parallelizing the test/doc/overview/fixer workstreams can never
+// exceed the provider's safe concurrency. Each step falls back to the base completer when its
+// provider is unset (matching prior call-site behaviour); per-step construction errors are
+// swallowed (base is used). err is non-nil only when the base/default completer failed to build
+// (callers may log it; generation is then skipped). Returns all-nil when cfg.LLM.Provider is empty.
+func BuildStepCompleters(cfg *config.Config) (base, doc, gen, fixer model.ChatCompleter, lim *model.LLMLimiter, err error) {
+	if cfg == nil || strings.TrimSpace(cfg.LLM.Provider) == "" {
+		return nil, nil, nil, nil, nil, nil
+	}
+	lim = model.NewLLMLimiter(cfg.LLM.MaxConcurrent)
+	base, err = NewChatCompleter(cfg)
+	doc, _ = NewChatCompleterForStep(cfg, StepDoc)
+	if doc == nil {
+		doc = base
+	}
+	gen, _ = NewChatCompleterForStep(cfg, StepGeneration)
+	if gen == nil {
+		gen = base
+	}
+	fixer, _ = NewChatCompleterForStep(cfg, StepFixer)
+	if fixer == nil {
+		fixer = base
+	}
+	// Ollama tool support is probed BEFORE wrapping, while the concrete client is still reachable.
+	//
+	// Self-hosted open models are a first-class deployment here, and their tool support is a
+	// property of the model's chat template rather than of the server or the family — it changes
+	// between tags. Probing is the only way to know; without it the client conservatively reports
+	// no tool calling and every Ollama run falls to the prompted tier, which is one lookup per turn
+	// instead of parallel native calls.
+	probeOllamaToolSupport(cfg, base, doc, gen, fixer)
+
+	base = model.NewConcurrencyLimitedCompleter(base, lim)
+	doc = model.NewConcurrencyLimitedCompleter(doc, lim)
+	gen = model.NewConcurrencyLimitedCompleter(gen, lim)
+	fixer = model.NewConcurrencyLimitedCompleter(fixer, lim)
+	return base, doc, gen, fixer, lim, err
+}
+
 // NewEmbedder returns an Embedder for the configured provider.
 // When EmbeddingProvider is set (e.g. openai while Provider is anthropic), that provider and its key are used so you can use Anthropic for chat and OpenAI for embeddings. Returns (nil, nil) when both Provider and EmbeddingProvider are empty.
+// Every provider is wrapped so its vectors are L2-normalized before they reach the store — see
+// llembed.L2Normalize for why the ANN metric and the scoring metric must agree.
 func NewEmbedder(cfg *config.Config) (model.Embedder, error) {
+	inner, err := newRawEmbedder(cfg)
+	if err != nil || inner == nil {
+		return inner, err
+	}
+	return llembed.NewNormalizingEmbedder(inner), nil
+}
+
+// NewCachedEmbedder is NewEmbedder plus the content-addressed memo, when a cache store is available
+// and llm.disable_embedding_cache is not set.
+//
+// The cache wraps the NORMALIZED embedder so a hit is indistinguishable from a fresh embed: cached
+// vectors are already unit length. Caching outside normalization would re-normalize on every hit;
+// caching inside it would store raw vectors that later reads use directly.
+func NewCachedEmbedder(cfg *config.Config, cache llembed.EmbeddingCache, dim int) (model.Embedder, error) {
+	emb, err := NewEmbedder(cfg)
+	if err != nil || emb == nil {
+		return emb, err
+	}
+	if cfg.LLM.DisableEmbeddingCache || cache == nil || dim <= 0 {
+		return emb, nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(cfg.LLM.EmbeddingProvider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))
+	}
+	return llembed.NewCachingEmbedder(emb, cache, provider, cfg.LLM.EmbeddingModel, dim, embeddings.CacheKey), nil
+}
+
+// newRawEmbedder builds the provider embedder without the normalization wrapper.
+func newRawEmbedder(cfg *config.Config) (model.Embedder, error) {
 	p := strings.ToLower(strings.TrimSpace(cfg.LLM.EmbeddingProvider))
 	if p == "" {
 		p = strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))

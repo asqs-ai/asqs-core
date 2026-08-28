@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Enables the live-db job below, which is skipped on ordinary pushes and PRs.
+  workflow_dispatch:
 
 jobs:
   go:
@@ -12,13 +14,47 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          # Must match go.mod. Pinning "1.24" against a go.mod declaring 1.25.0 survived only
+          # because the toolchain auto-downloaded a newer one — an implicit network dependency
+          # in CI that nobody chose.
+          go-version: "1.25"
       - name: build
         run: go build ./...
       - name: vet
         run: go vet ./...
       - name: test
         run: go test ./...
+
+  # Runs the *_live_test.go suites against a scratch Postgres + pgvector service container.
+  # Skipped by default: trigger it manually (workflow_dispatch). The database is named
+  # asqs_scratch because the livetest guard refuses to write to any database whose name does not
+  # contain "test" or "scratch" (internal/storage/metadata/livetest_guard.go).
+  live-db:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: asqs
+          POSTGRES_PASSWORD: asqs
+          POSTGRES_DB: asqs_scratch
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U asqs -d asqs_scratch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: live tests
+        env:
+          ASQS_TEST_METADATA_URL: postgres://asqs:asqs@localhost:5432/asqs_scratch?sslmode=disable
+        run: make test-live
 
   indexers:
     runs-on: ubuntu-latest

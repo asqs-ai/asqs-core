@@ -6,9 +6,9 @@ import (
 
 // DetectChanges compares the current file set with the last indexed state in metadata and returns a ChangeSet.
 // currentFiles: files present in the repo (path + SHA). meta: MetadataWriter to read last known files.
-func DetectChanges(ctx context.Context, currentFiles []FileVersion, meta MetadataWriter) (*ChangeSet, error) {
+func DetectChanges(ctx context.Context, currentFiles []FileVersion, meta MetadataWriter, repoID string) (*ChangeSet, error) {
 	// Load last indexed state: all files from metadata (we need ListFiles without lang filter to get all).
-	stored, err := meta.ListFiles(ctx, "", nil)
+	stored, err := meta.ListFiles(ctx, repoID, "", nil)
 	if err != nil {
 		return nil, err
 	}

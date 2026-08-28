@@ -2,7 +2,10 @@ package evaluator
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/errout"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,7 +16,9 @@ import (
 // helpers use these fields to scope the operation to one gap's artifacts only — they do not run
 // the project-wide evaluation that legacy `RunEvaluation` performs.
 //
-// Per-gap evaluation contract (per docs/SESSIONS.md per-gap pipeline):
+// Per-gap evaluation contract. (This used to cite the agent-session engine's reference document,
+// which is enterprise-excluded and will never exist here, so the contract is stated below rather
+// than referenced.)
 //   - Compile: project-wide (shared), see RunSharedCompile.
 //   - Test: per gap (only the gap's tests).
 //   - Lint: per gap (only the gap's artifacts).
@@ -52,6 +57,15 @@ type FinalEvalResult struct {
 	// FailingOutput is the (truncated) error output of the failing step, ready to feed into
 	// RunRunFixerOnce. Empty for Stable=true.
 	FailingOutput string
+}
+
+// FailureSignature hashes a failing step together with a position-insensitive form of its output.
+func FailureSignature(lang string, step SandboxStep, output string) string {
+	if strings.TrimSpace(output) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(string(step) + "\x00" + errout.SignatureNormalize(lang, output)))
+	return hex.EncodeToString(sum[:])
 }
 
 // RunSharedCompile invokes the compile step at run scope. It is a thin alias over RunCompile

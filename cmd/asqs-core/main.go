@@ -1,5 +1,6 @@
-// Command asqs-core is the open-source CLI: a single `run` command that generates unit/E2E tests
-// (and, optionally, ships them) for a local folder or a remote git repository.
+// Command asqs-core is the open-source CLI: `run` generates unit/E2E tests (and, optionally,
+// ships them) for a local folder or a remote git repository; `migrate` applies one-shot schema
+// and data migrations.
 package main
 
 import (
@@ -18,18 +19,42 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := dispatch(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: %v\n", err)
 		os.Exit(2)
 	}
 }
 
-func run() error {
-	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "usage: asqs-core run [flags] [<repo-path-or-git-url>]\n")
-		return fmt.Errorf("the only supported command is `run`")
+// dispatch routes to a subcommand. Extracted once, here, so a later subcommand is one case each
+// rather than another ad-hoc branch on os.Args — which is how a CLI becomes untestable. `run`'s flags and behaviour are unchanged by the extraction, and
+// a parity test pins its flag set and usage text.
+func dispatch(args []string) error {
+	if len(args) < 1 {
+		printTopLevelUsage()
+		return fmt.Errorf("missing command")
 	}
-	flags, err := parseRunFlags(os.Args[2:], os.Stderr)
+	switch args[0] {
+	case "run":
+		return runRun(args[1:])
+	case "migrate":
+		return runMigrate(args[1:])
+	case "ab-report":
+		return runABReport(args[1:])
+	default:
+		printTopLevelUsage()
+		return fmt.Errorf("unknown command %q (supported: run, migrate, ab-report)", args[0])
+	}
+}
+
+func printTopLevelUsage() {
+	fmt.Fprintf(os.Stderr, "usage: asqs-core <command> [flags]\n\ncommands:\n"+
+		"  run        generate unit/E2E tests for a repo and evaluate them (see `asqs-core run` for flags)\n"+
+		"  migrate    apply one-shot schema/data migrations recorded in schema_migrations\n"+
+		"  ab-report  compare outcome metrics across config revisions (first-wave metrics per run)\n")
+}
+
+func runRun(args []string) error {
+	flags, err := parseRunFlags(args, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -61,6 +86,14 @@ func run() error {
 	}
 	fmt.Fprintf(os.Stderr, "asqs-core: max-gaps=%d (%s) max-gaps-e2e=%d (%s)\n",
 		maxGaps, maxGapsSrc, maxGapsE2E, maxGapsE2ESrc)
+
+	// --- Audit log -----------------------------------------------------------------------
+	// Precedence: --audit-log, then audit.file_path (or ASQS_AUDIT_FILE_PATH). Empty = no audit
+	// file; the run keeps its stderr step lines either way.
+	auditLogPath, auditLogSrc := resolveAuditLogPath(flags.setFlags["audit-log"], flags.auditLog, cfg.Audit.FilePath)
+	if auditLogPath != "" {
+		fmt.Fprintf(os.Stderr, "asqs-core: audit-log=%s (%s)\n", auditLogPath, auditLogSrc)
+	}
 
 	// --- Ship settings (resolved up front) ----------------------------------------------
 	// Ship targets the REPO WE RUN AGAINST: the ship branch is prepared on that repo *before*
@@ -145,15 +178,33 @@ func run() error {
 		}
 	}
 
+	// The commit the working tree is at, for per-symbol history. Resolved HERE because this is where
+	// the repository is opened or cloned — pipeline.Options.CommitSHA has existed all along and
+	// nothing ever set it, so every symbol version would have been recorded against the empty commit
+	// and churn (distinct body hashes per commit window) could never have counted past one. Upstream
+	// shipped exactly that for weeks. Best-effort: a plain directory that is not a git checkout has
+	// no commit, and that is a supported way to run.
+	commitSHA := ""
+	if gitRepo != nil {
+		if sha, err := gitRepo.HeadSHA(); err == nil {
+			commitSHA = sha
+		} else {
+			fmt.Fprintf(os.Stderr, "asqs-core: could not resolve HEAD (%v); symbol history is not recorded for this run.\n", err)
+		}
+	}
+
 	// --- Run the pipeline ---------------------------------------------------------------
 	sum, err := pipeline.Run(ctx, cfg, pipeline.Options{
-		RepoPath:     repoDir,
-		RepoID:       repoID,
-		Lang:         flags.lang,
-		MaxGaps:      maxGaps,
-		MaxGapsE2E:   maxGapsE2E,
-		GenerateDocs: flags.docs,
-		Sandbox:      cfg.Runner.Type,
+		RepoPath:         repoDir,
+		RepoID:           repoID,
+		CommitSHA:        commitSHA,
+		Lang:             flags.lang,
+		MaxGaps:          maxGaps,
+		MaxGapsE2E:       maxGapsE2E,
+		GenerateDocs:     flags.docs,
+		Sandbox:          cfg.Runner.Type,
+		AuditLogPath:     auditLogPath,
+		AuditDumpPrompts: cfg.Audit.DumpPrompts,
 	})
 	if err != nil {
 		return err
@@ -208,6 +259,11 @@ func shipRun(ctx context.Context, cfg *config.Config, gitRepo *repo.Repo, origin
 			}
 		}
 	}
+	// `.asqs/` holds both run scratch and caches meant to outlive the run, and `Add(".")` cannot
+	// tell them apart. Clear it first, keeping only the paths that are supposed to reach the next
+	// run through this repository's clone — chiefly the project-intel cache, which core already
+	// commits today and which this must not silently stop committing.
+	pipeline.RemoveRepoAsqsDirForShip(gitRepo.Path, cfg)
 	if err := gitRepo.Add("."); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}

@@ -25,19 +25,6 @@ func dotnetOnPATH() bool {
 	return err == nil
 }
 
-// EffectivePostGenerateFormatCommand returns runner.format_command when set; for C# when empty, defaults to "dotnet format".
-func EffectivePostGenerateFormatCommand(lang, configured string) string {
-	if s := strings.TrimSpace(configured); s != "" {
-		return s
-	}
-	switch strings.ToLower(strings.TrimSpace(lang)) {
-	case "csharp", "cs":
-		return "dotnet format"
-	default:
-		return ""
-	}
-}
-
 // IsDotNetFormatCommand is true when the format step should use dotnet format --include (format_only_added path).
 func IsDotNetFormatCommand(cmd string) bool {
 	c := strings.TrimSpace(cmd)
@@ -116,7 +103,7 @@ func dotnetRestoreArgvForPreFormat(formatArgv []string) []string {
 	if r == nil {
 		return nil
 	}
-	return ApplyDotnetDockerDisableNuGetAudit(append([]string(nil), r...))
+	return ApplyDotnetDisableNuGetAudit(append([]string(nil), r...))
 }
 
 // dotnetFormatArgvInsertNoRestore inserts --no-restore immediately after the workspace argument so `dotnet format`
@@ -182,7 +169,7 @@ func runDotNetFormatIncludeOnce(ctx context.Context, repoPath string, relFiles [
 	if didRestore {
 		argv = dotnetFormatArgvInsertNoRestore(argv)
 	}
-	argv = ApplyDotnetDockerDisableNuGetAudit(append([]string(nil), argv...))
+	argv = ApplyDotnetDisableNuGetAudit(append([]string(nil), argv...))
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = dir
 	cmd.Env = formatEnv(dir)

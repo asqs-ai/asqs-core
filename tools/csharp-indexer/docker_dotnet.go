@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	defaultDotnetDockerWorkdir   = "/workspace"
-	defaultDllInContainer        = "/indexer/CSharpIndexer.dll"
-	defaultDockerNetwork         = "none"
-	defaultDotnetIndexerImage    = "mcr.microsoft.com/dotnet/sdk:10.0"
+	defaultDotnetDockerWorkdir = "/workspace"
+	defaultDllInContainer      = "/indexer/CSharpIndexer.dll"
+	defaultDockerNetwork       = "none"
+	defaultDotnetIndexerImage  = "mcr.microsoft.com/dotnet/sdk:10.0"
 )
 
 // DotnetDockerConfig configures ephemeral `docker run --rm` for the C# indexer DLL.

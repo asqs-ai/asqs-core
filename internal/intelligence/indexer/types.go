@@ -75,12 +75,14 @@ type ChunkPlan struct {
 	EndLine   int
 	RepoID    string
 	// SymbolFQ is the primary symbol for symbol_id resolution (first symbol when merged).
-	SymbolFQ      string
-	SymbolKind    string
-	ChunkIndex    int // 0 = single or first slice; >0 for large-symbol continuations (Phase D).
-	ParentFQ      string
-	SecondaryRole string // e.g. route_manifest, angular_template_file (Phase C); empty for normal chunks.
-	MetadataJSON  []byte // stored as chunk_metadata JSONB when non-nil (Phases A–D).
+	// The symbol's kind and any secondary role travel in MetadataJSON (`symbol_kind`,
+	// `chunk_role`) — they were also plain fields here once, set at every construction site and
+	// read by nothing, which made it ambiguous whether the metadata or the field was the record.
+	// The metadata is.
+	SymbolFQ     string
+	ChunkIndex   int // 0 = single or first slice; >0 for large-symbol continuations (Phase D).
+	ParentFQ     string
+	MetadataJSON []byte // stored as chunk_metadata JSONB when non-nil (Phases A–D).
 }
 
 // ChunkToEmbed is a chunk ready for embedding and storage (no vector yet).
@@ -121,23 +123,43 @@ func (c *ChunkToEmbed) ToChunk(embedding []float32) *embeddings.Chunk {
 // MetadataWriter is the subset of metadata.Store needed for indexing (write symbols, edges, files; delete for incremental; index runs).
 type MetadataWriter interface {
 	InsertSymbol(ctx context.Context, sym *metadata.Symbol) (string, error)
+	// InsertSymbols writes a file's symbols in one round trip and returns their ids in input
+	// order; InsertEdges is its edge twin. See the store's batch path for the atomicity contract.
+	InsertSymbols(ctx context.Context, syms []*metadata.Symbol) ([]string, error)
 	InsertEdge(ctx context.Context, e *metadata.Edge) error
+	InsertEdges(ctx context.Context, edges []*metadata.Edge) error
 	UpsertFile(ctx context.Context, f *metadata.File) error
-	DeleteSymbolsByFile(ctx context.Context, file string) (int64, error)
-	DeleteFile(ctx context.Context, file string) error
-	GetFile(ctx context.Context, file string) (*metadata.File, error)
-	ListFiles(ctx context.Context, lang string, isTest *bool) ([]*metadata.File, error)
-	ListSymbolsByFQName(ctx context.Context, fqName string) ([]*metadata.Symbol, error)
+	DeleteSymbolsByFile(ctx context.Context, repoID, file string) (int64, error)
+	// DeleteSymbolsByFileExcept prunes a reindexed file's symbols down to the ids just upserted.
+	// It replaces the delete-then-insert flow: deleting first would destroy the stable ids that
+	// make chunks.symbol_id durable and per-symbol history possible (CP13).
+	DeleteSymbolsByFileExcept(ctx context.Context, repoID, file string, keep []string) (int64, error)
+	// DeleteOutboundEdgesForFile clears the edges a reindexed file used to declare. The old
+	// delete-symbols cascade did this as a side effect; with stable ids nothing does, so a call
+	// removed from the source would otherwise linger as an edge forever.
+	DeleteOutboundEdgesForFile(ctx context.Context, repoID, file string) (int64, error)
+	// InsertSymbolVersions records one (symbol, commit) observation each. Auxiliary: a failure
+	// costs a churn observation, never the run.
+	InsertSymbolVersions(ctx context.Context, versions []*metadata.SymbolVersion) error
+	DeleteFile(ctx context.Context, repoID, file string) (deleted bool, err error)
+	GetFile(ctx context.Context, repoID, file string) (*metadata.File, error)
+	ListFiles(ctx context.Context, repoID, lang string, isTest *bool) ([]*metadata.File, error)
+	ListSymbolsByFQName(ctx context.Context, repoID, fqName string) ([]*metadata.Symbol, error)
+	// ListSymbolsByFQNames resolves many names in one query; see prefetchFQNames.
+	ListSymbolsByFQNames(ctx context.Context, repoID string, fqNames []string) (map[string][]*metadata.Symbol, error)
+	// RecomputeSymbolDegrees refreshes the materialized degree columns from edges after a run's
+	// writes finish. Mocks may return nil.
+	RecomputeSymbolDegrees(ctx context.Context, repoID string) error
 	// MaterializeTestsSourceEdges rebuilds TESTS_SOURCE edges after indexing (test→SUT heuristics). Mocks may return (0, nil).
-	MaterializeTestsSourceEdges(ctx context.Context) (inserted int, err error)
+	MaterializeTestsSourceEdges(ctx context.Context, repoID string) (inserted int, err error)
 	InsertIndexRun(ctx context.Context, runID, repoID, commitSHA string, startedAt int64, currentIteration int, extras *metadata.IndexRunStartExtras) error
 	UpdateIndexRunFinished(ctx context.Context, runID string, finishedAt int64) error
 	// CountSymbols returns the total number of symbols currently stored. The indexer calls this
 	// after writes finish so RunResult.SymbolsTotal reports the post-run count (A.7). Mock
 	// implementations may return (0, nil); the indexer treats counting failures as best-effort.
-	CountSymbols(ctx context.Context) (int64, error)
+	CountSymbols(ctx context.Context, repoID string) (int64, error)
 	// CountEdges returns the total number of edges currently stored. Best-effort; see CountSymbols.
-	CountEdges(ctx context.Context) (int64, error)
+	CountEdges(ctx context.Context, repoID string) (int64, error)
 	// CountIndexRuns returns the number of index_runs rows for the given repo (including the
 	// current run, which has already been inserted by indexer.Run before this call). The
 	// indexer uses the count to detect "first run for this repo": when count <= 1, no prior
@@ -151,7 +173,7 @@ type MetadataWriter interface {
 // EmbeddingsWriter is the subset of embeddings.Store needed for indexing.
 type EmbeddingsWriter interface {
 	InsertChunks(ctx context.Context, chunks []*embeddings.Chunk) ([]string, error)
-	DeleteByFile(ctx context.Context, file string) (int64, error)
+	DeleteByFile(ctx context.Context, repoID, file string) (int64, error)
 	DeleteByRepo(ctx context.Context, repoID string) (int64, error)
 	SetEmbeddingProvider(ctx context.Context, provider, embeddingModel string, dimension int) error
 	// CountChunksByRepo returns the total number of chunks currently stored for the given repo

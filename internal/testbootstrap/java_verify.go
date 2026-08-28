@@ -3,10 +3,8 @@ package testbootstrap
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -37,16 +35,9 @@ func mavenVerifyCommand(repo, pomAbs string) (cmd string, args []string, ok bool
 	if rel != "pom.xml" {
 		mvnArgs = append([]string{"-f", rel}, mvnArgs...)
 	}
-	if runtime.GOOS == "windows" {
-		mc := filepath.Join(repo, "mvnw.cmd")
-		if _, err := os.Stat(mc); err == nil {
-			return mc, mvnArgs, true
-		}
-	}
-	mvnw := filepath.Join(repo, "mvnw")
-	if _, err := os.Stat(mvnw); err == nil {
-		return mvnw, mvnArgs, true
-	}
+	// CP32: the PATH binary, never the repo wrapper. Bootstrap used to prefer ./mvnw while the
+	// eval step ran host `mvn`, so a single run could compile the same sources with two different
+	// Maven versions — the split this decision exists to remove.
 	return "mvn", mvnArgs, true
 }
 
@@ -60,16 +51,7 @@ func gradleVerifyCommand(repo, gradleAbs string) (cmd string, args []string, ok 
 	if rel != "." && rel != "" {
 		gargs = append([]string{"-p", filepath.ToSlash(rel)}, gargs...)
 	}
-	gw := filepath.Join(repo, "gradlew")
-	if runtime.GOOS == "windows" {
-		bat := filepath.Join(repo, "gradlew.bat")
-		if _, err := os.Stat(bat); err == nil {
-			return bat, gargs, true
-		}
-	}
-	if _, err := os.Stat(gw); err == nil {
-		return gw, gargs, true
-	}
+	// CP32: the PATH binary, never the repo wrapper. See mavenVerifyCommand.
 	return "gradle", gargs, true
 }
 
@@ -112,9 +94,8 @@ func javaVerifyDockerScript(repo string) (string, bool) {
 		if rel != "pom.xml" {
 			f = " " + shellQuoteArg("-f") + " " + shellQuoteArg(rel)
 		}
-		if fileExists(filepath.Join(repo, "mvnw")) {
-			return "chmod +x ./mvnw 2>/dev/null || true; ./mvnw -q test-compile -B" + f, true
-		}
+		// The `chmod +x ./mvnw` variant is gone with CP32: there is no wrapper to make
+		// executable, and the image supplies Maven.
 		return "mvn -q test-compile -B" + f, true
 	case javaBuildGradleGroovy, javaBuildGradleKotlin:
 		modDir := filepath.Dir(jbf.Abs)
@@ -126,9 +107,7 @@ func javaVerifyDockerScript(repo string) (string, bool) {
 		if rel != "." && rel != "" {
 			p = " " + shellQuoteArg("-p") + " " + shellQuoteArg(filepath.ToSlash(rel))
 		}
-		if fileExists(filepath.Join(repo, "gradlew")) {
-			return "chmod +x ./gradlew 2>/dev/null || true; ./gradlew" + p + " -q testClasses --no-daemon", true
-		}
+		// As the Maven branch: no wrapper, no chmod (CP32).
 		return "gradle" + p + " -q testClasses --no-daemon", true
 	default:
 		return "", false

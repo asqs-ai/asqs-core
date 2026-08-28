@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -36,6 +37,9 @@ type RunOptions struct {
 	EmbeddingProvider  string // e.g. "openai"
 	EmbeddingModel     string // e.g. "text-embedding-3-small"
 	EmbeddingDimension int    // 0 = infer from first vector length
+	// DependencyDocs enables local-only ingestion of direct-dependency documentation.
+	// Zero value = disabled.
+	DependencyDocs DependencyDocOptions
 	// Audit logs each step to the audit store (and optional file) for debugging and improvement. Optional.
 	Audit Auditor
 	// IndexablePaths when non-nil restricts indexing to these repo-relative paths (forward slashes).
@@ -85,6 +89,12 @@ type RunResult struct {
 
 // Run performs change detection, then incremental index: remove stale data, parse changed/added files,
 // write symbol table and dependency graph to metadata, chunk and sanitize, embed and store chunks.
+// legacyCSharpFQCounter is the optional metadata capability behind the B25 forced reindex; the
+// concrete metadata.Store implements it, mocks opt in to exercise the path.
+type legacyCSharpFQCounter interface {
+	CountLegacyCSharpFQNames(ctx context.Context, repoID string) (int64, error)
+}
+
 func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts RunOptions) (*RunResult, error) {
 	if meta == nil {
 		return nil, fmt.Errorf("indexer: MetadataWriter required")
@@ -113,6 +123,13 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	if currentIteration <= 0 {
 		currentIteration = 3
 	}
+	// The commit this pass observes symbol bodies at. Empty means "not a git checkout", which is a
+	// supported way to run — history simply does not accumulate for it.
+	commitSHA := strings.TrimSpace(opts.CommitSHA)
+	// Same fq_name+kind declared twice in one file: stored as distinct rows via dup_ordinal, but
+	// counted because it marks where the language indexer cannot name overloads apart.
+	naturalKeyCollisions := 0
+
 	preFilterCount := len(opts.CurrentFiles)
 	currentFiles := opts.CurrentFiles
 	if len(opts.IndexablePaths) > 0 {
@@ -152,7 +169,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		_ = meta.UpdateIndexRunFinished(ctx, runID, time.Now().UnixMilli())
 	}()
 
-	changeSet, err := DetectChanges(ctx, currentFiles, meta)
+	changeSet, err := DetectChanges(ctx, currentFiles, meta, opts.RepoID)
 	if err != nil {
 		return nil, fmt.Errorf("indexer: detect changes: %w", err)
 	}
@@ -208,6 +225,35 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 		}
 	}
+	// B25: parameterized C# FQNames are a BREAKING format change. Any stored callable still in the
+	// old parameterless form means this repository predates the format; incremental indexing would
+	// leave unchanged files with legacy names next to new-format ones, making overload gaps, edge
+	// binding and lookups silently inconsistent — so the whole repo reindexes, even when change
+	// detection found work of its own.
+	if lc, ok := meta.(legacyCSharpFQCounter); ok && !forceReindex {
+		if n, lerr := lc.CountLegacyCSharpFQNames(ctx, opts.RepoID); lerr == nil && n > 0 {
+			inSet := make(map[string]struct{}, len(changeSet.Added)+len(changeSet.Changed))
+			for _, fv := range changeSet.Added {
+				inSet[fv.Path] = struct{}{}
+			}
+			for _, fv := range changeSet.Changed {
+				inSet[fv.Path] = struct{}{}
+			}
+			missing := 0
+			for _, fv := range currentFiles {
+				if _, seen := inSet[fv.Path]; !seen {
+					changeSet.Changed = append(changeSet.Changed, fv)
+					missing++
+				}
+			}
+			if opts.Audit != nil {
+				opts.Audit.Log(ctx, "index.csharp_fqname_upgrade", map[string]interface{}{
+					"message":        fmt.Sprintf("%d C# symbol(s) carry pre-B25 parameterless FQNames; forcing a full reindex (%d file(s) added to the change set) so the stored graph is single-format.", n, missing),
+					"legacy_symbols": n, "files_forced": missing,
+				})
+			}
+		}
+	}
 	if forceReindex {
 		changeSet.Changed = append(changeSet.Changed, currentFiles...)
 		if opts.Audit != nil {
@@ -228,10 +274,10 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	// Remove stale: embeddings first, then symbols (cascade deletes edges), then file row
 	for _, path := range changeSet.Removed {
 		if emb != nil {
-			_, _ = emb.DeleteByFile(ctx, path)
+			_, _ = emb.DeleteByFile(ctx, opts.RepoID, path)
 		}
-		_, _ = meta.DeleteSymbolsByFile(ctx, path)
-		_ = meta.DeleteFile(ctx, path)
+		_, _ = meta.DeleteSymbolsByFile(ctx, opts.RepoID, path)
+		_, _ = meta.DeleteFile(ctx, opts.RepoID, path)
 	}
 	if opts.Audit != nil && len(changeSet.Removed) > 0 {
 		opts.Audit.Log(ctx, "index.removed", map[string]interface{}{
@@ -246,6 +292,8 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	chunksStored := 0
 	symbolsStored := 0
 	edgesStored := 0
+	var fileUpsertErrors int
+	var firstFileUpsertErr error
 	unresolvedCallerByType := make(map[string]int64)
 	unresolvedCalleeByType := make(map[string]int64)
 	filesToIndex := append(changeSet.Added, changeSet.Changed...)
@@ -337,14 +385,21 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			})
 		}
 
-		// Delete existing symbols/chunks for this file (reindex)
+		// Chunks are still delete-then-write: they carry no identity of their own, and the embeddings
+		// store rewrites the file's set in this pass.
+		//
+		// SYMBOLS are not. Deleting them here would destroy the ids that CP13 exists to preserve —
+		// and with them chunks.symbol_id and every row of the symbol's history. The file is
+		// upserted on the natural key below, then pruned of what it no longer declares.
 		if emb != nil {
-			_, _ = emb.DeleteByFile(ctx, fv.Path)
+			_, _ = emb.DeleteByFile(ctx, opts.RepoID, fv.Path)
 		}
-		_, _ = meta.DeleteSymbolsByFile(ctx, fv.Path)
 
 		// Insert symbols and collect IDs
 		symbolIDByFQName := make(map[string]string)
+		// One round trip for the whole file's symbols instead of one per symbol; ids come back in
+		// input order, which the maps below depend on.
+		metaSyms := make([]*metadata.Symbol, 0, len(parsed.Symbols))
 		for _, sym := range parsed.Symbols {
 			metaSym := &metadata.Symbol{
 				Lang:          parsed.Lang,
@@ -354,6 +409,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				StartLine:     sym.StartLine,
 				EndLine:       sym.EndLine,
 				SignatureJSON: sym.SignatureJSON,
+				RepoID:        opts.RepoID,
 			}
 			if sym.StartColumn != nil {
 				v := *sym.StartColumn
@@ -363,16 +419,75 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				v := *sym.EndColumn
 				metaSym.EndColumn = &v
 			}
-			id, err := meta.InsertSymbol(ctx, metaSym)
-			if err != nil {
-				return nil, fmt.Errorf("indexer: insert symbol %s: %w", sym.FQName, err)
+			metaSyms = append(metaSyms, metaSym)
+		}
+		ids, err := meta.InsertSymbols(ctx, metaSyms)
+		if err != nil {
+			return nil, fmt.Errorf("indexer: insert symbols for %s: %w", parsed.Path, err)
+		}
+		if len(ids) != len(metaSyms) {
+			return nil, fmt.Errorf("indexer: insert symbols for %s: got %d ids for %d symbols",
+				parsed.Path, len(ids), len(metaSyms))
+		}
+		// Natural-key collisions (the same fq_name+kind twice in one file) are stored as separate
+		// rows via dup_ordinal, but they mean the indexer cannot NAME the difference — the Java
+		// indexer's parameterless overload FQNames are the known case. Counted for the audit,
+		// because an invisible limitation never gets fixed.
+		{
+			keySeen := make(map[string]int, len(parsed.Symbols))
+			for _, sym := range parsed.Symbols {
+				k := sym.FQName + "\x00" + strings.ToLower(sym.Kind)
+				keySeen[k]++
+				if keySeen[k] == 2 {
+					naturalKeyCollisions++
+				}
 			}
-			symbolIDByFQName[sym.FQName] = id
-			fqNameToID[sym.FQName] = id // global for cross-file edge resolution
+		}
+		// Prune what the file no longer declares. This is the second half of the upsert flow, and
+		// without it a deleted symbol would live forever now that nothing deletes the file's rows.
+		if _, derr := meta.DeleteSymbolsByFileExcept(ctx, opts.RepoID, parsed.Path, ids); derr != nil {
+			return nil, fmt.Errorf("indexer: prune symbols for %s: %w", parsed.Path, derr)
+		}
+		// Stable ids keep the file's OLD outbound edges alive — the delete-symbols cascade used to
+		// clear them as a side effect. Drop them before this pass re-derives the current set, or a
+		// call that was removed from the source lingers as an edge forever.
+		if _, derr := meta.DeleteOutboundEdgesForFile(ctx, opts.RepoID, parsed.Path); derr != nil {
+			return nil, fmt.Errorf("indexer: clear outbound edges for %s: %w", parsed.Path, derr)
+		}
+		if commitSHA != "" {
+			versions := make([]*metadata.SymbolVersion, 0, len(ids))
+			for i, sym := range parsed.Symbols {
+				versions = append(versions, &metadata.SymbolVersion{
+					SymbolID:  ids[i],
+					CommitSHA: commitSHA,
+					BodyHash:  symbolBodyHash(parsed.Source, sym.StartLine, sym.EndLine),
+				})
+			}
+			if verr := meta.InsertSymbolVersions(ctx, versions); verr != nil {
+				// History is auxiliary: losing a churn observation must not fail an index run.
+				if opts.Audit != nil {
+					opts.Audit.LogError(ctx, "index.symbol_versions_error", map[string]interface{}{
+						"message": fmt.Sprintf("Could not record symbol versions for %s: %v. Churn history misses this pass.", parsed.Path, verr),
+						"file":    parsed.Path, "error": verr.Error(),
+					})
+				}
+			}
+		}
+		for i, sym := range parsed.Symbols {
+			symbolIDByFQName[sym.FQName] = ids[i]
+			fqNameToID[sym.FQName] = ids[i] // global for cross-file edge resolution
 			symbolsStored++
 		}
 		// Synthetic CONTAINS for chunk parent_fq / parent_symbol_id (same relations we persist below).
 		var chunkExtraEdges []ParsedEdge
+		// Edges are accumulated for the whole file and written in one batch below. Nothing between
+		// here and the flush reads edges back, so deferring the write costs no correctness.
+		var pendingEdges []*metadata.Edge
+		// One query for every fq_name this file's edges might have to resolve, instead of one per
+		// name. Derived names (normalized Java imports, trimmed C# namespaces) are not predictable
+		// from the edge list, so they still fall through to a single lookup each — the cache records
+		// those too, which matters because the same import repeats across a file.
+		fqCache := prefetchFQNames(ctx, meta, opts.RepoID, edgeResolutionCandidates(parsed))
 		importHintPaths := collectImportTargetPathsFromParsed(parsed)
 		edgeHintFiles := append([]string{parsed.Path}, importHintPaths...)
 		ambiguousEdgeKeys := make(map[string]struct{})
@@ -403,7 +518,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if callerID == "" {
 				var amb bool
-				callerID, amb = resolveSymbolIDForFQName(ctx, meta, e.CallerFQName, edgeHintFiles, parsed.Lang)
+				callerID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, e.CallerFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("caller", e.CallerFQName)
 				}
@@ -418,7 +533,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			if calleeID == "" {
 				var amb bool
-				calleeID, amb = resolveSymbolIDForFQName(ctx, meta, e.CalleeFQName, edgeHintFiles, parsed.Lang)
+				calleeID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, e.CalleeFQName, edgeHintFiles, parsed.Lang)
 				if amb {
 					logAmbiguous("callee", e.CalleeFQName)
 				}
@@ -434,7 +549,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 						calleeID = id
 					} else {
 						var amb bool
-						calleeID, amb = resolveSymbolIDForFQName(ctx, meta, normalized, edgeHintFiles, parsed.Lang)
+						calleeID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, normalized, edgeHintFiles, parsed.Lang)
 						if amb {
 							logAmbiguous("callee", normalized)
 						}
@@ -443,19 +558,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 			// IMPORTS: JavaParser emits full declaration text ("import pkg.T;"); normalize and strip segments for static members.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") {
-				calleeID = resolveJavaImportCalleeID(ctx, meta, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveJavaImportCalleeID(ctx, meta, fqCache, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			// C#: using directives reference namespaces; map to an indexed symbol by trimming suffixes.
 			if calleeID == "" && strings.EqualFold(edgeType, "IMPORTS") && parsed.Lang == "csharp" {
-				calleeID = resolveCSharpImportCalleeID(ctx, meta, symbolIDByFQName, fqNameToID, e.CalleeFQName)
+				calleeID = resolveCSharpImportCalleeID(ctx, meta, fqCache, opts.RepoID, symbolIDByFQName, fqNameToID, e.CalleeFQName)
 			}
 			if calleeID == "" {
 				unresolvedCalleeByType[metricKey]++
 				continue
 			}
-			if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType}) == nil {
-				edgesStored++
-			}
+			pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: callerID, CalleeSymbolID: calleeID, EdgeType: edgeType, RepoID: opts.RepoID})
 		}
 		// Java / C#: add type -> method "contains" for graph structure (method FQName uses Type#Member; see csharp-indexer).
 		if parsed.Lang == "java" || parsed.Lang == "csharp" {
@@ -474,7 +587,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				}
 				if classID == "" {
 					var amb bool
-					classID, amb = resolveSymbolIDForFQName(ctx, meta, classFQName, edgeHintFiles, parsed.Lang)
+					classID, amb = resolveSymbolIDForFQNameCached(ctx, meta, fqCache, opts.RepoID, classFQName, edgeHintFiles, parsed.Lang)
 					if amb {
 						logAmbiguous("class", classFQName)
 					}
@@ -482,9 +595,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 				methodID := symbolIDByFQName[sym.FQName]
 				if classID != "" && methodID != "" {
 					chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: classFQName, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-					if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS"}) == nil {
-						edgesStored++
-					}
+					pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: classID, CalleeSymbolID: methodID, EdgeType: "CONTAINS", RepoID: opts.RepoID})
 				}
 			}
 		}
@@ -506,15 +617,30 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 					childID := symbolIDByFQName[sym.FQName]
 					if childID != "" {
 						chunkExtraEdges = append(chunkExtraEdges, ParsedEdge{CallerFQName: moduleFQ, CalleeFQName: sym.FQName, EdgeType: "CONTAINS"})
-						if meta.InsertEdge(ctx, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS"}) == nil {
-							edgesStored++
-						}
+						pendingEdges = append(pendingEdges, &metadata.Edge{CallerSymbolID: moduleID, CalleeSymbolID: childID, EdgeType: "CONTAINS", RepoID: opts.RepoID})
 					}
 				}
 			}
 		}
 		// Upsert file
-		_ = meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest})
+		edgesStored += flushEdges(ctx, meta, pendingEdges)
+
+		// Upsert file. RepoID is not optional: `files` is keyed (repo_id, file), so a row written
+		// without it is a row this repository's own change detection can never see again — every
+		// file would look new on every run, and the reindex-required warning would never clear.
+		//
+		// The error is CHECKED, and that is the whole point. It used to be `_ = meta.UpsertFile(…)`.
+		// When UpsertFile started targeting ON CONFLICT (repo_id, file), a database whose primary key
+		// had not been migrated failed every single call with SQLSTATE 42P10 — and the discard turned
+		// 43 consecutive failures into a run that reported success, stored 367 symbols, wrote zero
+		// `files` rows, and then planned zero gaps because every consumer of `files` came back empty.
+		// A swallowed write error is indistinguishable from an empty repository.
+		if ferr := meta.UpsertFile(ctx, &metadata.File{File: parsed.Path, SHA: fv.SHA, Lang: parsed.Lang, Module: parsed.Module, IsTest: parsed.IsTest, RepoID: opts.RepoID}); ferr != nil {
+			fileUpsertErrors++
+			if firstFileUpsertErr == nil {
+				firstFileUpsertErr = ferr
+			}
+		}
 
 		// Chunk and optionally embed + store (include synthetic CONTAINS so parent_fq matches persisted graph).
 		forChunk := *parsed
@@ -618,7 +744,37 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 	// Match HTTP client symbols to backend routes by method + path (same run + fqNameToID).
-	if n := LinkAPIClientRequestsToRoutes(ctx, meta, fqNameToID); n > 0 {
+	// Degrees are derived from edges, so they are refreshed once here rather than maintained
+	// incrementally: an edge write anywhere changes two symbols' counts, and gap listing reads them
+	// on the next run, not during this one. A failure is logged and tolerated — stale degrees
+	// degrade gap *ordering*, which is worth far less than failing an otherwise complete index run.
+	if err := meta.RecomputeSymbolDegrees(ctx, opts.RepoID); err != nil && opts.Audit != nil {
+		opts.Audit.Log(ctx, "index.degrees_stale", map[string]interface{}{
+			"message": fmt.Sprintf("Could not recompute symbol degrees: %v. Gap centrality ordering may be stale.", err),
+			"run_id":  runID,
+		})
+	}
+
+	// A files-row write failure is fatal to the run's usefulness even though every other write
+	// succeeded: `files` is what change detection, gap listing, the doc plan and the overview all
+	// read, so a run that stored symbols but no files produces an empty plan and reports success.
+	// That exact combination is what made this failure invisible the first time.
+	if fileUpsertErrors > 0 {
+		if opts.Audit != nil {
+			opts.Audit.LogError(ctx, "index.file_upsert_failed", map[string]interface{}{
+				"message": fmt.Sprintf("%d of %d file row(s) could not be written: %v. Every consumer of `files` "+
+					"— change detection, gap listing, the documentation plan and the overview — will see an empty "+
+					"repository, so this run is failed rather than reported as successful.",
+					fileUpsertErrors, len(filesToIndex), firstFileUpsertErr),
+				"failed": fileUpsertErrors, "total": len(filesToIndex),
+				"error": firstFileUpsertErr.Error(), "run_id": runID,
+			})
+		}
+		return nil, fmt.Errorf("indexer: %d of %d file rows could not be written: %w",
+			fileUpsertErrors, len(filesToIndex), firstFileUpsertErr)
+	}
+
+	if n := LinkAPIClientRequestsToRoutes(ctx, meta, opts.RepoID, fqNameToID); n > 0 {
 		edgesStored += n
 		if opts.Audit != nil {
 			opts.Audit.Log(ctx, "index.api_client_route_links", map[string]interface{}{
@@ -628,11 +784,18 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 	}
 
-	if n, err := meta.MaterializeTestsSourceEdges(ctx); err != nil {
+	if n, err := meta.MaterializeTestsSourceEdges(ctx, opts.RepoID); err != nil {
 		if opts.Audit != nil {
+			// This is not a cosmetic index warning. TESTS_SOURCE edges carry the strongest
+			// "already covered by tests" penalty in gap ranking (retrieval.ListGaps subtracts 38
+			// for an inbound trace edge). When materialization fails the penalty silently cannot
+			// fire, so already-tested symbols stop being deprioritised and the plan quietly gets
+			// worse — with nothing in the plan audit to explain why. Name that consequence here so
+			// an operator reading the log does not dismiss it.
 			opts.Audit.LogError(ctx, "index.tests_source_materialize", map[string]interface{}{
-				"message": fmt.Sprintf("TESTS_SOURCE materialization failed: %v", err),
+				"message": fmt.Sprintf("TESTS_SOURCE materialization failed: %v. Gap ranking loses its test-traceability penalty for this run, so symbols that already have tests will not be deprioritised.", err),
 				"error":   err.Error(),
+				"impact":  "gap_ranking_missing_tests_source_penalty",
 			})
 		}
 	} else if n > 0 && opts.Audit != nil {
@@ -646,6 +809,17 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 
 	finished := time.Now().UnixMilli()
 	if opts.Audit != nil {
+		if naturalKeyCollisions > 0 {
+			opts.Audit.Log(ctx, "index.symbol_natural_key_collisions", map[string]interface{}{
+				"message": fmt.Sprintf("%d (file, fq_name, kind) key(s) are declared by more than one symbol and were stored under distinct dup_ordinal values — the language indexer cannot distinguish these overloads by name (Java's parameterless FQNames are the known case). Without dup_ordinal these symbols would collapse onto one row.", naturalKeyCollisions),
+				"count":   naturalKeyCollisions,
+			})
+		}
+		if commitSHA == "" && (len(changeSet.Added) > 0 || len(changeSet.Changed) > 0) {
+			opts.Audit.Log(ctx, "index.symbol_versions_skipped", map[string]interface{}{
+				"message": "No commit SHA on this run; symbol version history (churn) was not recorded for this pass.",
+			})
+		}
 		finishPayload := map[string]interface{}{
 			"message": fmt.Sprintf("Index run finished: %d added, %d changed, %d removed; %d symbols, %d edges, %d chunks; %d ms.", len(changeSet.Added), len(changeSet.Changed), len(changeSet.Removed), symbolsStored, edgesStored, chunksStored, finished-started),
 			"run_id":  runID, "added": len(changeSet.Added), "changed": len(changeSet.Changed),
@@ -663,6 +837,35 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 		}
 		opts.Audit.Log(ctx, "index.finished", finishPayload)
 	}
+	// Dependency documentation : local-only ingestion of docs for direct dependencies,
+	// after the core run has succeeded and before totals are counted. Best-effort — this is
+	// auxiliary context for retrieval, and a broken ~/.m2 layout must not fail an otherwise
+	// complete index run.
+	if opts.DependencyDocs.Enabled && emb != nil && opts.Embedder != nil {
+		ddStats, ddErr := ingestDependencyDocs(ctx, emb, opts, opts.DependencyDocs, chunkCfg)
+		if opts.Audit != nil {
+			payload := map[string]interface{}{
+				"message": fmt.Sprintf("Dependency docs: %d dependency(ies) scanned, %d ingested (%d chunks), %d without local artifact.",
+					ddStats.DepsScanned, ddStats.DepsIngested, ddStats.Chunks, ddStats.NoArtifact),
+				"run_id": runID, "deps_scanned": ddStats.DepsScanned, "deps_ingested": ddStats.DepsIngested,
+				"chunks": ddStats.Chunks, "no_artifact": ddStats.NoArtifact, "capped": ddStats.Capped,
+			}
+			if len(ddStats.IngestedCoordinates) > 0 {
+				payload["ingested_coordinates"] = ddStats.IngestedCoordinates
+			}
+			if len(ddStats.NoArtifactCoordinates) > 0 {
+				payload["no_artifact_coordinates"] = ddStats.NoArtifactCoordinates
+			}
+			if ddErr != nil {
+				payload["error"] = ddErr.Error()
+				payload["message"] = fmt.Sprintf("Dependency doc ingestion failed after %d chunk(s): %v. Run continues without dependency docs.", ddStats.Chunks, ddErr)
+				opts.Audit.LogError(ctx, "index.dependency_docs", payload)
+			} else {
+				opts.Audit.Log(ctx, "index.dependency_docs", payload)
+			}
+		}
+	}
+
 	// Best-effort post-run totals (A.7). Counting failures are non-fatal — we keep the
 	// otherwise-successful run result and report a zero total. Errors are surfaced via audit
 	// when an Auditor is wired so operators can investigate if the dashboards show 0 totals.
@@ -677,7 +880,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			})
 		}
 	}
-	if n, err := meta.CountSymbols(ctx); err == nil {
+	if n, err := meta.CountSymbols(ctx, opts.RepoID); err == nil {
 		symbolsTotal = n
 	} else if opts.Audit != nil {
 		opts.Audit.LogError(ctx, "index.totals_symbols_error", map[string]interface{}{
@@ -685,7 +888,7 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			"error":   err.Error(),
 		})
 	}
-	if n, err := meta.CountEdges(ctx); err == nil {
+	if n, err := meta.CountEdges(ctx, opts.RepoID); err == nil {
 		edgesTotal = n
 	} else if opts.Audit != nil {
 		opts.Audit.LogError(ctx, "index.totals_edges_error", map[string]interface{}{
@@ -864,6 +1067,8 @@ func qualifiedSignatureToFQName(sig string) string {
 func resolveJavaImportCalleeID(
 	ctx context.Context,
 	meta MetadataWriter,
+	cache fqNameCache,
+	repoID string,
 	symbolIDByFQName, fqNameToID map[string]string,
 	raw string,
 ) string {
@@ -878,7 +1083,7 @@ func resolveJavaImportCalleeID(
 		if id := fqNameToID[s]; id != "" {
 			return id
 		}
-		if syms, _ := meta.ListSymbolsByFQName(ctx, s); len(syms) > 0 {
+		if syms := lookupFQName(ctx, meta, cache, repoID, s); len(syms) > 0 {
 			return syms[0].ID
 		}
 		i := strings.LastIndex(s, ".")
@@ -888,4 +1093,47 @@ func resolveJavaImportCalleeID(
 		s = s[:i]
 	}
 	return ""
+}
+
+// flushEdges writes a file's edges in one batched round trip and returns how many were stored.
+//
+// On a batch error it retries the edges one at a time. That looks redundant next to the batch's own
+// transaction, and it is deliberate: the per-edge path this replaces tolerated individual failures
+// silently (`if InsertEdge(...) == nil { edgesStored++ }`), so a single unwritable edge cost that
+// edge and nothing else. A bare batch would turn the same situation into "this file has no edges at
+// all" — a behaviour change smuggled in by a performance bundle, and an invisible one, since edge
+// counts are not asserted anywhere a human looks. The fallback keeps the old tolerance exactly while
+// the healthy path pays one round trip.
+func flushEdges(ctx context.Context, meta MetadataWriter, edges []*metadata.Edge) int {
+	if len(edges) == 0 {
+		return 0
+	}
+	if err := meta.InsertEdges(ctx, edges); err == nil {
+		return len(edges)
+	}
+	stored := 0
+	for _, e := range edges {
+		if meta.InsertEdge(ctx, e) == nil {
+			stored++
+		}
+	}
+	return stored
+}
+
+// symbolBodyHash hashes the symbol's source span (1-based inclusive lines) for symbol_versions.
+// Line-slice rather than chunk content on purpose: chunking has its own budgets and overlap, and
+// the identity question is "did the SOURCE of this symbol change", not "did its chunks".
+func symbolBodyHash(source string, startLine, endLine int) string {
+	lines := strings.Split(source, "\n")
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	if startLine > len(lines) || endLine < startLine {
+		return fmt.Sprintf("%x", sha256.Sum256(nil))
+	}
+	span := strings.Join(lines[startLine-1:endLine], "\n")
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(span)))
 }

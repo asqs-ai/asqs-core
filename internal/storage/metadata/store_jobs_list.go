@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RunJobRecord is a full run_jobs row for list/detail APIs (repo_url resolved from projects.repo_url).
@@ -66,7 +68,7 @@ func (s *Store) ListRunJobs(ctx context.Context, opts ListRunJobsOptions) ([]Run
 
 	countQuery := "SELECT COUNT(*) FROM run_jobs j WHERE " + whereSQL
 	var total int64
-	if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -84,7 +86,7 @@ WHERE %s
 ORDER BY j.run_at DESC
 LIMIT $%d OFFSET $%d`, whereSQL, limitArg, offsetArg)
 
-	rows, err := s.db.QueryContext(ctx, query, argsWithPage...)
+	rows, err := s.db.Query(ctx, query, argsWithPage...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -116,13 +118,13 @@ func (s *Store) GetRunJobByID(ctx context.Context, jobID string) (*RunJobRecord,
 	}
 	var r RunJobRecord
 	var createdRun, cronExpr sql.NullString
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRow(ctx, `
 SELECT j.id::text, j.config_revision_id::text, COALESCE(p.repo_url, ''), j.project_id::text, j.run_at, j.status, j.created_run_id, j.created_at, j.cron_expression
 FROM run_jobs j
 LEFT JOIN projects p ON p.id = j.project_id
 WHERE j.id = $1::uuid`, jobID).Scan(
 		&r.ID, &r.ConfigRevisionID, &r.RepoURL, &r.ProjectID, &r.RunAt, &r.Status, &createdRun, &r.CreatedAt, &cronExpr)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -159,12 +161,12 @@ func (s *Store) CancelRunJob(ctx context.Context, jobID string) (CancelRunJobRes
 	if jobID == "" {
 		return CancelRunJobNotFound, fmt.Errorf("job id required")
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := s.db.Exec(ctx,
 		`UPDATE run_jobs SET status = 'cancelled' WHERE id = $1::uuid AND status = 'pending'`, jobID)
 	if err != nil {
 		return CancelRunJobNotFound, err
 	}
-	n, err := res.RowsAffected()
+	n := res.RowsAffected()
 	if err != nil {
 		return CancelRunJobNotFound, err
 	}
@@ -172,8 +174,8 @@ func (s *Store) CancelRunJob(ctx context.Context, jobID string) (CancelRunJobRes
 		return CancelRunJobUpdated, nil
 	}
 	var st string
-	err = s.db.QueryRowContext(ctx, `SELECT status FROM run_jobs WHERE id = $1::uuid`, jobID).Scan(&st)
-	if err == sql.ErrNoRows {
+	err = s.db.QueryRow(ctx, `SELECT status FROM run_jobs WHERE id = $1::uuid`, jobID).Scan(&st)
+	if err == pgx.ErrNoRows {
 		return CancelRunJobNotFound, nil
 	}
 	if err != nil {

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RecordWorkflowRunFailureParams inserts a failed index run row or transitions an existing **running** row to **failed**.
@@ -81,7 +83,7 @@ func (s *Store) ListIndexRuns(ctx context.Context, opts ListRunsOptions) ([]Inde
 
 	countQuery := "SELECT COUNT(*) FROM index_runs r WHERE " + whereSQL
 	var total int64
-	if err := s.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
@@ -105,7 +107,7 @@ WHERE %s
 ORDER BY %s
 LIMIT $%d OFFSET $%d`, whereSQL, orderBy, limitArg, offsetArg)
 
-	rows, err := s.db.QueryContext(ctx, query, argsWithPage...)
+	rows, err := s.db.Query(ctx, query, argsWithPage...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -144,13 +146,13 @@ FROM index_runs r
 WHERE r.run_id = $1`
 	var row IndexRunRow
 	var metrics sql.NullString
-	err := s.db.QueryRowContext(ctx, query, runID).Scan(
+	err := s.db.QueryRow(ctx, query, runID).Scan(
 		&row.RunID, &row.RepoID, &row.CommitSHA, &row.StartedAt, &row.LastHeartbeatAt, &row.FinishedAt, &row.CurrentIteration,
 		&row.Iterations, &row.ScheduledRerunAt, &row.Status, &row.Stable,
 		&row.WorkflowError, &row.TriggerSource, &row.RepoURL, &row.RepoLocalPath, &row.ConfigRevisionID, &row.ProjectID,
 		&row.HasAudit, &row.HasMetrics, &metrics,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -171,7 +173,7 @@ func (s *Store) SetIndexRunWorkflowError(ctx context.Context, runID, msg string)
 		msg = "workflow failed"
 	}
 	now := time.Now().UnixMilli()
-	_, err := s.db.ExecContext(ctx,
+	_, err := s.db.Exec(ctx,
 		`UPDATE index_runs SET workflow_error = $1, status = 'failed', finished_at = $2 WHERE run_id = $3 AND status = 'running'`,
 		msg, now, runID)
 	return err
@@ -232,7 +234,7 @@ func (s *Store) RecordWorkflowRunFailure(ctx context.Context, p *RecordWorkflowR
 		}
 	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.db.Exec(ctx, `
 INSERT INTO index_runs (
   run_id, repo_id, commit_sha, started_at, last_heartbeat_at, finished_at,
   current_iteration, status, stable,
@@ -261,8 +263,8 @@ WHERE index_runs.status = 'running'`,
 // run_sessions (FK to index_runs.run_id) to surface a clear error when the row is missing.
 func (s *Store) IndexRunExists(ctx context.Context, runID string) (bool, error) {
 	var one int
-	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
-	if err == sql.ErrNoRows {
+	err := s.db.QueryRow(ctx, `SELECT 1 FROM index_runs WHERE run_id = $1 LIMIT 1`, runID).Scan(&one)
+	if err == pgx.ErrNoRows {
 		return false, nil
 	}
 	if err != nil {

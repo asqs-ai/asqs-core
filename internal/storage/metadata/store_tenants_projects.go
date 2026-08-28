@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // TenantRow is one tenants row.
@@ -38,7 +40,7 @@ func (s *Store) InsertTenant(ctx context.Context, name string, maxProjects int) 
 	if maxProjects <= 0 {
 		maxProjects = 3
 	}
-	err = s.db.QueryRowContext(ctx,
+	err = s.db.QueryRow(ctx,
 		`INSERT INTO tenants (name, max_projects) VALUES ($1, $2) RETURNING id::text`,
 		name, maxProjects,
 	).Scan(&tenantID)
@@ -52,11 +54,11 @@ func (s *Store) GetTenantByID(ctx context.Context, tenantID string) (*TenantRow,
 		return nil, nil
 	}
 	var r TenantRow
-	err := s.db.QueryRowContext(ctx,
+	err := s.db.QueryRow(ctx,
 		`SELECT id::text, name, max_projects, created_at FROM tenants WHERE id = $1::uuid`,
 		tenantID,
 	).Scan(&r.ID, &r.Name, &r.MaxProjects, &r.CreatedAt)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -77,10 +79,10 @@ func (s *Store) ListTenants(ctx context.Context, limit, offset int) ([]TenantRow
 		offset = 0
 	}
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx,
+	rows, err := s.db.Query(ctx,
 		`SELECT id::text, name, max_projects, created_at FROM tenants ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
 		limit, offset,
 	)
@@ -115,7 +117,7 @@ func (s *Store) UpdateTenant(ctx context.Context, tenantID, name string, maxProj
 		if *maxProjects < 1 {
 			return false, fmt.Errorf("max_projects must be >= 1")
 		}
-		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, tenantID).Scan(&n); err != nil {
+		if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, tenantID).Scan(&n); err != nil {
 			return false, err
 		}
 		if *maxProjects < n {
@@ -126,33 +128,33 @@ func (s *Store) UpdateTenant(ctx context.Context, tenantID, name string, maxProj
 		if name == "" {
 			return false, fmt.Errorf("name required when not updating max_projects")
 		}
-		res, err := s.db.ExecContext(ctx, `UPDATE tenants SET name = $1 WHERE id = $2::uuid`, name, tenantID)
+		res, err := s.db.Exec(ctx, `UPDATE tenants SET name = $1 WHERE id = $2::uuid`, name, tenantID)
 		if err != nil {
 			return false, err
 		}
-		aff, _ := res.RowsAffected()
+		aff := res.RowsAffected()
 		return aff > 0, nil
 	}
 	if name == "" {
-		res, err := s.db.ExecContext(ctx, `UPDATE tenants SET max_projects = $1 WHERE id = $2::uuid`, *maxProjects, tenantID)
+		res, err := s.db.Exec(ctx, `UPDATE tenants SET max_projects = $1 WHERE id = $2::uuid`, *maxProjects, tenantID)
 		if err != nil {
 			return false, err
 		}
-		aff, _ := res.RowsAffected()
+		aff := res.RowsAffected()
 		return aff > 0, nil
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET name = $1, max_projects = $2 WHERE id = $3::uuid`, name, *maxProjects, tenantID)
+	res, err := s.db.Exec(ctx, `UPDATE tenants SET name = $1, max_projects = $2 WHERE id = $3::uuid`, name, *maxProjects, tenantID)
 	if err != nil {
 		return false, err
 	}
-	aff, _ := res.RowsAffected()
+	aff := res.RowsAffected()
 	return aff > 0, nil
 }
 
 // CountProjectsForTenant returns how many projects belong to the tenant.
 func (s *Store) CountProjectsForTenant(ctx context.Context, tenantID string) (int, error) {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, strings.TrimSpace(tenantID)).Scan(&n)
+	err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, strings.TrimSpace(tenantID)).Scan(&n)
 	return n, err
 }
 
@@ -186,10 +188,10 @@ func (s *Store) InsertProject(ctx context.Context, tenantID, name, repoURL, disp
 	var pinned sql.NullString
 	if pinnedConfigRevisionID != "" {
 		var cfgFromRev string
-		err := s.db.QueryRowContext(ctx,
+		err := s.db.QueryRow(ctx,
 			`SELECT config_id::text FROM config_revisions WHERE id = $1::uuid`, pinnedConfigRevisionID,
 		).Scan(&cfgFromRev)
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			return "", fmt.Errorf("pinned config revision not found")
 		}
 		if err != nil {
@@ -200,7 +202,7 @@ func (s *Store) InsertProject(ctx context.Context, tenantID, name, repoURL, disp
 		}
 		pinned = sql.NullString{String: pinnedConfigRevisionID, Valid: true}
 	}
-	err = s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRow(ctx, `
 INSERT INTO projects (tenant_id, name, repo_url, display_name, created_by, config_id, pinned_config_revision_id)
 VALUES ($1::uuid, $2, $3, $4, $5, $6::uuid, $7)
 RETURNING id::text`,
@@ -216,11 +218,11 @@ func (s *Store) GetProjectByID(ctx context.Context, projectID string) (*ProjectR
 		return nil, nil
 	}
 	var r ProjectRow
-	err := s.db.QueryRowContext(ctx, `
+	err := s.db.QueryRow(ctx, `
 SELECT id::text, tenant_id::text, name, repo_url, display_name, created_by, config_id::text, pinned_config_revision_id, created_at
 FROM projects WHERE id = $1::uuid`, projectID,
 	).Scan(&r.ID, &r.TenantID, &r.Name, &r.RepoURL, &r.DisplayName, &r.CreatedBy, &r.ConfigID, &r.PinnedConfigRevisionID, &r.CreatedAt)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -245,10 +247,10 @@ func (s *Store) ListProjectsByTenant(ctx context.Context, tenantID string, limit
 		offset = 0
 	}
 	var total int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, tenantID).Scan(&total); err != nil {
+	if err := s.db.QueryRow(ctx, `SELECT COUNT(*) FROM projects WHERE tenant_id = $1::uuid`, tenantID).Scan(&total); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.db.Query(ctx, `
 SELECT id::text, tenant_id::text, name, repo_url, display_name, created_by, config_id::text, pinned_config_revision_id, created_at
 FROM projects WHERE tenant_id = $1::uuid
 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
@@ -275,11 +277,11 @@ func (s *Store) DeleteProject(ctx context.Context, projectID string) (deleted bo
 	if projectID == "" {
 		return false, fmt.Errorf("project id required")
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM projects WHERE id = $1::uuid`, projectID)
+	res, err := s.db.Exec(ctx, `DELETE FROM projects WHERE id = $1::uuid`, projectID)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
+	n := res.RowsAffected()
 	return n > 0, nil
 }
 
@@ -309,10 +311,10 @@ func (s *Store) UpdateProject(ctx context.Context, projectID string, name, repoU
 		pin = sql.NullString{}
 	} else if rev := strings.TrimSpace(newPinnedRevisionID); rev != "" {
 		var cfgID string
-		err := s.db.QueryRowContext(ctx,
+		err := s.db.QueryRow(ctx,
 			`SELECT config_id::text FROM config_revisions WHERE id = $1::uuid`, rev,
 		).Scan(&cfgID)
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			return false, fmt.Errorf("pinned config revision not found")
 		}
 		if err != nil {
@@ -325,14 +327,14 @@ func (s *Store) UpdateProject(ctx context.Context, projectID string, name, repoU
 	} else {
 		pin = p.PinnedConfigRevisionID
 	}
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.db.Exec(ctx, `
 UPDATE projects SET name = $1, repo_url = $2, pinned_config_revision_id = $3 WHERE id = $4::uuid`,
 		newName, newURL, pin, projectID,
 	)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
+	n := res.RowsAffected()
 	return n > 0, nil
 }
 
@@ -353,10 +355,10 @@ func (s *Store) ResolveProjectForRun(ctx context.Context, projectID string) (rep
 	if p.PinnedConfigRevisionID.Valid {
 		rid := strings.TrimSpace(p.PinnedConfigRevisionID.String)
 		var cfgID string
-		err := s.db.QueryRowContext(ctx,
+		err := s.db.QueryRow(ctx,
 			`SELECT config_id::text FROM config_revisions WHERE id = $1::uuid`, rid,
 		).Scan(&cfgID)
-		if err == sql.ErrNoRows {
+		if err == pgx.ErrNoRows {
 			return "", "", fmt.Errorf("pinned config revision not found")
 		}
 		if err != nil {
@@ -367,11 +369,11 @@ func (s *Store) ResolveProjectForRun(ctx context.Context, projectID string) (rep
 		}
 		return repoURL, rid, nil
 	}
-	err = s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRow(ctx, `
 SELECT id::text FROM config_revisions WHERE config_id = $1::uuid ORDER BY version DESC LIMIT 1`,
 		p.ConfigID,
 	).Scan(&configRevisionID)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return "", "", fmt.Errorf("no config revision for project's config")
 	}
 	if err != nil {
@@ -391,7 +393,7 @@ type ProjectAPIBundle struct {
 	LatestRev       *Revision
 }
 
-func scanLatestRevisionTx(ctx context.Context, tx *sql.Tx, configID string) (*Revision, error) {
+func scanLatestRevisionTx(ctx context.Context, tx pgx.Tx, configID string) (*Revision, error) {
 	query := `
 SELECT r.id, r.version, r.created_at, r.created_by, r.yaml_body
 FROM config_revisions r
@@ -400,10 +402,10 @@ ORDER BY r.version DESC
 LIMIT 1`
 	var rev Revision
 	var at time.Time
-	err := tx.QueryRowContext(ctx, query, strings.TrimSpace(configID)).Scan(
+	err := tx.QueryRow(ctx, query, strings.TrimSpace(configID)).Scan(
 		&rev.ID, &rev.Version, &at, &rev.CreatedBy, &rev.YAMLBody,
 	)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -420,18 +422,18 @@ func (s *Store) GetProjectAPIBundle(ctx context.Context, projectID string) (*Pro
 	if projectID == "" {
 		return nil, nil
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var r ProjectRow
-	err = tx.QueryRowContext(ctx, `
+	err = tx.QueryRow(ctx, `
 SELECT id::text, tenant_id::text, name, repo_url, display_name, created_by, config_id::text, pinned_config_revision_id, created_at
 FROM projects WHERE id = $1::uuid`, projectID,
 	).Scan(&r.ID, &r.TenantID, &r.Name, &r.RepoURL, &r.DisplayName, &r.CreatedBy, &r.ConfigID, &r.PinnedConfigRevisionID, &r.CreatedAt)
-	if err == sql.ErrNoRows {
+	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
@@ -441,19 +443,19 @@ FROM projects WHERE id = $1::uuid`, projectID,
 	out := &ProjectAPIBundle{Project: r}
 	cfgID := strings.TrimSpace(r.ConfigID)
 	if cfgID == "" {
-		if err := tx.Commit(); err != nil {
+		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
 		return out, nil
 	}
 
 	var cfgUpdated time.Time
-	err = tx.QueryRowContext(ctx,
+	err = tx.QueryRow(ctx,
 		`SELECT name, description, updated_at FROM configs WHERE id = $1::uuid`,
 		cfgID,
 	).Scan(&out.ConfigName, &out.ConfigDesc, &cfgUpdated)
-	if err == sql.ErrNoRows {
-		if err := tx.Commit(); err != nil {
+	if err == pgx.ErrNoRows {
+		if err := tx.Commit(ctx); err != nil {
 			return nil, err
 		}
 		return out, nil
@@ -476,7 +478,7 @@ FROM projects WHERE id = $1::uuid`, projectID,
 			var rev Revision
 			var cfgFromRev string
 			var at time.Time
-			err = tx.QueryRowContext(ctx, `
+			err = tx.QueryRow(ctx, `
 SELECT r.id, r.version, r.created_at, r.created_by, r.yaml_body, r.config_id::text
 FROM config_revisions r
 WHERE r.id = $1::uuid`, rid,
@@ -484,7 +486,7 @@ WHERE r.id = $1::uuid`, rid,
 			if err == nil && cfgFromRev == cfgID {
 				rev.CreatedAt = at.UTC().Format(time.RFC3339Nano)
 				effective = &rev
-			} else if err != nil && err != sql.ErrNoRows {
+			} else if err != nil && err != pgx.ErrNoRows {
 				return nil, err
 			}
 		}
@@ -494,7 +496,7 @@ WHERE r.id = $1::uuid`, rid,
 	}
 	out.EffectiveRev = effective
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
 	return out, nil

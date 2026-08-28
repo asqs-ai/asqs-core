@@ -96,7 +96,8 @@ func LexicalJaccard(query, text string) float64 {
 	return float64(inter) / float64(union)
 }
 
-// cosineSimilarity returns the cosine of the angle between a and b, or 0 on mismatched/zero vectors.
+// cosineSimilarity returns the cosine of the angle between a and b, or 0 if lengths differ
+// or either vector has zero norm.
 func cosineSimilarity(a, b []float32) float64 {
 	if len(a) != len(b) || len(a) == 0 {
 		return 0
@@ -124,6 +125,43 @@ func cosineSimilarity(a, b []float32) float64 {
 // RankByEmbedding re-ranks candidates by cosine similarity to the target embedding.
 // Candidates without DocEmbedding fall to the bottom and retain their lexical order.
 func RankByEmbedding(candidates []RankedCandidate, target []float32) []RankedCandidate {
+	return RankByEmbeddingWithLinks(candidates, target, SymbolLinkBoost{})
+}
+
+// SymbolLinkBoost identifies the target symbol so a document that explicitly names it can be
+// preferred over one that merely embeds similarly.
+type SymbolLinkBoost struct {
+	// TargetFQName is the symbol under test, e.g. "com.acme.OrderService#place".
+	TargetFQName string
+	// ContainerFQName is its enclosing type, e.g. "com.acme.OrderService".
+	ContainerFQName string
+}
+
+// Boost weights. 0.35 is roughly one rank position at typical cosine spreads, so a single spurious
+// link cannot dominate a strongly-similar document.
+const (
+	directSymbolBoost    = 0.35 // the doc names the target symbol itself
+	containerSymbolBoost = 0.15 // the doc names the target's enclosing type
+)
+
+// RankByEmbeddingWithLinks ranks candidates by doc-summary cosine, boosted when a document
+// explicitly names the target symbol.
+//
+// The system already extracts capitalized references per document, resolves each with a
+// ListSymbolsByFQName query, and caches the result across runs in .asqs/project-intel-cache.json —
+// and then ranked purely by DocEmbedding cosine, never reading LinkedSymbolIDs. That discarded the
+// single most precise signal available: *this document explicitly names the symbol we are about to
+// write a test for*.
+//
+// Why it matters disproportionately: project-intel markdown is capped and PREPENDED to every gap
+// prompt with an explicit "these repo conventions take precedence" claim. It is high-priority
+// context by construction, so putting the wrong document in that slot is unusually costly. Summaries
+// are LLM-compressed prose, and their embeddings are not reliably closer to a Java method body for
+// the right document.
+//
+// Matching is on FQ NAME, not symbol id: symbols.id is regenerated on every reindex, so an
+// id-keyed boost would silently stop working after the next index run.
+func RankByEmbeddingWithLinks(candidates []RankedCandidate, target []float32, boost SymbolLinkBoost) []RankedCandidate {
 	if len(candidates) == 0 || len(target) == 0 {
 		return candidates
 	}
@@ -137,6 +175,11 @@ func RankByEmbedding(candidates []RankedCandidate, target []float32) []RankedCan
 		sim := -2.0 // sentinel: no embedding
 		if len(c.DocEmbedding) > 0 {
 			sim = cosineSimilarity(c.DocEmbedding, target)
+		}
+		// Only boost a document that already has an embedding score; boosting the sentinel would
+		// promote an unembeddable document above every real one.
+		if sim > -2.0 {
+			sim += linkBoostFor(c, boost)
 		}
 		rows[i] = scored{idx: i, sim: sim, path: c.RelPath}
 	}
@@ -153,14 +196,44 @@ func RankByEmbedding(candidates []RankedCandidate, target []float32) []RankedCan
 	return out
 }
 
+// linkBoostFor returns the boost a candidate earns for naming the target symbol or its container.
+func linkBoostFor(c RankedCandidate, b SymbolLinkBoost) float64 {
+	if len(c.LinkedSymbolIDs) == 0 && len(c.LinkedFQNames) == 0 {
+		return 0
+	}
+	if b.TargetFQName != "" && candidateNames(c, b.TargetFQName) {
+		return directSymbolBoost
+	}
+	if b.ContainerFQName != "" && candidateNames(c, b.ContainerFQName) {
+		return containerSymbolBoost
+	}
+	return 0
+}
+
+// candidateNames reports whether the candidate links to fqName.
+func candidateNames(c RankedCandidate, fqName string) bool {
+	for _, n := range c.LinkedFQNames {
+		if strings.EqualFold(strings.TrimSpace(n), fqName) {
+			return true
+		}
+	}
+	return false
+}
+
 // SelectForGap returns gap-specific markdown by re-ranking candidates against the target
 // embedding and taking the top maxDoc docs and maxSkill skills.
 // Falls back to the pre-built markdown when candidates is empty or target is nil/empty.
 func SelectForGap(candidates []RankedCandidate, targetEmbedding []float32, maxDoc, maxSkill, maxTotalRunes int, fallbackMarkdown string) string {
+	return SelectForGapWithLinks(candidates, targetEmbedding, maxDoc, maxSkill, maxTotalRunes, fallbackMarkdown, SymbolLinkBoost{})
+}
+
+// SelectForGapWithLinks is SelectForGap with the doc→symbol link boost applied, so a document that
+// explicitly names the target symbol outranks one that is merely topically similar.
+func SelectForGapWithLinks(candidates []RankedCandidate, targetEmbedding []float32, maxDoc, maxSkill, maxTotalRunes int, fallbackMarkdown string, boost SymbolLinkBoost) string {
 	if len(candidates) == 0 || len(targetEmbedding) == 0 {
 		return fallbackMarkdown
 	}
-	ranked := RankByEmbedding(candidates, targetEmbedding)
+	ranked := RankByEmbeddingWithLinks(candidates, targetEmbedding, boost)
 
 	var docs, skills []RankedCandidate
 	for _, c := range ranked {

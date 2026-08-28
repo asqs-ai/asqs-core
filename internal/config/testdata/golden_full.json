@@ -1,0 +1,253 @@
+{
+  "SourcePath": "",
+  "ClientID": "",
+  "Database": {
+    "MetadataURL": "postgres://user:pass@localhost:5432/meta?sslmode=disable",
+    "EmbeddingsURL": "postgres://user:pass@localhost:5432/emb?sslmode=disable",
+    "EmbeddingsDimension": 768,
+    "MaxOpenConns": 12
+  },
+  "VCS": {
+    "Provider": "gitlab",
+    "GitHub": {
+      "Token": "",
+      "BaseURL": "",
+      "DefaultOwner": "",
+      "DefaultRepo": "",
+      "Ship": {
+        "Enabled": false,
+        "Branch": "",
+        "BaseBranch": "",
+        "DraftPR": false
+      }
+    },
+    "GitLab": {
+      "Token": "PLACEHOLDER-NOT-A-REAL-TOKEN",
+      "BaseURL": "https://gitlab.example.com/api/v4",
+      "DefaultNamespace": "acme",
+      "DefaultProject": "widgets",
+      "Ship": {
+        "Enabled": true,
+        "Branch": "asqs-core",
+        "BaseBranch": "main",
+        "DraftPR": false
+      }
+    },
+    "Bitbucket": {
+      "Token": "",
+      "BaseURL": "",
+      "DefaultWorkspace": "",
+      "DefaultRepo": "",
+      "Ship": {
+        "Enabled": false,
+        "Branch": "",
+        "BaseBranch": "",
+        "DraftPR": false
+      }
+    },
+    "AzureDevOps": {
+      "Token": "",
+      "BaseURL": "",
+      "Organization": "",
+      "Project": "",
+      "Repository": "",
+      "Ship": {
+        "Enabled": false,
+        "Branch": "",
+        "BaseBranch": "",
+        "DraftPR": false
+      }
+    }
+  },
+  "LLM": {
+    "DisableEmbeddingCache": true,
+    "EmbeddingCacheRetentionDays": 14,
+    "Provider": "ollama",
+    "APIKey": "",
+    "APIKeyFromEnv": "",
+    "Model": "qwen3-coder",
+    "DocProvider": "",
+    "DocModel": "",
+    "DocAPIKey": "",
+    "DocAPIKeyFromEnv": "",
+    "GenerationProvider": "",
+    "GenerationModel": "",
+    "GenerationAPIKey": "",
+    "GenerationAPIKeyFromEnv": "",
+    "FixerProvider": "",
+    "FixerModel": "",
+    "FixerAPIKey": "",
+    "FixerAPIKeyFromEnv": "",
+    "EmbeddingProvider": "",
+    "EmbeddingAPIKey": "",
+    "EmbeddingAPIKeyFromEnv": "",
+    "EmbeddingModel": "nomic-embed-text",
+    "EmbeddingFallback": "",
+    "BaseURL": "",
+    "HTTPTimeout": "10m",
+    "HTTPDisableKeepAlives": false,
+    "HTTPResponseHeaderTimeout": "",
+    "OllamaNumCtx": 32768,
+    "MaxConcurrent": 3
+  },
+  "Runner": {
+    "Type": "local",
+    "Timeout": "45m",
+    "ImageJava": "",
+    "ImageJavaMaven": "",
+    "ImageJavaGradle": "",
+    "ImageNode": "",
+    "ImagePlaywright": "",
+    "ImagePlaywrightJava": "",
+    "ImagePlaywrightDotnet": "",
+    "ImageDotNet": "",
+    "DotNetFallbackTargetFramework": "",
+    "EvalProfile": "java-maven",
+    "DockerBinary": "",
+    "JobMemory": "4g",
+    "JobCPUs": 2,
+    "JobPidsLimit": 0,
+    "JobNetworkRestore": "",
+    "JobNetworkTest": "",
+    "DockerDisableOfflineTest": true,
+    "JobReadonlyRootfs": false,
+    "CacheMavenHost": "",
+    "CacheGradleHost": "",
+    "CacheNpmHost": "",
+    "CachePnpmHost": "",
+    "CacheNuGetHost": "",
+    "AzureDevOpsNuGetFeedEndpoints": null,
+    "PrivateRegistryCredentials": null,
+    "CacheCypressHost": "",
+    "RequireDockerBootstrap": false,
+    "FormatCommand": "",
+    "FormatOnlyAdded": false,
+    "BuildTool": "mvn",
+    "CompileCommand": "",
+    "TestCommand": "",
+    "UnitTestCommand": "",
+    "E2ETestCommand": "",
+    "CompileOncePerEval": false,
+    "DisableStructuredFixOutput": true,
+    "FixerDependencySignatureOnly": false,
+    "FixerStructuredUserMessage": false,
+    "DisableStructuredGenerateOutput": true,
+    "PreferDefaultTestSuffix": false,
+    "ProjectIntel": {
+      "Enabled": true,
+      "UseEmbeddingsRank": false,
+      "ExtraDocGlobs": null,
+      "ExtraSkillGlobs": null
+    },
+    "TwoPhaseTestGeneration": true,
+    "RepeatedTestFailureThreshold": 0,
+    "AbortOnUnrecoverableEnvCompileFailure": false,
+    "SkipFixerOnInfrastructureFailure": false,
+    "DisableErrorLogLLMSummary": true,
+    "ReconcileDuplicateTestArtifacts": false,
+    "FixContextRunesMax": 0,
+    "FixBackoff": "",
+    "FixLoopRepeatStopThreshold": 4,
+    "FixLoopRecurrenceStopThreshold": 0,
+    "FixLoopNoProgressStopThreshold": 0,
+    "StartMaxIteration": 0,
+    "MaxIteration": 0,
+    "HumanInTheLoopEmail": "",
+    "SMTPHost": "",
+    "SMTPPort": 0,
+    "SMTPUser": "",
+    "SMTPPassword": "",
+    "SMTPFrom": "",
+    "TestFrameworkBootstrap": {
+      "Enabled": true,
+      "Mode": "apply",
+      "PinVersions": false,
+      "AllowLockfileChange": false,
+      "Execution": ""
+    },
+    "E2EFrameworkBootstrap": {
+      "Enabled": false,
+      "Mode": "",
+      "PinVersions": false,
+      "AllowLockfileChange": false,
+      "Execution": ""
+    }
+  },
+  "Indexer": {
+    "DependencyDocs": {
+      "Enabled": true,
+      "MavenRepoDir": "",
+      "NuGetPackagesDir": ""
+    },
+    "Type": "advanced",
+    "Execution": "",
+    "DockerCLI": "",
+    "DockerJavaImage": "",
+    "DockerMemory": "",
+    "DockerNodeImage": "",
+    "DockerNodeHeapMB": 0,
+    "AdvancedJarPath": "",
+    "JSTIndexerPath": "",
+    "CSharpIndexerDllPath": "",
+    "DockerDotNetIndexerImage": "",
+    "CriticalModulePrefixes": null,
+    "MaxGaps": 25,
+    "MaxGapsPerFile": 0,
+    "MaxGapsE2E": 4,
+    "MaxGapsPerFileE2E": 0,
+    "OverviewDocPath": "",
+    "DisableOverviewDocGeneration": false,
+    "OverviewFullRewrite": false,
+    "OverviewMaxFilesPerSlice": 0,
+    "OverviewMaxIndexRunesPerSlice": 0,
+    "SkipPathPrefixes": null,
+    "MonoRepoWorkspace": "services/api",
+    "MonoRepoTestWorkspace": ""
+  },
+  "Retrieval": {
+    "Profile": "java_unit",
+    "ProfileE2E": "",
+    "FailureHintFile": ".asqs/ci-build.log",
+    "PersistLastEvalFailure": true,
+    "DisableHybridModuleFilter": true,
+    "DependencyMaxDepth": 0,
+    "Fusion": "dense",
+    "MaxContextTokens": 60000,
+    "ProfileBudgets": {
+      "http_api": {
+        "MaxSimilarTests": 8,
+        "MaxDependencyChunks": 20,
+        "MaxFixtures": 0
+      }
+    },
+    "AbstentionDisabled": true,
+    "MinSimilarTestsForGeneration": 0,
+    "MinSimilarityCosine": 0,
+    "ContextCompact": {
+      "Enabled": true
+    }
+  },
+  "Generation": {
+    "ToolsEnabled": true,
+    "PromptedToolsEnabled": false,
+    "MaxToolTurns": 5,
+    "MaxToolCallsPerTurn": 0,
+    "MaxToolCallsPerRun": 0,
+    "MaxToolResultChars": 0,
+    "FixerToolsEnabled": false,
+    "FixerMaxToolTurns": 0
+  },
+  "WebSearch": {
+    "Enabled": false,
+    "Offline": false,
+    "Provider": "",
+    "Endpoint": "",
+    "APIKey": "",
+    "APIKeyFromEnv": "",
+    "AllowedHosts": null
+  },
+  "Audit": {
+    "FilePath": "/var/log/asqs/audit.jsonl",
+    "DumpPrompts": false
+  }
+}

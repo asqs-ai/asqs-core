@@ -44,7 +44,7 @@ func CloneURLIsAzureDevOpsHTTPS(raw string) bool {
 }
 
 // CloneAuthTokenForURL returns the PAT/token to use for HTTPS git to this remote.
-// When remoteURL is Azure DevOps and vcs.azure_devops.token is set (YAML or ASQS_AZURE_DEVOPS_TOKEN after MergeEnvFromOS),
+// When remoteURL is Azure DevOps and general.git.azure_devops.token is set (YAML or ASQS_AZURE_DEVOPS_TOKEN after MergeEnvFromOS),
 // that value is used even if vcs.provider is github — so API/scheduled runs can clone Azure project repos without switching the whole config provider.
 func (c *Config) CloneAuthTokenForURL(remoteURL string) string {
 	if c == nil {
@@ -56,48 +56,6 @@ func (c *Config) CloneAuthTokenForURL(remoteURL string) string {
 		}
 	}
 	return c.ActiveVCSToken()
-}
-
-// ActiveWebhookListenAddress returns the webhook HTTP listen address for the active provider, or empty if disabled.
-func (c *Config) ActiveWebhookListenAddress() string {
-	switch normalizeVCSProvider(c.VCS.Provider) {
-	case vcs.ProviderGitLab:
-		return strings.TrimSpace(c.VCS.GitLab.Webhook.ListenAddress)
-	case vcs.ProviderBitbucket:
-		return strings.TrimSpace(c.VCS.Bitbucket.Webhook.ListenAddress)
-	case vcs.ProviderAzureDevOps:
-		return strings.TrimSpace(c.VCS.AzureDevOps.Webhook.ListenAddress)
-	default:
-		return strings.TrimSpace(c.VCS.GitHub.Webhook.ListenAddress)
-	}
-}
-
-// ActiveWebhookSecret returns the shared secret for webhook verification (provider-specific header).
-func (c *Config) ActiveWebhookSecret() string {
-	switch normalizeVCSProvider(c.VCS.Provider) {
-	case vcs.ProviderGitLab:
-		return strings.TrimSpace(c.VCS.GitLab.Webhook.Secret)
-	case vcs.ProviderBitbucket:
-		return strings.TrimSpace(c.VCS.Bitbucket.Webhook.Secret)
-	case vcs.ProviderAzureDevOps:
-		return strings.TrimSpace(c.VCS.AzureDevOps.Webhook.Secret)
-	default:
-		return strings.TrimSpace(c.VCS.GitHub.Webhook.Secret)
-	}
-}
-
-// ActiveGating returns gating rules for the active provider.
-func (c *Config) ActiveGating() GatingConfig {
-	switch normalizeVCSProvider(c.VCS.Provider) {
-	case vcs.ProviderGitLab:
-		return c.VCS.GitLab.Gating
-	case vcs.ProviderBitbucket:
-		return c.VCS.Bitbucket.Gating
-	case vcs.ProviderAzureDevOps:
-		return c.VCS.AzureDevOps.Gating
-	default:
-		return c.VCS.GitHub.Gating
-	}
 }
 
 // ActiveShip returns ship settings for the active provider.

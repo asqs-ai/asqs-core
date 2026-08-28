@@ -46,3 +46,38 @@ CREATE TABLE IF NOT EXISTS embedding_provider (
 INSERT INTO embedding_provider (id, provider, embedding_model, dimension)
 VALUES (1, '', '', 1536)
 ON CONFLICT (id) DO NOTHING;
+
+-- content_tsv: lexical index over chunk content.
+--
+-- "Hybrid" retrieval was dense ANN plus SQL equality filters — there was no lexical index to fuse
+-- with, and metadata filtering is a FILTER (it narrows candidates) not a RANKING (it does not score
+-- term overlap). Nothing in the system ranked a chunk higher because it literally contained the
+-- token `OrderRepository`, which is first-order for a task whose central question is "find the
+-- existing test for OrderService.place and the collaborators it mocks".
+--
+-- 'simple' rather than 'english' is deliberate: no stemming and no stop-word removal, because
+-- `get`, `set` and `is` are meaningful identifiers in code, not noise.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
+
+-- embedding_cache: content-addressed embedding memo.
+--
+-- detect.go skips unchanged FILES, but within a changed file every chunk is re-embedded: a
+-- one-character edit to a 50-method service re-embeds all 51 chunks. Reruns after an unstable
+-- evaluation re-index seam-touched files and re-embed them again, and boilerplate that is textually
+-- identical across files (generated DTOs, repository interfaces, index.ts re-export barrels) is
+-- embedded once per occurrence.
+--
+-- content_hash = sha256(provider || model || dimension || content). All four are in the key: on
+-- content alone, a model switch would silently serve vectors from the previous model — right shape,
+-- wrong space, undetectable at retrieval time.
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    content_hash BYTEA PRIMARY KEY,
+    embedding    vector(1536) NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- LRU pruning support. ~6 KB per cached vector means 1M chunks is ~6 GB, so pruning is not optional
+-- at scale (see PruneEmbeddingCache).
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_lru ON embedding_cache (last_used_at);

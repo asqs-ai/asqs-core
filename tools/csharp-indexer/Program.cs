@@ -33,51 +33,346 @@ internal static class Program
 
         // Precomputed net10.0 reference assemblies (TFM-specific package exposes Net100.References.All, not ReferenceAssemblies.Net100).
         var refs = Net100.References.All;
+        var stats = new RunStats();
 
-        foreach (var file in EnumerateCsFiles(repo))
+        // Spec 4(a)(c) / B24: one compilation PER PROJECT, not per file. A fresh single-file
+        // compilation makes every sibling-file type an error symbol, so GetSymbolInfo returns null
+        // and the CALLS edge silently disappears — in a layered project that is essentially all of
+        // them, and cross-file semantics are the entire reason to pay for Roslyn. A project is the
+        // directory tree rooted at a .csproj (nearest-ancestor ownership; nested projects own
+        // their subtrees), compiled together with the sources of transitively ProjectReference'd
+        // projects. Source inclusion instead of MSBuildWorkspace on purpose: no design-time build,
+        // no NuGet restore, no network, and "a project that fails to load degrades to per-file"
+        // stays a local catch instead of a workspace-wide failure mode.
+        var files = EnumerateCsFiles(repo).OrderBy(f => f, StringComparer.Ordinal).ToList();
+        var projectDirs = DiscoverProjectDirs(repo);
+        var ownership = AssignOwnership(files, projectDirs);
+        var refClosure = BuildProjectReferenceClosure(repo, projectDirs);
+        var treeCache = new Dictionary<string, (SyntaxTree Tree, string Text)>(StringComparer.Ordinal);
+
+        foreach (var projDir in projectDirs)
         {
-            var rel = Path.GetRelativePath(repo, file).Replace('\\', '/');
+            if (!ownership.OwnFiles.TryGetValue(projDir, out var ownFiles) || ownFiles.Count == 0)
+            {
+                continue;
+            }
+            stats.Projects++;
             try
             {
-                var text = File.ReadAllText(file);
-                var tree = CSharpSyntaxTree.ParseText(text, path: rel);
-                var compilation = CSharpCompilation.Create(
-                    "AsqsIndexer_" + Guid.NewGuid().ToString("N"),
-                    new[] { tree },
-                    refs,
-                    new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
-                        nullableContextOptions: NullableContextOptions.Enable));
+                IndexProject(repo, projDir, ownFiles, refClosure[projDir], ownership, refs, treeCache, stats);
+            }
+            catch (Exception ex)
+            {
+                var relDir = Rel(repo, projDir);
+                Console.Error.WriteLine($"csharp-indexer: project {relDir} failed ({ex.Message}); falling back to per-file for {ownFiles.Count} file(s)");
+                foreach (var f in ownFiles)
+                {
+                    IndexSingleFile(repo, f, refs, stats, countAsLoose: false);
+                }
+            }
+        }
+        foreach (var loose in ownership.LooseFiles)
+        {
+            IndexSingleFile(repo, loose, refs, stats, countAsLoose: true);
+        }
 
+        // Trailing summary object — no "path" key, so pre-B24 consumers skip it as a non-file
+        // line. indexer.csharp_unresolved_invocations is the direct health metric for this change:
+        // before it, a null symbol was a silent continue and the edge loss was invisible.
+        var summary = new Dictionary<string, object>
+        {
+            ["summary"] = "csharp_indexer_run",
+            ["projects"] = stats.Projects,
+            ["project_files"] = stats.ProjectFiles,
+            ["loose_files"] = stats.LooseFiles,
+            ["invocations_resolved"] = stats.Resolved,
+            ["invocations_unresolved"] = stats.Unresolved,
+        };
+        Console.WriteLine(JsonSerializer.Serialize(summary, JsonOpts));
+        Console.Error.WriteLine($"csharp-indexer: {stats.Projects} project(s), {stats.ProjectFiles} project file(s), {stats.LooseFiles} loose file(s); invocations resolved={stats.Resolved} unresolved={stats.Unresolved}");
+
+        return 0;
+    }
+
+    private sealed class RunStats
+    {
+        public int Projects;
+        public int ProjectFiles;
+        public int LooseFiles;
+        public int Resolved;
+        public int Unresolved;
+    }
+
+    private sealed class Ownership
+    {
+        public Dictionary<string, List<string>> OwnFiles { get; } = new(StringComparer.Ordinal);
+        public List<string> LooseFiles { get; } = new();
+    }
+
+    private static string Rel(string repo, string path) => Path.GetRelativePath(repo, path).Replace('\\', '/');
+
+    private static IEnumerable<string> EnumerateCsFiles(string repo)
+    {
+        foreach (var path in Directory.EnumerateFiles(repo, "*.cs", SearchOption.AllDirectories))
+        {
+            if (IsInSkippedDir(path)) continue;
+            yield return path;
+        }
+    }
+
+    private static bool IsInSkippedDir(string path)
+    {
+        var norm = path.Replace('\\', '/');
+        if (norm.Contains("/bin/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (norm.Contains("/obj/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (norm.Contains("/.vs/", StringComparison.OrdinalIgnoreCase)) return true;
+        if (norm.Contains("/node_modules/", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    // DiscoverProjectDirs returns the directories that contain at least one .csproj, sorted. The
+    // DIRECTORY is the unit — a directory with two csprojs is one project group, which sidesteps
+    // ambiguous file ownership between them.
+    private static List<string> DiscoverProjectDirs(string repo)
+    {
+        var dirs = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var csproj in Directory.EnumerateFiles(repo, "*.csproj", SearchOption.AllDirectories))
+        {
+            if (IsInSkippedDir(csproj)) continue;
+            var dir = Path.GetDirectoryName(csproj);
+            if (!string.IsNullOrEmpty(dir)) dirs.Add(Path.GetFullPath(dir));
+        }
+        return dirs.ToList();
+    }
+
+    // AssignOwnership maps each source file to its NEAREST ancestor project directory; files with
+    // no project ancestor stay loose and keep the pre-B24 per-file behaviour.
+    private static Ownership AssignOwnership(List<string> files, List<string> projectDirs)
+    {
+        var own = new Ownership();
+        var dirSet = new HashSet<string>(projectDirs, StringComparer.Ordinal);
+        foreach (var d in projectDirs) own.OwnFiles[d] = new List<string>();
+        foreach (var file in files)
+        {
+            string? owner = null;
+            var dir = Path.GetDirectoryName(Path.GetFullPath(file));
+            while (!string.IsNullOrEmpty(dir))
+            {
+                if (dirSet.Contains(dir)) { owner = dir; break; }
+                dir = Path.GetDirectoryName(dir);
+            }
+            if (owner != null) own.OwnFiles[owner].Add(file);
+            else own.LooseFiles.Add(file);
+        }
+        return own;
+    }
+
+    // BuildProjectReferenceClosure parses each project directory's csprojs for ProjectReference
+    // entries and returns the TRANSITIVE set of referenced project directories per project. A
+    // malformed csproj or a reference outside the repo degrades to "no references", never to a
+    // failed index.
+    private static Dictionary<string, List<string>> BuildProjectReferenceClosure(string repo, List<string> projectDirs)
+    {
+        var dirSet = new HashSet<string>(projectDirs, StringComparer.Ordinal);
+        var direct = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var dir in projectDirs)
+        {
+            var refsOut = new List<string>();
+            foreach (var csproj in Directory.EnumerateFiles(dir, "*.csproj", SearchOption.TopDirectoryOnly))
+            {
+                foreach (var target in ParseProjectReferences(csproj))
+                {
+                    var targetDir = Path.GetDirectoryName(Path.GetFullPath(target));
+                    if (string.IsNullOrEmpty(targetDir)) continue;
+                    if (dirSet.Contains(targetDir) && targetDir != dir && !refsOut.Contains(targetDir))
+                    {
+                        refsOut.Add(targetDir);
+                    }
+                }
+            }
+            direct[dir] = refsOut;
+        }
+
+        var closure = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var dir in projectDirs)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal) { dir };
+            var queue = new Queue<string>(direct[dir]);
+            var result = new List<string>();
+            while (queue.Count > 0)
+            {
+                var next = queue.Dequeue();
+                if (!seen.Add(next)) continue;
+                result.Add(next);
+                foreach (var r in direct.TryGetValue(next, out var rs) ? rs : new List<string>())
+                {
+                    queue.Enqueue(r);
+                }
+            }
+            closure[dir] = result;
+        }
+        return closure;
+    }
+
+    private static IEnumerable<string> ParseProjectReferences(string csprojPath)
+    {
+        var result = new List<string>();
+        try
+        {
+            var doc = System.Xml.Linq.XDocument.Load(csprojPath);
+            foreach (var pr in doc.Descendants())
+            {
+                if (pr.Name.LocalName != "ProjectReference") continue;
+                var include = pr.Attribute("Include")?.Value?.Trim();
+                if (string.IsNullOrEmpty(include)) continue;
+                var resolved = Path.Combine(Path.GetDirectoryName(csprojPath) ?? ".", include.Replace('\\', Path.DirectorySeparatorChar));
+                result.Add(resolved);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"csharp-indexer: csproj parse {csprojPath}: {ex.Message}");
+        }
+        return result;
+    }
+
+    // ImplicitUsingsTree synthesizes the base SDK global-usings set when any csproj in the group
+    // enables ImplicitUsings — the real generated file lives under obj/ (excluded), and without it
+    // simple names like Task or Console never bind. Base BCL set only: every namespace here exists
+    // in the reference assemblies, so the synthetic tree can never introduce binding errors.
+    private static SyntaxTree? ImplicitUsingsTree(string projDir)
+    {
+        var enabled = false;
+        foreach (var csproj in Directory.EnumerateFiles(projDir, "*.csproj", SearchOption.TopDirectoryOnly))
+        {
+            try
+            {
+                var doc = System.Xml.Linq.XDocument.Load(csproj);
+                foreach (var el in doc.Descendants())
+                {
+                    if (el.Name.LocalName == "ImplicitUsings" &&
+                        (el.Value.Trim().Equals("enable", StringComparison.OrdinalIgnoreCase) ||
+                         el.Value.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        enabled = true;
+                    }
+                }
+            }
+            catch
+            {
+                // Malformed csproj already reported by ParseProjectReferences; no usings then.
+            }
+        }
+        if (!enabled) return null;
+        const string src = "global using System;\nglobal using System.Collections.Generic;\nglobal using System.IO;\nglobal using System.Linq;\nglobal using System.Net.Http;\nglobal using System.Threading;\nglobal using System.Threading.Tasks;\n";
+        return CSharpSyntaxTree.ParseText(src, path: "__asqs_implicit_usings.cs");
+    }
+
+    private static (SyntaxTree Tree, string Text) ParseCached(
+        string repo, string file, Dictionary<string, (SyntaxTree Tree, string Text)> cache)
+    {
+        var rel = Rel(repo, file);
+        if (cache.TryGetValue(rel, out var hit)) return hit;
+        var text = File.ReadAllText(file);
+        var tree = CSharpSyntaxTree.ParseText(text, path: rel);
+        var entry = (tree, text);
+        cache[rel] = entry;
+        return entry;
+    }
+
+    private static void IndexProject(
+        string repo,
+        string projDir,
+        List<string> ownFiles,
+        List<string> referencedDirs,
+        Ownership ownership,
+        IEnumerable<MetadataReference> refs,
+        Dictionary<string, (SyntaxTree Tree, string Text)> treeCache,
+        RunStats stats)
+    {
+        var trees = new List<SyntaxTree>();
+        var ownEntries = new List<(string File, SyntaxTree Tree, string Text)>();
+        foreach (var f in ownFiles)
+        {
+            var e = ParseCached(repo, f, treeCache);
+            ownEntries.Add((f, e.Tree, e.Text));
+            trees.Add(e.Tree);
+        }
+        // Referenced projects contribute their SOURCES so cross-project calls resolve; their files
+        // are emitted only by their owning project, exactly once.
+        foreach (var refDir in referencedDirs)
+        {
+            if (!ownership.OwnFiles.TryGetValue(refDir, out var refFiles)) continue;
+            foreach (var f in refFiles)
+            {
+                trees.Add(ParseCached(repo, f, treeCache).Tree);
+            }
+        }
+        if (ImplicitUsingsTree(projDir) is { } usingsTree)
+        {
+            trees.Add(usingsTree);
+        }
+
+        var asmName = "AsqsIndexer_" + new string(Rel(repo, projDir).Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+        var compilation = CSharpCompilation.Create(
+            asmName,
+            trees,
+            refs,
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                nullableContextOptions: NullableContextOptions.Enable));
+
+        foreach (var (file, tree, text) in ownEntries)
+        {
+            var rel = Rel(repo, file);
+            try
+            {
                 var model = compilation.GetSemanticModel(tree);
-                var root = tree.GetRoot();
-
-                var doc = IndexFile(rel, text, root, model);
-                var line = JsonSerializer.Serialize(doc, JsonOpts);
-                Console.WriteLine(line);
+                var doc = IndexFile(rel, text, tree.GetRoot(), model, stats);
+                Console.WriteLine(JsonSerializer.Serialize(doc, JsonOpts));
+                stats.ProjectFiles++;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine($"csharp-indexer: skip {rel}: {ex.Message}");
             }
         }
-
-        return 0;
     }
 
-    private static IEnumerable<string> EnumerateCsFiles(string repo)
+    // IndexSingleFile is the pre-B24 behaviour, kept verbatim for files no project owns and for
+    // projects whose group compilation failed.
+    private static void IndexSingleFile(string repo, string file, IEnumerable<MetadataReference> refs, RunStats stats, bool countAsLoose)
     {
-        foreach (var path in Directory.EnumerateFiles(repo, "*.cs", SearchOption.AllDirectories))
+        var rel = Rel(repo, file);
+        try
         {
-            var norm = path.Replace('\\', '/');
-            if (norm.Contains("/bin/", StringComparison.OrdinalIgnoreCase)) continue;
-            if (norm.Contains("/obj/", StringComparison.OrdinalIgnoreCase)) continue;
-            if (norm.Contains("/.vs/", StringComparison.OrdinalIgnoreCase)) continue;
-            yield return path;
+            var text = File.ReadAllText(file);
+            var tree = CSharpSyntaxTree.ParseText(text, path: rel);
+            var compilation = CSharpCompilation.Create(
+                "AsqsIndexer_" + Guid.NewGuid().ToString("N"),
+                new[] { tree },
+                refs,
+                new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary,
+                    nullableContextOptions: NullableContextOptions.Enable));
+            var model = compilation.GetSemanticModel(tree);
+            var doc = IndexFile(rel, text, tree.GetRoot(), model, stats);
+            Console.WriteLine(JsonSerializer.Serialize(doc, JsonOpts));
+            if (countAsLoose) stats.LooseFiles++;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"csharp-indexer: skip {rel}: {ex.Message}");
         }
     }
 
-    private static LangIndexerDoc IndexFile(string relPath, string text, SyntaxNode root, SemanticModel model)
+    private sealed class InvocationStats
     {
+        public int Resolved;
+        public int Unresolved;
+    }
+
+    private static LangIndexerDoc IndexFile(string relPath, string text, SyntaxNode root, SemanticModel model, RunStats stats)
+    {
+        var invStats = new InvocationStats();
         var moduleNs = GuessModuleNamespace(root);
         var isTest = IsLikelyTestPath(relPath);
         var symbols = new List<SymbolDto>();
@@ -215,7 +510,7 @@ internal static class Program
             // DI extraction: constructor injection edges for the most activatable constructor.
             EmitConstructorInjectionEdges(typeDecl, typeFq, model, AddEdge);
 
-            CollectInvocations(typeDecl, model, edges);
+            CollectInvocations(typeDecl, model, edges, invStats);
         }
 
         if (isTest && text.Contains("Microsoft.Playwright", StringComparison.Ordinal))
@@ -234,6 +529,8 @@ internal static class Program
         CollectHttpClientRequests(root, model, symbols, edges);
         CollectServiceRegistrationEdges(root, model, moduleNs, AddEdge);
 
+        stats.Resolved += invStats.Resolved;
+        stats.Unresolved += invStats.Unresolved;
         return new LangIndexerDoc
         {
             Path = relPath,
@@ -242,6 +539,7 @@ internal static class Program
             IsTest = isTest,
             Symbols = symbols,
             Edges = edges,
+            UnresolvedInvocations = invStats.Unresolved > 0 ? invStats.Unresolved : null,
         };
     }
 
@@ -272,7 +570,7 @@ internal static class Program
     {
         var cs = model.GetDeclaredSymbol(cd);
         if (cs == null) return;
-        var fq = typeFq + "#.ctor";
+        var fq = MethodFqName(cs);
         var (sl, el, sc, ec) = LineSpan(cd);
         symbols.Add(new SymbolDto
         {
@@ -312,7 +610,7 @@ internal static class Program
         }
     }
 
-    private static void CollectInvocations(SyntaxNode scope, SemanticModel model, List<EdgeDto> edges)
+    private static void CollectInvocations(SyntaxNode scope, SemanticModel model, List<EdgeDto> edges, InvocationStats invStats)
     {
         foreach (var inv in scope.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
@@ -322,9 +620,16 @@ internal static class Program
             var sym = model.GetSymbolInfo(inv).Symbol;
             if (sym is IMethodSymbol called)
             {
+                invStats.Resolved++;
                 var callee = MethodFqName(called);
                 if (!string.IsNullOrEmpty(callee))
                     edges.Add(new EdgeDto { CallerFqName = callerMethodFq, CalleeFqName = callee, EdgeType = "CALLS" });
+            }
+            else
+            {
+                // The silent-continue this counter replaces WAS the defect metric: before B24
+                // every sibling-type call landed here invisibly.
+                invStats.Unresolved++;
             }
         }
     }
@@ -341,7 +646,7 @@ internal static class Program
             if (anc is ConstructorDeclarationSyntax cd)
             {
                 var s = model.GetDeclaredSymbol(cd);
-                return s != null ? TypeFqName(s.ContainingType) + "#.ctor" : null;
+                return s != null ? MethodFqName(s) : null;
             }
         }
         return null;
@@ -494,27 +799,87 @@ internal static class Program
         return null;
     }
 
+    // FQName format (Spec 4(b), B25 — BREAKING, requires reindex):
+    //   types:   Namespace.Type<T,U>          (declared type parameters, via OriginalDefinition)
+    //   methods: Namespace.Type<T>#M<TM>(int,List<T>)   — parameter list ALWAYS present, "()" when empty
+    //   ctors:   Namespace.Type#.ctor(string)
+    //   fields/properties/events: Namespace.Type<T>#Name (not callable — no parameter list)
+    //
+    // Why OriginalDefinition everywhere: a USE site sees constructed symbols (IRepository<Order>,
+    // Add(int) on List<int>), and rendering those would never equal the DECLARATION's FQName, so
+    // every edge into a generic type would dangle. The definition form makes both sides render
+    // identically. Parameter types render name-only with language keywords (int, string) — no
+    // namespaces, so the '#'-suffix stays free of dots and every legacy "last [.#] wins" consumer
+    // keeps a clean split point after BareFQName stripping.
     private static string MethodFqName(IMethodSymbol m)
     {
+        m = m.OriginalDefinition;
         var typeFq = TypeFqName(m.ContainingType);
-        return typeFq + "#" + m.Name;
+        var name = m.MethodKind == MethodKind.Constructor ? ".ctor" : m.Name;
+        if (m.TypeParameters.Length > 0)
+        {
+            name += "<" + string.Join(",", m.TypeParameters.Select(tp => tp.Name)) + ">";
+        }
+        return typeFq + "#" + name + "(" + string.Join(",", m.Parameters.Select(pr => ParamTypeName(pr.Type))) + ")";
+    }
+
+    private static string ParamTypeName(ITypeSymbol t)
+    {
+        var fmt = new SymbolDisplayFormat(
+            globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameOnly,
+            genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+            miscellaneousOptions: SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers |
+                                  SymbolDisplayMiscellaneousOptions.UseSpecialTypes);
+        return t.ToDisplayString(fmt);
     }
 
     private static string TypeFqName(INamedTypeSymbol t)
     {
+        t = (INamedTypeSymbol)t.OriginalDefinition;
         var fmt = new SymbolDisplayFormat(
             globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
             typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypesAndNamespaces,
-            genericsOptions: SymbolDisplayGenericsOptions.None,
+            genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
             miscellaneousOptions: SymbolDisplayMiscellaneousOptions.EscapeKeywordIdentifiers);
         return t.ToDisplayString(fmt);
     }
 
+    // BareFqName is the pre-B25 form — generic markers and parameter lists stripped — stored in
+    // signature_json.bare_fq_name so name-only lookups (a model calling get_symbol with what it
+    // read in prose) still resolve.
+    private static string BareFqName(string fq)
+    {
+        var hash = fq.IndexOf('#');
+        var typePart = hash >= 0 ? fq[..hash] : fq;
+        var memberPart = hash >= 0 ? fq[(hash + 1)..] : "";
+        var paren = memberPart.IndexOf('(');
+        if (paren >= 0) memberPart = memberPart[..paren];
+        typePart = StripAngles(typePart);
+        memberPart = StripAngles(memberPart);
+        return hash >= 0 ? typePart + "#" + memberPart : typePart;
+    }
+
+    private static string StripAngles(string s)
+    {
+        if (!s.Contains('<')) return s;
+        var b = new System.Text.StringBuilder(s.Length);
+        var depth = 0;
+        foreach (var c in s)
+        {
+            if (c == '<') { depth++; continue; }
+            if (c == '>') { if (depth > 0) depth--; continue; }
+            if (depth == 0) b.Append(c);
+        }
+        return b.ToString();
+    }
+
     private static JsonElement? BuildTypeSignature(INamedTypeSymbol t)
     {
-        return JsonSerializer.SerializeToElement(new
+        return JsonSerializer.SerializeToElement(new Dictionary<string, object>
         {
-            visibility = t.DeclaredAccessibility.ToString().ToLowerInvariant(),
+            ["visibility"] = t.DeclaredAccessibility.ToString().ToLowerInvariant(),
+            ["bare_fq_name"] = BareFqName(TypeFqName(t)),
         });
     }
 
@@ -524,6 +889,7 @@ internal static class Program
         {
             ["visibility"] = m.DeclaredAccessibility.ToString().ToLowerInvariant(),
             ["static"] = m.IsStatic,
+            ["bare_fq_name"] = BareFqName(MethodFqName(m)),
         });
     }
 
@@ -1031,6 +1397,9 @@ internal sealed class LangIndexerDoc
     [JsonPropertyName("is_test")] public bool IsTest { get; set; }
     [JsonPropertyName("symbols")] public List<SymbolDto> Symbols { get; set; } = new();
     [JsonPropertyName("edges")] public List<EdgeDto> Edges { get; set; } = new();
+    // Invocations whose target symbol did not resolve in this file (null on zero) — the per-file
+    // slice of indexer.csharp_unresolved_invocations.
+    [JsonPropertyName("unresolved_invocations")] public int? UnresolvedInvocations { get; set; }
 }
 
 internal sealed class SymbolDto

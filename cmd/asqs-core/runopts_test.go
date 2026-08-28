@@ -349,3 +349,79 @@ func TestParseRunFlagsEndToEndPrecedence(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveAuditLogPath covers the precedence chain for the audit JSONL path:
+// explicit --audit-log (even empty) > audit.file_path > none.
+func TestResolveAuditLogPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		flagSet    bool
+		flagVal    string
+		cfgVal     string
+		wantVal    string
+		wantSource string
+	}{
+		{
+			name:    "neither set means no audit file",
+			wantVal: "", wantSource: gapSourceDefault,
+		},
+		{
+			name:    "config path is honoured when the flag is absent",
+			cfgVal:  ".asqs/audit.jsonl",
+			wantVal: ".asqs/audit.jsonl", wantSource: gapSourceConfig,
+		},
+		{
+			name:    "explicit flag overrides config",
+			flagSet: true, flagVal: "/tmp/run.jsonl", cfgVal: ".asqs/audit.jsonl",
+			wantVal: "/tmp/run.jsonl", wantSource: gapSourceFlag,
+		},
+		{
+			name: "explicit empty flag disables a config-set path for one run",
+			// The same shape as --max-gaps-e2e 0: an explicit "off" must beat the config file.
+			flagSet: true, flagVal: "", cfgVal: ".asqs/audit.jsonl",
+			wantVal: "", wantSource: gapSourceFlag,
+		},
+		{
+			name:    "surrounding whitespace is trimmed",
+			flagSet: true, flagVal: "  out.jsonl  ",
+			wantVal: "out.jsonl", wantSource: gapSourceFlag,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, src := resolveAuditLogPath(tc.flagSet, tc.flagVal, tc.cfgVal)
+			if got != tc.wantVal || src != tc.wantSource {
+				t.Errorf("resolveAuditLogPath(%v, %q, %q) = (%q, %s), want (%q, %s)",
+					tc.flagSet, tc.flagVal, tc.cfgVal, got, src, tc.wantVal, tc.wantSource)
+			}
+		})
+	}
+}
+
+// The --audit-log flag parses in any position and records itself in setFlags, so an explicit
+// empty value is distinguishable from the flag being absent.
+func TestParseRunFlagsAuditLog(t *testing.T) {
+	f, err := parseRunFlags([]string{"./project", "--audit-log", "run.jsonl"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.auditLog != "run.jsonl" || !f.setFlags["audit-log"] {
+		t.Errorf("auditLog = %q setFlags[audit-log] = %v, want run.jsonl / true", f.auditLog, f.setFlags["audit-log"])
+	}
+
+	f, err = parseRunFlags([]string{"./project"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.auditLog != "" || f.setFlags["audit-log"] {
+		t.Errorf("without the flag: auditLog = %q setFlags[audit-log] = %v, want empty / false", f.auditLog, f.setFlags["audit-log"])
+	}
+
+	f, err = parseRunFlags([]string{"--audit-log", "", "./project"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.auditLog != "" || !f.setFlags["audit-log"] {
+		t.Errorf("explicit empty: auditLog = %q setFlags[audit-log] = %v, want empty / true", f.auditLog, f.setFlags["audit-log"])
+	}
+}

@@ -3,16 +3,21 @@ package generator
 import (
 	"context"
 	"fmt"
+	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
+	"golang.org/x/sync/singleflight"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/asqs/asqs-core/internal/evaluator/llmfix"
 	"github.com/asqs/asqs-core/internal/generator/contract"
+	"github.com/asqs/asqs-core/internal/genmanifest"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"github.com/asqs/asqs-core/internal/intelligence/tools"
 	"github.com/asqs/asqs-core/internal/layout"
 	"github.com/asqs/asqs-core/internal/workspace"
 )
@@ -33,12 +38,41 @@ type LLMGenerator struct {
 	E2EFramework                    string             // optional; playwright, cypress, …
 	DisableStructuredGenerateOutput bool
 	TwoPhaseTestGeneration          bool
+	// Tools optionally gives the model read-only access to the index during generation. Nil is the
+	// one-shot path: retrieval assembles a context and the model gets a single turn.
+	Tools tools.ToolInvoker
+	// ToolLoop bounds that access. Its zero Mode means one-shot regardless of Tools.
+	ToolLoop tools.LoopOptions
+	// APISurface, when set, resolves real member signatures from the compile classpath for the
+	// third-party types a generated test is about to call into. Optional: nil means generation
+	// behaves exactly as it did before this existed.
+	APISurface apisurface.Provider
+
+	// apiSurfaceMu guards apiSurfaceBlocks, which caches one rendered block per distinct TARGET
+	// SET for the life of the generator — not one block for the whole run. The target set varies
+	// with isE2E, so a single cached block let a unit gap's targets serve every E2E gap: upstream
+	// measured a run whose only api_surface event requested five Spring annotations and no
+	// Playwright types at all, despite e2e_framework=playwright-java.
+	apiSurfaceMu     sync.Mutex
+	apiSurfaceBlocks map[string]apiSurfaceEntry
+	apiSurfaceGroup  singleflight.Group
 	// RepoPath is the absolute or cwd-relative repo root. When set for C#, unit tests may be placed under a
 	// dedicated root-level tests directory (tests/, UnitTests/, …) instead of beside the source file.
 	RepoPath string
 	// MonoRepoWorkspace and MonoRepoTestWorkspace are normalized indexer.mono_repo_* values; when test is set, suggested paths for structured JSON / two-phase generation are remapped into the test project tree (see workspace.RemapSuggestedTestPathForMonoTestWorkspace).
 	MonoRepoWorkspace     string
 	MonoRepoTestWorkspace string
+	// Audit is optional; when set, output-truncation events (llm.output_truncated,
+	// llm.output_truncated_retry) and provider completion warnings are recorded so the frequency of
+	// provider-side truncation becomes visible instead of presenting as "the model produced garbage".
+	Audit Auditor
+}
+
+// Auditor is the audit sink this package needs (the same two-method shape the pipeline's auditor
+// satisfies everywhere else).
+type Auditor interface {
+	Log(ctx context.Context, step string, payload interface{})
+	LogError(ctx context.Context, step string, payload interface{})
 }
 
 func isJSTSLang(lang string) bool {
@@ -98,9 +132,20 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 		!strings.HasPrefix(strings.TrimSpace(contextStr), ExtendExistingTestContextPrefix)
 
 	system := g.buildGeneratorSystem(item, isE2E, itemLang, genModeSingle)
+	// Appended before the structured-output suffix so the output-format instruction stays last,
+	// where a small model weights it most heavily. Only the framework block belongs here: it is
+	// stable per (language, layer, framework), which is what makes caching it sound.
+	system += g.pregenerateAPISurface(ctx, itemLang, isE2E)
+	// The bootstrap contract, when one exists, is the most reliable statement available about what
+	// is on the test classpath, so it outranks anything the model infers from build files. Absent
+	// (bootstrap disabled — the default — or the repository already had its tooling) it renders
+	// nothing and the prompt is byte-identical to what it was before this existed.
+	system += g.testStackSystemBlock()
 	if useStructured {
 		system += structuredTestJSONSystemSuffix(suggestedPath)
 	}
+	// The per-symbol block goes in the USER message, where varying it per gap costs nothing.
+	contextStr += g.signatureAPISurface(ctx, item, itemLang)
 
 	runSinglePass := func(userText string) (string, string, error) {
 		messages := []model.Message{
@@ -118,6 +163,10 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	if err != nil {
 		return "", "", err
 	}
+	// A member the classpath proves exists under a different CASE is a repair, not a retry: the
+	// model had the right member and the wrong capitalisation, and a whole extra round to say so
+	// costs more than the substitution.
+	content = g.repairMemberCase(ctx, content, item, itemLang, isE2E)
 	if reason := lowValueGeneratedTestReason(item, isE2E, content); reason != "" {
 		retryUser := contextStr + "\n\n---\nQuality retry: your previous output was rejected because it produced low-value tests (" + reason + "). " +
 			"Replace reflection/existence/tautology checks with behavioral tests that invoke the production API and assert outcomes or verified mock interactions. " +
@@ -126,6 +175,7 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 		if err != nil {
 			return "", "", err
 		}
+		content = g.repairMemberCase(ctx, content, item, itemLang, isE2E)
 		if reason2 := lowValueGeneratedTestReason(item, isE2E, content); reason2 != "" {
 			return "", "", fmt.Errorf("llm generator: rejected low-value test output after retry (%s)", reason2)
 		}
@@ -217,17 +267,105 @@ func pickGeneratedContentFromPathMap(m map[string]string, suggestedPath string) 
 	return ""
 }
 
+// DefaultGenerateMaxTokens is the output cap for test generation when the caller sets none.
+//
+// Raised from 4096: a full JUnit or xUnit test class with several test methods routinely exceeds
+// 4096 output tokens, and a structured response is a JSON object mapping path -> whole file content,
+// which makes the payload larger still. The fixer already used 8192.
+const DefaultGenerateMaxTokens = 8192
+
+// maxGenerateOutputTokens bounds the truncation retry so a pathological gap cannot escalate without
+// limit. One doubling from the default lands here.
+const maxGenerateOutputTokens = 16384
+
+// truncationEscalations bounds how often one generation may re-ask at a larger output cap. It is a
+// separate budget from the transient retries, because a truncated completion is not a failed
+// request: retrying the same request reproduces it exactly, so the escalation asks a DIFFERENT
+// question (a larger cap). Two escalations means a caller-set 4096 can still reach
+// maxGenerateOutputTokens.
+const truncationEscalations = 2
+
+// completeOnce performs one generation attempt, with tool access when it is configured.
+//
+// The tool loop sits INSIDE the truncation retry: a completion cut short at max_tokens is retried as
+// a whole, tool calls included, because the retry re-asks the same question at a larger cap and the
+// lookups that informed the first attempt inform the second equally.
+func (g *LLMGenerator) completeOnce(ctx context.Context, messages []model.Message, opts model.CompleteOptions, budget *tools.RunBudget) (*model.CompleteResult, error) {
+	if g.Tools == nil || g.ToolLoop.Mode == "" || g.ToolLoop.Mode == tools.ModeOneShot {
+		return g.LLM.Complete(ctx, messages, opts)
+	}
+	loop := g.ToolLoop
+	// Attempts are audited per call. The hook is attached here rather than stored on the generator
+	// so it carries this call's ctx, which is what ties an attempt to its run in the audit log.
+	// (Upstream additionally composes in a context-carried observer installed by the session
+	// runner, so each lookup is also recorded as a gap-attributed session attempt; the session
+	// engine is outside core's seam, so there is nothing to compose with here.)
+	if loop.OnAttempt == nil {
+		loop.OnAttempt = g.auditToolAttempts(ctx)
+	}
+	if loop.OnCapHit == nil {
+		loop.OnCapHit = g.auditToolCapHit(ctx)
+	}
+	if loop.OnNoDefinitions == nil {
+		loop.OnNoDefinitions = g.auditNoToolDefinitions(ctx)
+	}
+	// The per-gap budget is supplied by the caller, not created here: this function runs once per
+	// retry attempt, so a budget created here would reset on every retry.
+	loop.Budget = budget
+	return tools.CompleteWithTools(ctx, g.LLM, g.Tools, messages, opts, loop)
+}
+
 func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages []model.Message, opts model.CompleteOptions) (*model.CompleteResult, error) {
 	if opts.MaxTokens == 0 {
-		opts.MaxTokens = 4096
+		opts.MaxTokens = DefaultGenerateMaxTokens
 	}
-	const maxRetries = 3
+	// ONE application-level retry, not three (M-18). This loop sits on top of the provider
+	// clients' own transport retry — 5 attempts with exponential backoff and jitter (OpenAI,
+	// Ollama, and Anthropic via retryhttp, all DefaultMaxAttempts = 5). Three application
+	// attempts over five transport attempts is up to 15 requests for one completion, and the
+	// callers stack further: the structured→unstructured fallback and the quality retry each
+	// call this path again. Against a flapping provider that is a self-inflicted load
+	// multiplier, and every request is billed.
+	//
+	// Resilience is not reduced below the retry bundle's baseline, because that baseline IS the
+	// transport retry and it is untouched: after five attempts with backoff have failed, a sixth
+	// issued immediately afterwards is not a meaningfully different bet. The truncation
+	// escalation keeps its own separate budget — it re-asks a DIFFERENT question (a larger
+	// output cap), so it must not draw from this one.
+	const maxRetries = 2
+	// One budget for this gap, shared by every attempt below. Retries re-ask the same question, so
+	// their lookups draw from the same allowance rather than starting fresh — a budget created per
+	// attempt would reset on every retry and the per-run cap would bound nothing. Measured upstream
+	// before this was wired: one gap made 8 loop invocations and 60 tool calls against a cap of 12.
+	budget := &tools.RunBudget{}
 	var result *model.CompleteResult
 	var err error
+	escalations := 0
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		result, err = g.LLM.Complete(ctx, messages, opts)
+		result, err = g.completeOnce(ctx, messages, opts, budget)
 		if err == nil {
+			// Provider-side conditions that did not fail the call but change how to read it —
+			// notably an Ollama prompt that filled num_ctx and was silently truncated at the
+			// front, taking the system prompt with it. Auditing it here is what turns "the model
+			// ignored the output contract" into "the model never received the output contract".
+			g.auditCompletionWarnings(ctx, result)
 			return result, nil
+		}
+		// A truncated completion is not a transport failure: retrying the same request reproduces
+		// it exactly. Re-ask at a larger cap, then surface it. Never fall through to the partial
+		// content — the defensive path/content parsers would happily extract a fragment from a JSON
+		// object cut mid-string and write it to disk. Escalations do not consume transient attempts.
+		if trunc, ok := model.IsTruncatedCompletion(err); ok {
+			if opts.MaxTokens < maxGenerateOutputTokens && escalations < truncationEscalations {
+				was := opts.MaxTokens
+				opts.MaxTokens = min(was*2, maxGenerateOutputTokens)
+				escalations++
+				attempt--
+				g.auditTruncation(ctx, "llm.output_truncated_retry", trunc, was, opts.MaxTokens)
+				continue
+			}
+			g.auditTruncation(ctx, "llm.output_truncated", trunc, opts.MaxTokens, 0)
+			return nil, err
 		}
 		if attempt == maxRetries-1 {
 			return nil, err
@@ -238,6 +376,35 @@ func (g *LLMGenerator) completeGenerateWithRetry(ctx context.Context, messages [
 		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
 	}
 	return nil, err
+}
+
+func (g *LLMGenerator) auditTruncation(ctx context.Context, step string, trunc *model.TruncatedCompletionError, was, now int) {
+	if g.Audit == nil || trunc == nil {
+		return
+	}
+	payload := map[string]interface{}{
+		"provider":       trunc.Provider,
+		"stop_reason":    trunc.Reason,
+		"max_tokens":     was,
+		"produced":       trunc.GotTokens,
+		"partial_length": len(trunc.Content),
+	}
+	if now > 0 {
+		payload["retry_max_tokens"] = now
+	}
+	g.Audit.Log(ctx, step, payload)
+}
+
+// auditCompletionWarnings records non-fatal provider warnings attached to a completion.
+func (g *LLMGenerator) auditCompletionWarnings(ctx context.Context, res *model.CompleteResult) {
+	if g.Audit == nil || res == nil || len(res.Warnings) == 0 {
+		return
+	}
+	for _, w := range res.Warnings {
+		g.Audit.Log(ctx, "llm.completion_warning", map[string]interface{}{
+			"message": w,
+		})
+	}
 }
 
 // suggestedJavaE2EPathForRouteGap maps a controller file (API_ROUTE symbol file) to a parallel integration/E2E test path.
@@ -475,15 +642,15 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 		} else {
 			dir = filepath.Join("src", "test", "java", dir)
 		}
-		return filepath.Join(dir, name+"Test"+ext)
+		return applyUnitSuffixConvention(filepath.ToSlash(filepath.Join(dir, name+"Test"+ext)), lang, conventionForItem(item))
 	}
 	// C#: sibling *Tests.cs, or under a root-level dedicated tests/ tree when repoPath is set.
 	if lang == "csharp" {
-		return layout.SuggestedCSharpUnitTestPath(f, repoPath)
+		return applyUnitSuffixConvention(layout.SuggestedCSharpUnitTestPath(f, repoPath), lang, conventionForItem(item))
 	}
 	// JS/TS: .test. / .spec. naming; optional dedicated tests/ tree when repoPath is set (see layout).
 	if lang == "javascript" || lang == "typescript" {
-		return layout.SuggestedJSTSUnitTestPath(f, repoPath, testFramework)
+		return applyUnitSuffixConvention(layout.SuggestedJSTSUnitTestPath(f, repoPath, testFramework), lang, conventionForItem(item))
 	}
 	// Default: same dir, Test suffix
 	dir := filepath.Dir(f)
@@ -511,7 +678,15 @@ func ExistingOrSuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2
 	if item.Gap != nil && item.Gap.Symbol != nil {
 		lang = strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Lang))
 	}
-	chosen := pickCanonicalExistingTestPath(item.Context.ExistingTestPaths, lang)
+	// Layer gate BEFORE canonical selection. ExistingTestPaths is keyed on the SOURCE file, which
+	// the unit and e2e plan layers share, so without this an e2e gap redirects into the unit suite
+	// (and vice versa) — silently discarding the path its own suggester produced. Falling through
+	// to defaultPath here is the desired outcome: that IS the layer's suggested path.
+	candidates, _ := existingTestPathsForItem(item)
+	if len(candidates) == 0 {
+		return defaultPath, false, defaultPath
+	}
+	chosen := pickCanonicalExistingTestPath(candidates, lang)
 	if chosen == "" {
 		return defaultPath, false, defaultPath
 	}
@@ -561,4 +736,136 @@ func pickCanonicalExistingTestPath(paths []string, lang string) string {
 		return canonical
 	}
 	return paths[0]
+}
+
+// rankExistingTestPaths returns the candidate a plan item should extend.
+//
+// This used to be "first path under the canonical test tree, else paths[0]", with the list sorted
+// lexicographically by buildExistingTestIndex. That tie-break is the second half of the duplicate
+// artifact bug: when a SUT has both FooTest.java (left by an earlier ASQS run) and FooTests.java
+// (the repository's real suite), BOTH sit under src/test/java, so the canonical check matched both
+// and paths[0] decided — and '.' (0x2E) sorts before 's' (0x73), so the leftover always won. The
+// repository's own suite was never extended again.
+//
+// The order below is a total order, most significant first. Layer is absent deliberately: callers
+// filter by layer before reaching here (see existingTestPathsForItem), and re-deciding it at two
+// levels is how the two got out of step in the first place.
+//
+//  1. under the language-canonical test tree
+//  2. matches the repository's detected naming convention
+//  3. human-authored in preference to ASQS-authored
+//  4. more existing test methods — a real suite outranks a stub
+//  5. lexicographic, purely so the result is deterministic
+func rankExistingTestPaths(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set) string {
+	return rankExistingTestPathsInRepo(paths, lang, conv, generated, "")
+}
+
+// RankExistingTestPaths is the exported form of rankExistingTestPathsInRepo, for callers outside
+// this package that must pick the same survivor this package would pick — notably duplicate-artifact
+// reconciliation, which decides which of two colliding files to keep. Sharing the ranking is the
+// point: a reconciler that chose differently would delete the file generation is about to extend.
+func RankExistingTestPaths(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set, repoRoot string) string {
+	return rankExistingTestPathsInRepo(paths, lang, conv, generated, repoRoot)
+}
+
+// rankExistingTestPathsInRepo is rankExistingTestPaths with repoRoot available, which enables the
+// test-method-count signal. repoRoot may be empty, in which case that signal is skipped.
+func rankExistingTestPathsInRepo(paths []string, lang string, conv TestSuffixConvention, generated genmanifest.Set, repoRoot string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	cands := make([]existingTestCandidate, 0, len(paths))
+	for _, p := range paths {
+		cands = append(cands, existingTestCandidate{
+			path:      p,
+			canonical: underCanonicalTestTree(p, lang),
+			matchesC:  conv.Detected() && unitTestSuffixOf(genmanifest.Normalize(p), lang) == conv.Suffix,
+			// Unknown provenance counts as human-authored: refusing to rank a file we have no
+			// record of would penalise every repository ASQS has never written to.
+			human:   !generated.Has(p),
+			methods: countTestMethods(repoRoot, p, lang),
+		})
+	}
+	best := 0
+	for i := 1; i < len(cands); i++ {
+		if betterExistingTestCandidate(cands[i], cands[best]) {
+			best = i
+		}
+	}
+	return cands[best].path
+}
+
+type existingTestCandidate struct {
+	path      string
+	canonical bool
+	matchesC  bool
+	human     bool
+	methods   int
+}
+
+// betterExistingTestCandidate reports whether a beats b under the documented total order.
+func betterExistingTestCandidate(a, b existingTestCandidate) bool {
+	if a.canonical != b.canonical {
+		return a.canonical
+	}
+	if a.matchesC != b.matchesC {
+		return a.matchesC
+	}
+	if a.human != b.human {
+		return a.human
+	}
+	if a.methods != b.methods {
+		return a.methods > b.methods
+	}
+	return a.path < b.path
+}
+
+// countTestMethods returns how many test methods rel declares, or 0 when it cannot be read. Used
+// only as a late tie-break, so an unreadable file degrades to "no signal" rather than an error.
+func countTestMethods(repoRoot, rel, lang string) int {
+	if strings.TrimSpace(repoRoot) == "" {
+		return 0
+	}
+	b, err := os.ReadFile(filepath.Join(repoRoot, filepath.FromSlash(genmanifest.Normalize(rel))))
+	if err != nil {
+		return 0
+	}
+	body := string(b)
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "java":
+		return strings.Count(body, "@Test")
+	case "csharp", "cs":
+		return strings.Count(body, "[Fact]") + strings.Count(body, "[Theory]") + strings.Count(body, "[Test]")
+	case "javascript", "typescript", "js", "ts":
+		return strings.Count(body, "it(") + strings.Count(body, "test(")
+	}
+	return 0
+}
+
+// underCanonicalTestTree reports whether p sits in the language's conventional test root.
+func underCanonicalTestTree(p, lang string) bool {
+	switch lang {
+	case "java":
+		return strings.Contains(filepath.ToSlash(p), "src/test/java/")
+	case "javascript", "typescript", "js", "ts", "csharp", "cs":
+		first := strings.SplitN(filepath.ToSlash(p), "/", 2)[0]
+		for _, root := range layout.DedicatedRootDirCandidates {
+			if strings.EqualFold(first, root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// auditCapabilityDegraded records that a requested CompleteOptions field is not supported by the
+// configured provider, so the fallback is a declared decision rather than an invisible one.
+func (g *LLMGenerator) auditCapabilityDegraded(ctx context.Context, capability, detail string) {
+	if g.Audit == nil {
+		return
+	}
+	g.Audit.Log(ctx, "llm.capability_degraded", map[string]interface{}{
+		"capability": capability,
+		"detail":     detail,
+	})
 }

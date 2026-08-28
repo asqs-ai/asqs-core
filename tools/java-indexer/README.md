@@ -11,7 +11,7 @@ Two backends share the same **`ParsedFile`** contract for `internal/intelligence
 
 Set **`indexer.execution: docker`** in config (advanced Java only). QualityBot runs:
 
-`docker run --rm` with **`indexer.docker_java_image`** (default **`eclipse-temurin:21-jre-jammy`**), bind-mounts the repo at **`/workspace`** (read-only) and the JAR at **`/indexer/java-indexer.jar`**, **`--network none`**, optional **`docker_memory`** / **`docker_cpus`**. JSONL is read from container stdout; file paths are normalized to repo-relative.
+`docker run --rm` with **`indexer.docker.java_image`** (default **`eclipse-temurin:21-jre-jammy`**), bind-mounts the repo at **`/workspace`** (read-only) and the JAR at **`/indexer/java-indexer.jar`**, **`--network none`**, optional **`indexer.docker.memory`** (CPU limits and the container network are constants — CP37). JSONL is read from container stdout; file paths are normalized to repo-relative.
 
 Integration smoke (Docker daemon + built JAR):
 
@@ -19,7 +19,8 @@ Integration smoke (Docker daemon + built JAR):
 go test -tags=integration ./tools/java-indexer/... -count=1 -run TestRunJARDocker_smoke
 ```
 
-See **`docs/PLAN-INDEXER-DOCKER.md`** (P0).
+Container execution follows the sandbox settings under `general.sandbox` — see
+[`docs/DOCUMENTATION.md`](../../docs/DOCUMENTATION.md#configuration).
 
 ## Advanced JAR (`JavaIndexer.java`)
 

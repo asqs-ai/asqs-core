@@ -1,0 +1,7 @@
+# The smallest config the loader accepts: only the required keys, everything else defaulted. This is
+# the resolution an operator gets with nothing tuned, so it is the single most important one to hold
+# still across schema changes.
+general:
+  database:
+    metadata_url: postgres://user:pass@localhost:5432/meta?sslmode=disable
+    embeddings_url: postgres://user:pass@localhost:5432/emb?sslmode=disable
