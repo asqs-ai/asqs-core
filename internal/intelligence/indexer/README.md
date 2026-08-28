@@ -2,17 +2,13 @@
 
 The indexer traverses the repo, detects changes, builds the AST/symbol table and dependency graph, chunks at symbol boundaries (300–800 tokens), sanitizes content, and stores symbols/edges in the metadata DB and chunks/embeddings in the vector DB.
 
-## Scheduling and first run
+## Scheduling
 
-**Not configurable in the open core, and not wired.** `Scheduler` in `schedule.go` is library code
-with no caller here: the CLI indexes once, when you run it, against the repository you name. The
-`indexer.schedule` and `indexer.run_on_first_start` keys that used to appear in this section were
-deleted in CP36 because nothing read them — a cron expression in a config file had no scheduler to
-reach. Drive recurring runs from your own cron job or CI schedule instead.
-
-A caller that wants the type can still construct it directly:
-`SchedulerOptions{ Schedule: "0 1 * * *", RunOnFirstStart: true, RepoID: "org/repo", Run: runFunc, HasPreviousRun: … }`,
-then `Start(ctx)` / `Stop()`.
+**There is none, and there is no scheduler type either.** The CLI indexes once, when you run it,
+against the repository you name. `indexer.schedule` and `indexer.run_on_first_start` were deleted in
+CP36 because nothing read them — a cron expression in a config file had no scheduler to reach — and
+the unreferenced `Scheduler` type they had once fed went with it. Drive recurring runs from your own
+cron job or CI schedule.
 
 ## Flow
 
