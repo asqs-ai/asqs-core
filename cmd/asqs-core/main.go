@@ -25,9 +25,8 @@ func main() {
 	}
 }
 
-// dispatch routes to a subcommand. Extracted once, here, so later subcommands (`ab-report`,
-// `config reference`) are one case each rather than a third ad-hoc branch on os.Args — which is
-// how a CLI becomes untestable. `run`'s flags and behaviour are unchanged by the extraction, and
+// dispatch routes to a subcommand. Extracted once, here, so a later subcommand is one case each
+// rather than another ad-hoc branch on os.Args — which is how a CLI becomes untestable. `run`'s flags and behaviour are unchanged by the extraction, and
 // a parity test pins its flag set and usage text.
 func dispatch(args []string) error {
 	if len(args) < 1 {
@@ -41,11 +40,9 @@ func dispatch(args []string) error {
 		return runMigrate(args[1:])
 	case "ab-report":
 		return runABReport(args[1:])
-	case "config":
-		return runConfig(args[1:])
 	default:
 		printTopLevelUsage()
-		return fmt.Errorf("unknown command %q (supported: run, migrate, ab-report, config)", args[0])
+		return fmt.Errorf("unknown command %q (supported: run, migrate, ab-report)", args[0])
 	}
 }
 
@@ -53,8 +50,7 @@ func printTopLevelUsage() {
 	fmt.Fprintf(os.Stderr, "usage: asqs-core <command> [flags]\n\ncommands:\n"+
 		"  run        generate unit/E2E tests for a repo and evaluate them (see `asqs-core run` for flags)\n"+
 		"  migrate    apply one-shot schema/data migrations recorded in schema_migrations\n"+
-		"  ab-report  compare outcome metrics across config revisions (first-wave metrics per run)\n"+
-		"  config     inspect the configuration schema (`config reference` renders the full key list)\n")
+		"  ab-report  compare outcome metrics across config revisions (first-wave metrics per run)\n")
 }
 
 func runRun(args []string) error {

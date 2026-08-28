@@ -51,10 +51,6 @@ func TestNoUnresolvableConfigPathsInDocs(t *testing.T) {
 		}
 		rel, _ := filepath.Rel(root, path)
 		rel = filepath.ToSlash(rel)
-		// The generated reference is the schema rendered; checking it against the schema is circular.
-		if rel == "docs/CONFIG-REFERENCE.md" {
-			continue
-		}
 		// A markdown table whose HEADER carries a historical marker — a migration table's "| v1 | v2 |"
 		// — is historical for all its rows. Requiring the marker on every row would either bloat the
 		// table or push someone to exempt the whole file, and a migration table naming old keys is

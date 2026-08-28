@@ -208,7 +208,7 @@ why it works that way. This section is the summary.
   under [Knowledge sources](./docs/DOCUMENTATION.md#knowledge-sources).
 - **Test framework bootstrap** (optional, off by default) detects a repository with no usable test
   stack, installs one, and smoke-verifies that it runs — then hands generation an authoritative
-  allow-list of importable libraries. See [TEST-FRAMEWORK-BOOTSTRAP.md](./docs/TEST-FRAMEWORK-BOOTSTRAP.md).
+  allow-list of importable libraries. See [Test framework bootstrap](./docs/DOCUMENTATION.md#test-framework-bootstrap).
 - **Evaluation** generates every gap's test first, then compiles + runs the **whole project once**
   in a local or Docker sandbox (not per gap — one compile per fix iteration, not N). The LLM fixer
   repairs failures over a bounded loop (`fixer.iterations.start`); tests that repeatedly fail are
@@ -341,20 +341,15 @@ Gap caps work the other way round: `--max-gaps` / `--max-gaps-e2e` override
 ### Upgrading
 
 Configuration is **schema v2** and the loader is strict — a pre-v2 file fails the load and says which
-sections moved. [docs/RELEASE-NOTES.md](./docs/RELEASE-NOTES.md) has the key-by-key migration table
-and the three things to do before your first run on this version.
+sections moved. [Upgrading from the pre-v2 schema](./docs/DOCUMENTATION.md#upgrading-from-the-pre-v2-schema)
+has the key-by-key migration table and the three things to do before your first run on this version.
 
 ### Where the full key list lives
 
-[`docs/CONFIG-REFERENCE.md`](./docs/CONFIG-REFERENCE.md) is generated from the schema and lists every
-key with its type, effective default and environment variable. Regenerate it after a schema change:
-
-```bash
-go run ./cmd/asqs-core config reference -o docs/CONFIG-REFERENCE.md
-```
-
-A test fails when the checked-in copy goes stale, so the document cannot quietly stop describing the
-code. `config.example.yaml` is deliberately much shorter — it is a starting point, not an inventory.
+[`internal/config/schema_v2.go`](./internal/config/schema_v2.go). Every field carries its own doc
+comment with the type, the effective default and the derived environment variable, and a test fails
+on an undocumented key — so the structs are the reference rather than a generated copy of them that
+could drift. `config.example.yaml` is deliberately much shorter: a starting point, not an inventory.
 
 Two properties are worth knowing before you edit a config:
 

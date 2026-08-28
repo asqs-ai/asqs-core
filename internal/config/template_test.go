@@ -50,8 +50,8 @@ func TestExampleTemplateStaysShort(t *testing.T) {
 	}
 	if n := len(strings.Split(strings.TrimRight(string(b), "\n"), "\n")); n > maxExampleTemplateLines {
 		t.Errorf("config.example.yaml is %d lines, over the %d-line cap. Exhaustiveness belongs to "+
-			"docs/CONFIG-REFERENCE.md, which is generated and cannot drift; the template's job is a "+
-			"working run.", n, maxExampleTemplateLines)
+			"the doc comments in schema_v2.go, which cannot drift from the fields they sit on; the "+
+			"template's job is a working run.", n, maxExampleTemplateLines)
 	}
 }
 
@@ -152,9 +152,10 @@ func looksLikeV2Config(block string) bool {
 	return false
 }
 
-// livingDocs returns the markdown a reader is expected to act on. The implementation plan is
-// excluded: it records what keys USED to be called, deliberately, and holding a history to the
-// current schema would be wrong.
+// livingDocs returns the markdown a reader is expected to act on — which, since docs/ was reduced to
+// a single document, is every .md in the tree. There is no history file to exclude any more: a
+// planning document records what keys USED to be called and would fail a check against the current
+// schema, so if one is ever added back it has to be excluded here rather than left to fail.
 func livingDocs(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string
@@ -170,11 +171,6 @@ func livingDocs(t *testing.T, root string) []string {
 			return nil
 		}
 		if filepath.Ext(path) != ".md" {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, path)
-		rel = filepath.ToSlash(rel)
-		if strings.HasPrefix(rel, "docs/IMPLEMENTATION-PLAN") {
 			return nil
 		}
 		out = append(out, path)

@@ -24,7 +24,7 @@ import (
 // wrong; collectIdentifiersOutsideConfig now scans those files. The genuinely dead remainder —
 // vcs.github.upload_url, runner.docker_endpoint, copilot.permissions.allow_write_globs and
 // allow_urls, plus the superseded websearch.cache_dir — was deleted outright, struct field, env tag,
-// docs and example lines together (docs/IMPLEMENTATION-PLAN-CONFIG-RESTRUCTURE.md §2.1, §2.4).
+// docs and example lines together.
 //
 // Keep it empty. Adding an entry is an admission that a documented YAML key does nothing; wire the
 // field or delete it instead. If a field is read only from inside internal/config, name the

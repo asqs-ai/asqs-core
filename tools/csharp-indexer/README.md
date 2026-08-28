@@ -35,5 +35,5 @@ Methods use **`Namespace.Type#Member`** so Go `indexer.Run` can synthesize **`co
 
 ## Docs
 
-C# parity with the Java reference indexer is tracked in `docs/IMPLEMENTATION-PLAN-PARITY-PORT.md`
-(CP54, CP55).
+How the indexers feed symbols and edges into the pipeline is described in
+[`docs/DOCUMENTATION.md` — Indexing](../../docs/DOCUMENTATION.md#indexing).

@@ -25,8 +25,8 @@ var pendingDocs = map[string]string{}
 // reDocRef finds docs/<NAME>.md paths cited anywhere in sources.
 //
 // The first character must be uppercase, which is what separates a citation of one of THIS
-// repository's documents from a path belonging to a repository under test. Core's docs are named in
-// caps (DOCUMENTATION.md, TEST-FRAMEWORK-BOOTSTRAP.md); the lowercase docs/readme.md and
+// repository's documents from a path belonging to a repository under test. Core's doc is named in
+// caps (DOCUMENTATION.md); the lowercase docs/readme.md and
 // docs/conventions.md that appear in projectintel's scanner and its fixtures are strings describing
 // somebody else's tree, and flagging those would make the guard cry wolf on its first run.
 var reDocRef = regexp.MustCompile(`docs/[A-Z][A-Za-z0-9_.-]*\.md`)
@@ -76,9 +76,6 @@ func TestNoDanglingDocReferences(t *testing.T) {
 			}
 			rel, _ := filepath.Rel(root, path)
 			rel = filepath.ToSlash(rel)
-			if strings.HasPrefix(rel, "docs/IMPLEMENTATION-PLAN") {
-				return nil
-			}
 			b, rerr := os.ReadFile(path)
 			if rerr != nil {
 				return nil
