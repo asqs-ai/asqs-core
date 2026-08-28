@@ -3117,57 +3117,78 @@ valid messages; every attempt is recorded with tool name, arguments size and out
 
 ### A/B measurement — generation tool loop (2026-08-27)
 
-**Result: the default stays OFF.** The comparison did not justify a flip, and the reason is specific
-rather than a shrug.
+**Result: INCONCLUSIVE. The default stays off because nothing yet justifies changing it, NOT because
+tools were shown not to help.** An earlier version of this record said the model "made zero tool
+calls" and that tools "cost ~5% more tokens and changed nothing". Both were one sample reported as a
+property. The correction is below, and the method that produced it matters more than the numbers.
 
-**Setup.** `asqs-java-test-2`, 11 files, 3 gaps, `qwen3-coder:30b-a3b-q8_0` on local Ollama, local
-sandbox, dedicated database. Two configs differing in exactly ONE line
-(`generation.policy.tools.enabled`), verified by diff; the fixture was reset to its committed state
-between arms.
+**What was measured.** `asqs-java-test-2`, `qwen3-coder:30b-a3b-q8_0` on local Ollama, local sandbox,
+dedicated database, bootstrap enabled in both arms. Two configs differing in exactly one line
+(`generation.policy.tools.enabled`), verified by diff, fixture reset between runs.
 
-| | stable | compile OK first pass | test OK without fix | iterations | compile fixes | test fixes | prompt tokens | total tokens |
-|---|---|---|---|---|---|---|---|---|
-| tools OFF | false | false | false | 3 | 2 | 1 | 54,071 | 61,977 |
-| tools ON | false | false | false | 3 | 2 | 1 | 59,377 | 65,349 |
+| | stable | compile OK first pass | test OK without fix | iterations | prompt tokens | total tokens |
+|---|---|---|---|---|---|---|
+| tools OFF | false | false | false | 3 | 54,071 | 61,977 |
+| tools ON | false | false | false | 3 | 59,377 | 65,349 |
 
-**Every outcome column is identical. Tools cost ~5% more tokens and changed nothing** — because the
-model made **zero tool calls**. Not one `generate.tool_call` event across the run.
+**Why those numbers settle nothing.** One run per arm, against a process whose tool use turned out to
+be intermittent. The token delta is a difference between two single draws, not a cost estimate, and
+it should not be quoted as one.
 
-**That is not the upstream defect returning, and the distinction took work to establish.** The
-mechanism is demonstrably live: CP41's Ollama probe detected native tool support; the mode resolved
-to `native` with structured output deferred to the final tool-free turn — CP41/CP44's fix for the
-exact grammar conflict that made upstream ship a tool-enabled fixer issuing zero calls; and the
-definitions reached the provider, which is what the +5,306 provider-reported prompt tokens are. The
-per-gap prompt hashes are byte-identical between arms, so the assembled context did not differ — the
-delta is the tool schemas and nothing else. The model was offered the tools, paid for them, and
-declined to use them.
+**The measurement that does hold, from a logging proxy between the process and Ollama.** Four
+identical runs — same config, model, repository and gap:
 
-**What this does and does not establish.** It is one run per arm, one model, one small repository. It
-cannot settle a small difference, and it is not evidence that tool access does not help in general.
-It IS sufficient for the decision actually in front of us: a default may only change on evidence that
-it helps, there is none here, and there is a measured ~5% cost. **CP45 and CP46 stay `in review`
-(A/B outstanding)** rather than being marked done on an inconclusive result.
+| run | tool-enabled requests | `tools` in payload | tool calls returned |
+|---|---|---|---|
+| 1 | REQ 1–3 | 5 | **4** |
+| 2 | REQ 9–10 | 5 | 0 |
+| 3 | REQ 14–15 | 5 | 0 |
+| 4 | REQ 21–22 | 5 | 0 |
 
-**What a conclusive comparison needs:** a model that calls tools unprompted (the hosted providers do;
-`qwen3-coder` on this task did not), several repositories, and repeated runs per arm so LLM sampling
-variance can be separated from the toggle. Churn weight (CP13) is blocked behind the same instrument.
+**The wiring is correct and this is settled by wire evidence, not inspection.** Every generation turn
+carries all five definitions with `format=false` (CP41/CP44's structured-output deferral working) and
+`num_ctx` set. When the model does call, the loop handles it: run 1's four calls were parsed, three
+executed, one capped by `max_calls_per_turn`, results fed back, conversation grown to eight messages.
+Wire and audit agree exactly — `generate.tool_call: 3` plus `generate.tool_cap: 1`.
 
-**Three findings from the same runs, recorded because they are worth more than the comparison:**
+**So the finding is intermittency: 1 run in 4 on this task.** Not a broken loop, and not a model that
+refuses. Everything ruled out along the way, each on direct evidence: registry attached, definitions
+non-empty, no wrapper dropping `opts.Tools`, response parsing correct, no prompt difference between
+the trees (neither carries a "you may call tools" instruction), both defaulting two-phase on, and
+CP45's inventory mode correctly active. The calls that did occur came in phase **2**, consistent with
+phase 1 being asked only for a skeleton.
+
+**CP45 and CP46 stay `in review (A/B outstanding)`.** A conclusive comparison needs enough runs per
+arm to see through this variance — at 1-in-4, single runs are noise. Several repositories, and
+ideally a model that calls tools more consistently, since the interesting question is what tools do
+when they are used, not how often this model reaches for them.
+
+**A defect found because of the diagnosis, and fixed** (`348daaf`): `CompleteWithTools` degraded
+silently to a plain completion when a registry advertised nothing — no tools sent, no audit event,
+indistinguishable from a model declining. That ambiguity is what made this cost a wire capture.
+`OnNoDefinitions` and `generate.tool_definitions_empty` now record it.
+
+**Three findings from the same runs, worth more than the comparison:**
 
 1. **`asqs-core migrate` failed on a fresh database** — the documented FIRST step of an install.
-   Fixed (`3087a99`); every schema must be created before any migration runs, since metadata's
+   Fixed (`3087a99`): every schema must be created before any migration runs, since metadata's
    repo-scoping migration reads `chunks`, which the embeddings schema owns.
 2. **Audit redaction was hashing counts.** `generate.prompt_budget` shipped
    `prompt_tokens: {sha256, len: 4}` — the figure CP29's ground truth calibrates against, replaced by
    a hash of its own digits. Fixed (`68f131e`).
 3. **CP03's deferred JSONL spot-check is CLOSED**, and CP13 is confirmed live: a real `commit_sha` in
-   the audit stream (the bug that cost upstream weeks), 82 `symbol_versions` rows, and one genuine
-   Java overload kept separate by `dup_ordinal`.
+   the audit stream, 82 `symbol_versions` rows, and a genuine Java overload kept separate by
+   `dup_ordinal`.
 
-**A fixture caveat worth keeping.** None of the `test-repos` fixtures carry a test framework, so the
-first attempt at this A/B produced 0/3 for a purely environmental reason — the model wrote correct
-tests against JUnit and Mockito that were not on the classpath. Bootstrap had to be enabled in BOTH
-arms for the comparison to measure anything. Any future A/B on these fixtures needs the same.
+**A fixture caveat.** None of the `test-repos` fixtures carry a test framework, so the first attempt
+at this A/B produced 0/3 for a purely environmental reason — the model wrote correct tests against
+JUnit and Mockito, which were not on the classpath. Bootstrap must be enabled in BOTH arms for any
+A/B on these fixtures to measure anything.
+
+**Method note for the next attempt.** A logging proxy in front of the provider is the tool that
+settled this, and it should be the first instrument reached for whenever "the model did not do X" is
+the hypothesis. Inference from token deltas is not evidence.
+
 
 ### CP45 — Core-plus-inventory context restructure
 
