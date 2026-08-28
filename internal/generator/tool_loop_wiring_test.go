@@ -152,3 +152,37 @@ func TestCompleteGenerateWithRetry_sharesOneBudgetAcrossAttempts(t *testing.T) {
 		t.Fatalf("%d tool calls for one gap against a per-run cap of 3 — the budget reset between attempts", got)
 	}
 }
+
+// A tool-enabled loop whose registry advertises nothing must SAY so.
+//
+// This is the state that cost a wire capture to diagnose: the run resolves a mode, audits it, and
+// proceeds believing it has tool access, while every turn goes out tool-free. Nothing in the log
+// separates that from a model that simply chose not to call anything — and those need completely
+// different responses from whoever is reading the log.
+func TestNoToolDefinitions_isAudited(t *testing.T) {
+	a := &recordingAuditor{}
+	g := &LLMGenerator{Audit: a}
+	hook := g.auditNoToolDefinitions(context.Background())
+	if hook == nil {
+		t.Fatal("no hook returned despite an auditor being set")
+	}
+	hook()
+	found := false
+	for _, s := range a.steps {
+		if s == "generate.tool_definitions_empty" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the empty-registry degradation was not audited; steps = %v", a.steps)
+	}
+}
+
+// No auditor means no hook, so the loop's hot path stays free — the same contract the attempt and
+// cap hooks follow.
+func TestNoToolDefinitions_nilWithoutAuditor(t *testing.T) {
+	g := &LLMGenerator{}
+	if g.auditNoToolDefinitions(context.Background()) != nil {
+		t.Error("a hook was returned with no auditor; an unaudited run should pay nothing")
+	}
+}

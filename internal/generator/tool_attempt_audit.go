@@ -96,3 +96,23 @@ func (g *LLMGenerator) auditToolCapHit(ctx context.Context) func(tools.CapHit) {
 		})
 	}
 }
+
+// auditNoToolDefinitions returns an OnNoDefinitions hook, or nil when there is no auditor.
+//
+// The event exists because the degradation it reports is otherwise invisible. A run resolves a tool
+// mode, audits it, and proceeds believing it has tool access — while the registry advertises nothing
+// and every turn goes out tool-free. Nothing in the log distinguishes that from a model that simply
+// chose not to call anything, which is the single most confusing state this feature can be in:
+// diagnosing it cost a wire capture between the process and the provider.
+func (g *LLMGenerator) auditNoToolDefinitions(ctx context.Context) func() {
+	if g.Audit == nil {
+		return nil
+	}
+	return func() {
+		g.Audit.LogError(ctx, "generate.tool_definitions_empty", map[string]interface{}{
+			"message": "Tool access is configured and a mode was resolved, but the registry advertised " +
+				"no tools, so every turn was sent WITHOUT them. This is not the model declining to " +
+				"call a tool — none were offered. Check that the metadata store reached the registry.",
+		})
+	}
+}

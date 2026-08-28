@@ -106,6 +106,10 @@ type LoopOptions struct {
 	OnAttempt       func(Attempt)
 	// OnCapHit is called whenever a bound truncates or ends the loop. Optional.
 	OnCapHit func(CapHit)
+	// OnNoDefinitions is called when a tool-enabled loop finds the registry advertises nothing, so
+	// every turn will be tool-free. Optional; without it that degradation is silent, and silence
+	// makes "the model did not call tools" indistinguishable from "no tools were ever offered".
+	OnNoDefinitions func()
 	// Budget carries spend across every call made for one gap. Nil gives this call its own budget,
 	// which is only correct when the caller makes exactly one call per gap.
 	Budget *RunBudget
@@ -167,6 +171,16 @@ func CompleteWithTools(
 		return nil, fmt.Errorf("tools: a chat completer is required")
 	}
 	defs := definitionsFor(reg)
+	// A registry that advertises NOTHING degrades to a plain completion. That is the right
+	// behaviour and the wrong silence: the caller resolved a tool mode, audited it, and believes
+	// this run has tool access — while every turn is tool-free and no event says so. It is the
+	// same invisible-no-op shape as an inert config key, and it is exactly what makes "the model
+	// did not call tools" indistinguishable from "the model was never offered any".
+	//
+	// OnNoDefinitions lets the caller record the difference. Nil keeps the old behaviour.
+	if loop.Mode != ModeOneShot && len(defs) == 0 && loop.OnNoDefinitions != nil {
+		loop.OnNoDefinitions()
+	}
 	if loop.Mode == ModeOneShot || len(defs) == 0 {
 		return cc.Complete(ctx, messages, opts)
 	}

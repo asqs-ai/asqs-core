@@ -306,6 +306,9 @@ func (g *LLMGenerator) completeOnce(ctx context.Context, messages []model.Messag
 	if loop.OnCapHit == nil {
 		loop.OnCapHit = g.auditToolCapHit(ctx)
 	}
+	if loop.OnNoDefinitions == nil {
+		loop.OnNoDefinitions = g.auditNoToolDefinitions(ctx)
+	}
 	// The per-gap budget is supplied by the caller, not created here: this function runs once per
 	// retry attempt, so a budget created here would reset on every retry.
 	loop.Budget = budget
