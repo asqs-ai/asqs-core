@@ -177,6 +177,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			Runner:        &cfg.Runner,
 			RunnerType:    cfg.Runner.Type,
 		}, audit); err != nil {
+			// Also to the audit log, not only stderr: bootstrap can fail BEFORE it logs its first
+			// event, and a reader of audit.log would then see the step simply not happen.
+			audit.LogError(ctx, "test_bootstrap.run_failed", map[string]interface{}{
+				"message": "Unit test framework bootstrap failed before it could set anything up; the run continues without it: " + err.Error(),
+				"error":   err.Error(),
+			})
 			fmt.Fprintf(os.Stderr, "asqs-core: bootstrap: %v (continuing)\n", err)
 		}
 	}
@@ -196,6 +202,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			Runner:        &cfg.Runner,
 			RunnerType:    cfg.Runner.Type,
 		}, audit); err != nil {
+			// Same reasoning as above, and this one is why the event exists: a path-resolution
+			// failure returned here left NO audit trace at all, so a run generated Playwright
+			// tests into a repository where E2E bootstrap had silently never run.
+			audit.LogError(ctx, "e2e_bootstrap.run_failed", map[string]interface{}{
+				"message": "E2E framework bootstrap failed before it could set anything up; generated E2E tests may import a stack that is not installed: " + err.Error(),
+				"error":   err.Error(),
+			})
 			fmt.Fprintf(os.Stderr, "asqs-core: e2e bootstrap: %v (continuing)\n", err)
 		}
 	}

@@ -47,19 +47,31 @@ func RunE2EBootstrap(ctx context.Context, p E2EParams, audit Auditor) error {
 		return fmt.Errorf("e2e_framework_bootstrap: unsupported mode %q (use auto, playwright, cypress, or off)", cfg.Mode)
 	}
 
-	repo := filepath.Clean(strings.TrimSpace(p.RepoPath))
-	if repo == "" {
+	// Emptiness is tested on the TRIMMED string, before filepath.Clean — Clean("") returns ".",
+	// not "", so a Clean-first check can never see an absent path. That is not a style point: it
+	// silently disabled this whole step. pipeline.go does not set GitRepoRoot (the workspace IS
+	// the repository there), so gitRoot became ".", Abs resolved it to the asqs-core process's own
+	// working directory, and the containment check below then rejected every repository on earth
+	// with `workspace %q must be under git root %q` — before the first audit event, so the only
+	// trace was one stderr line and an E2E stack that was never installed. A run would generate
+	// Playwright tests against a repository with no Playwright, fail to compile, and hand the fix
+	// loop an error it is not allowed to repair, because adding a dependency is a build-manifest
+	// change. testbootstrap.Run — the unit-test counterpart, which has always worked — trims
+	// without Clean for exactly this reason; this is the copy that drifted.
+	repoRaw := strings.TrimSpace(p.RepoPath)
+	if repoRaw == "" {
 		return fmt.Errorf("e2e_framework_bootstrap: empty repo path")
 	}
+	repo := filepath.Clean(repoRaw)
 	var err error
 	repo, err = filepath.Abs(repo)
 	if err != nil {
 		return fmt.Errorf("e2e_framework_bootstrap: %w", err)
 	}
-	gitRoot := filepath.Clean(strings.TrimSpace(p.GitRepoRoot))
-	if gitRoot == "" {
-		gitRoot = repo
-	} else {
+	gitRootRaw := strings.TrimSpace(p.GitRepoRoot)
+	gitRoot := repo
+	if gitRootRaw != "" {
+		gitRoot = filepath.Clean(gitRootRaw)
 		gitRoot, err = filepath.Abs(gitRoot)
 		if err != nil {
 			return fmt.Errorf("e2e_framework_bootstrap: %w", err)
