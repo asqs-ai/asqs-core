@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -63,19 +64,20 @@ exec sleep 30`)
 	if elapsed > 10*time.Second {
 		t.Fatalf("run did not return promptly after the deadline (%s) — a grandchild may be holding the output pipe", elapsed)
 	}
-	// Output written before the kill does NOT survive: exec.CommandContext discards the buffered
-	// combined output when it kills the process (verified — the container's `echo` above is gone).
+	// Whether output written BEFORE the kill survives is platform-dependent, so it is recorded
+	// here rather than asserted. On darwin exec.CommandContext discards the buffered combined
+	// output when it kills the process and the container's `echo` above is gone; on linux — which
+	// is what CI runs, and what every Docker evaluation runs on — the write reaches the pipe first
+	// and survives. Asserting the darwin behaviour made this test fail on every Linux machine,
+	// which is the one place the answer actually matters.
 	//
-	// This is why the discarded-deadline bug was worse than "a timeout looks like a test failure".
-	// With no output AND a non-zero ExitCode, the old gate fell through to
-	// failedStepSummary(step, "", 5), which returns the bare string "failed" with an empty Output —
-	// and evaluator.compileErrorTouchesArtifactScope treats empty output as in-scope, so the LLM
-	// fixer was handed nothing and burned the iteration budget. Exactly the F1 pathology that
-	// sandboxStepFailure was written to prevent on the local path.
-	if strings.TrimSpace(res.CombinedOutput) != "" {
-		t.Errorf("assumption changed: killed job now yields output %q; revisit the empty-output "+
-			"reasoning in step_failure.go", res.CombinedOutput)
-	}
+	// Nothing downstream depends on the choice: sandboxStepFailure branches on hasOutput and names
+	// the deadline either way — prepending the timeout note when there is output, and using the
+	// note as both summary and output when there is none. The bug that motivated this test was the
+	// deadline being DISCARDED, which the assertions above pin; the empty-output case was only the
+	// worst of its symptoms, because evaluator.compileErrorTouchesArtifactScope treats empty output
+	// as in-scope and the fixer was handed nothing to work from.
+	t.Logf("pre-kill output on %s: %q", runtime.GOOS, res.CombinedOutput)
 }
 
 // An ordinary non-zero exit is NOT a run error: jobrunner reports it as (res, nil) through its
