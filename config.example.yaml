@@ -1,8 +1,8 @@
 # asqs-core example configuration (schema v2). Copy to config.yaml and edit.
 #
 # Only the keys below are needed for a single `asqs-core run`. The full surface is larger; every key
-# is documented in the generated reference rather than here, because an exhaustive template stops
-# being a starting point.
+# is documented on its own field in internal/config/schema_v2.go rather than here, because an
+# exhaustive template stops being a starting point.
 #
 # Two rules make this file predictable:
 #   * every toggle is positive — `enabled: false`, never `disable_something: true`;
