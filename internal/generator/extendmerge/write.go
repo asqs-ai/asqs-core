@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
@@ -39,6 +40,17 @@ type Item struct {
 	// SourceSymbolFile is the symbol-under-test's file, used to refuse writing unit tests into
 	// production source.
 	SourceSymbolFile string
+	// ImportResolver maps simple type names the payload uses but never imported to their
+	// fully-qualified names, omitting any name it cannot resolve to exactly one type.
+	//
+	// A hook rather than a dependency: resolving means asking the compile classpath, which lives
+	// behind apisurface.Provider and has no business in a package whose job is splicing text. Nil
+	// disables inference, which is the pre-existing behaviour.
+	ImportResolver func(simpleNames []string) map[string]string
+	// TypeExists reports whether the compile classpath provides each fully-qualified name asked
+	// about. Used to tell a real JLS 7.5 shadowing hazard from a name collision that cannot
+	// actually occur. Nil disables the check, which is the pre-existing behaviour.
+	TypeExists func(fqns []string) map[string]bool
 	// Err, when set, skips the item; it carries a generation failure the caller already recorded.
 	Err error
 }
@@ -55,10 +67,47 @@ type Item struct {
 // PerGapWriteResult already carries a SkipReason field that the tool surfaces as `skip_reason` in
 // the audit payload — it was simply never populated for this path. This returns what that field
 // needs.
+// ImportMerge is what the import union did for one extended file.
+//
+// It exists because these decisions used to reach stderr and nowhere else, which left the audit
+// with no record of the merge at all. In audit.log of 2026-08-29 every compile error in the run
+// traced back to this step — a Playwright wildcard shadowed by the target's existing
+// org.springframework.data.domain.Page import, and four files' worth of annotations whose imports
+// the payload never declared — and the log carried not one line about it. The skip reasons in
+// particular are already computed by unionImports and were simply thrown away.
+type ImportMerge struct {
+	// Path is the repo-relative file that was extended.
+	Path string
+	// Merged is the rendered import lines added to the target, in the order they were written.
+	Merged []string
+	// Skipped maps a rendered import line to the reason the union refused it (already imported,
+	// JLS 7.5.1 simple-name collision, covered by an on-demand import, CS1537, ...).
+	Skipped map[string]string
+	// Inferred lists simple names the payload used without importing, which were resolved against
+	// the compile classpath and added. These never appeared in the payload at all, so they are
+	// reported apart from Merged.
+	Inferred []string
+	// ShadowedNames maps a simple name to the existing single-type import that would shadow an
+	// on-demand import this payload needed (JLS 7.5). Non-empty means the merge was refused.
+	ShadowedNames map[string]string
+}
+
+// Write extends or creates each item and reports what was written and what was dropped.
+//
+// It delegates to WriteWithImportReport and discards the import detail, so existing callers keep
+// working unchanged.
 func Write(repoRoot string, items []Item) (int, []string, []string) {
+	wrote, written, skips, _ := WriteWithImportReport(repoRoot, items)
+	return wrote, written, skips
+}
+
+// WriteWithImportReport is Write plus one ImportMerge per file whose import block it touched.
+// Only extended files appear: a newly created file carries its own imports and has nothing to union.
+func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []string, []ImportMerge) {
 	var wrote int
 	var writtenPaths []string
 	var skips []string
+	var importReport []ImportMerge
 	for _, g := range items {
 		if g.Path == "" || g.Content == "" || g.Err != nil {
 			continue
@@ -172,8 +221,45 @@ func Write(repoRoot string, items []Item) (int, []string, []string) {
 			// the file that will actually be written.
 			base := string(existing)
 			ext := strings.ToLower(filepath.Ext(g.Path))
-			if len(payloadImports) > 0 && (ext == ".java" || ext == ".cs") {
-				addImports, skippedImports := unionImports(parseImports(base, ext), payloadImports, ext)
+			if ext == ".java" || ext == ".cs" {
+				existingImports := parseImports(base, ext)
+				// Infer imports for names the payload USED but never declared. The union can only
+				// reason about directives the payload wrote; this supplies the ones it forgot,
+				// and only where the classpath resolves the name to exactly one type.
+				var inferredNames []string
+				if ext == ".java" && g.ImportResolver != nil {
+					if missing := unresolvedPayloadAnnotations(payload, existingImports, payloadImports); len(missing) > 0 {
+						for name, fqn := range g.ImportResolver(missing) {
+							if fqn == "" {
+								continue
+							}
+							payloadImports = append(payloadImports, importDecl{kind: importPlain, path: fqn})
+							inferredNames = append(inferredNames, name)
+						}
+						sort.Strings(inferredNames)
+					}
+				}
+				addImports, skippedImports := unionImports(existingImports, payloadImports, ext)
+				// JLS 7.5: a single-type import the target already carries SHADOWS an on-demand
+				// import we are about to add, so the payload's uses of that name would silently
+				// bind to the wrong type. Nothing downstream can catch this — the merged file is
+				// syntactically perfect — so refuse the merge rather than ship a module that
+				// cannot compile. Repairing it properly means fully qualifying the payload's uses,
+				// which is a source rewrite this splice-only package should not attempt.
+				if ext == ".java" {
+					if shadowed := shadowedByExistingSingleImport(payload, existingImports, addImports, g.TypeExists); len(shadowed) > 0 {
+						importReport = append(importReport, ImportMerge{
+							Path:          filepath.ToSlash(strings.TrimSpace(g.Path)),
+							Skipped:       skippedImports,
+							ShadowedNames: shadowed,
+						})
+						noteSkip(fmt.Sprintf(
+							"payload needs an on-demand import whose name(s) the target already binds elsewhere: %s; merging would silently resolve them to the wrong type (JLS 7.5)",
+							describeShadowedNames(shadowed)))
+						continue
+					}
+				}
+				var rendered []string
 				if len(addImports) > 0 {
 					merged, ok := mergeImportsIntoFile(base, addImports, ext)
 					if !ok {
@@ -183,7 +269,7 @@ func Write(repoRoot string, items []Item) (int, []string, []string) {
 						continue
 					}
 					base = merged
-					rendered := make([]string, 0, len(addImports))
+					rendered = make([]string, 0, len(addImports))
 					for _, d := range addImports {
 						rendered = append(rendered, d.render(ext))
 					}
@@ -193,6 +279,15 @@ func Write(repoRoot string, items []Item) (int, []string, []string) {
 				if s := describeSkippedImports(skippedImports); s != "" {
 					fmt.Fprintf(os.Stderr, "  skipped redundant/colliding import(s) for %s: %s\n", g.Path, s)
 				}
+				// Reported even when both lists are empty: "the union ran and changed nothing" is a
+				// different fact from "the union never ran", and only the first is consistent with a
+				// payload that declared imports.
+				importReport = append(importReport, ImportMerge{
+					Path:     filepath.ToSlash(strings.TrimSpace(g.Path)),
+					Merged:   rendered,
+					Skipped:  skippedImports,
+					Inferred: inferredNames,
+				})
 			}
 			combined := insertInsideClassBody([]byte(base), payload)
 			// SyntacticShellReason runs on the COMBINED result: a payload can never satisfy its
@@ -234,7 +329,7 @@ func Write(repoRoot string, items []Item) (int, []string, []string) {
 		wrote++
 		writtenPaths = append(writtenPaths, filepath.ToSlash(strings.TrimSpace(g.Path)))
 	}
-	return wrote, writtenPaths, skips
+	return wrote, writtenPaths, skips, importReport
 }
 
 // looksLikeTestPath reports whether path looks like a test file (.test., .spec., .cy., _test.go, *Test.java, *Tests.cs).

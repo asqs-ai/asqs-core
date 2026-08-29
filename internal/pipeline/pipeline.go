@@ -407,13 +407,22 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
 	// upstream against a labelled suite it delivers about half the relevant chunks, and the model
 	// has no way to ask for the rest. The registry is what turns a retrieval miss into a lookup.
-	if reg := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
-		loop, reason := toolLoopFromConfig(cfg, trackedGen)
-		gen.Tools = reg
-		gen.ToolLoop = loop
-		auditToolMode(ctx, audit, loop.Mode,
-			appendStructuredDeferralNote(reason, trackedGen, !cfg.Runner.DisableStructuredGenerateOutput))
+	//
+	// The mode is audited on EVERY path, including the one where tools are off. The audit call used
+	// to live inside this `reg != nil` block, so a run with tools disabled — the default — produced
+	// no tool-mode event at all, and the only trace of one-shot anywhere in the log was a
+	// tools_mode field buried in each evaluator.fix_request payload. That is precisely the
+	// condition ResolveMode's doc calls out: "a silent downgrade is how 'tools are enabled' and
+	// 'the model never called a tool' coexist for weeks without anyone noticing."
+	genTools := buildGenerationTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient)
+	genLoop, genReason := toolLoopFromConfig(cfg, trackedGen)
+	if genTools != nil {
+		gen.Tools = genTools
+		gen.ToolLoop = genLoop
 	}
+	genMode, genReason := effectiveToolMode(genLoop, genReason, genTools != nil)
+	auditToolMode(ctx, audit, genMode,
+		appendStructuredDeferralNote(genReason, trackedGen, !cfg.Runner.DisableStructuredGenerateOutput))
 	// With tools in play the prompt carries a high-precision core plus an INVENTORY of what can be
 	// fetched, rather than every dependency body inline.
 	//
@@ -441,13 +450,18 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	// The fixer gets the same read-only suite, behind its own gate: generation and repair are
 	// toggled independently so a fix-quality comparison can move one without the other.
-	if reg := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient); reg != nil {
-		loop, reason := fixerToolLoopFromConfig(cfg, trackedFixer)
-		fixer.Tools = reg
-		fixer.ToolLoop = loop
-		auditFixerToolMode(ctx, audit, loop.Mode,
-			appendStructuredDeferralNote(reason, trackedFixer, !cfg.Runner.DisableStructuredFixOutput))
+	// Audited unconditionally, for the same reason as generation above — and this is the half that
+	// actually differs in practice, because fixer tools are gated separately and stay off in
+	// configurations that turn generation tools on.
+	fixTools := buildFixerTools(cfg, meta, emb, embedder, opts.RepoID, lang, repoAbs, apiSurface, webClient)
+	fixLoop, fixReason := fixerToolLoopFromConfig(cfg, trackedFixer)
+	if fixTools != nil {
+		fixer.Tools = fixTools
+		fixer.ToolLoop = fixLoop
 	}
+	fixMode, fixReason := effectiveToolMode(fixLoop, fixReason, fixTools != nil)
+	auditFixerToolMode(ctx, audit, fixMode,
+		appendStructuredDeferralNote(fixReason, trackedFixer, !cfg.Runner.DisableStructuredFixOutput))
 	sandbox := runner.NewSandboxFromConfig(cfg)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
@@ -544,6 +558,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Phase 1 — generate + write every gap's test (no per-gap evaluation). Collect the unique
 	// artifact paths so the whole project is compiled/tested exactly once below.
 	var artifactPaths []string
+	// Artifacts we appended to a file the repository already owned. Tracked separately because the
+	// discard path below is os.Remove: deleting one of these would take the project's own tests
+	// with it. See EvalOptions.ExtendedArtifactPaths.
+	var extendedArtifactPaths []string
 	seen := map[string]bool{}
 	outcomeIdxByPath := map[string]int{} // normalized path -> index of the gap that first wrote it
 	anyE2E := false
@@ -592,17 +610,55 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			if doExtend {
 				writePath = extendPath
 			}
-			wrote, written, skips := extendmerge.Write(repoAbs, []extendmerge.Item{{
+			wrote, written, skips, imports := extendmerge.WriteWithImportReport(repoAbs, []extendmerge.Item{{
 				Path:             writePath,
 				Content:          content,
 				ExtendExisting:   doExtend,
 				SourceSymbolFile: planItemSourceFile(item),
+				// Names the payload used without importing are resolved against this project's
+				// compile classpath — the same source, and the same exactly-one-candidate rule,
+				// that gives generation its canonical framework imports.
+				ImportResolver: func(names []string) map[string]string {
+					return apisurface.ResolveSimpleNames(ctx, apiSurface, repoAbs, lang, names)
+				},
+				TypeExists: func(fqns []string) map[string]bool {
+					return apisurface.TypesPresent(ctx, apiSurface, repoAbs, lang, fqns)
+				},
 			}})
 			for _, sk := range skips {
 				audit.Log(ctx, "generate.write_skipped", map[string]interface{}{
 					"message": "Generated artifact was not written: " + sk,
 					"symbol":  out.Symbol,
 				})
+			}
+			// What the import union did when extending an existing test file. Every compile failure
+			// in the run of 2026-08-29 originated here and the audit said nothing, because these
+			// lines went to stderr only.
+			for _, im := range imports {
+				payload := map[string]interface{}{
+					"message": fmt.Sprintf("Extend merge for %s: added %d import(s), refused %d.",
+						im.Path, len(im.Merged), len(im.Skipped)),
+					"symbol":          out.Symbol,
+					"path":            im.Path,
+					"merged":          im.Merged,
+					"merged_count":    len(im.Merged),
+					"skipped_count":   len(im.Skipped),
+					"extend_existing": doExtend,
+				}
+				if len(im.Skipped) > 0 {
+					payload["skipped"] = im.Skipped
+				}
+				if len(im.Inferred) > 0 {
+					payload["inferred"] = im.Inferred
+					payload["message"] = fmt.Sprintf("Extend merge for %s: added %d import(s) (%d inferred from use: %s), refused %d.",
+						im.Path, len(im.Merged), len(im.Inferred), strings.Join(im.Inferred, ", "), len(im.Skipped))
+				}
+				if len(im.ShadowedNames) > 0 {
+					payload["shadowed_names"] = im.ShadowedNames
+					payload["message"] = fmt.Sprintf("Extend merge for %s REFUSED: %d name(s) the payload uses are already bound by a single-type import that would shadow the on-demand import it needs (JLS 7.5).",
+						im.Path, len(im.ShadowedNames))
+				}
+				audit.Log(ctx, "generate.extend_imports", payload)
 			}
 			switch {
 			case wrote == 0:
@@ -628,6 +684,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 					seen[np] = true
 					outcomeIdxByPath[np] = len(sum.Outcomes) // index this outcome will take below
 					artifactPaths = append(artifactPaths, relPath)
+					if doExtend {
+						extendedArtifactPaths = append(extendedArtifactPaths, relPath)
+					}
 				}
 			}
 		}
@@ -713,8 +772,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		RepoPath:         repoAbs,
 		Lang:             lang,
 		MaxFixIterations: maxFix,
-		ArtifactPaths:    artifactPaths,
-		Fixer:            fixer,
+		// Per-step repair budgets, independent of the iteration budget above. Unset = maxFix.
+		MaxCompileFixAttempts: cfg.Runner.MaxCompileFixAttempts,
+		MaxTestFixAttempts:    cfg.Runner.MaxTestFixAttempts,
+		ArtifactPaths:         artifactPaths,
+		ExtendedArtifactPaths: extendedArtifactPaths,
+		Fixer:                 fixer,
 		// The fixer may now repair inherited breakage on evidence rather than on a regex guess
 		// over each round's diagnostic.
 		BaselineFailingPaths: append([]string(nil), baseline.Paths...),
@@ -763,6 +826,15 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// The project is green when the eval passed outright, or stayed stable after discarding.
 	sum.ProjectStable = evalRes.Stable || evalRes.EarlyExitStableAfterDiscard
+	// A cancelled or timed-out evaluation never reports stable, and therefore never ships. Today
+	// RunEvaluation cannot reach out.Stable = true on a cancelled context (every step failure
+	// continues the loop, and sandboxStepFailure marks a cancelled step OK=false), so this only
+	// makes the invariant explicit instead of emergent — which is what a ship gate warrants.
+	// DeadlineExceeded as well as Canceled: RunEvaluation returns whatever ctx.Err() gives, and a
+	// run killed by its own deadline has finished no more than an interrupted one.
+	if eerr != nil && (errors.Is(eerr, context.Canceled) || errors.Is(eerr, context.DeadlineExceeded)) {
+		sum.ProjectStable = false
+	}
 
 	// Close the loop the read half above opens: this run's failing output becomes the next run's
 	// planning hint, so a repository that keeps failing the same way gets retrieval steered at the

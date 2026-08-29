@@ -66,13 +66,34 @@ var ErrFixArtifactTooLarge = errors.New("fixer artifact exceeds full-file prompt
 
 // EvalOptions configures the evaluation workflow (which steps to run, max fix iterations).
 type EvalOptions struct {
-	RepoPath             string              // repo root for reading/writing artifact files
-	Lang                 string              // e.g. "java"
-	CriticalModules      []string            // for optional mutation step
-	RunMutation          bool                // if true, run mutation tests for critical modules
-	MaxFixIterations     int                 // max loop iterations (compile fail → fix; test fail → fix; then re-run)
-	ArtifactPaths        []string            // repo-relative paths to generated files (read and passed to Fixer on failure)
-	ArtifactDependencies map[string][]string // optional: artifact path -> repo-relative paths of source/dependency files to include in fix context (e.g. controller, repository, service)
+	RepoPath         string   // repo root for reading/writing artifact files
+	Lang             string   // e.g. "java"
+	CriticalModules  []string // for optional mutation step
+	RunMutation      bool     // if true, run mutation tests for critical modules
+	MaxFixIterations int      // max loop iterations (compile fail → fix; test fail → fix; then re-run)
+	// MaxCompileFixAttempts / MaxTestFixAttempts bound LLM repair rounds per step. 0 = use
+	// MaxFixIterations, which is what both were hardcoded to.
+	//
+	// They are different budgets and were spending one number. An iteration costs a container
+	// build; a fix attempt costs a model call. In the run of 2026-08-29 a single setting —
+	// fixer.iterations.start — bought 40 of each, so raising the iteration ceiling to let a slow
+	// suite converge also bought 40 rounds of a fixer whose breakers stop it after 3, and lowering
+	// the fix budget to save model calls would have capped the loop itself.
+	MaxCompileFixAttempts int
+	MaxTestFixAttempts    int
+	ArtifactPaths         []string // repo-relative paths to generated files (read and passed to Fixer on failure)
+	// ExtendedArtifactPaths is the subset of ArtifactPaths this run APPENDED to an existing test
+	// file rather than created. They are writable by the fixer like any other artifact, but they
+	// must never be discarded: the caller implements discard as os.Remove, and removing one of
+	// these deletes the repository's own tests along with ours.
+	//
+	// This is not hypothetical. In the run of 2026-08-29, 21 of 24 items took the extend path and
+	// the compiler blamed OwnerControllerTests.java — 420 lines of the project's own tests, with
+	// ours appended. Nothing distinguished it from a file we had created from scratch, so it was a
+	// discard candidate; only the fact that discard was unreachable from a never-green compile kept
+	// it on disk.
+	ExtendedArtifactPaths []string
+	ArtifactDependencies  map[string][]string // optional: artifact path -> repo-relative paths of source/dependency files to include in fix context (e.g. controller, repository, service)
 	// ArtifactContexts: optional artifact path -> retrieval/generation context string that was used to create the test.
 	// Passed to the fixer so repairs preserve dependency-graph intent and branch-gap guidance from planning.
 	ArtifactContexts map[string]string
@@ -234,9 +255,16 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 			r.ResetConversation()
 		}
 	}
-	// Use current iteration budget (MaxFixIterations) for both compile and test fix limits.
-	maxCompileFix := opts.MaxFixIterations
-	maxTestFix := opts.MaxFixIterations
+	// Per-step repair budgets, defaulting to the iteration budget so an unset field keeps the
+	// previous behaviour exactly.
+	maxCompileFix := opts.MaxCompileFixAttempts
+	if maxCompileFix <= 0 {
+		maxCompileFix = opts.MaxFixIterations
+	}
+	maxTestFix := opts.MaxTestFixAttempts
+	if maxTestFix <= 0 {
+		maxTestFix = opts.MaxFixIterations
+	}
 	var compileFixAttempts, testFixAttempts int
 	// Per-step fix-loop repeat detectors. Each applyLLMFix call canonicalises its input into a
 	// fingerprint (step + sorted artifact paths + sanitised error output) and increments the
@@ -260,6 +288,33 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 	var e2eFailFP string
 
 	for iter := 0; iter < opts.MaxFixIterations; iter++ {
+		// Cancellation ends the loop; it is not a failing iteration.
+		//
+		// Every failure path in this loop ends in `continue`, so one check at the top covers all of
+		// them. Without it a cancelled context is laundered into an ordinary step failure: the
+		// runner labels the StepResult "cancelled before it completed" (runner.sandboxStepFailure)
+		// but nothing here reads ctx, so the loop spends its whole remaining budget re-running
+		// steps that return instantly. Measured in audit.log of 2026-08-29: the context was
+		// cancelled at 08:39:31 during iteration 19 and iterations 20-40 then ran within the same
+		// millisecond, each logging evaluator.compile_failed plus a spurious
+		// evaluator.fix_skipped_out_of_scope_compile_error (the 46-character cancellation note
+		// names no artifact, so the scope check cannot match it).
+		//
+		// out.Iterations is deliberately left at the last iteration that actually ran, and the
+		// error is returned rather than swallowed so first-wave metrics record NULL for a run that
+		// never finished instead of a fabricated result.
+		if cerr := ctx.Err(); cerr != nil {
+			if audit != nil {
+				audit.LogError(ctx, "evaluator.run_cancelled", map[string]interface{}{
+					"message": fmt.Sprintf("Evaluation cancelled after iteration %d of %d; %v.",
+						out.Iterations, opts.MaxFixIterations, cerr),
+					"iteration":      out.Iterations,
+					"max_iterations": opts.MaxFixIterations,
+					"error":          cerr.Error(),
+				})
+			}
+			return out, cerr
+		}
 		out.Iterations = iter + 1
 		if audit != nil {
 			audit.Log(ctx, "evaluator.iteration", map[string]interface{}{
@@ -405,15 +460,67 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 					}
 					continue
 				}
-				if opts.Fixer != nil && compileFixAttempts < maxCompileFix {
-					if applied, touched, _ := applyLLMFix(ctx, opts, StepCompile, compileRes.Output, audit, &compileFixAttempts, maxCompileFix, &compileFixState, ""); applied {
+				skipReason := ""
+				if fixerCanAttempt(opts.Fixer, &compileFixState, compileFixAttempts, maxCompileFix) {
+					applied, touched, why := applyLLMFix(ctx, opts, StepCompile, compileRes.Output, audit, &compileFixAttempts, maxCompileFix, &compileFixState, "")
+					skipReason = why
+					if applied {
 						if len(touched) > 0 {
 							out.IterationArtifacts = append(out.IterationArtifacts, touched)
 						}
 						continue
 					}
 				}
-				continue
+				// The fixer is out of road for compile. Stop, instead of re-running a deterministic
+				// step that nothing between iterations can change.
+				//
+				// This branch used to end in a bare `continue`. When the circuit-breaker trips it
+				// sets compileFixAttempts = maxCompileFix, so the guard above is false from then on
+				// and every remaining iteration ran a full container compile with no fixer call
+				// at all: in the run of 2026-08-29 that was 15 iterations and ~14 minutes of Docker
+				// after the breaker fired at 08:25:15. The test branch has had this exit since RC3
+				// (see StepTest below); compile never got one, which also made
+				// exitByDiscardingStuckArtifacts unreachable for any run whose compile never went
+				// green — the exact runs that need it most.
+				//
+				// A retryable skip (an unusable model turn) is NOT terminal and falls through to
+				// another iteration, which is what the FixSkip* taxonomy exists to distinguish.
+				fixerExhausted := opts.Fixer == nil ||
+					compileFixState.tripped ||
+					compileFixAttempts >= maxCompileFix ||
+					IsTerminalFixSkip(skipReason)
+				if !fixerExhausted {
+					continue
+				}
+				if exitByDiscardingStuckArtifacts(ctx, opts, StepCompile, compileRes.Output, &out, audit, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
+					return out, nil
+				}
+				// Nothing discardable — typically because the blamed files are ones we extended
+				// rather than created, so removing them would delete the repository's own tests.
+				// Leave them on disk, report why the loop stopped, and let the caller mark the run
+				// unstable.
+				if audit != nil {
+					audit.LogError(ctx, "evaluator.compile_fix_exhausted", map[string]interface{}{
+						"message": fmt.Sprintf(
+							"Compile still failing and the fixer can do no more (fixer=%v, breaker_tripped=%v, attempts=%d of %d, last_skip=%q); stopping after iteration %d of %d rather than re-running an unchanged compile.",
+							opts.Fixer != nil, compileFixState.tripped, compileFixAttempts, maxCompileFix, skipReason, out.Iterations, opts.MaxFixIterations),
+						"step":            StepCompile,
+						"fixer_present":   opts.Fixer != nil,
+						"breaker_tripped": compileFixState.tripped,
+						"breaker_reason":  compileFixState.trippedReason,
+						"fix_attempts":    compileFixAttempts,
+						"max_fix_attempt": maxCompileFix,
+						"last_skip":       skipReason,
+						"iteration":       out.Iterations,
+						"max_iterations":  opts.MaxFixIterations,
+					})
+				}
+				out.CompileOKAfterGenerate = firstIterCompileOK
+				out.CompileFixCount = compileFixAttempts
+				out.TestFixCount = testFixAttempts
+				out.TestOKWithoutFix = false
+				out.LastFixAction = FixStabilize
+				return out, nil
 			}
 		}
 
@@ -446,12 +553,12 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 				})
 			}
 			if infraKind != "" && opts.SkipFixerOnInfrastructureFailure {
-				if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, testRes.Output, &out, audit, &unitFailStreak, &unitFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
+				if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, StepTest, testRes.Output, &out, audit, &unitFailStreak, &unitFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 					return out, nil
 				}
 				continue
 			}
-			if opts.Fixer != nil && testFixAttempts < maxTestFix {
+			if fixerCanAttempt(opts.Fixer, &testFixState, testFixAttempts, maxTestFix) {
 				if applied, touched, _ := applyLLMFix(ctx, opts, StepTest, testRes.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraKind); applied {
 					if len(touched) > 0 {
 						out.IterationArtifacts = append(out.IterationArtifacts, touched)
@@ -468,7 +575,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 				exitByDiscardingStuckArtifacts(ctx, opts, StepTest, testRes.Output, &out, audit, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 				return out, nil
 			}
-			if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, testRes.Output, &out, audit, &unitFailStreak, &unitFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
+			if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, StepTest, testRes.Output, &out, audit, &unitFailStreak, &unitFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 				return out, nil
 			}
 			continue
@@ -509,12 +616,12 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 						})
 					}
 					if infraE2E != "" && opts.SkipFixerOnInfrastructureFailure {
-						if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, testE2E.Output, &out, audit, &e2eFailStreak, &e2eFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
+						if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, StepTestE2E, testE2E.Output, &out, audit, &e2eFailStreak, &e2eFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 							return out, nil
 						}
 						continue
 					}
-					if opts.Fixer != nil && testFixAttempts < maxTestFix {
+					if fixerCanAttempt(opts.Fixer, &testFixState, testFixAttempts, maxTestFix) {
 						if applied, touched, _ := applyLLMFix(ctx, opts, StepTestE2E, testE2E.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraE2E); applied {
 							if len(touched) > 0 {
 								out.IterationArtifacts = append(out.IterationArtifacts, touched)
@@ -527,7 +634,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 						exitByDiscardingStuckArtifacts(ctx, opts, StepTestE2E, testE2E.Output, &out, audit, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 						return out, nil
 					}
-					if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, testE2E.Output, &out, audit, &e2eFailStreak, &e2eFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
+					if repThr > 0 && maybeExitOnRepeatedTestFailure(ctx, opts, StepTestE2E, testE2E.Output, &out, audit, &e2eFailStreak, &e2eFailFP, repThr, compileFixAttempts, testFixAttempts, firstIterCompileOK) {
 						return out, nil
 					}
 					continue
@@ -659,21 +766,52 @@ func sortedFailureFingerprint(paths []string) string {
 }
 
 // discardableFailingPaths is the intersection of failing paths and generated artifact paths (only discard files we wrote).
-func discardableFailingPaths(failingPaths, generatedPaths []string) []string {
+// discardableFailingPaths narrows failing paths to those this run may safely delete: a generated
+// artifact that is not an extend-in-place edit of a file the repository already owned.
+//
+// The extended exclusion is a safety property, not a preference. Discard is implemented by the
+// caller as os.Remove, so without it a stuck compile could delete a pre-existing test file whose
+// only fault was that we appended to it. Excluded paths are returned separately so the caller can
+// say what it declined to remove instead of silently narrowing the set.
+func discardableFailingPaths(failingPaths, generatedPaths, extendedPaths []string) (discard, protectedExtended []string) {
 	genSet := make(map[string]bool)
 	for _, p := range generatedPaths {
 		genSet[normalizePathForFix(p)] = true
 	}
-	var out []string
+	extSet := make(map[string]bool, len(extendedPaths))
+	for _, p := range extendedPaths {
+		extSet[normalizePathForFix(p)] = true
+	}
 	seen := make(map[string]bool)
 	for _, p := range failingPaths {
 		n := normalizePathForFix(p)
-		if genSet[n] && !seen[n] {
-			seen[n] = true
-			out = append(out, n)
+		if !genSet[n] || seen[n] {
+			continue
 		}
+		seen[n] = true
+		if extSet[n] {
+			protectedExtended = append(protectedExtended, n)
+			continue
+		}
+		discard = append(discard, n)
 	}
-	return out
+	return discard, protectedExtended
+}
+
+// auditProtectedExtended reports failing artifacts that were eligible for discard but withheld
+// because this run extended them rather than created them. Silence here would read as "nothing was
+// failing", when the truth is "the failing file is the repository's and we will not delete it".
+func auditProtectedExtended(ctx context.Context, audit Auditor, step SandboxStep, protectedExtended []string) {
+	if audit == nil || len(protectedExtended) == 0 {
+		return
+	}
+	audit.Log(ctx, "evaluator.discard_withheld_extended_artifact", map[string]interface{}{
+		"message": fmt.Sprintf(
+			"%d failing artifact(s) on step %s were not discarded: this run appended to files the repository already owned, and discard deletes the file. Fix them or revert the append by hand: %s",
+			len(protectedExtended), step, strings.Join(protectedExtended, ", ")),
+		"step":  step,
+		"paths": protectedExtended,
+	})
 }
 
 // hasPassingGeneratedArtifact is true when some generated path is not listed as failing (best-effort from parser).
@@ -694,7 +832,7 @@ func hasPassingGeneratedArtifact(generated, failing []string) bool {
 }
 
 // maybeExitOnRepeatedTestFailure updates streak/fingerprint and, when threshold is reached, sets EarlyExit* fields on out and returns true.
-func maybeExitOnRepeatedTestFailure(ctx context.Context, opts EvalOptions, testOutput string, out *EvalWorkflowResult, audit Auditor, streak *int, lastFP *string, thr int, compileFixAttempts, testFixAttempts int, firstIterCompileOK bool) bool {
+func maybeExitOnRepeatedTestFailure(ctx context.Context, opts EvalOptions, step SandboxStep, testOutput string, out *EvalWorkflowResult, audit Auditor, streak *int, lastFP *string, thr int, compileFixAttempts, testFixAttempts int, firstIterCompileOK bool) bool {
 	if thr <= 0 || len(opts.ArtifactPaths) == 0 {
 		return false
 	}
@@ -714,7 +852,8 @@ func maybeExitOnRepeatedTestFailure(ctx context.Context, opts EvalOptions, testO
 	if *streak < thr {
 		return false
 	}
-	discard := discardableFailingPaths(failing, opts.ArtifactPaths)
+	discard, protectedExtended := discardableFailingPaths(failing, opts.ArtifactPaths, opts.ExtendedArtifactPaths)
+	auditProtectedExtended(ctx, audit, step, protectedExtended)
 	if len(discard) == 0 {
 		*streak = 0
 		*lastFP = ""
@@ -761,7 +900,8 @@ func exitByDiscardingStuckArtifacts(ctx context.Context, opts EvalOptions, step 
 	// explicit compile-cited-path pass so a container-prefixed or basename-only citation still maps.
 	failing := ParseFailingTestPaths(testOutputWithoutPassLines(output), opts.ArtifactPaths)
 	failing = append(failing, compileCitedArtifactPaths(output, opts.ArtifactPaths, opts.RepoPath)...)
-	discard := discardableFailingPaths(failing, opts.ArtifactPaths)
+	discard, protectedExtended := discardableFailingPaths(failing, opts.ArtifactPaths, opts.ExtendedArtifactPaths)
+	auditProtectedExtended(ctx, audit, step, protectedExtended)
 	if len(discard) == 0 {
 		return false
 	}
@@ -1234,9 +1374,9 @@ func manifestPathsForFixer(repoPath, lang, monoWorkspace string, artifactAndRela
 type FixLoopState struct {
 	lastSignature string
 	streak        int
-	// tripped becomes true once the breaker has fired; subsequent calls are no-ops (the outer loop
-	// will already have seen *attemptCounter == maxAttempts and stopped, but this guards nested or
-	// reentrant call paths).
+	// tripped becomes true once the breaker has fired. It is THE stop signal for the step: the
+	// outer loop reads it through fixerCanAttempt, and subsequent calls here are no-ops. It
+	// replaced a counter bump that stopped the loop by faking an exhausted budget.
 	tripped bool
 	// trippedReason is the FixSkip* constant for the breaker that fired, so the sticky no-op path
 	// reports the same cause as the round that actually tripped rather than a generic label.
@@ -1350,11 +1490,11 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 	if loopState == nil {
 		return false, ""
 	}
-	// Sticky breaker: once tripped, subsequent calls are immediate no-ops regardless of whether
-	// the outer loop honoured the counter bump (defensive against reentrancy / tests). The reason
-	// is sticky too, so the no-op path reports the same cause as the round that actually tripped.
+	// Sticky breaker: once tripped, subsequent calls are immediate no-ops. The outer loop's
+	// fixerCanAttempt guard should already have stopped calling us, so this is the defence against
+	// reentrant or test call paths that bypass it. The reason is sticky too, so the no-op path
+	// reports the same cause as the round that actually tripped.
 	if loopState.tripped {
-		*attemptCounter = maxAttempts
 		if loopState.trippedReason != "" {
 			return true, loopState.trippedReason
 		}
@@ -1455,10 +1595,29 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 			"error_output_sanitized": errorOutputSanitized,
 		})
 	}
-	// Consume the remaining attempt budget so the outer loop's guard trips and no further
-	// applyLLMFix call is issued for this step.
-	*attemptCounter = maxAttempts
+	// The breaker does NOT touch the attempt counter. It used to set it to maxAttempts, which was
+	// the only way to stop the outer loop back when nothing read loopState.tripped — and it
+	// falsified the very audit trail that made the breaker worth having: the event below reports
+	// fix_attempt 4 of 40 while the counter it just moved says the budget is spent, so every later
+	// reader sees "ran out of attempts" where the truth is "gave up after three identical rounds".
+	// The two are different diagnoses with different fixes (raise the budget vs. change the prompt).
+	//
+	// fixerCanAttempt is what stops the loop now, and it reads tripped directly.
 	return true, tripReason
+}
+
+// fixerCanAttempt reports whether another applyLLMFix call for this step could accomplish anything:
+// a fixer exists, its circuit-breaker has not tripped, and the per-step budget is not spent.
+//
+// The tripped check is the half that used to be missing. The breaker signalled "stop" by setting
+// the attempt counter to the budget, so the budget comparison alone happened to work — at the cost
+// of an audit trail that could no longer tell an exhausted budget from a tripped breaker. Reading
+// tripped directly means the counter can go back to counting attempts.
+func fixerCanAttempt(fixer Fixer, st *FixLoopState, attempts, max int) bool {
+	if fixer == nil || st == nil {
+		return fixer != nil && attempts < max
+	}
+	return !st.tripped && attempts < max
 }
 
 // fixLoopSignature returns a short, stable fingerprint for the (step, artifact_paths, error_output)
@@ -1539,8 +1698,9 @@ func mergeFixRequestAuditErrorOutput(canonicalErr string, errorOutputRaw string,
 // When step is StepTest or StepTestE2E and FailingTestCandidatePaths is set, failure output is parsed and any failing path in that candidate list is included so pre-existing failing tests (e.g. E2E or port/config) get fix context too.
 // loopState is the per-step repeat detector: when the same (step, sorted(artifact_paths),
 // canonical(error_output)) signature arrives FixLoopRepeatStopThreshold times in a row, the call
-// short-circuits, emits evaluator.fix_rejected_low_value with reason="fix_loop_repeat", and bumps
-// *attemptCounter to maxAttempts so the outer loop stops calling us for this step.
+// short-circuits, emits evaluator.fix_rejected_low_value with reason="fix_loop_repeat", and marks
+// loopState.tripped so the outer loop's fixerCanAttempt guard stops calling us for this step. The
+// attempt counter is left alone: it counts attempts, and a tripped breaker is not an attempt.
 // applyLLMFix runs the LLM fixer for one failed step and writes accepted file content to disk.
 // Returns (applied, touchedPaths): applied is true when at least one file was written;
 // touchedPaths is the repo-relative paths actually written this call (after path remap, scope
@@ -2179,12 +2339,18 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			artifactContextRunes += len([]rune(c))
 		}
 		payload := map[string]interface{}{
-			"message":                         fmt.Sprintf("LLM fix requested for step %s (%d files).", step, len(files)),
-			"step":                            step,
-			"artifact_paths":                  artifactPathsAudit,
-			"dependency_paths":                dependencyPaths,
-			"manifest_paths":                  manifestPathsAudit,
-			"context_dump":                    contextDump,
+			"message":          fmt.Sprintf("LLM fix requested for step %s (%d files).", step, len(files)),
+			"step":             step,
+			"artifact_paths":   artifactPathsAudit,
+			"dependency_paths": dependencyPaths,
+			"manifest_paths":   manifestPathsAudit,
+			// Named *_prompt_dump so audit.RedactPayload covers it: with general.audit.dump_prompts
+			// off (the default) the body is stored as {sha256, len} instead of verbatim. Under the
+			// old name "context_dump" the redactor's key rule — anything containing "prompt" or
+			// "completion" — did not match, so a 104k-rune blob of repository source, extracted
+			// config and compiler output was written to the audit file on every fix round by a
+			// configuration that had explicitly asked for prompts NOT to be dumped.
+			"fix_prompt_dump":                 contextDump,
 			"context_dump_length":             len(contextDump),
 			"artifact_context_count":          artifactContextCount,
 			"artifact_context_total_runes":    artifactContextRunes,
@@ -2239,7 +2405,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		if audit != nil {
 			audit.LogError(ctx, "evaluator.fix_llm_error", map[string]interface{}{
 				"message": fmt.Sprintf("LLM fix failed: %s", err.Error()),
-				"error":   err.Error(), "context_dump": contextDump, "context_dump_length": len(contextDump),
+				"error":   err.Error(), "fix_prompt_dump": contextDump, "context_dump_length": len(contextDump),
 			})
 		}
 		// Bank the round before returning. This return sits far above recordFixAttempt, so the
@@ -2482,15 +2648,40 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		pathsUpdated = append(pathsUpdated, relClean)
 		appliedChanges[relClean] = summarizeAppliedChange(files[relClean], content)
 	}
-	if primarySite.OK && primarySiteKnown && !primarySiteTouched && len(pathsUpdated) > 0 && audit != nil {
+	// Did this round write the blamed file AT ALL, and if so did it move the blamed line?
+	//
+	// These are two different questions and the guard used to conflate them. TouchedPrimarySite
+	// returns known=false for any path that is not the primary file, so primarySiteKnown could only
+	// become true when the model had already written the primary file — which made the event report
+	// the narrow case ("wrote the blamed file, left the blamed line alone") and stay silent on the
+	// broader, worse one ("never wrote the blamed file"). Measured in audit.log of 2026-08-29: the
+	// primary site was OwnerControllerTests.java:427 for all 40 iterations, all three fix rounds
+	// wrote only VetsTests.java, and this event fired zero times — the single most diagnostic line
+	// the log could have carried.
+	primaryWritten := false
+	for _, p := range pathsUpdated {
+		if sameDiagnosticFile(primarySite.Path, p) {
+			primaryWritten = true
+			break
+		}
+	}
+	if primarySite.OK && len(pathsUpdated) > 0 && audit != nil &&
+		(!primaryWritten || (primarySiteKnown && !primarySiteTouched)) {
+		msg := fmt.Sprintf(
+			"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely.",
+			len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line)
+		if !primaryWritten {
+			msg = fmt.Sprintf(
+				"Round wrote %d file(s), none of them %s — the file the compiler blames at line %d; the identical failure is likely.",
+				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line)
+		}
 		audit.Log(ctx, "evaluator.fix_primary_site_untouched", map[string]interface{}{
-			"message": fmt.Sprintf(
-				"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely.",
-				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line),
-			"step":         step,
-			"primary_path": primarySite.Path,
-			"primary_line": primarySite.Line,
-			"paths":        pathsUpdated,
+			"message":              msg,
+			"step":                 step,
+			"primary_path":         primarySite.Path,
+			"primary_line":         primarySite.Line,
+			"primary_path_written": primaryWritten,
+			"paths":                pathsUpdated,
 		})
 	}
 	if audit != nil && len(pathsUpdated) > 0 {
@@ -2578,7 +2769,13 @@ func normalizePathForFix(p string) string {
 	return strings.TrimPrefix(filepath.ToSlash(filepath.Clean(p)), "/")
 }
 
-// formatFixRequestDump returns a single string representation of the fix request for audit context_dump.
+// formatFixRequestDump returns a single string representation of the fix request for the audit's
+// fix_prompt_dump field.
+//
+// Files are emitted in sorted path order. Ranging the map directly made the dump's file order
+// differ on every call, so two rounds handed identical input produced dumps that diffed everywhere
+// — and the order shown bore no relation to the order buildFixUserMessage actually spends its rune
+// budget in, which invited exactly the wrong inference during a post-mortem.
 func formatFixRequestDump(step SandboxStep, errorOutput string, files map[string]string) string {
 	var b strings.Builder
 	b.WriteString("step: ")
@@ -2586,11 +2783,11 @@ func formatFixRequestDump(step SandboxStep, errorOutput string, files map[string
 	b.WriteString("\nerror_output:\n")
 	b.WriteString(errorOutput)
 	b.WriteString("\n\nfiles:\n")
-	for path, content := range files {
+	for _, path := range sortedMapKeys(files) {
 		b.WriteString("--- ")
 		b.WriteString(path)
 		b.WriteString(" ---\n")
-		b.WriteString(content)
+		b.WriteString(files[path])
 		b.WriteString("\n\n")
 	}
 	return b.String()

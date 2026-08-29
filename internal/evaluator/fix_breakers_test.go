@@ -81,8 +81,21 @@ func TestCheckFixLoopBreakers_reportsTheBreakerThatActuallyFired(t *testing.T) {
 					t.Errorf("evidence key %q missing; the stop reason cannot be checked without re-deriving the loop state", k)
 				}
 			}
-			if counter != 9 {
-				t.Errorf("a trip must consume the remaining budget, got counter=%d", counter)
+			// The counter counts ATTEMPTS and a tripped breaker is not one, so the trip must leave
+			// it alone. It used to be bumped to the budget, which was how the breaker stopped the
+			// outer loop before anything read tripped — and it made every later reader see
+			// "ran out of attempts" where the truth was "gave up after three identical rounds".
+			if counter != 0 {
+				t.Errorf("a trip must not touch the attempt counter, got counter=%d", counter)
+			}
+			if !state.tripped {
+				t.Error("a trip must set loopState.tripped; it is the stop signal the outer loop reads")
+			}
+			if state.trippedReason != tc.wantReason {
+				t.Errorf("trippedReason = %q, want %q", state.trippedReason, tc.wantReason)
+			}
+			if fixerCanAttempt(&stubFixer{}, state, counter, 9) {
+				t.Error("fixerCanAttempt must be false once the breaker has tripped, whatever the counter says")
 			}
 		})
 	}
@@ -264,7 +277,7 @@ func TestMaybeExitOnRepeatedTestFailure_differentFingerprintResets(t *testing.T)
 	out := &EvalWorkflowResult{}
 	streak, fp := 2, "stale-fingerprint"
 
-	maybeExitOnRepeatedTestFailure(context.Background(), opts,
+	maybeExitOnRepeatedTestFailure(context.Background(), opts, StepTest,
 		"FAILED a/ATest.java\n", out, nil, &streak, &fp, 5, 0, 0, true)
 
 	if streak != 1 {

@@ -18,7 +18,7 @@ import (
 //
 // The section order and content budgets exactly mirror buildFixUserMessage so this variant is a
 // drop-in replacement at the same per-request rune budget.
-func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
+func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, rep *promptAssembly) string {
 	var b strings.Builder
 
 	b.WriteString("<metadata>\n")
@@ -148,6 +148,9 @@ func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits
 		maxTotal = maxFixRequestRunes
 	}
 	totalRunes := len([]rune(b.String()))
+	if rep != nil {
+		rep.BudgetRunes = maxTotal
+	}
 	// slicedLikely returns true when the file body looks like a signature-only slice produced by
 	// internal/evaluator/fixslice. We sniff for the elided-body marker so the LLM gets a matching
 	// `sliced="signatures_only"` attribute without plumbing a separate map through.
@@ -157,6 +160,7 @@ func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits
 	emitFile := func(path, content string, isArtifact bool) {
 		if totalRunes >= maxTotal {
 			b.WriteString(fmt.Sprintf("<file path=%q role=\"omitted\" writable=%q>\n[OMITTED - context limit]\n</file>\n\n", path, boolAttr(isArtifact)))
+			rep.record(path, isArtifact, true, false)
 			return
 		}
 		role := "dependency"
@@ -179,6 +183,7 @@ func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits
 			b.WriteString("\n")
 		}
 		b.WriteString("</file>\n\n")
+		rep.record(path, isArtifact, false, errloc.IsWindowed(display))
 		totalRunes = len([]rune(b.String()))
 	}
 
@@ -207,7 +212,11 @@ func buildStructuredFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits
 	b.WriteString("<output_contract>\n")
 	b.WriteString("Respond with a single JSON object: { \"path/to/file\": \"full content\" } covering every `<file writable=\"true\">` you changed. No markdown or explanation.\n")
 	b.WriteString("</output_contract>\n")
-	return b.String()
+	out := b.String()
+	if rep != nil {
+		rep.Runes = len([]rune(out))
+	}
+	return out
 }
 
 // canonicalKey returns the original (possibly non-normalised) key inside req.Files that matches

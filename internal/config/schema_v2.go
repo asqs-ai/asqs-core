@@ -690,6 +690,13 @@ type FixerIterationsV2 struct {
 	// Start is the budget the first run gets, when a deployment escalates across reruns rather than
 	// spending everything at once. 0 = use Max.
 	Start int `yaml:"start"`
+	// CompileFixAttempts caps LLM repair rounds for the compile step. 0 = the iteration budget.
+	// Separate because an iteration costs a container build while a repair round costs a model
+	// call, and one number could not price both.
+	CompileFixAttempts int `yaml:"compile_fix_attempts"`
+	// TestFixAttempts caps LLM repair rounds shared by the unit and E2E test steps. 0 = the
+	// iteration budget.
+	TestFixAttempts int `yaml:"test_fix_attempts"`
 }
 
 // FixerPolicyV2 shapes how the fixer works and when it gives up.

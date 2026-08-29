@@ -722,6 +722,11 @@ type RunnerConfig struct {
 	StartMaxIteration int `yaml:"start_max_iteration"`
 	// MaxIteration is the ceiling for current_iteration; we never allow more than this many fix iterations per run. 0 = use default 10.
 	MaxIteration int `yaml:"max_iteration"`
+	// MaxCompileFixAttempts caps LLM repair rounds for the compile step; MaxTestFixAttempts does the
+	// same for the unit and E2E test steps, which share one budget. 0 = the iteration budget, which
+	// is what both were hardcoded to. Reaches EvalOptions of the same names.
+	MaxCompileFixAttempts int `yaml:"max_compile_fix_attempts"`
+	MaxTestFixAttempts    int `yaml:"max_test_fix_attempts"`
 	// HumanInTheLoopEmail is the address to notify when max_iteration is reached and evaluation is still unstable. Empty = do not send.
 	HumanInTheLoopEmail string `yaml:"human_in_the_loop_email"`
 	// SMTP* configure the human-in-the-loop email sender. SMTPHost and SMTPFrom are required to

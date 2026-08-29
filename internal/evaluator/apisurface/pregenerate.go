@@ -114,6 +114,112 @@ func ResolveCanonicalImports(ctx context.Context, provider Provider, repoPath, l
 	return out
 }
 
+// ResolveSimpleNames maps each requested simple type name to the fully-qualified name this
+// project's compile classpath provides, omitting every name that resolves to nothing or to more
+// than one class.
+//
+// It is ResolveCanonicalImports generalised past the fixed framework list: the extend-merge path
+// needs the same question asked about whatever names a generated payload actually used. The
+// exactly-one rule is the reason both live here rather than at their call sites — a name with two
+// candidates must produce silence, not a coin flip. `Order` is the standing example: in the run of
+// 2026-08-29 it resolved to four types at once (jakarta.persistence.criteria, org.hibernate.query,
+// org.junit.jupiter.api, org.springframework.core.annotation), and any of the three wrong ones
+// would have compiled into a different bug than the missing import it replaced.
+func ResolveSimpleNames(ctx context.Context, provider Provider, repoPath, lang string, names []string) map[string]string {
+	if provider == nil || strings.TrimSpace(repoPath) == "" || len(names) == 0 {
+		return nil
+	}
+	if NormalizeLang(lang) != LangJava {
+		return nil
+	}
+	seen := make(map[string]bool, len(names))
+	targets := make([]Target, 0, len(names))
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		targets = append(targets, Target{Kind: KindSymbol, Name: n})
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	surfaces, err := provider.Lookup(ctx, repoPath, targets)
+	if err != nil || len(surfaces) == 0 {
+		return nil
+	}
+	bySimple := map[string][]string{}
+	for _, sf := range surfaces {
+		fq := strings.TrimSpace(sf.FQCN)
+		if fq == "" {
+			continue
+		}
+		simple := fq[strings.LastIndex(fq, ".")+1:]
+		bySimple[simple] = append(bySimple[simple], fq)
+	}
+	out := map[string]string{}
+	for _, t := range targets {
+		if got := bySimple[t.Name]; len(got) == 1 {
+			out[t.Name] = got[0]
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// TypesPresent reports, for each fully-qualified type name asked about, whether this project's
+// compile classpath actually provides it.
+//
+// Only a provider that can PROVE absence answers: for anyone else an empty Lookup result means "not
+// in whatever index I happen to read", which is not the same claim, and a caller that acts on the
+// difference would be acting on a guess. Without such a provider every name reports false-with-no-
+// answer, i.e. the returned map is nil and the caller must treat the question as unanswered rather
+// than as a "no".
+//
+// The extend path uses this to tell a real shadowing hazard from a coincidence: `java.util.*` beside
+// an existing `org.junit.jupiter.api.Test` is harmless because java.util.Test does not exist, while
+// `com.microsoft.playwright.*` beside `org.springframework.data.domain.Page` is not, because
+// com.microsoft.playwright.Page does.
+func TypesPresent(ctx context.Context, provider Provider, repoPath, lang string, fqns []string) map[string]bool {
+	if provider == nil || !CanProveTypeAbsence(provider) || strings.TrimSpace(repoPath) == "" || len(fqns) == 0 {
+		return nil
+	}
+	if NormalizeLang(lang) != LangJava {
+		return nil
+	}
+	seen := make(map[string]bool, len(fqns))
+	targets := make([]Target, 0, len(fqns))
+	for _, n := range fqns {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		targets = append(targets, Target{Kind: KindType, Name: n})
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	surfaces, err := provider.Lookup(ctx, repoPath, targets)
+	if err != nil {
+		return nil
+	}
+	found := make(map[string]bool, len(surfaces))
+	for _, sf := range surfaces {
+		if fq := strings.TrimSpace(sf.FQCN); fq != "" {
+			found[fq] = true
+		}
+	}
+	out := make(map[string]bool, len(targets))
+	for _, t := range targets {
+		out[t.Name] = found[t.Name]
+	}
+	return out
+}
+
 func e2eAssertionTargets(lang, e2eFramework string, isE2E bool) []Target {
 	if !isE2E {
 		return nil

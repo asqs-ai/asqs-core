@@ -45,6 +45,20 @@ func toolLoopFromConfig(cfg *config.Config, cc model.ChatCompleter) (tools.LoopO
 	}, caps, declared)
 }
 
+// effectiveToolMode reports the mode the model will ACTUALLY get, as opposed to the one
+// configuration asked for.
+//
+// A nil registry means one-shot at runtime regardless of config — LLMGenerator and llmfix.Fixer
+// both treat `Tools == nil` as the one-shot path. Reporting the resolved mode without checking the
+// registry would therefore audit "native" for a run that never had a tool to call, which is the
+// same silent-downgrade class ResolveMode's own doc warns about, just from the other direction.
+func effectiveToolMode(loop tools.LoopOptions, reason string, haveRegistry bool) (tools.Mode, string) {
+	if haveRegistry || loop.Mode == tools.ModeOneShot {
+		return loop.Mode, reason
+	}
+	return tools.ModeOneShot, "tools are enabled but no tool registry could be built (no metadata store)"
+}
+
 // buildGenerationTools assembles the read-only tool registry for generation, or nil when the
 // pipeline cannot support it.
 //

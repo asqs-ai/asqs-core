@@ -352,6 +352,8 @@ func translateFixer(s *SchemaV2, c *Config) {
 
 	c.Runner.MaxIteration = f.Iterations.Max
 	c.Runner.StartMaxIteration = f.Iterations.Start
+	c.Runner.MaxCompileFixAttempts = f.Iterations.CompileFixAttempts
+	c.Runner.MaxTestFixAttempts = f.Iterations.TestFixAttempts
 
 	c.Generation.FixerToolsEnabled = boolOr(f.Policy.Tools.Enabled, false)
 	c.Generation.FixerMaxToolTurns = f.Policy.Tools.MaxTurns

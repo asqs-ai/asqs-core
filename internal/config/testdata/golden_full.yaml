@@ -100,6 +100,10 @@ generation:
       enabled: false
 
 fixer:
+  iterations:
+    # Per-step repair budgets, independent of the iteration ceiling.
+    compile_fix_attempts: 6
+    test_fix_attempts: 4
   policy:
     # Sixth and seventh inversions.
     structured_output:

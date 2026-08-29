@@ -489,3 +489,179 @@ func describeSkippedImports(skipped map[string]string) string {
 	}
 	return strings.Join(parts, "; ")
 }
+
+// --- Payload symbol analysis (extend path) ---
+//
+// The import union can only reason about imports the payload DECLARED. Two failures live in the gap
+// between that and the imports the payload NEEDS, and both were live in the run of 2026-08-29:
+//
+//  1. A name the payload uses and never imports. `payloadImports` is built from literal `import …;`
+//     lines (hoistTopLevelImports), so an annotation the model wrote without an import produced
+//     `cannot find symbol` on a file that had just been merged: @AfterEach, @AfterAll, @DisplayName,
+//     @Order and @LocalServerPort across four files in that one run.
+//  2. A name the payload uses that an on-demand import was supposed to supply, but which the target
+//     already binds from somewhere else. Under JLS 7.5 a single-type import SHADOWS an on-demand
+//     one, so `import com.microsoft.playwright.*;` merged into a file already carrying
+//     `import org.springframework.data.domain.Page;` left every Playwright `page.navigate(...)`
+//     resolving to Spring's Page — eight diagnostics from one silently-wrong binding.
+
+// javaAnnotationUseRE matches an annotation USE: `@Name`, `@Name(...)`, `@Name.Nested`.
+//
+// The leading capital is what keeps Javadoc out: `@param`, `@return`, `@throws` are lower-case, so
+// requiring [A-Z] excludes the entire tag vocabulary without needing to strip comments. An
+// annotation named inside a line comment can still match, which costs at most one redundant import
+// for a name that resolves — and nothing at all for one that does not.
+var javaAnnotationUseRE = regexp.MustCompile(`@([A-Z][A-Za-z0-9_]*)`)
+
+// javaLangAnnotations are importable from nowhere: java.lang is implicitly imported, so emitting an
+// import for one is pure noise even though it would resolve.
+var javaLangAnnotations = map[string]bool{
+	"Override": true, "Deprecated": true, "SuppressWarnings": true,
+	"SafeVarargs": true, "FunctionalInterface": true,
+}
+
+// payloadAnnotationNames returns the distinct annotation simple names a payload uses.
+//
+// Annotations only, deliberately. They are the one reference shape whose syntax marks it
+// unambiguously as a type use — `@Name` cannot be a variable, a method, or a field — so extracting
+// them needs no parser and cannot mistake an identifier for a type. Every unresolved symbol in the
+// run this exists to fix was an annotation. Widening to bare type references wants a real parser.
+func payloadAnnotationNames(payload string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range javaAnnotationUseRE.FindAllStringSubmatch(payload, -1) {
+		name := m[1]
+		if javaLangAnnotations[name] || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// usesSimpleName reports whether payload references name as a word, so `Page` does not match
+// `Pageable` or `PageImpl`.
+func usesSimpleName(payload, name string) bool {
+	re, err := regexp.Compile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	if err != nil {
+		return false
+	}
+	return re.MatchString(payload)
+}
+
+// unresolvedPayloadAnnotations returns the annotation names in payload that no single-type import
+// in scope binds — neither the target's nor the payload's own.
+//
+// An on-demand import in scope is deliberately NOT a reason to stay silent, though the first draft
+// of this treated it as one. The caller only ever adds a name its resolver mapped to EXACTLY ONE
+// type on the whole compile classpath, and if only one type has that simple name then a wildcard
+// could not have supplied a different one — so the explicit import either duplicates what the
+// wildcard would have bound, or supplies what it could not. Both are safe, and a single-type import
+// shadows an on-demand one (JLS 7.5), so the explicit spelling wins deterministically.
+//
+// Staying silent instead was measurably wrong: all three files broken by missing annotation imports
+// in the run of 2026-08-29 also carried `import com.microsoft.playwright.*;`, so a wildcard bail-out
+// would have skipped inference on 100% of the cases it exists to repair.
+func unresolvedPayloadAnnotations(payload string, existing, incoming []importDecl) []string {
+	bound := map[string]bool{}
+	for _, set := range [][]importDecl{existing, incoming} {
+		for _, d := range set {
+			if name, ok := javaSingleTypeSimpleName(d, ".java"); ok {
+				bound[name] = true
+			}
+		}
+	}
+	var out []string
+	for _, name := range payloadAnnotationNames(payload) {
+		if !bound[name] {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+// shadowedByExistingSingleImport reports names the payload uses that an on-demand import in
+// addImports really would have supplied, but which the target already binds by a single-type import
+// from a different package.
+//
+// Adding the wildcard is legal and silent — javac reports nothing about the import line itself —
+// and then every use of the name resolves to the wrong type. That asymmetry is why the caller fails
+// closed on a hit: refusing the merge costs one gap's coverage, while accepting it costs the whole
+// module's compile and, as measured, the fixer's entire attempt budget chasing diagnostics whose
+// cause is an import that looks correct.
+//
+// typeExists is what keeps this from firing on coincidences, and it is required: a name the payload
+// uses which the target already imports is the NORMAL case, not the hazard. A payload adding
+// `java.util.*` while using @Test in a file importing org.junit.jupiter.api.Test is fine, because
+// java.util.Test does not exist; the same shape with com.microsoft.playwright.* and Page is not,
+// because com.microsoft.playwright.Page does. Without a way to ask, we cannot tell the two apart, so
+// a nil or unanswering typeExists reports no hazard rather than refusing every wildcard.
+func shadowedByExistingSingleImport(payload string, existing, addImports []importDecl, typeExists func([]string) map[string]bool) map[string]string {
+	if typeExists == nil {
+		return nil
+	}
+	var wildcards []string
+	for _, d := range addImports {
+		if p, onDemand := d.onDemandPrefix(); onDemand && d.kind == importPlain {
+			wildcards = append(wildcards, p)
+		}
+	}
+	if len(wildcards) == 0 {
+		return nil
+	}
+	// Candidate FQNs: for every name the payload uses that the target binds from elsewhere, the
+	// name as the wildcard's package would spell it.
+	candidates := map[string]string{} // fqn -> existing import path that would shadow it
+	names := map[string]string{}      // fqn -> simple name
+	for _, d := range existing {
+		name, ok := javaSingleTypeSimpleName(d, ".java")
+		if !ok || !usesSimpleName(payload, name) {
+			continue
+		}
+		for _, prefix := range wildcards {
+			// Same package: the single import and the wildcard name the same type, so the single
+			// import winning is harmless.
+			if parentOf(d.path) == prefix {
+				continue
+			}
+			fqn := prefix + "." + name
+			candidates[fqn] = d.path
+			names[fqn] = name
+		}
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	ask := make([]string, 0, len(candidates))
+	for fqn := range candidates {
+		ask = append(ask, fqn)
+	}
+	sort.Strings(ask)
+	present := typeExists(ask)
+	out := map[string]string{}
+	for fqn, shadowedBy := range candidates {
+		if present[fqn] {
+			out[names[fqn]] = shadowedBy
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// describeShadowedNames renders shadowedByExistingSingleImport's result deterministically.
+func describeShadowedNames(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s (already imported from %s)", k, m[k]))
+	}
+	return strings.Join(parts, ", ")
+}

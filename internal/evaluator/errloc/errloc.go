@@ -228,7 +228,7 @@ func FormatFileForPrompt(content string, lineNums []int, o PromptOpts) string {
 		}
 		iv = mergeOverlapping(iv)
 		s := renderIntervals(lines, iv, n)
-		s = "[ERROR-LOCALIZED CONTEXT — not full file; total_lines=" + strconv.Itoa(n) + "]\n" + s
+		s = windowedPrefix + strconv.Itoa(n) + "]\n" + s
 		if len([]rune(s)) <= o.MaxRunes {
 			return s
 		}
@@ -249,7 +249,7 @@ func FormatFileForPrompt(content string, lineNums []int, o PromptOpts) string {
 	}
 	iv = mergeOverlapping(iv)
 	s := renderIntervals(lines, iv, n)
-	s = "[ERROR-LOCALIZED CONTEXT — not full file; total_lines=" + strconv.Itoa(n) + "]\n" + s
+	s = windowedPrefix + strconv.Itoa(n) + "]\n" + s
 	out := []rune(s)
 	if len(out) > o.MaxRunes {
 		return string(out[:o.MaxRunes]) + "\n[TRUNCATED]\n"
@@ -262,6 +262,16 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// windowedPrefix opens every error-localized rendering. Exported through IsWindowed so callers can
+// tell a windowed body from a whole file without re-deriving the marker text.
+const windowedPrefix = "[ERROR-LOCALIZED CONTEXT — not full file; total_lines="
+
+// IsWindowed reports whether s is an error-localized window rather than a whole file, as produced
+// by FormatFileForPrompt.
+func IsWindowed(s string) bool {
+	return strings.HasPrefix(s, windowedPrefix)
 }
 
 func mergedIntervals(hits []int, before, after, n int) [][2]int {

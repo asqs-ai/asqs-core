@@ -111,3 +111,23 @@ const (
 	FixSkipNoWritableArtifacts = "no_writable_artifacts"
 	FixSkipNoAcceptedWrites    = "no_accepted_writes"
 )
+
+// IsTerminalFixSkip reports whether a FixSkip* reason means the fixer is out of road for this step,
+// as opposed to having produced one unusable turn.
+//
+// The taxonomy above was documented from the day the constants were added but had no predicate, so
+// every call site discarded the reason with `_` and could not act on the distinction. The compile
+// branch in particular then had no way to tell "retry, a fresh turn may work" from "nothing further
+// will ever be attempted for this step".
+//
+// FixSkipNoAcceptedWrites is deliberately NOT terminal: every write the model proposed was refused
+// by a quality gate this round (empty file, deleted tests, syntactic shell), and a different turn
+// can propose something the gates accept.
+func IsTerminalFixSkip(reason string) bool {
+	switch reason {
+	case FixSkipLoopRepeat, FixSkipLoopOscillation, FixSkipLoopNoProgress, FixSkipNoWritableArtifacts:
+		return true
+	default:
+		return false
+	}
+}

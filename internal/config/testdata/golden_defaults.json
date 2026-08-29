@@ -152,6 +152,8 @@
     "FixLoopNoProgressStopThreshold": 0,
     "StartMaxIteration": 0,
     "MaxIteration": 0,
+    "MaxCompileFixAttempts": 0,
+    "MaxTestFixAttempts": 0,
     "HumanInTheLoopEmail": "",
     "SMTPHost": "",
     "SMTPPort": 0,

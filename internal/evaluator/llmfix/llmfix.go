@@ -202,14 +202,21 @@ func (f *Fixer) Fix(ctx context.Context, req evaluator.FixRequest) (evaluator.Fi
 	buildMainUser := func(retryLevel int) ([]model.Message, string) {
 		lim := fixPromptLimitsForTransientRetryLevel(retryLevel)
 		var u string
+		// One report per build, audited immediately: the builder runs again at each tighter retry
+		// tier, and which files a tightening drops is exactly the thing worth seeing.
+		rep := &promptAssembly{}
+		shape := "plain"
 		switch {
 		case f.MultiTurnRepair && len(f.convMsgs) > 0 && !escalatedThisTurn:
-			u = buildFixFollowUpUserMessage(req, lim)
+			shape = "follow_up"
+			u = buildFixFollowUpUserMessage(req, lim, rep)
 		case useStructuredUser:
-			u = buildStructuredFixUserMessage(req, lim)
+			shape = "structured"
+			u = buildStructuredFixUserMessage(req, lim, rep)
 		default:
-			u = buildFixUserMessage(req, lim, oversizedArtifacts)
+			u = buildFixUserMessage(req, lim, oversizedArtifacts, rep)
 		}
+		f.auditPromptAssembly(ctx, req.Step, shape, retryLevel, rep)
 		msgs := []model.Message{{Role: "system", Content: system}}
 		// Drop prior conversation turns when escalation forced structured layout: the whole point
 		// of the break-out is to stop replaying the same follow-up shape that didn't converge on
@@ -736,7 +743,7 @@ func rankDependencyPaths(files map[string]string, emitted map[string]bool, lineB
 }
 
 // buildFixUserMessage builds the user message: metadata, then dependency manifests (so LLM only uses listed packages), then error log, then files.
-func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld []string) string {
+func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld []string, rep *promptAssembly) string {
 	var b strings.Builder
 	// --- Metadata ---
 	b.WriteString("=== METADATA ===\n")
@@ -862,9 +869,13 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld
 		maxTotal = maxFixRequestRunes
 	}
 	totalRunes := len([]rune(b.String()))
+	if rep != nil {
+		rep.BudgetRunes = maxTotal
+	}
 	emitFile := func(path, content string, isArtifact bool) {
 		if totalRunes >= maxTotal {
 			b.WriteString(fmt.Sprintf("--- FILE: %s ---\n[OMITTED - context limit; use error log line numbers]\n\n", path))
+			rep.record(path, isArtifact, true, false)
 			return
 		}
 		if isArtifact {
@@ -878,6 +889,7 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld
 		display := errloc.FormatFileForPrompt(content, lines, o)
 		b.WriteString(display)
 		b.WriteString("\n\n")
+		rep.record(path, isArtifact, false, errloc.IsWindowed(display))
 		totalRunes = len([]rune(b.String()))
 	}
 	b.WriteString("=== FILES (artifacts to fix + dependencies for reference) ===\n\n")
@@ -901,11 +913,15 @@ func buildFixUserMessage(req evaluator.FixRequest, lim fixPromptLimits, withheld
 		emitFile(canonical, req.Files[canonicalKey(canonical, req.Files)], false)
 	}
 	b.WriteString("Respond with a single JSON object: { \"path/to/file\": \"full content\" }. Only the test file(s) you changed. No markdown or explanation.")
-	return b.String()
+	out := b.String()
+	if rep != nil {
+		rep.Runes = len([]rune(out))
+	}
+	return out
 }
 
 // buildFixFollowUpUserMessage is used when MultiTurnRepair is on and convMsgs is non-empty: new error + artifact test files only (no repeated manifests / dependency sources).
-func buildFixFollowUpUserMessage(req evaluator.FixRequest, lim fixPromptLimits) string {
+func buildFixFollowUpUserMessage(req evaluator.FixRequest, lim fixPromptLimits, rep *promptAssembly) string {
 	var b strings.Builder
 	b.WriteString("=== FOLLOW-UP (multi-turn repair, same step) ===\n")
 	b.WriteString("Earlier messages in this thread contain dependency manifests, reference sources, and prior errors. Your last JSON output was applied where paths were valid. The workspace was re-run; below is the **new** tool output.\n\n")
@@ -955,9 +971,13 @@ func buildFixFollowUpUserMessage(req evaluator.FixRequest, lim fixPromptLimits) 
 		maxTotal = maxFixRequestRunes
 	}
 	totalRunes := len([]rune(b.String()))
+	if rep != nil {
+		rep.BudgetRunes = maxTotal
+	}
 	emitArtifact := func(path, content string) {
 		if totalRunes >= maxTotal {
 			b.WriteString(fmt.Sprintf("--- FILE: %s ---\n[OMITTED - context limit]\n\n", path))
+			rep.record(path, true, true, false)
 			return
 		}
 		b.WriteString(fmt.Sprintf("--- FILE (ARTIFACT TO FIX): %s ---\n", path))
@@ -967,6 +987,7 @@ func buildFixFollowUpUserMessage(req evaluator.FixRequest, lim fixPromptLimits) 
 		display := errloc.FormatFileForPrompt(content, lines, o)
 		b.WriteString(display)
 		b.WriteString("\n\n")
+		rep.record(path, true, false, errloc.IsWindowed(display))
 		totalRunes = len([]rune(b.String()))
 	}
 	b.WriteString("=== ARTIFACT TEST FILES (current content from disk) ===\n\n")
@@ -987,7 +1008,11 @@ func buildFixFollowUpUserMessage(req evaluator.FixRequest, lim fixPromptLimits) 
 		}
 	}
 	b.WriteString("Reply with ONLY the JSON object for artifact test file(s) you change (full file content per key). Same rules as before: keys = exact artifact paths.\n")
-	return b.String()
+	out := b.String()
+	if rep != nil {
+		rep.Runes = len([]rune(out))
+	}
+	return out
 }
 
 // primaryErrorLine returns the first line of the error output that looks like an error or failure (e.g. "[ERROR]", "error:", "failed", "exception", "cannot find"). Empty if none found. Used to surface the main issue at the top of the fix context. Avoids matching lines that merely mention the word "error" in prose.
@@ -1529,4 +1554,74 @@ func writeErrorSummaryBlock(b *strings.Builder, req evaluator.FixRequest) {
 	b.WriteString("=== ERROR SUMMARY (LLM-generated, SECONDARY — the raw error log below is authoritative; if they disagree, trust the log) ===\n")
 	b.WriteString(s)
 	b.WriteString("\n\n")
+}
+
+// promptAssembly records what the prompt builder actually put in the user message, per file.
+//
+// The fix_request audit event reports the files the evaluator OFFERED the fixer (file_paths,
+// artifact_paths) and a pre-budget dump of them. What it never reported is what survived the
+// builder's rune budget — and the two differ, because maxFixRequestRunes caps the user message at
+// 50,000 runes while the offered set is routinely larger. In audit.log of 2026-08-29 the fixer was
+// offered 16 files against a 104,272-rune dump, returned edits to exactly one of them on all three
+// rounds, and the log could not answer whether the file carrying the primary diagnostic had even
+// reached the model.
+//
+// Full/windowed/omitted are the three outcomes emitFile can produce: verbatim, an errloc
+// error-localized window, or a placeholder once the budget is spent.
+type promptAssembly struct {
+	// Full are paths emitted verbatim.
+	Full []string
+	// Windowed are paths emitted as an errloc error-localized window rather than whole.
+	Windowed []string
+	// Omitted are paths replaced by a placeholder because the rune budget was already spent.
+	Omitted []string
+	// Artifacts is the subset of the above that were writable artifacts rather than dependencies.
+	Artifacts []string
+	// Runes is the size of the finished user message.
+	Runes int
+	// BudgetRunes is the cap it was assembled against.
+	BudgetRunes int
+}
+
+// record files one emission. Nil-safe so a builder can be called without a report.
+func (a *promptAssembly) record(path string, isArtifact, omitted, windowed bool) {
+	if a == nil {
+		return
+	}
+	switch {
+	case omitted:
+		a.Omitted = append(a.Omitted, path)
+	case windowed:
+		a.Windowed = append(a.Windowed, path)
+	default:
+		a.Full = append(a.Full, path)
+	}
+	if isArtifact {
+		a.Artifacts = append(a.Artifacts, path)
+	}
+}
+
+// auditPromptAssembly emits fix.prompt_assembled.
+//
+// Keys deliberately avoid the substrings "prompt" and "completion": audit.RedactPayload digests any
+// key containing either that carries text, which would reduce these path lists to {sha256, len} and
+// destroy the one thing the event exists to show.
+func (f *Fixer) auditPromptAssembly(ctx context.Context, step evaluator.SandboxStep, shape string, retryLevel int, a *promptAssembly) {
+	if f.Audit == nil || a == nil {
+		return
+	}
+	f.Audit.Log(ctx, "fix.prompt_assembled", map[string]interface{}{
+		"message": fmt.Sprintf(
+			"Fix user message (%s, retry_level=%d): %d rune(s) of %d budget; %d file(s) in full, %d windowed, %d omitted for budget.",
+			shape, retryLevel, a.Runes, a.BudgetRunes, len(a.Full), len(a.Windowed), len(a.Omitted)),
+		"step":           step,
+		"shape":          shape,
+		"retry_level":    retryLevel,
+		"user_runes":     a.Runes,
+		"budget_runes":   a.BudgetRunes,
+		"files_full":     a.Full,
+		"files_window":   a.Windowed,
+		"files_omitted":  a.Omitted,
+		"files_writable": a.Artifacts,
+	})
 }
