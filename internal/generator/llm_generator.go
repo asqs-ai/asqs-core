@@ -607,7 +607,11 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 	if item == nil || item.Gap == nil || item.Gap.Symbol == nil {
 		return ""
 	}
-	switch strings.TrimSpace(item.Gap.Symbol.Kind) {
+	// Uppercased because a kind read back from storage is lowercase (metadata.InsertSymbol
+	// normalises on insert) while these literals are SCREAMING_CASE. Comparing them raw sent every
+	// JS/TS route gap into the generic branch below, which hands an E2E item the UNIT test path for
+	// its source file — see retrieval.SymbolKindIs.
+	switch strings.ToUpper(strings.TrimSpace(item.Gap.Symbol.Kind)) {
 	case "E2E_SPEC", "PAGE_OBJECT", "USER_FLOW":
 		return item.Gap.Symbol.File
 	case "API_ROUTE":

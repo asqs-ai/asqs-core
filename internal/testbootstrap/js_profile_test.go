@@ -190,7 +190,7 @@ func TestBuildJSTestProfile_runnerAndEnvironment(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := buildJSTestProfile(tc.det)
+			p := buildJSTestProfile(tc.det, testNodeVersion)
 			if p.Runner != tc.runner {
 				t.Errorf("runner = %q, want %q", p.Runner, tc.runner)
 			}
@@ -212,8 +212,8 @@ func TestBuildJSTestProfile_runnerAndEnvironment(t *testing.T) {
 
 func TestBuildJSTestProfile_reactTestingLibraryTracksReactMajor(t *testing.T) {
 	// RTL 16 declares react ^18 || ^19; the 12 line declares react <18. A mismatch fails install.
-	p18 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6})
-	p17 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 17, ViteMajor: 6})
+	p18 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6}, testNodeVersion)
+	p17 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 17, ViteMajor: 6}, testNodeVersion)
 	find := func(p jsTestProfile) string {
 		for _, d := range p.Deps {
 			if d.Name == "@testing-library/react" {
@@ -245,7 +245,7 @@ func TestNestTestingForMajor(t *testing.T) {
 }
 
 func TestJSProfile_missingDeps(t *testing.T) {
-	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6})
+	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6}, testNodeVersion)
 	pkg := jsPackageJSON{DevDependencies: map[string]string{"vitest": "^4.0.0"}}
 	missing := p.missingDeps(pkg)
 	for _, d := range missing {
@@ -344,7 +344,7 @@ func TestBuildJSTestProfile_vitePicksVitestRegardlessOfFramework(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := buildJSTestProfile(tc.det)
+			p := buildJSTestProfile(tc.det, testNodeVersion)
 			if p.Runner != tc.wantRunner {
 				t.Fatalf("runner = %q, want %q", p.Runner, tc.wantRunner)
 			}
@@ -365,11 +365,11 @@ func TestBuildJSTestProfile_vitePicksVitestRegardlessOfFramework(t *testing.T) {
 // TestBuildJSTestProfile_angularAndNestKeepJestEvenWithVite: Angular ships its own builder and
 // preset, and Nest's convention is Jest. A stray vite.config must not switch either.
 func TestBuildJSTestProfile_angularAndNestKeepJestEvenWithVite(t *testing.T) {
-	ng := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkAngular, FrameworkMajor: 19, ViteMajor: 6, IsTS: true})
+	ng := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkAngular, FrameworkMajor: 19, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	if ng.Runner != JSRunnerJest || ng.Stack != "jest-preset-angular" {
 		t.Errorf("angular → %s/%s", ng.Runner, ng.Stack)
 	}
-	nest := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkNest, FrameworkMajor: 11, ViteMajor: 6, IsTS: true})
+	nest := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkNest, FrameworkMajor: 11, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	if nest.Runner != JSRunnerJest || nest.Stack != "jest-nestjs" {
 		t.Errorf("nestjs → %s/%s", nest.Runner, nest.Stack)
 	}
@@ -403,12 +403,12 @@ func TestDetectJSFramework_browserLikeFromIndexHTMLOrUILibrary(t *testing.T) {
 }
 
 func TestRenderJSUnitSmoke_assertsTheDOMWhenEnvironmentIsJsdom(t *testing.T) {
-	jsdomProf := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkPlain, ViteMajor: 6, BrowserLike: true, IsTS: true})
+	jsdomProf := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkPlain, ViteMajor: 6, BrowserLike: true, IsTS: true}, testNodeVersion)
 	src, _ := renderJSUnitSmoke(jsdomProf)
 	if !strings.Contains(src, "document.createElement") {
 		t.Errorf("a jsdom profile's mandatory smoke must prove the DOM environment:\n%s", src)
 	}
-	nodeProf := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkPlain})
+	nodeProf := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkPlain}, testNodeVersion)
 	src2, _ := renderJSUnitSmoke(nodeProf)
 	if strings.Contains(src2, "document.createElement") {
 		t.Errorf("a node profile must not reference document:\n%s", src2)
@@ -453,11 +453,11 @@ func TestBuildJSTestProfile_vueTestUtilsTracksVueMajor(t *testing.T) {
 		}
 		return ""
 	}
-	v3 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true})
+	v3 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	if find(v3) != VersionVueTestUtils {
 		t.Errorf("vue 3 → @vue/test-utils %s", find(v3))
 	}
-	v2 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 2, IsTS: true})
+	v2 := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 2, IsTS: true}, testNodeVersion)
 	if find(v2) != VersionVueTestUtilsLegacy {
 		t.Errorf("vue 2 → @vue/test-utils %s, want the 1.x line", find(v2))
 	}
@@ -470,7 +470,7 @@ func TestBuildJSTestProfile_vueTestUtilsTracksVueMajor(t *testing.T) {
 // without resolve.conditions=['browser'], Svelte resolves to its server build and render() throws
 // "mount(...) is not available on the server" even though the jsdom environment is correct.
 func TestBuildJSTestProfile_svelteNeedsBrowserResolveCondition(t *testing.T) {
-	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true})
+	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	if len(p.ResolveConditions) == 0 || p.ResolveConditions[0] != "browser" {
 		t.Fatalf("svelte profile must set resolve.conditions=['browser'], got %v", p.ResolveConditions)
 	}
@@ -479,7 +479,7 @@ func TestBuildJSTestProfile_svelteNeedsBrowserResolveCondition(t *testing.T) {
 		t.Errorf("rendered config missing the browser condition:\n%s", cfg)
 	}
 	// Vue must not get it — nothing there needs it, and narrowing resolution has side effects.
-	vue := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true})
+	vue := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	if len(vue.ResolveConditions) != 0 {
 		t.Errorf("vue should not narrow resolve conditions, got %v", vue.ResolveConditions)
 	}
@@ -489,19 +489,19 @@ func TestBuildJSTestProfile_svelteNeedsBrowserResolveCondition(t *testing.T) {
 // only through that framework's Vite plugin, so importing a real one is what proves the plugin
 // reaches the test run through the merged config.
 func TestRenderJSFrameworkSmokeSpec_vueAndSvelteShipACompanionComponent(t *testing.T) {
-	vue := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true}))
+	vue := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkVue, FrameworkMajor: 3, ViteMajor: 6, IsTS: true}, testNodeVersion))
 	if vue.CompanionName != "AsqsSmoke.vue" || !strings.Contains(vue.TestSource, "./AsqsSmoke.vue") {
 		t.Errorf("vue smoke must import a real SFC: %+v", vue.CompanionName)
 	}
 	if !strings.Contains(vue.CompanionSource, "<template>") {
 		t.Errorf("companion is not an SFC:\n%s", vue.CompanionSource)
 	}
-	sv := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true}))
+	sv := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true}, testNodeVersion))
 	if sv.CompanionName != "AsqsSmoke.svelte" || !strings.Contains(sv.TestSource, "./AsqsSmoke.svelte") {
 		t.Errorf("svelte smoke must import a real component: %+v", sv.CompanionName)
 	}
 	// React needs no companion: JSX lives in the test file itself.
-	react := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6, IsTS: true}))
+	react := renderJSFrameworkSmokeSpec(buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6, IsTS: true}, testNodeVersion))
 	if react.CompanionName != "" {
 		t.Errorf("react should need no companion, got %q", react.CompanionName)
 	}
@@ -509,7 +509,7 @@ func TestRenderJSFrameworkSmokeSpec_vueAndSvelteShipACompanionComponent(t *testi
 
 func TestWriteJSFrameworkSmokeTest_writesAndReportsTheCompanion(t *testing.T) {
 	dir := t.TempDir()
-	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true})
+	p := buildJSTestProfile(jsFrameworkDetection{Framework: JSFrameworkSvelte, FrameworkMajor: 5, ViteMajor: 6, IsTS: true}, testNodeVersion)
 	test, extra, staged, err := writeJSFrameworkSmokeTest(dir, p)
 	if err != nil || !staged {
 		t.Fatalf("staged = %v err = %v", staged, err)

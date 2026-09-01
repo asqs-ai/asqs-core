@@ -6,12 +6,41 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
 )
 
+// nodeProbeTimeout bounds the runtime version probe. It is one `node -p`, but in Docker it is also
+// a container start, so it gets its own small budget rather than the 15-minute install one.
+const nodeProbeTimeout = 2 * time.Minute
+
+// detectNodeVersion asks the environment the generated tests will actually run in — the bootstrap
+// container when there is one, the host otherwise — which Node it has.
+//
+// The image tag cannot answer this: `node:lts` moves between majors, client images are opaque, and a
+// host bootstrap has no image at all. An empty return means "not determined", which every caller
+// reads as a reason to be conservative rather than a reason to fail.
+func detectNodeVersion(ctx context.Context, ed *EphemeralDocker, repo string) string {
+	pCtx, cancel := context.WithTimeout(ctx, nodeProbeTimeout)
+	defer cancel()
+	out, err := RunArgv(pCtx, ed, repo, []string{"node", "-p", "process.versions.node"}, nil)
+	if err != nil {
+		return ""
+	}
+	// Last non-empty line: `node -p` prints only the version, but a container entrypoint may not.
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if v := strings.TrimSpace(lines[i]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // resolveJSTestProfile reads the package the bootstrap will patch and derives the required stack.
-func resolveJSTestProfile(repo, lang string) (jsTestProfile, string, error) {
+// nodeVersion is the runtime the stack has to load on; "" when it could not be determined.
+func resolveJSTestProfile(repo, lang, nodeVersion string) (jsTestProfile, string, error) {
 	pkgDir, err := resolveJSPackageDirForBootstrap(repo)
 	if err != nil {
 		return jsTestProfile{}, "", err
@@ -20,11 +49,12 @@ func resolveJSTestProfile(repo, lang string) (jsTestProfile, string, error) {
 	if err != nil {
 		return jsTestProfile{}, pkgDir, err
 	}
-	return buildJSTestProfile(det), pkgDir, nil
+	return buildJSTestProfile(det, nodeVersion), pkgDir, nil
 }
 
 func runJSBootstrap(ctx context.Context, repo string, cfg *config.TestFrameworkBootstrapConfig, lang string, audit Auditor, runnerTimeout string, ed *EphemeralDocker) error {
-	prof, pkgDir, err := resolveJSTestProfile(repo, lang)
+	nodeVersion := detectNodeVersion(ctx, ed, repo)
+	prof, pkgDir, err := resolveJSTestProfile(repo, lang, nodeVersion)
 	if err != nil {
 		return fmt.Errorf("test_framework_bootstrap: %w", err)
 	}
@@ -44,13 +74,25 @@ func runJSBootstrap(ctx context.Context, repo string, cfg *config.TestFrameworkB
 		"stack":             prof.Stack,
 		"required_deps":     describeJSDeps(prof.Deps),
 		"package_root":      relPathForBootstrap(repo, pkgDir),
+		// The runtime is a stack input, not a detail: jsdom's line is chosen from it, and its
+		// absence from this event is why a jsdom/Node mismatch previously needed a Docker repro to
+		// diagnose from audit.log alone.
+		"node_version": nodeVersion,
 	})
 
 	if prof.Declined {
+		// The runtime decline is a different fault from the framework ones: nothing about the repo
+		// is wrong, so the reason code has to point at the environment or the audit sends whoever
+		// reads it to the wrong file.
+		reason := "framework_unsupported"
+		if prof.Stack == jsStackJsdomDeclined {
+			reason = "runtime_unsupported"
+		}
 		logAudit(audit, ctx, "test_bootstrap.skip_framework_unsupported", map[string]interface{}{
-			"message":   prof.DeclinedReason,
-			"framework": string(prof.Framework),
-			"reason":    "framework_unsupported",
+			"message":      prof.DeclinedReason,
+			"framework":    string(prof.Framework),
+			"reason":       reason,
+			"node_version": nodeVersion,
 		})
 		fmt.Fprintf(os.Stderr, "  test_framework_bootstrap: skipped — %s\n", prof.DeclinedReason)
 		return nil

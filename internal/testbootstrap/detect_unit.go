@@ -73,7 +73,9 @@ func detectUnitJS(dir string) (Report, error) {
 		}
 		return Report{HasFramework: false, Reason: "no unit test runner deps, scripts, or config found"}, nil
 	}
-	prof := buildJSTestProfile(det)
+	// "" for the runtime: this is a detection question about the repository, and missingDeps matches
+	// dependencies by NAME, so which jsdom line the profile would pin cannot change the answer.
+	prof := buildJSTestProfile(det, "")
 	if prof.Declined {
 		return Report{HasFramework: true, Framework: string(prof.Framework), Reason: prof.DeclinedReason}, nil
 	}

@@ -110,10 +110,10 @@ func BuildLLMContextForGap(item *TestPlanItem, opts FormatOptions) string {
 				intro.WriteString("Do **not** output Playwright, Cypress, Jest, Vitest, JUnit test bodies, or other runnable test suites—no `describe`, `it`, `test(`, `expect`, or spec files.\n\n")
 				intro.WriteString(fmt.Sprintf("Gap reason: %s. ", item.Gap.Reason))
 				intro.WriteString(fmt.Sprintf("Target: %s (%s) in %s.", item.Gap.Symbol.FQName, item.Gap.Symbol.Kind, item.Gap.Symbol.File))
-				if symKind == "API_ROUTE" {
+				if SymbolKindIs(symKind, "API_ROUTE") {
 					intro.WriteString(" Summarize the HTTP surface (method, path shape, purpose) in prose inside the comment block only. ")
 				}
-				if symKind == "PAGE_ROUTE" {
+				if SymbolKindIs(symKind, "PAGE_ROUTE") {
 					intro.WriteString(" Summarize the route’s role and parameters in prose inside the comment block only. ")
 				}
 			} else {
@@ -125,10 +125,10 @@ func BuildLLMContextForGap(item *TestPlanItem, opts FormatOptions) string {
 				intro.WriteString("Generate or extend **end-to-end** tests for the following target. ")
 				intro.WriteString(fmt.Sprintf("Gap reason: %s. ", item.Gap.Reason))
 				intro.WriteString(fmt.Sprintf("Target: %s (%s) in %s.", item.Gap.Symbol.FQName, item.Gap.Symbol.Kind, item.Gap.Symbol.File))
-				if symKind == "API_ROUTE" {
+				if SymbolKindIs(symKind, "API_ROUTE") {
 					intro.WriteString(" This is an **HTTP entrypoint** that still needs an integration or E2E flow (e.g. Spring MockMvc / WebTestClient / RestAssured, Nest/supertest, or UI automation that drives this API). ")
 				}
-				if symKind == "PAGE_ROUTE" {
+				if SymbolKindIs(symKind, "PAGE_ROUTE") {
 					intro.WriteString(" This is a **client-side route** (e.g. React Router / Angular Router). Add or extend a browser E2E spec that visits this path. ")
 				}
 				intro.WriteString(fmt.Sprintf("\n\n**Detected E2E stack: %s.** Use this stack only (JS/TS: @playwright/test or Cypress; Java: Playwright Java / Selenium / Selenide; .NET: Microsoft.Playwright / Selenium). ", fw))

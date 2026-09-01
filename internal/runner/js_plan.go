@@ -126,6 +126,12 @@ func (s *Sandbox) jsStepScript(plan *StepPlan, meta jsPackageMeta, step evaluato
 
 	case evaluator.StepTest:
 		switch {
+		case profile.BootstrapTestScriptName(meta.Scripts) != "":
+			// The runner test_framework_bootstrap installed and verified is the one to run. A
+			// repository that already had a working unit runner is skipped before any package.json
+			// edit, so this script exists only where `<pm> test` is NOT the verified runner — on an
+			// Angular fixture it was an echo that exits 0 without executing a single test.
+			return pm + " run " + profile.BootstrapTestScriptName(meta.Scripts), runStep()
 		case !meta.HasTest && meta.IsNest:
 			return "npx nest test", runStep()
 		case !meta.HasTest:

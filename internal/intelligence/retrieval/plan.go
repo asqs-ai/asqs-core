@@ -461,7 +461,7 @@ func e2eSymbolQueriesForWorkflowLang(workflowLang string) []e2eSymbolQuery {
 }
 
 func e2eGapBaseReasonForSymbolKind(kind string) string {
-	switch strings.TrimSpace(kind) {
+	switch strings.ToUpper(strings.TrimSpace(kind)) {
 	case "API_ROUTE":
 		return "HTTP API route — no E2E or integration test targets this endpoint yet"
 	case "PAGE_ROUTE":
@@ -895,9 +895,9 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 					gap.Priority += len(edgesToCentrality)
 					if gap.Kind == GapNoTests {
 						gap.Kind = GapLowCoverageCentral
-						if strings.TrimSpace(sym.Kind) == "PAGE_OBJECT" {
+						if SymbolKindIs(sym.Kind, "PAGE_OBJECT") {
 							gap.Reason = "page object linked to many symbols"
-						} else if strings.TrimSpace(sym.Kind) == "USER_FLOW" {
+						} else if SymbolKindIs(sym.Kind, "USER_FLOW") {
 							gap.Reason = "user flow linked to many symbols"
 						} else {
 							gap.Reason = "e2e spec linked to many symbols"

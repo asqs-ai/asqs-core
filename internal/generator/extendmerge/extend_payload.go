@@ -123,6 +123,9 @@ func classifyExtendPayload(path, payload string) extendPayloadKind {
 		}
 		return payloadMembersOnly
 	default:
+		if isJSExtendPath(path) && jsPayloadIsCompilationUnit(s) {
+			return payloadCompilationUnit
+		}
 		return payloadMembersOnly
 	}
 }
@@ -166,7 +169,10 @@ func unwrapCompilationUnit(path, payload string) (string, bool) {
 	case ".cs":
 		open, closeIdx, ok = csharpPrimaryTypeBodyRange(s)
 	default:
-		return "", false
+		if !isJSExtendPath(path) {
+			return "", false
+		}
+		open, closeIdx, ok = jsPrimaryDescribeBodyRange(s)
 	}
 	if !ok || open < 0 || closeIdx <= open || closeIdx > len(s) {
 		return "", false
@@ -293,7 +299,18 @@ func dropDuplicateMembers(path, existing, payload string) (string, []string) {
 		re, fieldRE, decoratorRE = csharpMethodDeclRE, csharpFieldDeclRE, leadingAttributeRE
 		typeRE, typeNameGroup = csharpClassDeclRE, 1
 	default:
-		return payload, nil
+		if !isJSExtendPath(path) {
+			return payload, nil
+		}
+		// JavaScript has no method name to compare, so members are keyed on the identity a reader
+		// and a test report both use: the `it(...)` / `describe(...)` title, the hook's kind, and
+		// the declared binding name. Dropping them is what keeps the spliced payload from
+		// re-declaring the suite's own `let` bindings and beforeEach.
+		surviving, dropped, ok := jsDropDuplicateMembers(existing, payload)
+		if !ok {
+			return payload, nil
+		}
+		return surviving, dropped
 	}
 	// Direct members only. The sweep used to be flat over the whole file, so a name declared
 	// inside an existing @Nested class counted as "already defined" for a payload that declares
@@ -525,7 +542,15 @@ func mergedPayloadInsideTypeBody(path, existing, merged string) bool {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".java", ".cs":
 	default:
-		return true
+		// JS/TS only when the describe block can be located exactly; anything else keeps the
+		// historical "no opinion", because refusing a write destroys an artifact with no previous
+		// version on disk.
+		if !isJSExtendPath(path) {
+			return true
+		}
+		if _, _, ok := jsPrimaryDescribeBodyRange(merged); !ok {
+			return true
+		}
 	}
 	mergedTail, ok := tailAfterPrimaryType(path, merged)
 	if !ok {
@@ -552,7 +577,10 @@ func tailAfterPrimaryType(path, s string) (string, bool) {
 	case ".cs":
 		_, closeIdx, ok = csharpPrimaryTypeBodyRange(s)
 	default:
-		return "", false
+		if !isJSExtendPath(path) {
+			return "", false
+		}
+		_, closeIdx, ok = jsPrimaryDescribeBodyRange(s)
 	}
 	if !ok || closeIdx+1 > len(s) {
 		return "", false

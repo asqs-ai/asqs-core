@@ -171,14 +171,19 @@ func introducedLowValueFixReason(path, before, after string) string {
 //     the mismatch eventually but we burn a whole fix-loop iteration and a full LLM call first.
 //
 // Detection is conservative by design (false negatives are preferred over false positives —
-// the compiler is still the authoritative check): unknown extensions return "", TypeScript /
-// JavaScript are intentionally excluded because template-literal interpolation (`${…}`) makes
-// simple brace counting unsafe, and the Java/C# top-level-declaration check only fires when
-// the file contains ZERO type declarations (a real file with extra top-level garbage BEFORE
-// the class is caught by the brace/fence checks but not by the declaration regex). Returns
-// "" for whitespace-only content so the caller can emit evaluator.fix_skip_empty instead.
+// the compiler is still the authoritative check): unknown extensions return "", and the Java/C#
+// top-level-declaration check only fires when the file contains ZERO type declarations (a real
+// file with extra top-level garbage BEFORE the class is caught by the brace/fence checks but not
+// by the declaration regex). Returns "" for whitespace-only content so the caller can emit
+// evaluator.fix_skip_empty instead.
 //
-// Supported languages: Java (.java), C# (.cs), Go (.go).
+// TypeScript / JavaScript get the fence check plus a stray-backslash scan, and NOT brace counting:
+// template-literal interpolation (`${…}`) makes counting braces unsafe, which is why this
+// extension was excluded outright until a run proved the exclusion too broad. See
+// jsSyntacticShellReason.
+//
+// Supported languages: Java (.java), C# (.cs), Go (.go), TypeScript / JavaScript
+// (.ts, .tsx, .mts, .cts, .js, .jsx, .mjs, .cjs).
 func SyntacticShellReason(path, content string) string {
 	if strings.TrimSpace(content) == "" {
 		return ""
@@ -191,8 +196,24 @@ func SyntacticShellReason(path, content string) string {
 		return csharpSyntacticShellReason(content)
 	case strings.HasSuffix(base, ".go"):
 		return goSyntacticShellReason(content)
+	case hasJSExtension(base):
+		return jsSyntacticShellReason(content)
 	}
 	return ""
+}
+
+// jsExtensions are the suffixes jsSyntacticShellReason understands. .tsx / .jsx are included: the
+// scan bails on JSX before it can misread it (see jsSyntacticShellReason), so the fence check still
+// covers them and nothing else fires.
+var jsExtensions = []string{".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"}
+
+func hasJSExtension(base string) bool {
+	for _, ext := range jsExtensions {
+		if strings.HasSuffix(base, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func javaSyntacticShellReason(s string) string {
@@ -221,6 +242,173 @@ func csharpSyntacticShellReason(s string) string {
 		return "no class/interface/struct/enum/record/delegate declaration, file will not parse as C#"
 	}
 	return ""
+}
+
+// jsSyntacticShellReason is the TypeScript / JavaScript branch of the pre-write gate.
+//
+// It is NOT the Java/C# check with a different extension list. Brace counting is deliberately
+// absent: `${…}` interpolation inside a template literal makes it unsafe, and that is why this
+// language was excluded from the gate entirely until run api-f1d4227cb6db875a2e51c3100b3e1be8
+// showed the exclusion was too broad. That run generated
+// src/app/features/checkout/checkout.component.test.ts containing `const quantity = 5;\      const`
+// — the model's structured JSON output carried an illegal `\ ` escape where `\n` belonged — and
+// nothing looked at the file: the eval's `npm test` ran the repository's own echo script, `ng build`
+// compiles only the graph reachable from main.ts, and prettier was not installed. The broken file
+// went into the PR.
+//
+// So the two checks here are the ones that cannot be wrong about JavaScript:
+//
+//   - a markdown fence, which is never valid source in any language;
+//   - a backslash sitting in code position, which no JS/TS grammar accepts. Every legal backslash
+//     lives inside a string, a template literal, a regex, or a comment.
+//
+// It runs on BOTH the generate and fix paths, for the same reason the fence check does: it detects
+// content that is UNUSABLE rather than broken. A backslash in code position cannot be repaired by a
+// later fix round, because the file it produces never reaches a compiler that would report it.
+func jsSyntacticShellReason(s string) string {
+	if strings.Contains(s, "```") {
+		return "contains markdown code fence (```), LLM emitted fenced output instead of raw TypeScript/JavaScript source"
+	}
+	if line, col, found := jsStrayBackslash(s); found {
+		return fmt.Sprintf("stray backslash at line %d column %d, outside any string, template literal, "+
+			"regex or comment; no JS/TS grammar accepts it and the file will not parse", line, col)
+	}
+	return ""
+}
+
+// jsStrayBackslash reports the position of the first backslash in CODE position, or found=false
+// when the file is clean OR when the scanner cannot stay in sync.
+//
+// The two error directions cost very different amounts — a false negative costs one compile cycle,
+// a false positive silently discards a correct artifact — so this bails out (found=false) on every
+// construct it cannot tokenize exactly, exactly as illegalEscapeReason does:
+//
+//   - a `/` in code position that begins neither `//` nor `/*`. It could open a regex literal, be a
+//     division, or close a JSX tag, and guessing wrong desynchronises everything after it. This is
+//     what makes .tsx effectively fence-only, which is the intended trade.
+//   - a string literal left unterminated at a newline or at EOF, and an unterminated block comment
+//     or template — all of which mean sync is already lost.
+func jsStrayBackslash(s string) (line, col int, found bool) {
+	line, col = 1, 1
+	advance := func(c byte) {
+		if c == '\n' {
+			line++
+			col = 1
+			return
+		}
+		col++
+	}
+	// templateBrace holds one entry per `${` interpolation currently open; the value counts the
+	// unclosed `{` inside it, so the matching `}` returns the scanner to template text.
+	var templateBrace []int
+	inTemplate := false
+
+	for i, n := 0, len(s); i < n; {
+		c := s[i]
+		if inTemplate {
+			switch {
+			case c == '\\':
+				if i+1 >= n {
+					return 0, 0, false
+				}
+				advance(c)
+				advance(s[i+1])
+				i += 2
+				continue
+			case c == '`':
+				inTemplate = false
+			case c == '$' && i+1 < n && s[i+1] == '{':
+				templateBrace = append(templateBrace, 0)
+				inTemplate = false
+				advance(c)
+				advance(s[i+1])
+				i += 2
+				continue
+			}
+			advance(c)
+			i++
+			continue
+		}
+
+		switch c {
+		case '/':
+			if i+1 >= n {
+				return 0, 0, false
+			}
+			switch s[i+1] {
+			case '/':
+				for i < n && s[i] != '\n' {
+					advance(s[i])
+					i++
+				}
+			case '*':
+				advance(c)
+				advance(s[i+1])
+				i += 2
+				for {
+					if i+1 >= n {
+						return 0, 0, false
+					}
+					if s[i] == '*' && s[i+1] == '/' {
+						advance(s[i])
+						advance(s[i+1])
+						i += 2
+						break
+					}
+					advance(s[i])
+					i++
+				}
+			default:
+				return 0, 0, false
+			}
+			continue
+		case '\'', '"':
+			quote := c
+			advance(c)
+			i++
+			for {
+				if i >= n || s[i] == '\n' {
+					return 0, 0, false
+				}
+				if s[i] == '\\' {
+					if i+1 >= n {
+						return 0, 0, false
+					}
+					advance(s[i])
+					advance(s[i+1])
+					i += 2
+					continue
+				}
+				closing := s[i] == quote
+				advance(s[i])
+				i++
+				if closing {
+					break
+				}
+			}
+			continue
+		case '`':
+			inTemplate = true
+		case '{':
+			if len(templateBrace) > 0 {
+				templateBrace[len(templateBrace)-1]++
+			}
+		case '}':
+			if top := len(templateBrace) - 1; top >= 0 {
+				if templateBrace[top] == 0 {
+					templateBrace = templateBrace[:top]
+					inTemplate = true
+				} else {
+					templateBrace[top]--
+				}
+			}
+		case '\\':
+			return line, col, true
+		}
+		advance(c)
+		i++
+	}
+	return 0, 0, false
 }
 
 func goSyntacticShellReason(s string) string {

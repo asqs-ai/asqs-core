@@ -97,6 +97,8 @@ const (
 	// jsAsqsTestScript is where bootstrap puts its runner invocation. `npm test` is the repo's, not
 	// ours: overwriting it destroyed `ng test` on Angular repos and any custom harness elsewhere.
 	jsAsqsTestScript = "test:asqs"
+	// jsStackJsdomDeclined marks a profile declined for the runtime rather than for the repo.
+	jsStackJsdomDeclined = "jsdom-declined"
 )
 
 // semverMajor extracts the leading major from a package.json range ("^19.2.0" → 19). 0 when unknown.
@@ -111,6 +113,28 @@ func semverMajor(v string) int {
 		return 0
 	}
 	return n
+}
+
+// nodeSemver splits a Node runtime version ("v20.20.2", "22.23.2") into major, minor and patch.
+// Zeros when unknown — every caller treats that as "runtime not determined".
+func nodeSemver(v string) (major, minor, patch int) {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "v")
+	if i := strings.IndexAny(v, "-+ "); i > 0 {
+		v = v[:i]
+	}
+	parts := strings.Split(v, ".")
+	at := func(i int) int {
+		if i >= len(parts) {
+			return 0
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(parts[i]))
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	}
+	return at(0), at(1), at(2)
 }
 
 // jsPackageJSON is the subset of package.json detection needs.
@@ -238,7 +262,15 @@ func detectJSFramework(pkgDir string, lang string) (jsFrameworkDetection, error)
 }
 
 // buildJSTestProfile turns a detection into the required stack.
-func buildJSTestProfile(det jsFrameworkDetection) jsTestProfile {
+//
+// nodeVersion is the Node runtime the install and the generated tests will actually run on — the
+// bootstrap container's when there is one, the host's otherwise. It is not a repo fact: only jsdom
+// depends on it (see jsdomVersionForNode), and callers that never install anything pass "".
+func buildJSTestProfile(det jsFrameworkDetection, nodeVersion string) jsTestProfile {
+	// Resolved once, used by every DOM stack below; jsdomOK is false only when the runtime is older
+	// than every current jsdom line, which becomes a declined profile after the switch.
+	jsdomVer, jsdomOK := jsdomVersionForNode(nodeVersion)
+
 	p := jsTestProfile{
 		Framework:        det.Framework,
 		FrameworkVersion: det.FrameworkVersion,
@@ -300,7 +332,7 @@ func buildJSTestProfile(det jsFrameworkDetection) jsTestProfile {
 			p.Runner = JSRunnerVitest
 			p.Deps = []jsDep{
 				{"vitest", vitestVersionForVite(det.ViteMajor)},
-				{"jsdom", VersionJsdom},
+				{"jsdom", jsdomVer},
 				{"@testing-library/react", rtl},
 				{"@testing-library/jest-dom", VersionTestingLibraryJestDom},
 			}
@@ -334,7 +366,7 @@ func buildJSTestProfile(det jsFrameworkDetection) jsTestProfile {
 		p.Runner = JSRunnerVitest
 		p.Deps = []jsDep{
 			{"vitest", vitestVersionForVite(det.ViteMajor)},
-			{"jsdom", VersionJsdom},
+			{"jsdom", jsdomVer},
 			{"@testing-library/jest-dom", VersionTestingLibraryJestDom},
 		}
 		if det.Framework == JSFrameworkVue {
@@ -388,7 +420,7 @@ func buildJSTestProfile(det jsFrameworkDetection) jsTestProfile {
 			p.TestEnvironment = "node"
 			p.Stack = "vitest-vite"
 			if det.BrowserLike {
-				p.Deps = append(p.Deps, jsDep{"jsdom", VersionJsdom})
+				p.Deps = append(p.Deps, jsDep{"jsdom", jsdomVer})
 				p.TestEnvironment = "jsdom"
 				p.Stack = "vitest-vite-jsdom"
 			}
@@ -419,7 +451,40 @@ func buildJSTestProfile(det jsFrameworkDetection) jsTestProfile {
 			p.Stack = "jest-node"
 		}
 	}
+
+	// A stack that needs jsdom on a runtime no jsdom line supports cannot host a generated test, and
+	// the failure is invisible until the smoke gate: npm installs the package regardless, then the
+	// Vitest worker dies inside jsdom's own require(). Decline instead, so the package is skipped
+	// with a reason rather than the whole run aborted with someone else's stack trace.
+	if !jsdomOK && jsProfileNeedsJsdom(p) {
+		return jsTestProfile{
+			Framework:        det.Framework,
+			FrameworkVersion: det.FrameworkVersion,
+			IsTS:             det.IsTS,
+			IsESM:            det.IsESM,
+			ViteMajor:        det.ViteMajor,
+			Evidence:         det.Evidence,
+			TestScript:       jsAsqsTestScript,
+			Stack:            jsStackJsdomDeclined,
+			Declined:         true,
+			DeclinedReason: fmt.Sprintf("Node %s is older than every current jsdom line (>= 18 required), "+
+				"so a DOM test stack cannot run here. Raise general.sandbox.images.node, or the "+
+				"host's Node when bootstrap runs outside Docker, before bootstrapping this package.",
+				strings.TrimSpace(nodeVersion)),
+		}
+	}
 	return p
+}
+
+// jsProfileNeedsJsdom reports whether the profile installs jsdom itself. Jest's DOM stacks do not:
+// jest-environment-jsdom vendors its own, so their testEnvironment is 'jsdom' without a jsdom dep.
+func jsProfileNeedsJsdom(p jsTestProfile) bool {
+	for _, d := range p.Deps {
+		if d.Name == "jsdom" {
+			return true
+		}
+	}
+	return false
 }
 
 // jsVitestConfigName keeps the config file's language matching the package's.

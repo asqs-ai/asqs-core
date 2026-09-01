@@ -115,7 +115,9 @@ func verifyExistingCSharpStack(ctx context.Context, audit Auditor, repo, runnerT
 // at all — bootstrap has no smoke test in those dialects, and a Jest-shaped file would fail for
 // reasons that say nothing about the repository.
 func verifyExistingJSStack(ctx context.Context, audit Auditor, repo, lang, runnerTimeout string, ed *EphemeralDocker) existingStackVerification {
-	prof, pkgDir, err := resolveJSTestProfile(repo, lang)
+	// "" for the runtime: this path installs only the repository's OWN dependencies and uses the
+	// profile for the smoke test shape, so no pin from it is ever written to package.json.
+	prof, pkgDir, err := resolveJSTestProfile(repo, lang, "")
 	if err != nil || prof.Declined {
 		return existingStackVerification{Reason: "no usable JS package"}
 	}

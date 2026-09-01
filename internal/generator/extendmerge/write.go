@@ -177,6 +177,13 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 			// declares imports from being misread as a full compilation unit.
 			payloadImports, payload := hoistTopLevelImports(g.Path, payload)
 			payload = strings.TrimSpace(payload)
+			// Dialect check before the payload is unwrapped, while it still carries its own suite
+			// header. A Playwright spec spliced into a Jest suite type-checks and then fails at run
+			// time on a fixture Jest never supplies.
+			if isJSExtendPath(g.Path) && !JSSuiteKindsCompatible(string(existing), payload) {
+				noteSkip("extend payload uses a different test dialect than the file it would extend")
+				continue
+			}
 			switch kind := classifyExtendPayload(g.Path, payload); kind {
 			case payloadUnusable:
 				noteSkip("extend payload unusable: empty or markdown-fenced")

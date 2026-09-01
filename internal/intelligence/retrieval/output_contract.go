@@ -10,11 +10,30 @@ func IsE2EPlanItem(item *TestPlanItem) bool {
 	}
 	symKind := ""
 	if item.Gap != nil && item.Gap.Symbol != nil {
-		symKind = strings.TrimSpace(item.Gap.Symbol.Kind)
+		symKind = item.Gap.Symbol.Kind
 	}
 	return strings.EqualFold(strings.TrimSpace(item.Layer), "e2e") ||
-		symKind == "E2E_SPEC" || symKind == "PAGE_OBJECT" || symKind == "USER_FLOW" ||
-		symKind == "API_ROUTE" || symKind == "PAGE_ROUTE"
+		SymbolKindIs(symKind, "E2E_SPEC") || SymbolKindIs(symKind, "PAGE_OBJECT") ||
+		SymbolKindIs(symKind, "USER_FLOW") || SymbolKindIs(symKind, "API_ROUTE") ||
+		SymbolKindIs(symKind, "PAGE_ROUTE")
+}
+
+// SymbolKindIs compares a symbol kind READ BACK FROM STORAGE against one of the SCREAMING_CASE
+// literals this codebase writes at call sites.
+//
+// The two are not the same string. metadata.InsertSymbol lowercases every kind on the way in and
+// metadata.normalizeSymbolKind lowercases query arguments on the way out, so the store's own
+// comparisons are symmetric — but that normalisation stops at the storage boundary. A Symbol loaded
+// from the database carries `page_route`, and every `sym.Kind == "PAGE_ROUTE"` in Go is therefore
+// false. The indexers disagree too: the Java and OpenAPI indexers emit SCREAMING_CASE while the
+// JS/TS indexer emits snake_case, so neither side can be assumed.
+//
+// That is not theoretical. In run 2026-09-01T08:36Z two `page_route` gaps fell through
+// SuggestedTestPath's `case "PAGE_ROUTE"` into the generic branch, were handed the UNIT test path
+// for their source file, found the unit suite already on disk and extended it — a Playwright payload
+// aimed at a Jest suite.
+func SymbolKindIs(kind, want string) bool {
+	return strings.EqualFold(strings.TrimSpace(kind), want)
 }
 
 const outputContractHeader = "## OUTPUT CONTRACT (mandatory — read last)\n\n"

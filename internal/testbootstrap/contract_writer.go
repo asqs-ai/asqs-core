@@ -116,7 +116,9 @@ func contractForCompleteStack(repo, lang string) (teststack.Contract, bool) {
 		}
 		return csharpContract(prof), true
 	case isJSLang(lang):
-		prof, _, err := resolveJSTestProfile(repo, lang)
+		// "" for the runtime: this path installs nothing and the contract records dependency names,
+		// not versions, so the jsdom line it would pick is never used.
+		prof, _, err := resolveJSTestProfile(repo, lang, "")
 		if err != nil || prof.Declined {
 			return teststack.Contract{}, false
 		}

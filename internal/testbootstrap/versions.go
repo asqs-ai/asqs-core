@@ -43,8 +43,75 @@ const (
 	VersionVitest4 = "4.1.11" // Vite 6+
 	VersionVitest3 = "3.2.4"  // Vite 5, or no Vite at all (self-contained)
 	VersionVitest1 = "1.6.1"  // Vite 4 and older
-	VersionJsdom   = "30.0.1"
 )
+
+// jsdom lines. jsdom is the only pin in this package constrained by the RUNTIME rather than by the
+// repo's own manifest, so it cannot be a single constant.
+//
+// jsdom 30 moved to undici 8, which calls worker_threads.markAsUncloneable — a symbol that does not
+// exist before Node 22.10. npm treats `engines` as advisory (EBADENGINE is a warning and the install
+// still exits 0), so on Node 20 the install succeeds and jsdom then fails at require() time with
+// "webidl.util.markAsUncloneable is not a function". The Vitest worker never starts, no test runs,
+// and the mandatory smoke gate aborts the whole run — which is exactly what a React/Vite repository
+// did on node:20-bookworm-slim before jsdomVersionForNode was derived from the registry:
+//
+//	jsdom 30.x  node ^22.22.2 || ^24.15.0 || >=26.0.0   (undici ^8, itself node >=22.19.0)
+//	jsdom 29.x  node ^20.19.0 || ^22.13.0 || >=24.0.0   (undici ^7, itself node >=20.18.1)
+//	jsdom 26.x  node >=18                               (last line with no undici dependency)
+const (
+	VersionJsdom30 = "30.0.1"
+	VersionJsdom29 = "29.1.1"
+	VersionJsdom26 = "26.1.0"
+)
+
+// jsdomLines are the releases bootstrap may install, newest first. Supported mirrors the release's
+// own engines.node, so selection follows the declared contract rather than what happens to load:
+// on Node 24.14.0 this picks the 29 line even though 30 runs there, because 30 declares ^24.15.0.
+var jsdomLines = []struct {
+	Version   string
+	Supported func(major, minor, patch int) bool
+}{
+	{VersionJsdom30, func(major, minor, patch int) bool {
+		switch major {
+		case 22:
+			return minor > 22 || (minor == 22 && patch >= 2)
+		case 24:
+			return minor >= 15
+		default:
+			return major >= 26
+		}
+	}},
+	{VersionJsdom29, func(major, minor, patch int) bool {
+		switch major {
+		case 20:
+			return minor >= 19
+		case 22:
+			return minor >= 13
+		default:
+			return major >= 24
+		}
+	}},
+	{VersionJsdom26, func(major, minor, patch int) bool { return major >= 18 }},
+}
+
+// jsdomVersionForNode picks the newest jsdom the given Node runtime can actually load. ok is false
+// only when no current line supports it at all, which the caller turns into a declined profile.
+//
+// An empty or unparseable nodeVersion means the runtime probe failed; that falls back to the
+// widest-support line rather than the newest, because the two errors are not symmetric: a too-new
+// jsdom aborts the run at the smoke gate, while an older one still hosts generated tests.
+func jsdomVersionForNode(nodeVersion string) (version string, ok bool) {
+	major, minor, patch := nodeSemver(nodeVersion)
+	if major == 0 {
+		return VersionJsdom26, true
+	}
+	for _, l := range jsdomLines {
+		if l.Supported(major, minor, patch) {
+			return l.Version, true
+		}
+	}
+	return "", false
+}
 
 // Vue and Svelte component-testing libraries.
 //

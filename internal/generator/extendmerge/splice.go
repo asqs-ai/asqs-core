@@ -246,6 +246,9 @@ func insertInsideClassBody(existing []byte, newContent string) string {
 		indented := indentLines(newContent, indent)
 		return s[:idx] + "\n" + indented + "\n" + s[idx:]
 	}
+	if merged, ok := jsInsertBeforeDescribeClose(s, newContent); ok {
+		return merged
+	}
 	if idx, ok := csharpInsertIndexBeforeTestClassClose(s); ok {
 		lineStart := strings.LastIndex(s[:idx], "\n") + 1
 		prefixLen := len(s[lineStart:idx]) - len(strings.TrimLeft(s[lineStart:idx], " \t"))

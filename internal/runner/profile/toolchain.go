@@ -2,6 +2,7 @@
 package profile
 
 import (
+	"encoding/json"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -131,8 +132,8 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			Restore: []string{"sh", "-c", "corepack enable && pnpm install --frozen-lockfile"},
 			// Prepend node_modules/.bin so scripts that call `tsc` find the local typescript package (common with node:lts / slim images).
 			Compile:  []string{"sh", "-c", "corepack enable && export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && pnpm run build"},
-			Test:     []string{"sh", "-c", "corepack enable && CI=true pnpm test --if-present"},
-			Coverage: []string{"sh", "-c", "corepack enable && CI=true pnpm run test:coverage --if-present || CI=true pnpm test --if-present"},
+			Test:     []string{"sh", "-c", "corepack enable && CI=true " + pnpmTestInvocation(repoPath)},
+			Coverage: []string{"sh", "-c", "corepack enable && CI=true pnpm run test:coverage --if-present || CI=true " + pnpmTestInvocation(repoPath)},
 		}
 	case TypeScriptYarn:
 		img := strings.TrimSpace(imageNode)
@@ -144,8 +145,8 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			Image:    img,
 			Restore:  []string{"yarn", "install", "--frozen-lockfile"},
 			Compile:  []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && yarn run build"},
-			Test:     []string{"sh", "-c", "CI=true yarn test"},
-			Coverage: []string{"sh", "-c", "CI=true yarn run coverage || CI=true yarn test"},
+			Test:     []string{"sh", "-c", "CI=true " + yarnTestInvocation(repoPath)},
+			Coverage: []string{"sh", "-c", "CI=true yarn run coverage || CI=true " + yarnTestInvocation(repoPath)},
 		}
 	case CSharpDotnet:
 		img := resolveDotNetDockerImage(imageDotNet, repoPath)
@@ -170,10 +171,94 @@ func builtinToolchain(id ToolchainID, imageJavaMaven, imageJavaGradle, imageNode
 			Image:    img,
 			Restore:  []string{"npm", "install"},
 			Compile:  []string{"sh", "-c", "export PATH=\"${PWD}/node_modules/.bin:${PATH}\" && npm run build"},
-			Test:     []string{"sh", "-c", "CI=true npm test"},
-			Coverage: []string{"sh", "-c", "CI=true npm run coverage --if-present || CI=true npm test"},
+			Test:     []string{"sh", "-c", "CI=true " + npmTestInvocation(repoPath)},
+			Coverage: []string{"sh", "-c", "CI=true npm run coverage --if-present || CI=true " + npmTestInvocation(repoPath)},
 		}
 	}
+}
+
+// asqsBootstrapTestScript is the package.json script test_framework_bootstrap installs for the
+// runner it sets up. Duplicated from internal/testbootstrap (jsAsqsTestScript) rather than shared:
+// that package imports this one, so the dependency cannot run the other way. Change both together.
+const asqsBootstrapTestScript = "test:asqs"
+
+// BootstrapTestScriptName returns asqsBootstrapTestScript when scripts declares it, or "" when it
+// does not. It is the single definition of "which package script actually runs this repository's
+// tests", shared by every layer that builds a JS test command:
+//
+//   - runner.jsPlanCommand, which builds the host/plan argv;
+//   - the toolchain profile defaults below.
+//
+// They must agree. Note the ordering that makes this easy to get wrong: ApplyCommandOverrides puts
+// a configured general.build.test_command / unit_test_command AHEAD of the profile default, so on a
+// repository that pins either one, NEITHER home below is consulted at all.
+func BootstrapTestScriptName(scripts map[string]string) string {
+	if strings.TrimSpace(scripts[asqsBootstrapTestScript]) == "" {
+		return ""
+	}
+	return asqsBootstrapTestScript
+}
+
+// BootstrapTestScriptForRepo is bootstrapTestScript for callers outside this package: it answers
+// whether test_framework_bootstrap left its runner script in the package at repoPath.
+func BootstrapTestScriptForRepo(repoPath string) string { return bootstrapTestScript(repoPath) }
+
+// bootstrapTestScript returns asqsBootstrapTestScript when the package at repoPath declares it, or
+// "" when it does not — which is also what an empty repoPath returns, so the no-repo callers
+// (BuiltinToolchain) keep their historical argv.
+//
+// Bootstrap writes its runner to `test:asqs` and deliberately leaves `scripts.test` alone whenever
+// the package already has one: overwriting it destroyed `ng test` on Angular repos (see
+// internal/testbootstrap/package_json.go). Nothing then ran the script it had just installed and
+// verified, because the eval's test step is `npm test`. In run
+// api-f1d4227cb6db875a2e51c3100b3e1be8 that executed the repository's own
+// `echo "no unit/e2e runners configured in this ASQS fixture"` — 284 ms, exit 0, "tests ok" — while
+// ten generated Angular tests, one of them syntactically broken, were never run and shipped in the
+// PR. Bootstrap had proved Jest worked by invoking it directly, and the evaluation then asked a
+// different question.
+//
+// Presence of the script is exactly the right signal: bootstrap adds it only when it APPLIED a
+// stack, and a repository whose own unit runner is already complete is skipped before any
+// package.json edit. So when this returns non-empty, ASQS's runner is the verified one.
+func bootstrapTestScript(repoPath string) string {
+	repoPath = strings.TrimSpace(repoPath)
+	if repoPath == "" {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(repoPath, "package.json"))
+	if err != nil {
+		return ""
+	}
+	var pkg struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(b, &pkg); err != nil {
+		return ""
+	}
+	return BootstrapTestScriptName(pkg.Scripts)
+}
+
+// npmTestInvocation / pnpmTestInvocation / yarnTestInvocation run the script bootstrap installed
+// when it is there, and otherwise keep the historical `<pm> test` invocation verbatim.
+func npmTestInvocation(repoPath string) string {
+	if s := bootstrapTestScript(repoPath); s != "" {
+		return "npm run " + s
+	}
+	return "npm test"
+}
+
+func pnpmTestInvocation(repoPath string) string {
+	if s := bootstrapTestScript(repoPath); s != "" {
+		return "pnpm run " + s
+	}
+	return "pnpm test --if-present"
+}
+
+func yarnTestInvocation(repoPath string) string {
+	if s := bootstrapTestScript(repoPath); s != "" {
+		return "yarn run " + s
+	}
+	return "yarn test"
 }
 
 // DetectToolchainID picks a profile from repo layout and language.
