@@ -203,7 +203,24 @@ func renderJSFrameworkSmoke(p jsTestProfile) (source, ext string) {
 }
 
 func writeJSSmoke(pkgDir, base, ext, source string) (jsSmokeFile, error) {
-	rel := filepath.ToSlash(filepath.Join(jsSmokeDir, base+".test"+ext))
+	return writeJSSmokeIn(pkgDir, jsSmokeDir, base, ext, source)
+}
+
+// writeJSSmokeIn is writeJSSmoke with the directory chosen by the caller.
+//
+// The type-check gate needs its probe INSIDE the project's tsconfig program — generated tests land
+// beside sources, and a tsconfig whose include is ["src"] type-checks nothing in __tests__/. A probe
+// staged in the default smoke directory would pass vacuously, which is exactly how the run of
+// 2026-09-01 recorded verified=true for a stack that could not compile a single generated test.
+//
+// A non-".test" extension (a Vue/Svelte companion component) is written as-is, so it is a module the
+// probe can import rather than a second test file the runner would try to execute.
+func writeJSSmokeIn(pkgDir, dir, base, ext, source string) (jsSmokeFile, error) {
+	name := base + ".test" + ext
+	if ext == ".vue" || ext == ".svelte" {
+		name = base + ext
+	}
+	rel := filepath.ToSlash(filepath.Join(dir, name))
 	abs := filepath.Join(pkgDir, filepath.FromSlash(rel))
 	f := jsSmokeFile{Abs: abs, Rel: rel}
 	if fileExists(abs) {

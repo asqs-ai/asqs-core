@@ -217,8 +217,15 @@ export function enrichFileAngularGraph(
 
         const tu = meta.templateUrl as string | undefined;
         if (tu) {
-          entry.edges.push({ caller_fq_name: symFq, callee_fq_name: tu, edge_type: "USES_TEMPLATE" });
+          // The callee must be the ANGULAR_TEMPLATE symbol emitted just below, not the raw
+          // templateUrl: the Go indexer stores an edge only when BOTH endpoint names match a
+          // symbol fq_name (see this tool's README), and "./x.component.html" matches none. Every
+          // USES_TEMPLATE edge was therefore dropped — 6 of 6 in run
+          // api-663c3b516ed4f1349f657b73acb6162d — so nothing could traverse from a component to
+          // its template. The symbol is worth reaching: chunk_secondary.angularTemplateChunkPlans
+          // reads signature.path off it and attaches the template file's full text as a chunk.
           const tplFq = `ANGULAR_TEMPLATE:${tu}`;
+          entry.edges.push({ caller_fq_name: symFq, callee_fq_name: tplFq, edge_type: "USES_TEMPLATE" });
           entry.symbols.push({
             kind: "ANGULAR_TEMPLATE",
             fq_name: tplFq,

@@ -2075,6 +2075,10 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		}
 	}
 	scopeNarrowed := false
+	// scopeNarrowReason names WHICH rule narrowed, so the audit row distinguishes an exact
+	// compiler-citation subset from the test-side stem match. It was a hardcoded string on the
+	// audit call for as long as only one rule existed.
+	scopeNarrowReason := ""
 	var scopedAuditPaths []string
 	// preNarrowAuditPaths is the writable candidate set BEFORE narrowing, recorded for audit.
 	// `artifact_paths_all` used to report opts.ArtifactPaths, which understates the set once
@@ -2095,7 +2099,39 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// FailingTestCandidatePaths matches, which require an on-disk test-shaped path under RepoPath.
 	// Dependency and source files reach the prompt through opts.ArtifactDependencies, never
 	// pathsToRead.
-	if (step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
+	if (step == StepCompile || step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
+		// A test step's FIRST attempt ships the full page: every writable artifact stays writable
+		// and every artifact-context block survives (within the prompt-side budget). Test-failure
+		// repairs are semantic — sibling tests' fixtures and patterns are evidence — and the
+		// test-side narrowing signal (ParseFailingTestPaths) is a stem-match heuristic, so a
+		// first-attempt false negative would exclude a genuinely broken file. Narrowing applies
+		// from attempt 2, re-derived from that round's own failure output.
+		//
+		// COMPILE narrows from attempt 1 deliberately: compiler citations are exact — javac,
+		// roslyn and tsc all name file and line on every diagnostic — so there is no heuristic to
+		// be wrong about. Leaving compile un-narrowed is what sent an 18-artifact whole-file
+		// rewrite into an 8192-token output cap on 2026-09-01: 12 files were cited, 4 more had no
+		// error at all, and 2 were Playwright specs that tsconfig.app.json does not even compile.
+		// The deferred subset is still derived and audited, so a first attempt without
+		// fix_scope_narrowed is distinguishable from "nothing cited".
+		deferFirstTestAttempt := (step == StepTest || step == StepTestE2E) && currentAttempt == 1
+		narrowingDeferred := false
+		auditDeferred := func(reason string, wouldScope, basis []string) {
+			narrowingDeferred = true
+			if audit == nil {
+				return
+			}
+			audit.Log(ctx, "evaluator.fix_scope_narrowing_deferred", map[string]interface{}{
+				"message": fmt.Sprintf(
+					"Deferred writable-scope narrowing for step %s: the step's first attempt ships the full page (%d artifact(s)); the %d-path subset (%s) applies from attempt 2.",
+					step, len(basis), len(wouldScope), reason),
+				"step":                       step,
+				"attempt":                    currentAttempt,
+				"reason":                     reason,
+				"artifact_paths_would_scope": wouldScope,
+				"artifact_paths_all":         basis,
+			})
+		}
 		cited := errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath))
 		if len(cited) > 0 {
 			citedSet := make(map[string]bool, len(cited))
@@ -2121,9 +2157,34 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				scoped = append(scoped, a)
 			}
 			if len(scoped) > 0 && len(scoped) < uniqueArtifactCount {
-				writableArtifacts = scoped
-				scopeNarrowed = true
-				scopedAuditPaths = append([]string(nil), scoped...)
+				if deferFirstTestAttempt {
+					auditDeferred("error_cited_subset", append([]string(nil), scoped...), append([]string(nil), writableArtifacts...))
+				} else {
+					writableArtifacts = scoped
+					scopeNarrowed = true
+					scopeNarrowReason = "error_cited_subset"
+					scopedAuditPaths = append([]string(nil), scoped...)
+				}
+			}
+		}
+		// Test-failure fallback: AllCitedRepoPaths only resolves compiler-shaped citations, and
+		// JUnit/surefire failure output cites tests as
+		// `com.example.VetsTests.method(VetsTests.java:40)` — a bare basename that resolves to no
+		// repo path. ParseFailingTestPaths already does the basename/stem match (guarded against
+		// PASS lines and bare "Running FooTest" INFO), so reuse it against the same writable basis.
+		// Cited-subset narrowing keeps priority; this runs only when it found nothing — deferred
+		// counts as found, so one round never reports two would-be subsets.
+		if !scopeNarrowed && !narrowingDeferred && (step == StepTest || step == StepTestE2E) {
+			failing := ParseFailingTestPaths(errorOutput, writableArtifacts)
+			if len(failing) > 0 && len(failing) < len(writableArtifacts) {
+				if deferFirstTestAttempt {
+					auditDeferred("failing_test_subset", append([]string(nil), failing...), append([]string(nil), writableArtifacts...))
+				} else {
+					writableArtifacts = failing
+					scopeNarrowed = true
+					scopeNarrowReason = "failing_test_subset"
+					scopedAuditPaths = append([]string(nil), failing...)
+				}
 			}
 		}
 	}
@@ -2155,7 +2216,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			"artifact_paths_all":             preNarrowAuditPaths,
 			"artifact_paths_generated":       append([]string(nil), opts.ArtifactPaths...),
 			"artifact_paths_scoped":          scopedAuditPaths,
-			"reason":                         "error_cited_subset",
+			"reason":                         scopeNarrowReason,
 			"error_output_sanitized":         errorOutputSanitized,
 			"artifact_context_dropped_paths": droppedArtifactCtxPaths,
 			"artifact_context_dropped_runes": droppedArtifactCtxRunes,

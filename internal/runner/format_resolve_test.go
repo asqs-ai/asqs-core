@@ -165,3 +165,57 @@ func TestFormatAvailability_repoWrapperIsNotAvailability(t *testing.T) {
 		t.Errorf("docker target must not skip: the image supplies mvn (got %q)", got)
 	}
 }
+
+// `npx --no-install prettier` cannot succeed when node_modules/.bin/prettier is absent, which is
+// precisely when the resolver used to reach for it. Run api-3c56b784842358e936ec60e505209bc6 ran it
+// nine times, once per fix round, and every invocation exited 1 with "npx canceled due to missing
+// packages". A repo with no prettier must resolve to a clean skip instead.
+func TestPrettierCommand_noLocalInstallIsNotAvailable(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"name":"x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, target := range []Target{TargetDocker, TargetLocal} {
+		if cmd, ok := prettierRepoWideCommand(dir, target); ok && strings.Contains(cmd, "npx") {
+			t.Errorf("%s repo-wide: resolved %q, which can only exit 1", target, cmd)
+		}
+		if cmd, ok := prettierPerFileCommand(dir, target); ok && strings.Contains(cmd, "npx") {
+			t.Errorf("%s per-file: resolved %q, which can only exit 1", target, cmd)
+		}
+	}
+
+	// Docker additionally must not resolve a HOST-installed prettier: node_modules is bind-mounted
+	// into the container, an arbitrary host binary is not.
+	if cmd, ok := prettierRepoWideCommand(dir, TargetDocker); ok {
+		t.Errorf("docker: resolved %q from the host PATH; the container has no such binary", cmd)
+	}
+	r := ResolveFormatCommand(dir, "typescript", "", "auto", false, TargetDocker)
+	if r.Command != "" {
+		t.Errorf("Command = %q, want an empty command", r.Command)
+	}
+	if r.SkipReason == "" {
+		t.Error("SkipReason is empty; a skipped format step must say why")
+	}
+}
+
+// An explicitly configured `npx prettier` (no --no-install) fetches the package itself, so the
+// availability probe must not skip it just because the repo has no local prettier. Only the
+// --no-install form depends on what is installed.
+func TestFormatAvailability_configuredNpxPrettierIsNotSkipped(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{"name":"x"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := ResolveFormatCommand(dir, "typescript", "npx prettier --write .", "auto", false, TargetDocker)
+	if r.Command != "npx prettier --write ." {
+		t.Errorf("Command = %q (skip %q), want the configured command honoured", r.Command, r.SkipReason)
+	}
+
+	// The --no-install form is the one that genuinely cannot run here.
+	r = ResolveFormatCommand(dir, "typescript", "npx --no-install prettier --write .", "auto", false, TargetDocker)
+	if r.SkipReason != "formatter_not_available:prettier" {
+		t.Errorf("SkipReason = %q, want formatter_not_available:prettier", r.SkipReason)
+	}
+}

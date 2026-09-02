@@ -112,8 +112,16 @@ func jsViteConfigRel(pkgDir string) string {
 
 // writeIfAbsentOrOwned writes path unless a file exists that ASQS did not generate.
 func writeIfAbsentOrOwned(path, content string) (wrote bool, err error) {
+	return writeIfAbsentOrOwnedMarked(path, content, asqsGeneratedHeader)
+}
+
+// writeIfAbsentOrOwnedMarked is writeIfAbsentOrOwned with the ownership marker supplied by the
+// caller, so the E2E bootstrap can claim its own files without either bootstrap being able to
+// overwrite the other's. Same contract otherwise: a file carrying no marker is the repository's and
+// is never clobbered.
+func writeIfAbsentOrOwnedMarked(path, content, marker string) (wrote bool, err error) {
 	if b, rerr := os.ReadFile(path); rerr == nil {
-		if !strings.Contains(string(b), asqsGeneratedHeader) {
+		if !strings.Contains(string(b), marker) {
 			return false, nil // user-owned; never clobber
 		}
 		if string(b) == content {
@@ -187,7 +195,10 @@ const angularTsconfigSpec = `{
     "esModuleInterop": true,
     "types": ["jest"]
   },
-  "include": ["src/**/*.spec.ts", "src/**/*.d.ts", "__tests__/**/*.ts"]
+  /* Both suffixes: jsTestMatchGlobs accepts spec AND test, and layout.SuggestedTestPath emits
+     *.test.ts for every runner except jasmine — so on this (jest) path every generated unit test
+     is a *.test.ts and an include listing only *.spec.ts covered none of them. */
+  "include": ["src/**/*.spec.ts", "src/**/*.test.ts", "src/**/*.d.ts", "__tests__/**/*.ts"]
 }
 `
 

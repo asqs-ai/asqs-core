@@ -235,3 +235,46 @@ func TestValidRunnerTypes_isTheSingleSource(t *testing.T) {
 		}
 	}
 }
+
+// The JS/TS branch of planDocker applies the override at its own site, not the one the Java case
+// above exercises, so it needs its own regression guard: asqs-go carried the same planner with only
+// the Java coverage and the JS/TS branch silently dropped the override, planning the plain Node
+// image for every Playwright run. Asserts Profile.Image as well as Image —
+// runDockerEvalWithImageOverride runs the profile, and dockerImageNeedsPlaywrightIPC reads
+// Profile.Image to decide on --ipc=host.
+func TestPlanDocker_imageOverrideAppliesForJSTS(t *testing.T) {
+	sb, _ := fakeDockerSandbox(t, "30s", "exit 0")
+	repo := writeRepo(t, map[string]string{
+		"package.json": `{"name":"x","scripts":{"test":"playwright test"}}`,
+	}, nil)
+	const want = "mcr.microsoft.com/playwright:v1.49.1-jammy"
+
+	for _, lang := range []string{"typescript", "javascript"} {
+		plan, err := sb.buildStepPlan(repo, lang, want)
+		if err != nil {
+			t.Fatalf("%s: buildStepPlan: %v", lang, err)
+		}
+		if plan.Image != want {
+			t.Errorf("%s: Image = %q, want the Playwright override", lang, plan.Image)
+		}
+		if plan.Profile.Image != want {
+			t.Errorf("%s: Profile.Image = %q, want the Playwright override (this is the image that runs)", lang, plan.Profile.Image)
+		}
+	}
+}
+
+// No override means the plain Node toolchain image, for every step that is not the E2E pass.
+func TestPlanDocker_jsWithoutOverrideKeepsNodeImage(t *testing.T) {
+	sb, _ := fakeDockerSandbox(t, "30s", "exit 0")
+	repo := writeRepo(t, map[string]string{
+		"package.json": `{"name":"x","scripts":{"test":"jest"}}`,
+	}, nil)
+
+	plan, err := sb.buildStepPlan(repo, "typescript", "")
+	if err != nil {
+		t.Fatalf("buildStepPlan: %v", err)
+	}
+	if strings.Contains(plan.Image, "playwright") {
+		t.Errorf("Image = %q, want the Node toolchain image when no override is given", plan.Image)
+	}
+}

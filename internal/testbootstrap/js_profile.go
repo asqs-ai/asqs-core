@@ -452,6 +452,8 @@ func buildJSTestProfile(det jsFrameworkDetection, nodeVersion string) jsTestProf
 		}
 	}
 
+	p = ensureNodeTypesForNodeEnvironment(p)
+
 	// A stack that needs jsdom on a runtime no jsdom line supports cannot host a generated test, and
 	// the failure is invisible until the smoke gate: npm installs the package regardless, then the
 	// Vitest worker dies inside jsdom's own require(). Decline instead, so the package is skipped
@@ -473,6 +475,31 @@ func buildJSTestProfile(det jsFrameworkDetection, nodeVersion string) jsTestProf
 				strings.TrimSpace(nodeVersion)),
 		}
 	}
+	return p
+}
+
+// ensureNodeTypesForNodeEnvironment adds Node's own type declarations to a Node-environment
+// TypeScript stack.
+//
+// Its tests legitimately reach for process, Buffer, path and __dirname, and none of them are
+// declared by the runner's globals. The jest-node profile has always installed this; the Vitest ones
+// never did.
+//
+// Deliberately NOT extended to the jsdom profiles. Those are browser applications, their tsconfig
+// usually has no compilerOptions.types, and @types/node is therefore ambient across src/** — which
+// would make `process.env` type-check inside browser code that will not have a `process` at run
+// time, removing an error the repository was correctly getting. A generated jsdom test that reaches
+// for a Node global is the fix loop's to repair — it is a one-token edit in a writable artifact, and
+// the idiomatic `globalThis` needs no declaration at all — so generation is steered away from
+// `global` in the test-stack contract instead.
+//
+// Also not left to chance: @types/node arrives as a TRANSITIVE dependency of vitest in some
+// resolutions and not others (it did not in the run above), so a stack that needs it must declare it.
+func ensureNodeTypesForNodeEnvironment(p jsTestProfile) jsTestProfile {
+	if !p.IsTS || p.TestEnvironment != "node" || profileHasDep(p, typesNodePackage) {
+		return p
+	}
+	p.Deps = append(p.Deps, jsDep{typesNodePackage, VersionTypesNode})
 	return p
 }
 

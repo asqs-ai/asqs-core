@@ -1,0 +1,72 @@
+package errout
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// AllCitedRepoPaths is what the evaluator's writable-scope narrowing runs on. It resolved NOTHING
+// from a TypeScript compile log until the parenthesised position shape was parsed, so a compile
+// round shipped every artifact to the fixer whether or not the compiler had named it.
+func TestAllCitedRepoPaths_tscAndMavenShapes(t *testing.T) {
+	repo := t.TempDir()
+	for _, rel := range []string{
+		"src/app/AppLayout.test.tsx",
+		"src/features/orders/orderFormat.test.ts",
+		"src/main/java/com/example/Foo.java",
+		"Controllers/OwnerController.cs",
+	} {
+		p := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := "src/app/AppLayout.test.tsx(34,22): error TS2339: Property 'toBeInTheDocument' does not exist.\n" +
+		"src/features/orders/orderFormat.test.ts(27,22): error TS2304: Cannot find name 'formatOrderRef'.\n" +
+		"Controllers/OwnerController.cs(33,12): error CS1002: ; expected\n" +
+		"src/main/java/com/example/Foo.java:[12,5] error: cannot find symbol\n"
+
+	got := AllCitedRepoPaths(log, repo)
+	seen := map[string]bool{}
+	for _, p := range got {
+		seen[p] = true
+	}
+	for _, want := range []string{
+		"src/app/AppLayout.test.tsx",
+		"src/features/orders/orderFormat.test.ts",
+		"Controllers/OwnerController.cs",
+		"src/main/java/com/example/Foo.java",
+	} {
+		if !seen[want] {
+			t.Errorf("AllCitedRepoPaths did not resolve %s; got %v", want, got)
+		}
+	}
+}
+
+// A file the log never names must not be resolved — narrowing that returns everything is the bug
+// this pattern exists to avoid.
+func TestAllCitedRepoPaths_uncitedFileNotReturned(t *testing.T) {
+	repo := t.TempDir()
+	for _, rel := range []string{"src/a.test.tsx", "src/b.test.tsx"} {
+		p := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := AllCitedRepoPaths("src/a.test.tsx(1,1): error TS1005: ',' expected.\n", repo)
+	for _, p := range got {
+		if p == "src/b.test.tsx" {
+			t.Fatalf("resolved an uncited file: %v", got)
+		}
+	}
+	if len(got) != 1 || got[0] != "src/a.test.tsx" {
+		t.Errorf("got %v, want [src/a.test.tsx]", got)
+	}
+}

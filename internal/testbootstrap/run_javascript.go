@@ -151,7 +151,7 @@ func runJSBootstrap(ctx context.Context, repo string, cfg *config.TestFrameworkB
 	}
 
 	if prof.IsTS {
-		tsconfigPatches, terr := ensureJestTypeScriptTooling(repo, pkgDir)
+		tsconfigPatches, terr := ensureTestTypeScriptTooling(repo, pkgDir, prof)
 		if terr != nil {
 			logAuditError(audit, ctx, "test_bootstrap.apply_failed", map[string]interface{}{
 				"message": fmt.Sprintf("Failed to set up TypeScript test globals: %v", terr),
@@ -205,6 +205,18 @@ func runJSBootstrap(ctx context.Context, repo string, cfg *config.TestFrameworkB
 	}
 
 	frameworkOK, note := runJSFrameworkSmoke(ctx, runner, audit, repo, pkgDir, prof, &filesChanged)
+
+	// Second mandatory gate for TypeScript: the stack must COMPILE a generated test, not only run
+	// one. See js_typecheck.go — the runner gate above cannot see a missing type declaration,
+	// because the libraries it exercises work at run time regardless.
+	typecheckNote, terr := runJSTypecheckGateAudited(ctx, runner, audit, pkgDir, prof)
+	if terr != nil {
+		removeJSSmokeFile(unitSmoke)
+		return terr
+	}
+	if typecheckNote != "" {
+		note += typecheckNote
+	}
 
 	// Instruments, not deliverables — see the Java path for the reasoning. An ESLint or Prettier
 	// check in the project's own pipeline has the same claim on a foreign file that

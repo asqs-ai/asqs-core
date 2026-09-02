@@ -56,6 +56,12 @@ type LLMGenerator struct {
 	apiSurfaceMu     sync.Mutex
 	apiSurfaceBlocks map[string]apiSurfaceEntry
 	apiSurfaceGroup  singleflight.Group
+
+	// UISelectors + RepoID back the E2E selector inventory (see ui_selectors.go). Both unset is
+	// the old behaviour: no block, no query.
+	UISelectors UISelectorLister
+	RepoID      string
+	uiSelectorState
 	// RepoPath is the absolute or cwd-relative repo root. When set for C#, unit tests may be placed under a
 	// dedicated root-level tests directory (tests/, UnitTests/, …) instead of beside the source file.
 	RepoPath string
@@ -136,6 +142,9 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	// where a small model weights it most heavily. Only the framework block belongs here: it is
 	// stable per (language, layer, framework), which is what makes caching it sound.
 	system += g.pregenerateAPISurface(ctx, itemLang, isE2E)
+	// Same placement rationale as the framework block above: the inventory is repo-wide, identical
+	// for every gap in the run, so it does not disturb the system prompt's cache breakpoint.
+	system += g.uiSelectorInventory(ctx, itemLang, isE2E)
 	// The bootstrap contract, when one exists, is the most reliable statement available about what
 	// is on the test classpath, so it outranks anything the model infers from build files. Absent
 	// (bootstrap disabled — the default — or the repository already had its tooling) it renders

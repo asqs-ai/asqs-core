@@ -21,10 +21,20 @@ export class AppComponent {}
     enrichFileAngularGraph(sf, entry, "src.app.component", "src.app.component");
     const comp = entry.symbols.find((s) => s.kind === "ANGULAR_COMPONENT");
     expect(comp).toBeDefined();
-    expect(entry.edges.some((e) => e.edge_type === "USES_TEMPLATE" && e.callee_fq_name === "./app.component.html")).toBe(
-      true,
-    );
-    expect(entry.symbols.some((s) => s.kind === "ANGULAR_TEMPLATE")).toBe(true);
+    // The edge must name the ANGULAR_TEMPLATE SYMBOL, not the raw templateUrl: the Go indexer
+    // drops any edge whose endpoint does not match a symbol fq_name, and this assertion used to
+    // lock in the raw form that matches nothing.
+    const tplSym = entry.symbols.find((s) => s.kind === "ANGULAR_TEMPLATE");
+    expect(tplSym).toBeDefined();
+    expect(tplSym!.fq_name).toBe("ANGULAR_TEMPLATE:./app.component.html");
+    expect(
+      entry.edges.some((e) => e.edge_type === "USES_TEMPLATE" && e.callee_fq_name === tplSym!.fq_name),
+    ).toBe(true);
+    // Every USES_TEMPLATE endpoint must resolve to a symbol this file emits.
+    const symbolNames = new Set(entry.symbols.map((s) => s.fq_name));
+    for (const e of entry.edges.filter((x) => x.edge_type === "USES_TEMPLATE")) {
+      expect(symbolNames.has(e.callee_fq_name)).toBe(true);
+    }
   });
 
   it("emits ANGULAR_MODULE and MODULE_DECLARATIONS", () => {

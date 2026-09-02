@@ -252,16 +252,48 @@ var (
 	errUnsupportedBuildTool = errors.New("unsupported build tool")
 )
 
+// prettierAvailabilitySkipReason answers "can this prettier command run where it will run", for
+// both configured and auto-detected commands.
+//
+// `npx prettier` without --no-install fetches the package itself, so it is available whatever the
+// repository has installed. `npx --no-install prettier` is the opposite: it refuses unless
+// node_modules/.bin/prettier exists, which is exactly what the two resolvers below check.
+func prettierAvailabilitySkipReason(repoPath, cmd string, target Target) string {
+	low := strings.ToLower(cmd)
+	if strings.Contains(low, "npx ") && !strings.Contains(low, "--no-install") {
+		return ""
+	}
+	dir := filepath.Clean(strings.TrimSpace(repoPath))
+	if _, ok := prettierPerFileCommand(dir, target); ok {
+		return ""
+	}
+	if _, ok := prettierRepoWideCommand(dir, target); ok {
+		return ""
+	}
+	return "formatter_not_available:prettier"
+}
+
+// prettierPerFileCommand and prettierRepoWideCommand deliberately have no `npx` rung.
+//
+// `npx --no-install prettier` cannot succeed when node_modules/.bin/prettier is absent — which is
+// exactly the case localNodeBin above has just ruled out — so the rung only ever produced a command
+// that exits 1 ("npx canceled due to missing packages"). It also probed as available forever:
+// formatAvailabilitySkipReason lists npx in imageProvidedFormatBinaries, so no availability check
+// could catch it. Run api-3c56b784842358e936ec60e505209bc6 spent nine Docker invocations on it, one
+// per fix round, and every repaired artifact went unformatted.
+//
+// The global-PATH rung is local-only for the mirror-image reason: node_modules is bind-mounted into
+// the container, but a formatter installed on the HOST is not, so probing the host's PATH answers
+// the wrong question for the Docker target.
 func prettierPerFileCommand(repoPath string, target Target) (string, bool) {
 	dir := filepath.Clean(strings.TrimSpace(repoPath))
 	if bin := localNodeBin(dir, "prettier", target); bin != "" {
 		return bin + " --write", true
 	}
-	if _, err := exec.LookPath("npx"); err == nil {
-		return "npx --no-install prettier --write", true
-	}
-	if _, err := exec.LookPath("prettier"); err == nil {
-		return "prettier --write", true
+	if target == TargetLocal {
+		if _, err := exec.LookPath("prettier"); err == nil {
+			return "prettier --write", true
+		}
 	}
 	return "", false
 }
@@ -274,11 +306,10 @@ func prettierRepoWideCommand(repoPath string, target Target) (string, bool) {
 	if bin := localNodeBin(dir, "prettier", target); bin != "" {
 		return bin + " --write .", true
 	}
-	if _, err := exec.LookPath("npx"); err == nil {
-		return "npx --no-install prettier --write .", true
-	}
-	if _, err := exec.LookPath("prettier"); err == nil {
-		return "prettier --write .", true
+	if target == TargetLocal {
+		if _, err := exec.LookPath("prettier"); err == nil {
+			return "prettier --write .", true
+		}
 	}
 	return "", false
 }
@@ -336,6 +367,13 @@ func formatAvailabilitySkipReason(repoPath string, r FormatResolveResult, target
 		}
 		return ""
 	}
+	// npx is in imageProvidedFormatBinaries, so the generic probe below answers "yes" for every
+	// `npx …` command whether or not the package it names exists. Ask the prettier question
+	// directly instead of the binary question, or a configured `npx --no-install prettier` resolves
+	// as available in a repo that has no prettier at all — and then exits 1 on every invocation.
+	if strings.Contains(strings.ToLower(cmd), "prettier") {
+		return prettierAvailabilitySkipReason(repoPath, cmd, target)
+	}
 	if strings.HasPrefix(bin, "./") || strings.HasPrefix(bin, ".\\") {
 		if pathExists(filepath.Join(filepath.Clean(repoPath), filepath.FromSlash(bin))) {
 			return ""
@@ -385,11 +423,7 @@ func shellFormatAvailabilitySkipReason(repoPath, cmd string, target Target) stri
 			return "formatter_not_available:gradle"
 		}
 	case strings.Contains(low, "prettier"):
-		if _, ok := prettierPerFileCommand(dir, target); !ok {
-			if _, ok := prettierRepoWideCommand(dir, target); !ok {
-				return "formatter_not_available:prettier"
-			}
-		}
+		return prettierAvailabilitySkipReason(dir, cmd, target)
 	case strings.Contains(low, "dotnet"):
 		if !dotnetOnPATH() {
 			return "formatter_not_available:dotnet"

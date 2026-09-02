@@ -46,6 +46,21 @@ func testStackLLMBlock(repoPath string) string {
 			b.WriteString(" — there is no DOM here; do not render components or touch `document`")
 		}
 		b.WriteString("\n")
+		// A DOM environment still EXECUTES on Node, so `global` exists at run time — but nothing in
+		// a browser stack DECLARES it, because @types/node is deliberately not installed there: with
+		// no compilerOptions.types it would be ambient over the whole app and license `process.env`
+		// inside browser code that has no process at run time.
+		//
+		// So `global.fetch = vi.fn()` runs and then fails the compile step with
+		// `TS2304: Cannot find name 'global'` — 3 of the 112 errors on 2026-09-01. `globalThis` is
+		// the standard spelling, is declared by the ES2020+ lib every one of these projects already
+		// targets, and needs no dependency at all. Saying so once here is cheaper than repairing it
+		// per test, and unlike a hand-written ambient declaration it fixes the cause.
+		if isDOMTestEnvironment(e) {
+			b.WriteString("- **Use `globalThis`, never `global`.** This environment runs on Node, so `global` exists at run " +
+				"time, but nothing here declares it to TypeScript and `global.fetch = ...` fails the compile step with " +
+				"`Cannot find name 'global'`. `globalThis` is declared by the standard library and always type-checks.\n")
+		}
 	}
 
 	if len(c.AvailableImports) > 0 {
@@ -173,6 +188,18 @@ func ResolveTestStackCanonicalImports(ctx context.Context, audit Auditor, provid
 		"lang":    lang,
 		"imports": rendered,
 	})
+}
+
+// isDOMTestEnvironment reports whether a JS/TS test environment provides a DOM. Anything that is not
+// Node's bare environment is one: jsdom is what this bootstrap installs, and happy-dom is the common
+// substitute in repositories that configured their own.
+func isDOMTestEnvironment(env string) bool {
+	switch strings.ToLower(strings.TrimSpace(env)) {
+	case "", "node":
+		return false
+	default:
+		return true
+	}
 }
 
 func sortedImportKeys(m map[string]string) []string {

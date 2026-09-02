@@ -207,7 +207,7 @@ func applyPlaywrightBootstrap(ctx context.Context, p E2EParams, audit Auditor, r
 		})
 		return fmt.Errorf("e2e_framework_bootstrap package.json: %w", err)
 	}
-	if err := writePlaywrightConfig(pkgDir); err != nil {
+	if err := writePlaywrightConfig(pkgDir, p.Lang); err != nil {
 		logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
 			"message": fmt.Sprintf("Failed to write playwright.config.ts: %v", err),
 			"error":   err.Error(),

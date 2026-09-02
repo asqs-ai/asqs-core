@@ -34,30 +34,38 @@ func (r *Registry) resolveSymbol(ctx context.Context, fqName string) (*metadata.
 	if err != nil {
 		return nil, err
 	}
-	var live []*metadata.Symbol
-	for _, s := range syms {
-		if s != nil {
-			live = append(live, s)
-		}
-	}
+	live := appendLiveSymbols(nil, syms)
 	if len(live) == 0 {
 		// B25: C# FQNames carry parameter lists and generic markers, but a model that read
 		// "OrderService#GetOrder" in prose asks with the bare form. The indexer stores that form
 		// in signature_json.bare_fq_name; stores that support the lookup resolve it here.
 		// Overloads come back as multiple candidates and fall into the deterministic-first
 		// handling below, same as same-FQName collisions always have.
-		if bl, ok := r.Meta.(bareFQLookup); ok {
-			bare, berr := bl.ListSymbolsByBareFQName(ctx, r.RepoID, metadata.BareFQName(fqName))
-			if berr == nil {
-				for _, s := range bare {
-					if s != nil {
-						live = append(live, s)
-					}
-				}
+		live = r.appendBareFQMatches(ctx, live, fqName)
+	}
+	if len(live) == 0 {
+		// A model that has just been reading repo-relative PATHS asks with the separator it read:
+		// "src/app/core/session-context.service.SessionContextService" for a symbol the index
+		// stores dot-joined as "src.app.core.session-context.service.SessionContextService". Run
+		// api-3c56b784842358e936ec60e505209bc6 lost three get_symbol / expand_symbol calls to that
+		// one keystroke, on a symbol that WAS indexed.
+		//
+		// Reached only after the exact lookup missed, which is what makes it safe: the kinds whose
+		// FQName legitimately carries a slash — E2E_SPEC:e2e/smoke.spec.ts,
+		// PAGE_ROUTE:/checkout@src.app.app.routes:L21 — resolve on the first rung and never arrive
+		// here. A misspelled one misses either way.
+		if norm := normalizeFQNameSeparators(fqName); norm != fqName {
+			if normSyms, nerr := r.Meta.ListSymbolsByFQName(ctx, r.RepoID, norm); nerr == nil {
+				live = appendLiveSymbols(live, normSyms)
+			}
+			if len(live) == 0 {
+				live = r.appendBareFQMatches(ctx, live, norm)
 			}
 		}
 	}
 	if len(live) == 0 {
+		// The caller's own spelling, not a normalized one: an operator reading the audit needs to
+		// see what the model actually asked for.
 		return nil, noSymbolError{fq: fqName}
 	}
 	if len(live) > 1 {
@@ -69,6 +77,41 @@ func (r *Registry) resolveSymbol(ctx context.Context, fqName string) (*metadata.
 		})
 	}
 	return live[0], nil
+}
+
+// appendLiveSymbols appends the non-nil entries of syms to live. Every resolution rung filters the
+// same way, and a nil entry from a store is not an error — it is a row the store could not hydrate.
+func appendLiveSymbols(live []*metadata.Symbol, syms []*metadata.Symbol) []*metadata.Symbol {
+	for _, s := range syms {
+		if s != nil {
+			live = append(live, s)
+		}
+	}
+	return live
+}
+
+// appendBareFQMatches resolves fq through the optional bareFQLookup capability and appends what it
+// finds. A store without the capability, or a lookup error, contributes nothing: this is a fallback
+// rung, and turning its failure into the caller's failure would mask the real miss.
+func (r *Registry) appendBareFQMatches(ctx context.Context, live []*metadata.Symbol, fq string) []*metadata.Symbol {
+	bl, ok := r.Meta.(bareFQLookup)
+	if !ok {
+		return live
+	}
+	bare, err := bl.ListSymbolsByBareFQName(ctx, r.RepoID, metadata.BareFQName(fq))
+	if err != nil {
+		return live
+	}
+	return appendLiveSymbols(live, bare)
+}
+
+// normalizeFQNameSeparators rewrites path separators as the "." the indexer joins FQName segments
+// with. Returns fq unchanged when it carries none, so callers can compare and skip the extra query.
+func normalizeFQNameSeparators(fq string) string {
+	if !strings.ContainsAny(fq, `/\`) {
+		return fq
+	}
+	return strings.NewReplacer("/", ".", `\`, ".").Replace(fq)
 }
 
 // bareFQLookup is the optional store capability behind the B25 name-only fallback; the concrete

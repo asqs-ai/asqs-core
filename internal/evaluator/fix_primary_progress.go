@@ -90,8 +90,26 @@ func primarySiteStreakSignature(lang string, site PrimaryFailureSite, errorOutpu
 // This does not block anything. It reports, so a round that changed a file without touching the
 // line the compiler named is visible immediately instead of after seven of them.
 
-// primaryDiagnosticRE captures the first `path:[line,col]` javac/roslyn location in an output.
-var primaryDiagnosticRE = regexp.MustCompile(`([\w./\\-]+\.(?:java|kt|cs|ts|tsx|js|jsx|go)):\[?(\d+)[,:]`)
+// primaryDiagnosticRE captures the first diagnostic location in a compiler output, in either shape
+// the toolchains this project drives emit:
+//
+//	javac / Maven   OwnerTests.java:[149,17] cannot find symbol
+//	javac / go      Foo.java:12:5: ...        internal/foo.go:12:3: ...
+//	tsc / MSBuild   src/app/AppLayout.test.tsx(34,22): error TS2339: ...
+//	                Foo.cs(11,19): error CS1002: ...
+//
+// The parenthesised alternative is not cosmetic. Without it this pattern matched NOTHING in a
+// TypeScript compile log, and every breaker built on it was silently inert on TS and C#:
+// FileDiagnostics returned nil so stalledFiles compared two empty maps and
+// evaluator.fix_file_no_progress could never fire, and ParsePrimaryFailureSite never reported OK so
+// the primary-site guard and evaluator.fix_primary_site_untouched could never fire either. The run
+// of 2026-09-01 is what that looks like from outside: a fix loop visibly repeating itself with not
+// one progress signal in the audit, on 112 errors none of which this pattern could see.
+//
+// A column is still required after the line in the paren form (the trailing [,:] class), so
+// `foo.ts(3)` appearing in prose cannot open a bogus diagnostic bucket. tsc and MSBuild both always
+// emit line AND column on error lines.
+var primaryDiagnosticRE = regexp.MustCompile(`([\w./\\-]+\.(?:java|kt|cs|ts|tsx|js|jsx|go))(?::\[?|\()(\d+)[,:]`)
 
 // PrimaryFailureSite is the file and line the first diagnostic blames.
 type PrimaryFailureSite struct {

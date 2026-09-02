@@ -477,6 +477,18 @@ export function indexProjectStreaming(
       if (node.isKind(SyntaxKind.VariableStatement)) {
         const declList = node.getDeclarationList();
         for (const decl of declList.getDeclarations()) {
+          // getName() returns the SOURCE TEXT of the binding name, so a destructuring declaration
+          // yields the pattern itself: `const { rows, summary } = useOrders([...])` produced the
+          // symbol `src.pages.OrdersPage.{ rows, summary }`, which the Go planner then took as a
+          // unit gap and generated a test for (run of 2026-09-01). A pattern binds several names
+          // and is not itself a symbol; emitting one name for it was never right.
+          //
+          // Skipped rather than expanded per binding element: the alternative changes the symbol
+          // universe (new rows, new edges, new chunks) for what is almost always an in-function
+          // `const [a, b] = useState()`. A module-level `export const { a, b } = f()` is
+          // consequently not indexed — which loses a rare export, where today it stores a symbol
+          // whose name is not a name.
+          if (!decl.getNameNode().isKind(SyntaxKind.Identifier)) continue;
           const name = decl.getName();
           if (typeof name !== "string") continue;
           const init = decl.getInitializer();

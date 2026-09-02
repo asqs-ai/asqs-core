@@ -402,6 +402,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// writes it rather than by a containerised compile a round later.
 		APISurface: apiSurface,
 	}
+	// The E2E selector inventory (generator/ui_selectors.go), assigned only when there is a store
+	// to ask: meta is a concrete *metadata.Store, so assigning a nil one into the interface field
+	// would leave it non-nil and holding nil, and the inventory would call through and panic.
+	if meta != nil {
+		gen.UISelectors = meta
+		gen.RepoID = opts.RepoID
+	}
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured

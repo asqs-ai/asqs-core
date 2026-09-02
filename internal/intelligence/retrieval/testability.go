@@ -126,7 +126,50 @@ const (
 	IneligibleFrameworkConfig = "framework_config_bean"
 	IneligibleTrivialAccessor = "trivial_accessor"
 	IneligibleNoBody          = "no_body"
+	// IneligibleBindingPattern is a candidate whose FQName is not a symbol name at all — a
+	// destructuring pattern the language indexer stored verbatim. See fqNameIsBindingPattern.
+	IneligibleBindingPattern = "binding_pattern"
 )
+
+// fqNameIsBindingPattern reports whether a candidate's FQName is a destructuring pattern rather
+// than a symbol name.
+//
+// The JS/TS indexer builds a variable's FQName from ts-morph's VariableDeclaration.getName(), which
+// returns the SOURCE TEXT of the binding name. For an identifier that is the name; for a binding
+// pattern it is the pattern itself. In the run of 2026-09-01 that produced a unit gap named
+// `src.pages.OrdersPage.{ rows, summary }` — the destructuring at OrdersPage.tsx:13
+// (`const { rows, summary } = useOrders([...])`). It was planned, retrieved and generated for like
+// any real symbol, and its artifact resolved to the same test path as the real OrdersPage gap, so
+// the two were merged into one file.
+//
+// The two tests below are chosen to be provably safe against every FQName format this project
+// stores, because a false positive silently drops a real gap:
+//
+//   - braces: C# renders types and parameter lists through SymbolDisplayFormat
+//     (Namespace.Type<T>#M<TM>(int,List<T>)) and Java is classFq + "#" + name — neither can contain
+//     `{` or `}`, and no language admits them in an identifier;
+//   - a leading `[` on the final dot-separated segment: C# array parameters render as `int[]`
+//     INSIDE a parameter list, so `[` never opens a segment there, while an array pattern
+//     (`const [a, b] = useState()`) always does.
+//
+// It is deliberately not exhaustive — an array pattern carrying a dotted default (`[a = x.y]`)
+// splits such that the last segment starts with `y`. Closing that needs the indexer to stop
+// emitting patterns at all, which is the companion fix in language-indexer.ts; this guard is the
+// net for rows already in the database, which no code change re-indexes.
+func fqNameIsBindingPattern(fq string) bool {
+	fq = strings.TrimSpace(fq)
+	if fq == "" {
+		return false
+	}
+	if strings.ContainsAny(fq, "{}") {
+		return true
+	}
+	last := fq
+	if i := strings.LastIndex(fq, "."); i >= 0 {
+		last = fq[i+1:]
+	}
+	return strings.HasPrefix(strings.TrimSpace(last), "[")
+}
 
 // gapEligibility decides whether a candidate symbol represents testable behaviour.
 //
@@ -142,6 +185,11 @@ const (
 func gapEligibility(sym *metadata.Symbol, enclosing *metadata.Symbol, outboundCalls int) (ok bool, reason string) {
 	if sym == nil {
 		return false, IneligibleNoBody
+	}
+	// Before anything derived from the symbol's shape: a destructuring pattern is not a symbol, so
+	// no span or call count it carries means anything.
+	if fqNameIsBindingPattern(sym.FQName) {
+		return false, IneligibleBindingPattern
 	}
 	span := sym.EndLine - sym.StartLine
 

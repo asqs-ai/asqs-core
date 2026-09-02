@@ -18,11 +18,31 @@ type Location struct {
 
 var (
 	// file:line or file:line:column (TS/Jest, rustc-style, many compilers)
-	reFileLineColon = regexp.MustCompile(`([A-Za-z0-9_.][A-Za-z0-9_./\\~-]*\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|go|scala)):(\d+)(?::\d+)?`)
+	reFileLineColon = regexp.MustCompile(`([A-Za-z0-9_./\\~-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|go|scala)):(\d+)(?::\d+)?`)
 	// Java / JVM stack: at pkg.Class.method(File.java:12)
 	reJavaParen = regexp.MustCompile(`\(([A-Za-z0-9_./\\$-]+\.(?:java|kt|kts|scala)):(\d+)\)`)
-	// C# / MSBuild: Path\File.cs(33,12) or (Path/File.cs(33,12) in some logs
-	reCSharpParen = regexp.MustCompile(`(?:^|[\s(:'"[])([A-Za-z0-9_./\\]+\.cs)\((\d+),\s*\d+\)`)
+	// Parenthesised line/column, the shape MSBuild/roslyn AND tsc both emit:
+	//   Path\File.cs(33,12): error CS1002: ...
+	//   src/app/AppLayout.test.tsx(34,22): error TS2339: ...
+	//
+	// This was `.cs`-only, which is why AllCitedRepoPaths resolved nothing at all in a TypeScript
+	// compile log — tsc puts the position in parentheses, so neither this nor reFileLineColon (which
+	// needs a colon straight after the extension) nor reJavaParen (JVM extensions only) could see a
+	// single one of them. Everything downstream that narrows or windows by cited path was therefore
+	// working from an empty set on TS.
+	//
+	// The extension list is deliberately the same alternation reFileLineColon uses rather than a
+	// third divergent one; JVM extensions never appear in this shape, so admitting them costs
+	// nothing. The path class gains `~-` because real JS/TS repo paths contain hyphens, which the
+	// old class silently truncated.
+	//
+	// It must keep admitting `/` and `\` in FIRST position, unlike reFileLineColon's class. This
+	// pattern is anchored by a preceding delimiter, so restricting the first character to
+	// [A-Za-z0-9_.] makes an absolute path unmatchable: for "/workspace/src/Api/Program.cs(10,1)"
+	// the match can then only begin at "workspace", whose preceding character is `/` and therefore
+	// not in the delimiter class, and for "C:\proj\Svc.cs(33,12)" it can only begin after a
+	// backslash. Both forms appear in real logs — Docker sandbox paths and Windows MSBuild.
+	reFileParenLineCol = regexp.MustCompile(`(?:^|[\s(:'"[])([A-Za-z0-9_./\\~-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|go|scala))\((\d+),\s*\d+\)`)
 )
 
 // ParseLocations extracts (file, line) pairs from build/test output. Order is scan order; callers dedupe.
@@ -51,7 +71,7 @@ func ParseLocations(log string) []Location {
 			add(sub[1], line)
 		}
 	}
-	for _, sub := range reCSharpParen.FindAllStringSubmatch(log, -1) {
+	for _, sub := range reFileParenLineCol.FindAllStringSubmatch(log, -1) {
 		if len(sub) >= 3 {
 			line, _ := strconv.Atoi(sub[2])
 			add(sub[1], line)
