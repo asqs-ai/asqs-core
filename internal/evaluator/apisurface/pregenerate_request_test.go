@@ -44,17 +44,30 @@ func TestPregenerateTargets_requestTypesAreE2EOnly(t *testing.T) {
 }
 
 // TypeScript's default E2E profile is browser-driven (orchestrator.DefaultRetrievalProfileE2E), so
-// it keeps the assertion list and pays nothing for the request half. Pinned because the natural
-// instinct on reading e2eRequestTargets is to add Node "for symmetry".
-func TestPregenerateTargets_nodeKeepsAssertionsOnly(t *testing.T) {
+// it pays nothing for the REQUEST half — issuing HTTP calls is Java's and .NET's layer, not its.
+// Pinned because the natural instinct on reading e2eRequestTargets is to add Node "for symmetry".
+//
+// Routing is the exception, and deliberately so: interception is how a BROWSER test controls what
+// the application receives, so it belongs to precisely the profile that has no request half.
+func TestPregenerateTargets_nodeGetsAssertionsAndRoutingButNotRequests(t *testing.T) {
 	got := PregenerateTargets("typescript", "playwright", true)
-	if len(got) != 3 {
-		t.Fatalf("want the three TS assertion types only, got %+v", got)
-	}
+	names := map[string]bool{}
 	for _, tgt := range got {
-		if !strings.HasSuffix(tgt.Name, "Assertions") {
-			t.Errorf("unexpected non-assertion target for TypeScript: %+v", tgt)
+		names[tgt.Name] = true
+	}
+	for _, want := range []string{"LocatorAssertions", "PageAssertions", "APIResponseAssertions", "Route", "Page"} {
+		if !names[want] {
+			t.Errorf("TypeScript E2E is missing %s: %+v", want, got)
 		}
+	}
+	// The request-issuing types stay out.
+	for _, unwanted := range []string{"APIRequest", "APIRequestContext", "RequestOptions", "APIResponse"} {
+		if names[unwanted] {
+			t.Errorf("TypeScript E2E carries the request type %s, which its profile does not use: %+v", unwanted, got)
+		}
+	}
+	if len(got) != 5 {
+		t.Errorf("got %d targets, want 3 assertions + 2 routing: %+v", len(got), got)
 	}
 }
 

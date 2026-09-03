@@ -214,6 +214,14 @@ func applyPlaywrightBootstrap(ctx context.Context, p E2EParams, audit Auditor, r
 		})
 		return fmt.Errorf("e2e_framework_bootstrap playwright config: %w", err)
 	}
+	if _, _, err := writePlaywrightSupportHelpers(pkgDir); err != nil {
+		logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
+			"message": fmt.Sprintf("Failed to write %s: %v", playwrightSupportRel, err),
+			"step":    "playwright_support_helpers",
+			"error":   err.Error(),
+		})
+		return fmt.Errorf("e2e_framework_bootstrap playwright support helpers: %w", err)
+	}
 	if err := writePlaywrightSmokeSpec(pkgDir); err != nil {
 		logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
 			"message": fmt.Sprintf("Failed to write e2e/smoke.spec.ts: %v", err),
@@ -244,8 +252,8 @@ func applyPlaywrightBootstrap(ctx context.Context, p E2EParams, audit Auditor, r
 
 	pm := detectPackageManager(npmWorkdir)
 	logAudit(audit, ctx, "e2e_bootstrap.apply_ok", map[string]interface{}{
-		"message":         fmt.Sprintf("Playwright bootstrap complete (%s); package.json, playwright.config.ts, e2e/smoke.spec.ts", string(pm)),
-		"files_changed":   []string{"package.json", "playwright.config.ts", "e2e/smoke.spec.ts"},
+		"message":         fmt.Sprintf("Playwright bootstrap complete (%s); package.json, playwright.config.ts, e2e/smoke.spec.ts, %s", string(pm), playwrightSupportRel),
+		"files_changed":   []string{"package.json", "playwright.config.ts", "e2e/smoke.spec.ts", playwrightSupportRel},
 		"package_manager": string(pm),
 		"stack":           "playwright",
 		"package_root":    relPathForBootstrap(repo, pkgDir),

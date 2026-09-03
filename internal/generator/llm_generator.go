@@ -61,6 +61,12 @@ type LLMGenerator struct {
 	// the old behaviour: no block, no query.
 	UISelectors UISelectorLister
 	RepoID      string
+	// E2EAppPort is the port the E2E web server serves the application on, so the unserved-backend
+	// notice can exclude it. Zero means unknown, which only costs a redundant origin in the notice.
+	E2EAppPort int
+	// E2ESupportModule is the repo-relative path of the route-control helpers the E2E bootstrap
+	// wrote, or "" when the repository brought its own E2E setup and never received them.
+	E2ESupportModule string
 	uiSelectorState
 	// RepoPath is the absolute or cwd-relative repo root. When set for C#, unit tests may be placed under a
 	// dedicated root-level tests directory (tests/, UnitTests/, …) instead of beside the source file.
@@ -145,6 +151,8 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	// Same placement rationale as the framework block above: the inventory is repo-wide, identical
 	// for every gap in the run, so it does not disturb the system prompt's cache breakpoint.
 	system += g.uiSelectorInventory(ctx, itemLang, isE2E)
+	// Same placement and caching rationale: a property of the repository, not of the gap.
+	system += g.e2eBackendNotice(ctx, itemLang, isE2E)
 	// The bootstrap contract, when one exists, is the most reliable statement available about what
 	// is on the test classpath, so it outranks anything the model infers from build files. Absent
 	// (bootstrap disabled — the default — or the repository already had its tooling) it renders

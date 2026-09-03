@@ -32,6 +32,7 @@ func PregenerateTargets(lang, e2eFramework string, isE2E bool) []Target {
 	out := append([]Target(nil), frameworkAnnotationTargets(lang)...)
 	out = append(out, e2eAssertionTargets(lang, e2eFramework, isE2E)...)
 	out = append(out, e2eRequestTargets(lang, e2eFramework, isE2E)...)
+	out = append(out, e2eRoutingTargets(lang, e2eFramework, isE2E)...)
 	if len(out) == 0 {
 		return nil
 	}
@@ -332,6 +333,58 @@ func e2eRequestTargets(lang, e2eFramework string, isE2E bool) []Target {
 			{Kind: KindType, Name: "Microsoft.Playwright.IAPIRequest"},
 			{Kind: KindType, Name: "Microsoft.Playwright.IAPIRequestContext"},
 			{Kind: KindType, Name: "Microsoft.Playwright.IAPIResponse"},
+		}
+	default:
+		return nil
+	}
+}
+
+// e2eRoutingTargets returns the types an E2E test calls to INTERCEPT a request, as opposed to the
+// types it calls to issue one (e2eRequestTargets) or to assert on the result (e2eAssertionTargets).
+//
+// This is the "separate evidence" e2eRequestTargets' comment said a TypeScript request fixture would
+// need, and it arrived: run api-428e4bb1f792d71bacd54d8ba3953801 wrote
+//
+//	await page.route('**/api/catalog*', async (route) => { await route.delay(1500); … })
+//	  → TypeError: route.delay is not a function
+//
+// The interception itself was right — correct API-only URL pattern, registered before navigation —
+// and the model then invented a member to hold the response open. `delay` is not a fabrication out
+// of nowhere: it is a real name in Playwright's surface, an option FIELD on keyboard and mouse
+// options, attached here to the wrong receiver. A complete member list is what separates those two
+// cases, and Route's is short.
+//
+// All three bindings, unlike e2eRequestTargets. Interception is not an API-testing concern that
+// happens to be Java and C#'s default layer — it is how a browser test controls what the
+// application receives, so a Playwright suite in any binding reaches for it, and every binding
+// names the members differently enough to invent.
+//
+// Page is included for the entry point: route() is where an interception starts, and its overloads
+// say what a handler may be. Page is a large interface, so RankMembers caps it at
+// maxMembersPerType and marks it truncated — which RenderSurfaces states, so a bounded dump cannot
+// be read as proof that an unlisted member is absent.
+func e2eRoutingTargets(lang, e2eFramework string, isE2E bool) []Target {
+	if !isE2E {
+		return nil
+	}
+	if !strings.Contains(strings.ToLower(strings.TrimSpace(e2eFramework)), "playwright") {
+		return nil
+	}
+	switch NormalizeLang(lang) {
+	case LangJava:
+		return []Target{
+			{Kind: KindType, Name: "com.microsoft.playwright.Route"},
+			{Kind: KindType, Name: "com.microsoft.playwright.Page"},
+		}
+	case LangCSharp:
+		return []Target{
+			{Kind: KindType, Name: "Microsoft.Playwright.IRoute"},
+			{Kind: KindType, Name: "Microsoft.Playwright.IPage"},
+		}
+	case LangNode:
+		return []Target{
+			{Kind: KindType, Name: "Route"},
+			{Kind: KindType, Name: "Page"},
 		}
 	default:
 		return nil

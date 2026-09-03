@@ -132,3 +132,146 @@ func TestUISelectorInventory_capsTheBlock(t *testing.T) {
 		t.Error("cap must trim the block, not suppress it")
 	}
 }
+
+// Listing a bare attribute name invites the model to invent a query method for it. Run
+// api-7e4930f7306db0a480d4ced6c4107ede took the real data-cy value this block had listed and wrote
+// `getByTestId('checkout-line-total').getByCy('checkout-total-amount')` — getByCy is not a
+// Playwright API. The block must name the CALL, not just the value.
+func TestUISelectorInventory_rendersTheQueryFormNotTheAttribute(t *testing.T) {
+	syms := []*metadata.Symbol{
+		hook("src/app/features/checkout/checkout.component.html", "data-testid", "checkout-title"),
+		hook("src/app/features/checkout/checkout.component.html", "data-cy", "checkout-total-amount"),
+		// A Thymeleaf th:testid is recorded with selector_kind "testid"; it has no dedicated
+		// Playwright getter either.
+		hook("src/app/features/checkout/checkout.component.html", "testid", "legacy-total"),
+	}
+
+	t.Run("playwright", func(t *testing.T) {
+		g := &LLMGenerator{UISelectors: &fakeSelectorLister{syms: syms}, RepoID: "r", E2EFramework: "playwright"}
+		block := g.uiSelectorInventory(context.Background(), "typescript", true)
+		// data-testid is Playwright's DEFAULT testIdAttribute, so the idiomatic getter is correct.
+		if !strings.Contains(block, `getByTestId('checkout-title')`) {
+			t.Errorf("want getByTestId for data-testid:\n%s", block)
+		}
+		// Everything else must use the attribute-selector form, which is correct whatever the
+		// repository configured.
+		for _, want := range []string{
+			`locator('[data-cy="checkout-total-amount"]')`,
+			`locator('[testid="legacy-total"]')`,
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("want %s:\n%s", want, block)
+			}
+		}
+		if strings.Contains(block, "getByCy") {
+			t.Errorf("block suggests a getter that does not exist:\n%s", block)
+		}
+		// The bare attribute name must not appear as a standalone label any more.
+		if strings.Contains(block, "\n  data-cy: ") || strings.Contains(block, "\n  data-testid: ") {
+			t.Errorf("block still lists raw attribute labels:\n%s", block)
+		}
+	})
+
+	t.Run("cypress", func(t *testing.T) {
+		g := &LLMGenerator{UISelectors: &fakeSelectorLister{syms: syms}, RepoID: "r", E2EFramework: "cypress"}
+		block := g.uiSelectorInventory(context.Background(), "typescript", true)
+		for _, want := range []string{
+			`cy.get('[data-testid="checkout-title"]')`,
+			`cy.get('[data-cy="checkout-total-amount"]')`,
+		} {
+			if !strings.Contains(block, want) {
+				t.Errorf("want %s:\n%s", want, block)
+			}
+		}
+		if strings.Contains(block, "getByTestId") {
+			t.Errorf("Playwright getter leaked into a Cypress block:\n%s", block)
+		}
+	})
+}
+
+// The model read the template paths out of this block and passed them to get_symbol, which fails:
+// the indexed symbols are named STATIC_TEMPLATE:<path>, not <path>. Three wasted tool calls in run
+// api-7e4930f7306db0a480d4ced6c4107ede.
+func TestUISelectorInventory_saysHeadingsArePathsNotSymbols(t *testing.T) {
+	g := &LLMGenerator{UISelectors: &fakeSelectorLister{syms: angularHooks()}, RepoID: "r"}
+	block := g.uiSelectorInventory(context.Background(), "typescript", true)
+	if !strings.Contains(block, "get_symbol") {
+		t.Errorf("block does not warn that the headings are paths, not symbols:\n%s", block)
+	}
+}
+
+func lifecycleHook(path, value string, conditional, repeated bool) *metadata.Symbol {
+	sig := `{"selector_kind":"data-testid","value":"` + value + `","framework":"html","template_path":"` + path +
+		`","conditional":` + boolLit(conditional) + `,"repeated":` + boolLit(repeated) + `}`
+	return &metadata.Symbol{Kind: "ui_test_hook", Lang: "html", File: path, SignatureJSON: []byte(sig)}
+}
+
+func boolLit(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+// A flat list answers "what exists" and says nothing about "when". Every remaining E2E failure in
+// run api-c81d90a22d1460d87b64e483837fdc24 was a REAL selector asserted at the wrong moment:
+// `catalog-loading` lives inside `@if (loading)` and is gone once the search resolves.
+func TestUISelectorInventory_annotatesConditionalAndRepeatedSelectors(t *testing.T) {
+	const tpl = "src/app/features/catalog/catalog.component.html"
+	g := &LLMGenerator{RepoID: "r", E2EFramework: "playwright", UISelectors: &fakeSelectorLister{syms: []*metadata.Symbol{
+		lifecycleHook(tpl, "catalog-results", false, false),
+		lifecycleHook(tpl, "catalog-loading", true, false),
+		lifecycleHook(tpl, "catalog-item-price", true, true),
+	}}}
+
+	block := g.uiSelectorInventory(context.Background(), "typescript", true)
+
+	for _, line := range strings.Split(block, "\n") {
+		switch {
+		case strings.Contains(line, "catalog-loading"):
+			if !strings.Contains(line, "@if") || strings.Contains(line, "@for") {
+				t.Errorf("conditional selector must be marked as @if-gated: %q", line)
+			}
+			// "drive the app into that state" was the first wording and run
+			// api-620c78444155f43a6afdc9587c097eae showed it is unfollowable: a loading flag
+			// cleared when the request settles lasts microseconds against a dev server with no
+			// backend. Only holding the response open makes the assertion mean anything.
+			if !strings.Contains(line, "page.route(") {
+				t.Errorf("a conditional selector gated on a request must recommend interception: %q", line)
+			}
+		case strings.Contains(line, "catalog-item-price"):
+			if !strings.Contains(line, "@for") {
+				t.Errorf("repeated selector must be marked as @for-repeated: %q", line)
+			}
+			if !strings.Contains(line, "empty") {
+				t.Errorf("a repeated selector must say it is absent when the collection is empty: %q", line)
+			}
+			if !strings.Contains(line, "page.route(") {
+				t.Errorf("a repeated selector needs a populated collection, which means interception: %q", line)
+			}
+		case strings.Contains(line, "catalog-results"):
+			// Always present: no note, or the model is told to wait for a state that never changes.
+			if strings.Contains(line, "@if") || strings.Contains(line, "@for") {
+				t.Errorf("an unconditional selector must carry no lifecycle note: %q", line)
+			}
+		}
+	}
+
+	// The empty-container case is not expressible per selector, so the header has to carry it.
+	if !strings.Contains(block, "no size while the collection is empty") {
+		t.Errorf("header must warn that an empty repeated container is attached but not visible:\n%s", block)
+	}
+}
+
+// Signatures written before the indexer recorded lifecycle simply have no flags, and must render
+// exactly as they did.
+func TestUISelectorInventory_toleratesSignaturesWithoutLifecycle(t *testing.T) {
+	g := &LLMGenerator{RepoID: "r", UISelectors: &fakeSelectorLister{syms: angularHooks()}}
+	block := g.uiSelectorInventory(context.Background(), "typescript", true)
+	if strings.Contains(block, "@if") || strings.Contains(block, "@for") {
+		t.Errorf("absent flags must not produce a lifecycle note:\n%s", block)
+	}
+	if !strings.Contains(block, "getByTestId('catalog-search-input')") {
+		t.Errorf("selectors must still render:\n%s", block)
+	}
+}

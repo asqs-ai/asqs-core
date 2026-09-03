@@ -117,6 +117,15 @@ func applyPlaywrightJavaBootstrap(ctx context.Context, p E2EParams, audit Audito
 		filesChanged = append(filesChanged, relPathForBootstrap(repo, smokePath))
 	}
 
+	// Route-control helpers, beside the smoke test. Same reasoning as the JS/TS bootstrap's
+	// e2e/support/api.ts: a generated E2E test that asserts on API-rendered UI has to decide what
+	// the API returns, and hand-rolling that handler is where a model invents a Route member.
+	if stubsPath, stubsWrote, serr := writeJavaAPIStubs(moduleRoot); serr != nil {
+		return fmt.Errorf("e2e_framework_bootstrap write api stubs: %w", serr)
+	} else if stubsWrote {
+		filesChanged = append(filesChanged, relPathForBootstrap(repo, stubsPath))
+	}
+
 	if len(filesChanged) > 0 {
 		logAudit(audit, ctx, "e2e_bootstrap.patched", map[string]interface{}{
 			"message": fmt.Sprintf("Patched: %s", strings.Join(filesChanged, ", ")), "files_changed": filesChanged,

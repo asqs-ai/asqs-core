@@ -159,7 +159,7 @@ func TestClampFixContextRunes_protectsWritableArtifacts(t *testing.T) {
 		"src/Big.java": strings.Repeat("x", 900),
 		"src/Mid.java": strings.Repeat("y", 500),
 	}
-	dropped := clampFixContextRunes(files, []string{"a/ATest.java"}, 1000)
+	dropped := clampFixContextRunes(files, []string{"a/ATest.java"}, 1000, "")
 
 	if _, ok := files["a/ATest.java"]; !ok {
 		t.Fatal("the writable artifact was shed; the fixer cannot rewrite a file it was not given")
@@ -167,11 +167,12 @@ func TestClampFixContextRunes_protectsWritableArtifacts(t *testing.T) {
 	if len(dropped) == 0 {
 		t.Fatal("an over-budget context must shed something")
 	}
-	// Largest-first reaches the budget in the fewest drops.
+	// Largest-first WITHIN A RELEVANCE TIER reaches the budget in the fewest drops; with no
+	// failure output and no artifact reference, nothing here is relevant, so size decides.
 	if dropped[0] != "src/Big.java" && len(dropped) == 1 {
 		t.Errorf("dropped = %v, want the largest dependency first", dropped)
 	}
-	if clampFixContextRunes(map[string]string{"a": "small"}, nil, 0) != nil {
+	if clampFixContextRunes(map[string]string{"a": "small"}, nil, 0, "") != nil {
 		t.Error("an uncapped budget must shed nothing")
 	}
 }

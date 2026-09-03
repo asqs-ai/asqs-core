@@ -19,19 +19,21 @@ func TestPregenerateTargets_scope(t *testing.T) {
 		// 4 for Java and .NET (static factory + three assertion types), 3 for TypeScript
 		// (expect() is a function, so there is no factory type), and Java adds a fifth, AssertJ's
 		// Assertions, because the Playwright four cannot assert on a plain value and the block
-		// they are rendered in claims to be exhaustive; and an API-driven E2E gap adds the REQUEST
-		// types, 5 for Java and 4 for .NET. TypeScript gets none of the third group: its default
-		// E2E profile is browser-driven (see e2eRequestTargets).
-		{name: "java playwright e2e", lang: "java", framework: "playwright", isE2E: true, wantCount: 5 + 5 + 5},
-		{name: "case insensitive", lang: "Java", framework: "Playwright-Java", isE2E: true, wantCount: 5 + 5 + 5},
+		// they are rendered in claims to be exhaustive; an API-driven E2E gap adds the REQUEST
+		// types, 5 for Java and 4 for .NET, and TypeScript gets none of that third group because
+		// its default E2E profile is browser-driven (see e2eRequestTargets); and every Playwright
+		// binding adds the two ROUTING types, because interception is how a browser test controls
+		// what the application receives and no binding's default covers it.
+		{name: "java playwright e2e", lang: "java", framework: "playwright", isE2E: true, wantCount: 5 + 5 + 5 + 2},
+		{name: "case insensitive", lang: "Java", framework: "Playwright-Java", isE2E: true, wantCount: 5 + 5 + 5 + 2},
 		{name: "java unit gap keeps the annotations", lang: "java", framework: "playwright", isE2E: false, wantCount: 5},
 		{name: "java unit gap with no framework", lang: "java", framework: "", isE2E: false, wantCount: 5},
 		{name: "cypress java keeps annotations, drops assertions", lang: "java", framework: "cypress", isE2E: true, wantCount: 5},
-		{name: "csharp", lang: "csharp", framework: "playwright-dotnet", isE2E: true, wantCount: 4 + 4},
-		{name: "csharp cs alias", lang: "cs", framework: "playwright", isE2E: true, wantCount: 4 + 4},
+		{name: "csharp", lang: "csharp", framework: "playwright-dotnet", isE2E: true, wantCount: 4 + 4 + 2},
+		{name: "csharp cs alias", lang: "cs", framework: "playwright", isE2E: true, wantCount: 4 + 4 + 2},
 		{name: "csharp unit gap has no annotation group", lang: "csharp", framework: "playwright", isE2E: false, wantCount: 0},
-		{name: "typescript", lang: "typescript", framework: "playwright", isE2E: true, wantCount: 3},
-		{name: "javascript alias", lang: "js", framework: "playwright", isE2E: true, wantCount: 3},
+		{name: "typescript", lang: "typescript", framework: "playwright", isE2E: true, wantCount: 3 + 2},
+		{name: "javascript alias", lang: "js", framework: "playwright", isE2E: true, wantCount: 3 + 2},
 		{name: "unknown language is out of scope", lang: "python", framework: "playwright", isE2E: true, wantCount: 0},
 	}
 	for _, tc := range cases {

@@ -180,3 +180,27 @@ func TestAngularTsconfigSpec_includesBothTestSuffixes(t *testing.T) {
 		}
 	}
 }
+
+// Angular's generated tsconfig sets noPropertyAccessFromIndexSignature, under which
+// `process.env.CI` is TS4111. Run api-7e4930f7306db0a480d4ced6c4107ede reported it four times
+// against this generated file once the post-generate type-check gate was switched on — the config
+// ASQS writes must itself survive the gate ASQS runs.
+func TestPlaywrightConfig_usesBracketAccessForEnv(t *testing.T) {
+	dir := writePkg(t, map[string]string{"package.json": angularPkgJSON})
+	if err := writePlaywrightConfig(dir, "typescript"); err != nil {
+		t.Fatalf("writePlaywrightConfig: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "playwright.config.ts"))
+	got := string(b)
+
+	if strings.Contains(got, "process.env.CI") {
+		t.Errorf("dotted env access is TS4111 under noPropertyAccessFromIndexSignature:\n%s", got)
+	}
+	if !strings.Contains(got, "process.env['CI']") {
+		t.Errorf("want bracket access:\n%s", got)
+	}
+	// Every env read must be bracketed, in the webServer block too.
+	if n := strings.Count(got, "process.env['CI']"); n != 4 {
+		t.Errorf("process.env['CI'] appears %d times, want 4 (forbidOnly, retries, workers, reuseExistingServer)", n)
+	}
+}

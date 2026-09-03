@@ -75,11 +75,64 @@ func isJSTSLangForSelectors(lang string) bool {
 	return false
 }
 
+// uiSelectorQueryForm renders how to ACTUALLY query one selector in the run's E2E framework.
+//
+// Listing the bare attribute name was not enough and was actively harmful. Run
+// api-7e4930f7306db0a480d4ced6c4107ede took `checkout-total-amount` — a real `data-cy` value this
+// block had correctly listed — and reached for `getByCy(...)`, invented by analogy with the
+// `getByTestId(...)` it knew, which is not a Playwright API at all. Naming the selector without
+// naming the call is an invitation to guess the call.
+//
+// `getByTestId` is emitted only for `data-testid`, and only because that is Playwright's default
+// testIdAttribute — the value the bootstrap's own generated config leaves in place. Every other
+// attribute gets the attribute-selector form, which is correct whatever a repository has
+// configured.
+func uiSelectorQueryForm(e2eFramework, kind, value string) string {
+	attr := fmt.Sprintf("[%s=%q]", kind, value)
+	if strings.EqualFold(strings.TrimSpace(e2eFramework), "cypress") {
+		return fmt.Sprintf("cy.get('%s')", attr)
+	}
+	if strings.EqualFold(kind, "data-testid") {
+		return fmt.Sprintf("getByTestId('%s')", value)
+	}
+	return fmt.Sprintf("locator('%s')", attr)
+}
+
+// uiSelectorLifecycleNote says WHEN the element exists, or "" for one that is simply always there.
+//
+// A flat list of selectors answers "what exists" and says nothing about "when", and every remaining
+// E2E failure in run api-c81d90a22d1460d87b64e483837fdc24 was a real selector asserted at the wrong
+// moment: `catalog-loading` sits inside `@if (loading)` and is gone the instant the search resolves,
+// so `toBeVisible()` on it can only pass by luck.
+//
+// The advice names route interception rather than "drive the app into that state", which is what
+// this note said first and what run api-620c78444155f43a6afdc9587c097eae showed to be unfollowable.
+// A loading flag is set on click and cleared when the request settles; against a dev server with no
+// backend the request fails on the next tick, so the state exists for microseconds and no amount of
+// driving reaches it. Holding the response open is the only way the assertion can be made to mean
+// anything, and it is also how a repeated selector gets a non-empty collection to be repeated over.
+func uiSelectorLifecycleNote(s uiSelector) string {
+	switch {
+	case s.Repeated:
+		return "   — one per item in an @for / *ngFor; absent entirely when the collection is empty, " +
+			"so populate the collection (intercept the request with page.route(...) and fulfil it) before asserting"
+	case s.Conditional:
+		return "   — only present while its @if / *ngIf condition holds. If that condition is a pending " +
+			"request, hold the request open with page.route(...) rather than racing it; a state that ends when " +
+			"the request settles cannot be observed by polling"
+	}
+	return ""
+}
+
 // uiSelector is one indexed selector, flattened from a UI_TEST_HOOK symbol's signature.
 type uiSelector struct {
 	Kind         string
 	Value        string
 	TemplatePath string
+	// Conditional / Repeated describe WHEN the element is on the page, which the selector alone
+	// cannot say. The HTML indexer derives them from the template's Angular control flow.
+	Conditional bool
+	Repeated    bool
 }
 
 func (g *LLMGenerator) buildUISelectorInventory(ctx context.Context) string {
@@ -121,9 +174,11 @@ func (g *LLMGenerator) buildUISelectorInventory(ctx context.Context) string {
 
 	var b strings.Builder
 	b.WriteString("\n\n**Indexed UI test selectors (read from this repository's own templates).**\n")
-	b.WriteString("These are the selectors that actually exist. Prefer them over any selector you would otherwise infer, ")
-	b.WriteString("and do not assert on a `placeholder`, label or test id that is not listed here — a selector absent from this list is one the page does not have. ")
-	b.WriteString("A template may also contain selectors built at runtime from an expression, which cannot be listed: prefer a listed container selector over guessing an item selector.\n")
+	b.WriteString("Each entry below is written in the form you should call — copy it verbatim rather than inventing a query method for the attribute. ")
+	b.WriteString("These are the selectors that actually exist: do not assert on a `placeholder`, label or test id that is not listed here, because a selector absent from this list is one the page does not have. ")
+	b.WriteString("A template may also contain selectors built at runtime from an expression, which cannot be listed: prefer a listed container selector over guessing an item selector. ")
+	b.WriteString("Note that a container whose only contents are repeated is in the DOM but has no size while the collection is empty, so `toBeVisible()` on it fails until something has been rendered into it — assert on its contents, or on the container being attached. ")
+	b.WriteString("The headings are template FILE PATHS, not indexed symbols — do not pass them to get_symbol.\n")
 
 	renderedTemplates, renderedSelectors := 0, 0
 	for _, p := range paths {
@@ -137,21 +192,16 @@ func (g *LLMGenerator) buildUISelectorInventory(ctx context.Context) string {
 			}
 			return sels[i].Value < sels[j].Value
 		})
-		byKind := map[string][]string{}
-		kinds := []string{}
-		for _, s := range sels {
-			if len(byKind[s.Kind]) >= uiSelectorMaxPerTemplate {
-				continue
-			}
-			if _, ok := byKind[s.Kind]; !ok {
-				kinds = append(kinds, s.Kind)
-			}
-			byKind[s.Kind] = append(byKind[s.Kind], truncateRunes(s.Value, uiSelectorMaxValueRunesShown))
-			renderedSelectors++
-		}
 		line := "\n" + p + "\n"
-		for _, k := range kinds {
-			line += "  " + k + ": " + strings.Join(byKind[k], ", ") + "\n"
+		perTemplate := 0
+		for _, s := range sels {
+			if perTemplate >= uiSelectorMaxPerTemplate {
+				break
+			}
+			line += "  " + uiSelectorQueryForm(g.E2EFramework, s.Kind, truncateRunes(s.Value, uiSelectorMaxValueRunesShown)) +
+				uiSelectorLifecycleNote(s) + "\n"
+			perTemplate++
+			renderedSelectors++
 		}
 		if len([]rune(b.String()))+len([]rune(line)) > uiSelectorMaxBlockRunes {
 			break
@@ -172,6 +222,8 @@ func uiSelectorFromSignature(sig []byte) (uiSelector, bool) {
 		SelectorKind string `json:"selector_kind"`
 		Value        string `json:"value"`
 		TemplatePath string `json:"template_path"`
+		Conditional  bool   `json:"conditional"`
+		Repeated     bool   `json:"repeated"`
 	}
 	if json.Unmarshal(sig, &m) != nil {
 		return uiSelector{}, false
@@ -182,7 +234,7 @@ func uiSelectorFromSignature(sig []byte) (uiSelector, bool) {
 	if kind == "" || value == "" || path == "" {
 		return uiSelector{}, false
 	}
-	return uiSelector{Kind: kind, Value: value, TemplatePath: path}, true
+	return uiSelector{Kind: kind, Value: value, TemplatePath: path, Conditional: m.Conditional, Repeated: m.Repeated}, true
 }
 
 func truncateRunes(s string, max int) string {
@@ -229,4 +281,8 @@ func errString(err error) string {
 type uiSelectorState struct {
 	uiSelectorOnce  sync.Once
 	uiSelectorBlock string
+	// The unserved-backend notice is resolved the same way and for the same reason: it is a
+	// property of the repository, identical for every gap in the run.
+	e2eBackendOnce  sync.Once
+	e2eBackendBlock string
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -2358,7 +2359,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// Honour the context budget BEFORE any of the audit path lists below are derived from `files`:
 	// they all enumerate the map, so shedding afterwards would advertise dependency files the model
 	// never received. req.Files aliases this map, so the request shrinks with it.
-	if shed := clampFixContextRunes(files, writableArtifacts, opts.FixContextRunesMax); len(shed) > 0 && audit != nil {
+	if shed := clampFixContextRunes(files, writableArtifacts, opts.FixContextRunesMax, errorOutput); len(shed) > 0 && audit != nil {
 		audit.Log(ctx, "evaluator.fix_context_clamped", map[string]interface{}{
 			"message":         fmt.Sprintf("Dropped %d read-only dependency file(s) to fit the fix context budget of %d runes.", len(shed), opts.FixContextRunesMax),
 			"budget_runes":    opts.FixContextRunesMax,
@@ -2900,10 +2901,19 @@ func compileErrorTouchesArtifactScope(errorOutput string, opts EvalOptions) bool
 // alone already exceed the budget the function shreds every dependency and stops — an over-budget
 // prompt beats an unusable one.
 //
-// Largest-first is deliberate: it reaches the budget in the fewest drops, so the model keeps the
-// most distinct pieces of context. Ties break on path so the choice is deterministic across runs
-// (map iteration order is not) and two identical runs produce identical prompts.
-func clampFixContextRunes(files map[string]string, writableArtifacts []string, maxRunes int) []string {
+// Shedding order is RELEVANCE first, size second. Largest-first alone optimises for the number of
+// files retained, and the largest read-only file is reliably the production source under test — so
+// it was reliably the first thing thrown away. Run api-c81d90a22d1460d87b64e483837fdc24 is the case
+// in full: repairing `No provider for InjectionToken API_BASE_URL` in catalog.service.test.ts, the
+// clamp dropped catalog.service.ts (848 bytes, the largest candidate) while keeping smaller files
+// that had nothing to do with the failure. The one file naming both `inject(API_BASE_URL)` and the
+// token's import path was the one file removed, and the fixer answered by returning the test
+// unchanged — correctly, from where it was standing.
+//
+// A dependency is relevant when the failure output names it, or when a writable artifact references
+// it. Within a tier the old largest-first rule still applies, so "reach the budget in the fewest
+// drops" survives wherever relevance does not distinguish two candidates.
+func clampFixContextRunes(files map[string]string, writableArtifacts []string, maxRunes int, errorOutput string) []string {
 	if maxRunes <= 0 || len(files) == 0 {
 		return nil
 	}
@@ -2918,18 +2928,24 @@ func clampFixContextRunes(files map[string]string, writableArtifacts []string, m
 	for _, p := range writableArtifacts {
 		protected[normalizePathForFix(p)] = true
 	}
+	relevant := relevantDependencyPaths(files, protected, errorOutput)
 	type entry struct {
-		path  string
-		runes int
+		path     string
+		runes    int
+		relevant bool
 	}
 	candidates := make([]entry, 0, len(files))
 	for p, c := range files {
 		if protected[normalizePathForFix(p)] {
 			continue
 		}
-		candidates = append(candidates, entry{path: p, runes: len([]rune(c))})
+		candidates = append(candidates, entry{path: p, runes: len([]rune(c)), relevant: relevant[normalizePathForFix(p)]})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
+		// Irrelevant first: these are shed before anything the failure or an artifact points at.
+		if candidates[i].relevant != candidates[j].relevant {
+			return !candidates[i].relevant
+		}
 		if candidates[i].runes != candidates[j].runes {
 			return candidates[i].runes > candidates[j].runes
 		}
@@ -2946,6 +2962,54 @@ func clampFixContextRunes(files map[string]string, writableArtifacts []string, m
 	}
 	sort.Strings(dropped)
 	return dropped
+}
+
+// relevantDependencyPaths reports which read-only dependencies the failure or the writable
+// artifacts point at.
+//
+// Two signals, both cheap and both deliberately generous — a wrong "keep" costs a few hundred runes
+// of prompt, a wrong "drop" costs the round:
+//
+//   - the failure output names the file. A stack frame is enough: the observed NullInjectorError
+//     carried "at new CatalogService (src/app/features/catalog/catalog.service.ts:37:8)".
+//   - a writable artifact references it by module name, which is what an import of a repo file
+//     looks like once the extension is stripped ("./catalog.service" for catalog.service.ts).
+func relevantDependencyPaths(files map[string]string, protected map[string]bool, errorOutput string) map[string]bool {
+	out := make(map[string]bool, len(files))
+	normErr := strings.ReplaceAll(errorOutput, "\\", "/")
+	artifacts := make([]string, 0, len(protected))
+	for p, c := range files {
+		if protected[normalizePathForFix(p)] {
+			artifacts = append(artifacts, c)
+		}
+	}
+	for p := range files {
+		norm := normalizePathForFix(p)
+		if protected[norm] {
+			continue
+		}
+		if normErr != "" && strings.Contains(normErr, norm) {
+			out[norm] = true
+			continue
+		}
+		base := path.Base(norm)
+		if normErr != "" && base != "" && strings.Contains(normErr, base) {
+			out[norm] = true
+			continue
+		}
+		// Module name: the base name without its extension, which is how a repo import spells it.
+		module := strings.TrimSuffix(base, path.Ext(base))
+		if module == "" {
+			continue
+		}
+		for _, a := range artifacts {
+			if strings.Contains(a, module) {
+				out[norm] = true
+				break
+			}
+		}
+	}
+	return out
 }
 
 // sleepBetweenFixAttempts waits d before fix attempts after the first, so an operator who set

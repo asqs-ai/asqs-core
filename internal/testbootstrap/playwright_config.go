@@ -103,9 +103,14 @@ func renderPlaywrightConfig(ws playwrightWebServer) string {
 	b.WriteString("export default defineConfig({\n")
 	b.WriteString("  testDir: './e2e',\n")
 	b.WriteString("  fullyParallel: true,\n")
-	b.WriteString("  forbidOnly: !!process.env.CI,\n")
-	b.WriteString("  retries: process.env.CI ? 2 : 0,\n")
-	b.WriteString("  workers: process.env.CI ? 1 : undefined,\n")
+	// process.env['CI'], not process.env['CI']: Angular's generated tsconfig sets
+	// noPropertyAccessFromIndexSignature, under which dotted access to an index-signature property
+	// is TS4111. Run api-7e4930f7306db0a480d4ced6c4107ede reported it four times against this file
+	// once the post-generate type-check gate was switched on. Bracket access is valid under every
+	// tsconfig, so it costs nothing where the flag is off.
+	b.WriteString("  forbidOnly: !!process.env['CI'],\n")
+	b.WriteString("  retries: process.env['CI'] ? 2 : 0,\n")
+	b.WriteString("  workers: process.env['CI'] ? 1 : undefined,\n")
 	b.WriteString("  reporter: 'list',\n")
 	b.WriteString("  use: {\n")
 	if ws.ok() {
@@ -120,7 +125,7 @@ func renderPlaywrightConfig(ws playwrightWebServer) string {
 		// localhost, not 127.0.0.1: it is what both `ng serve` and `vite` bind by default, so the
 		// readiness probe resolves the same way the server does.
 		fmt.Fprintf(&b, "    url: 'http://localhost:%d',\n", ws.Port)
-		b.WriteString("    reuseExistingServer: !process.env.CI,\n")
+		b.WriteString("    reuseExistingServer: !process.env['CI'],\n")
 		// 120s, not Playwright's 60s default: a cold Angular or Vite build from an unwarmed cache
 		// regularly exceeds a minute inside a container.
 		b.WriteString("    timeout: 120_000,\n")
@@ -166,4 +171,19 @@ func writePlaywrightSmokeSpec(dir string) error {
 		return nil
 	}
 	return atomicWrite(p, []byte(playwrightSmokeSpec))
+}
+
+// E2EAppPort reports the port the generated Playwright config serves the application on, or 0 when
+// no web server could be named for this repository.
+//
+// Exported for the generator, which needs to exclude the app's own origin when warning that the
+// application calls a backend nothing will be serving during the suite. internal/orchestrator cannot
+// import this package (it is imported BY it), so the workflow layer reads the port here and passes
+// it down.
+func E2EAppPort(repo, lang string) int {
+	pkgDir, err := resolveJSPackageDirForBootstrap(strings.TrimSpace(repo))
+	if err != nil {
+		return 0
+	}
+	return detectPlaywrightWebServer(pkgDir, lang).Port
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -42,6 +43,30 @@ func (r *Registry) resolveSymbol(ctx context.Context, fqName string) (*metadata.
 		// Overloads come back as multiple candidates and fall into the deterministic-first
 		// handling below, same as same-FQName collisions always have.
 		live = r.appendBareFQMatches(ctx, live, fqName)
+	}
+	if len(live) == 0 {
+		// A template asked for by its FILE PATH. The E2E selector inventory lists template paths as
+		// headings, and a model reading it reaches for the template the obvious way — run
+		// api-c81d90a22d1460d87b64e483837fdc24 lost seven lookups to
+		// `src/app/features/catalog/catalog.component.html` and its siblings. Telling the model not
+		// to ask was tried in the inventory text and did not work, which is the right outcome: its
+		// instinct is correct, the index HAS those templates, and only the name differs.
+		//
+		// The HTML indexer names them `STATIC_TEMPLATE:<repo-relative path>` and the Angular
+		// component enricher names its own stub `ANGULAR_TEMPLATE:<templateUrl>` — a
+		// component-relative "./x.component.html". Both are tried, STATIC_TEMPLATE first because it
+		// is the one that owns the UI_TEST_HOOK children the caller is really after.
+		//
+		// Placed ahead of the separator rung below so a path is never mangled into
+		// "src.app.…component.html" and two lookups wasted before it gets here.
+		for _, candidate := range templateSymbolCandidates(fqName) {
+			if syms, terr := r.Meta.ListSymbolsByFQName(ctx, r.RepoID, candidate); terr == nil {
+				live = appendLiveSymbols(live, syms)
+			}
+			if len(live) > 0 {
+				break
+			}
+		}
 	}
 	if len(live) == 0 {
 		// A model that has just been reading repo-relative PATHS asks with the separator it read:
@@ -103,6 +128,24 @@ func (r *Registry) appendBareFQMatches(ctx context.Context, live []*metadata.Sym
 		return live
 	}
 	return appendLiveSymbols(live, bare)
+}
+
+// templateSymbolCandidates returns the indexed symbol names a template FILE PATH could stand for,
+// or nil when fq is not a template path. Ordered cheapest-to-most-useful-first; the caller stops at
+// the first hit.
+func templateSymbolCandidates(fq string) []string {
+	p := filepath.ToSlash(strings.TrimSpace(fq))
+	low := strings.ToLower(p)
+	if !strings.HasSuffix(low, ".html") && !strings.HasSuffix(low, ".htm") {
+		return nil
+	}
+	out := []string{"STATIC_TEMPLATE:" + p}
+	// The Angular stub is keyed on the component-relative templateUrl, so only its base name is
+	// recoverable from a repo-relative path.
+	if base := path.Base(p); base != "" && base != "." && base != p {
+		out = append(out, "ANGULAR_TEMPLATE:./"+base)
+	}
+	return out
 }
 
 // normalizeFQNameSeparators rewrites path separators as the "." the indexer joins FQName segments

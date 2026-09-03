@@ -409,6 +409,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		gen.UISelectors = meta
 		gen.RepoID = opts.RepoID
 	}
+	// The port the E2E web server serves the app on, so the unserved-backend notice can exclude the
+	// one origin that IS served. Read here because internal/generator cannot import
+	// internal/testbootstrap — the dependency runs the other way.
+	gen.E2EAppPort = testbootstrap.E2EAppPort(repoAbs, lang)
+	// Empty when the repository brought its own E2E setup: the bootstrap skips entirely in that
+	// case, so there are no ASQS helpers to point at and the notice must not invent one.
+	gen.E2ESupportModule = testbootstrap.PlaywrightSupportModule(repoAbs)
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
@@ -775,7 +782,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Phase 2 — evaluate the WHOLE project once: one compile + one test pass (+ optional E2E),
 	// with a single fix loop across all generated files.
 	fmt.Fprintf(os.Stderr, "asqs-core: evaluating %d generated test file(s) (whole-project compile + test)…\n", len(artifactPaths))
-	evalRes, eerr := evaluator.RunEvaluation(ctx, sandbox, evaluator.EvalOptions{
+	evalOpts := evaluator.EvalOptions{
 		RepoPath:         repoAbs,
 		Lang:             lang,
 		MaxFixIterations: maxFix,
@@ -807,7 +814,8 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		// see, because EvalOptions declares an identically named field.
 		DisableErrorLogLLMSummary: cfg.Runner.DisableErrorLogLLMSummary,
 		ErrorLogSummarizer:        errorLogSummarizer(cfg, fixerChat),
-	}, audit)
+	}
+	evalRes, eerr := evaluator.RunEvaluation(ctx, sandbox, evalOpts, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)
 	}
@@ -831,8 +839,26 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		fmt.Fprintf(os.Stderr, "asqs-core: discarded %d repeatedly-failing test file(s); the rest are green.\n", sum.Discarded)
 	}
 
-	// The project is green when the eval passed outright, or stayed stable after discarding.
-	sum.ProjectStable = evalRes.Stable || evalRes.EarlyExitStableAfterDiscard
+	// Phase 3b — verify what the discard left behind, and repair what that turns up.
+	//
+	// "The rest are green" was an assumption, never a measurement. The evaluator stops at the FIRST
+	// failing step, so a run whose unit suite never passed has never executed the E2E pass at all
+	// (workflow.go step 2b sits after the unit block's `continue`) — and discarding the stuck unit
+	// artifacts is exactly what unblocks it. The core run of 2026-09-02 shipped three generated
+	// Playwright specs on that basis: bootstrapped, planned, written, and never once run.
+	//
+	// Re-running the whole evaluation is what turns the claim into a check. Discard is disabled for
+	// this pass (a negative threshold) so it cannot answer a failure by deleting more of its own
+	// output, and the artifacts just removed are dropped from the writable set because they are no
+	// longer on disk.
+	postDiscardVerified := true
+	if sum.Discarded > 0 && (evalRes.Stable || evalRes.EarlyExitStableAfterDiscard) {
+		postDiscardVerified = verifyAfterDiscard(ctx, sandbox, evalOpts, evalRes.EarlyExitDiscardPaths, audit)
+	}
+
+	// The project is green when the eval passed outright, or stayed stable after discarding AND the
+	// tree that remained then verified.
+	sum.ProjectStable = (evalRes.Stable || evalRes.EarlyExitStableAfterDiscard) && postDiscardVerified
 	// A cancelled or timed-out evaluation never reports stable, and therefore never ships. Today
 	// RunEvaluation cannot reach out.Stable = true on a cancelled context (every step failure
 	// continues the loop, and sandboxStepFailure marks a cancelled step OK=false), so this only
