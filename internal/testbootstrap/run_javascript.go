@@ -337,7 +337,22 @@ func installJSDependencies(ctx context.Context, repo, npmWorkdir string, cfg *co
 		})
 		return fmt.Errorf("test_framework_bootstrap install: %w\n%s", err, truncate(string(out), 4000))
 	}
+	auditInstallRetried(audit, ctx, "test_bootstrap.install_retried_newer_npm", cmdLine, out)
 	return nil
+}
+
+// auditInstallRetried records that the image's npm crashed and the install succeeded only on the
+// npx fallback (see npmFallbackSpec). Silent when no retry happened.
+func auditInstallRetried(audit Auditor, ctx context.Context, step, cmdLine string, out []byte) {
+	if !installOutputRetried(out) {
+		return
+	}
+	logAudit(audit, ctx, step, map[string]interface{}{
+		"message": fmt.Sprintf("%s failed with an internal npm crash (Cannot read properties of null); the install succeeded on retry with %s via npx. The image's npm has a resolver bug for this manifest; consider a newer Node image.", cmdLine, npmFallbackSpec),
+		"command": cmdLine,
+		"retry":   "npx --yes " + npmFallbackSpec,
+		"output":  truncate(string(out), 4000),
+	})
 }
 
 func isJSLang(lang string) bool {

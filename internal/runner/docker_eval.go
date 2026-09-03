@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/runner/jobrunner"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
@@ -90,7 +91,9 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	}
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=main argv=[%s] network=%s\n", label, strings.Join(argv, " "), network)
 	res, runErr := s.runDockerJob(ctx, abs, p, argv, network, dockerImageNeedsPlaywrightIPC(p.Image))
-	out := res.CombinedOutput
+	// Captured text is the source of every downstream parse (excerpt, discard attribution, scope
+	// narrowing, the fixer prompt); strip terminal colour once, here, so all of them see plain text.
+	out := errloc.StripANSI(res.CombinedOutput)
 	// A non-nil runErr means the JOB failed to run to completion — the CLI would not start, the
 	// JobSpec was rejected, or the deadline fired — as distinct from the container running and
 	// exiting non-zero, which jobrunner reports as (res, nil) via its ExitError branch.
@@ -104,8 +107,17 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 		return sandboxStepFailure(stepEval, out, runErr, s.jobTimeout())
 	}
 	ok := res.ExitCode == 0
-	if !ok && stepEval == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
-		ok = true
+	// JS runners exit non-zero in two situations that are not test failures: a summary that shows
+	// zero failures (open handles), and no test files at all. The suffix names which one so the
+	// evaluator can tell them apart (see evaluator.NoTestFilesSuffix).
+	exitSuffix := ""
+	if !ok && stepEval == evaluator.StepTest && isJSLang(lang) {
+		switch {
+		case jsTestOutputSummaryShowsZeroFailures(out):
+			ok, exitSuffix = true, jsExitCodeIgnoredSuffix
+		case jsTestOutputReportsNoTestFiles(out):
+			ok, exitSuffix = true, evaluator.NoTestFilesSuffix
+		}
 	}
 	// Result shaping comes from the shared helpers, so a step that passes reads the same on both
 	// targets — including the coverage summary, which used to be a flat "<label> ok" here and
@@ -113,8 +125,8 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	summary := stepSuccessSummary(stepEval, plan, s.evalHostCwd(abs))
 	if !ok {
 		summary = failedStepSummary(stepEval, out, 5)
-	} else if res.ExitCode != 0 && stepEval == evaluator.StepTest && isJSLang(lang) {
-		summary += jsExitCodeIgnoredSuffix
+	} else {
+		summary += exitSuffix
 	}
 	if ok {
 		fmt.Fprintf(os.Stderr, "  %s (docker): ok.\n", label)
@@ -181,8 +193,15 @@ func stepEnv(id profile.ToolchainID, target Target, dockerExtra []string) []stri
 }
 
 // baseStepEnv is what every step sets on every target: CI=true, so build plugins and watch-mode
-// test runners behave as they would in CI rather than waiting for a terminal.
-func baseStepEnv() []string { return []string{"CI=true"} }
+// test runners behave as they would in CI rather than waiting for a terminal, and NO_COLOR=1, so
+// they do not colour their output while doing so.
+//
+// NO_COLOR is needed BECAUSE of CI=true: picocolors/tinyrainbow (vitest, vite) read `CI` as "the
+// user wants colour" and emitted escape codes into a pipe, which broke every log parser
+// downstream (see errloc.StripANSI for the run). NO_COLOR is honoured by those libraries, by
+// chalk, by Node itself, by Maven 3.9+/Gradle and by dotnet. FORCE_COLOR=0 is deliberately NOT
+// set: the same libraries treat the mere presence of FORCE_COLOR as an enable switch.
+func baseStepEnv() []string { return []string{"CI=true", "NO_COLOR=1"} }
 
 // dockerJobEnv is the environment a Docker eval job runs with. Shared by runDockerJobWithTimeout
 // and the step planner so the plan cannot disagree with what the container actually receives.

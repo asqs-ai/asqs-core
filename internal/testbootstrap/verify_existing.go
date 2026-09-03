@@ -143,6 +143,7 @@ func verifyExistingJSStack(ctx context.Context, audit Auditor, repo, lang, runne
 		if ierr != nil {
 			return existingStackVerification{Attempted: true, Reason: "dependency install failed", Detail: truncate(string(out), 8000)}
 		}
+		auditInstallRetried(audit, ctx, "test_bootstrap.verify_existing_install_retried_newer_npm", installCmdLine(pm, false, hasLock, false, ""), out)
 	}
 
 	smoke, err := writeJSUnitSmokeTest(pkgDir, prof)

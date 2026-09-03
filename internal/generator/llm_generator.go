@@ -548,7 +548,7 @@ func reactTSXUnitTestHint(item *retrieval.TestPlanItem) string {
 	if kind != "RENDERS" && kind != "USES_HOOK" && kind != "ACCEPTS_PROPS_TYPE" && !strings.HasSuffix(file, ".tsx") {
 		return ""
 	}
-	return "\n\n**React / .tsx target:** Treat this as a **UI unit** test. Follow **Similar tests** in context when they use Testing Library; otherwise use `@testing-library/react` + `@testing-library/user-event`: wrap with the same providers as production if needed, `render()` the exported component, query the document (`screen.getByRole`, `findByText`, etc.), and assert **user-visible** results or **mock** invocations. Mock framework modules (`next/navigation`, router, data fetching) instead of asserting route strings against themselves."
+	return "\n\n**React / .tsx target:** Treat this as a **UI unit** test. Follow **Similar tests** in context when they use Testing Library; otherwise use `@testing-library/react` + `@testing-library/user-event`: wrap with the same providers as production if needed, `render()` the exported component, query the document (`screen.getByRole`, `findByText`, etc.), and assert **user-visible** results or **mock** invocations. Mock framework modules (`next/navigation`, data fetching) instead of asserting route strings against themselves. **react-router:** a component that renders `Link`, `NavLink`, `Outlet` or calls `useNavigate` needs a router in the tree — wrap it in `MemoryRouter` (or `createMemoryRouter` + `RouterProvider` for data routers) rather than mocking `react-router-dom`; `Link` outside a router throws `Cannot destructure property 'basename'`."
 }
 
 // e2eGenerationActiveTestsPolicy discourages default @Disabled / test.skip on new E2E (models mimic Spring samples)

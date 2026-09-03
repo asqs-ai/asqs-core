@@ -130,6 +130,12 @@ const (
 	VersionTestingLibraryReact       = "16.3.2"
 	VersionTestingLibraryReactLegacy = "12.1.5"
 	VersionTestingLibraryJestDom     = "7.0.1"
+	// user-event is what the React generation hint (reactTSXUnitTestHint) tells the model to reach
+	// for, so the profile must install it: run api-72dad6bb281cacee338f43c48432a780 lost two whole
+	// suites to `Failed to resolve import "@testing-library/user-event"`. Its only peer is
+	// @testing-library/dom >=7.21.4, which both RTL lines already bring in (16 as a peer that npm
+	// auto-installs, 12 as a dependency). Latest 14.x on npm as of 2026-09-03.
+	VersionTestingLibraryUserEvent = "14.6.7"
 )
 
 // jestPresetAngularForMajor maps an Angular major to a jest-preset-angular release, plus the Jest

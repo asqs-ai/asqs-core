@@ -47,3 +47,28 @@ func jsTestOutputSummaryShowsZeroFailures(out string) bool {
 }
 
 var vitestTestsPassedLine = regexp.MustCompile(`(?m)^\s*Tests\s+\d+\s+passed`)
+
+// jsNoTestFilesLine matches the message vitest and jest print when their include pattern matched
+// no file at all. Both exit 1 in that case; neither ran a single test.
+var jsNoTestFilesLine = regexp.MustCompile(`(?im)^\s*No (?:test files|tests) found`)
+
+// jsTestOutputReportsNoTestFiles is true when a JS test runner exited non-zero only because it
+// found no test files: vitest's "No test files found, exiting with code 1" and jest's "No tests
+// found, exiting with code 1". Distinct from jsTestOutputSummaryShowsZeroFailures, which needs a
+// summary table proving tests ran and passed; here nothing ran.
+//
+// The runner cannot know whether an empty tree is fine (only E2E specs survived a discard) or a
+// misconfiguration (generated unit tests exist but the include glob misses them), so it reports
+// the step as passed with evaluator.NoTestFilesSuffix and the evaluator decides
+// (overrideNoTestFilesPass). Run api-72dad6bb281cacee338f43c48432a780 spent three repair rounds
+// on this exact exit code after every unit artifact had been discarded.
+func jsTestOutputReportsNoTestFiles(out string) bool {
+	if strings.TrimSpace(out) == "" {
+		return false
+	}
+	if jestTestSuitesFailed.MatchString(out) || jestTestsFailed.MatchString(out) ||
+		vitestTestsFailed.MatchString(out) || vitestFilesFailed.MatchString(out) {
+		return false
+	}
+	return jsNoTestFilesLine.MatchString(out)
+}

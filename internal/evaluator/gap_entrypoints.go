@@ -517,7 +517,12 @@ func auditFinalStep(ctx context.Context, audit Auditor, sr StepResult) {
 	if audit == nil {
 		return
 	}
+	// `message` is what every step listing renders; without it the evaluator.final.<step> rows
+	// showed up blank next to every other event (seen in the asqs-go audit log of run
+	// api-72dad6bb281cacee338f43c48432a780), and the summary — the one field that says what
+	// happened — had to be dug out of the payload by hand.
 	payload := map[string]any{
+		"message":     finalStepMessage(sr),
 		"step":        string(sr.Step),
 		"ok":          sr.OK,
 		"summary":     sr.Summary,
@@ -531,4 +536,22 @@ func auditFinalStep(ctx context.Context, audit Auditor, sr StepResult) {
 		return
 	}
 	audit.Log(ctx, fmt.Sprintf("evaluator.final.%s", string(sr.Step)), payload)
+}
+
+// finalStepMessage renders the one-line message for a final step result: the step, its verdict,
+// and the first line of its summary — enough to read the outcome from a step listing without
+// opening the payload.
+func finalStepMessage(sr StepResult) string {
+	verdict := "ok"
+	if !sr.OK {
+		verdict = "failed"
+	}
+	summary := strings.TrimSpace(sr.Summary)
+	if i := strings.IndexByte(summary, '\n'); i >= 0 {
+		summary = strings.TrimSpace(summary[:i])
+	}
+	if summary == "" {
+		return fmt.Sprintf("%s step %s.", sr.Step, verdict)
+	}
+	return fmt.Sprintf("%s step %s: %s", sr.Step, verdict, summary)
 }

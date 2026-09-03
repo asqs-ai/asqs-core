@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 )
 
 // Test-failure block extraction. Test logs are dominated by framework noise: a Spring Boot
@@ -97,7 +99,9 @@ func testFailureContinuationLine(line string) bool {
 // contains no recognisable failure marker, in which case the caller must fall back to its plain
 // head/gist behaviour rather than presenting an empty excerpt.
 func ExtractTestFailureBlocks(s string) string {
-	lines := strings.Split(s, "\n")
+	// The marker checks below are prefix checks (`FAIL `, `❯ `); colour codes in front of the
+	// marker hid every vitest failure block (see errloc.StripANSI).
+	lines := strings.Split(errloc.StripANSI(s), "\n")
 	var out []string
 	included := 0
 	lastEmitted := -2 // line index of the previously emitted line; -2 so line 0 never looks adjacent

@@ -139,3 +139,63 @@ func TestDockerTest_successIsUnaffected(t *testing.T) {
 		t.Fatalf("exit 0 must report OK, got summary %q", res.Summary)
 	}
 }
+
+// The sandbox sets CI=true, which makes vitest colour its output even into a pipe; every parser
+// downstream (excerpt, discard attribution, scope narrowing) expects plain text. The strip happens
+// once, at capture, so a coloured runner cannot reach any of them.
+func TestDockerTest_outputIsStrippedOfANSI(t *testing.T) {
+	sb, repo := fakeDockerSandbox(t, "30s", `printf ' \033[32m✓\033[39m src/app/AppLayout.test.tsx\n\033[41m\033[1m FAIL \033[22m\033[49m src/app/router.test.tsx:\033[2m59:24\033[22m\n'
+exit 1`)
+
+	// The fixture repo resolves to the java-maven profile; the strip is language-independent and a
+	// "typescript" step on a pom.xml repo would be skipped before any capture happened.
+	res := sb.Test(context.Background(), repo, "java")
+
+	if res.OK {
+		t.Fatal("non-zero exit must fail the step")
+	}
+	if strings.Contains(res.Output, "\x1b[") {
+		t.Errorf("escape codes survived capture: %q", res.Output)
+	}
+	for _, want := range []string{"✓ src/app/AppLayout.test.tsx", "FAIL  src/app/router.test.tsx:59:24"} {
+		if !strings.Contains(res.Output, want) {
+			t.Errorf("stripped output lost %q: %q", want, res.Output)
+		}
+	}
+}
+
+// fakeDockerSandboxJS is fakeDockerSandbox for a Node package: the docker step plan for JS/TS
+// resolves through package.json, and the runner's JS exit-code rules only apply to JS languages.
+func fakeDockerSandboxJS(t *testing.T, script string) (*Sandbox, string) {
+	t.Helper()
+	sb, repo := fakeDockerSandbox(t, "30s", script)
+	if err := os.WriteFile(filepath.Join(repo, "package.json"), []byte(`{"name":"x","scripts":{"test":"vitest run"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return sb, repo
+}
+
+// vitest exits 1 when its include pattern matches nothing. That is not a failed test: the step
+// passes and carries evaluator.NoTestFilesSuffix so the evaluator can decide whether an empty tree
+// is acceptable (only E2E specs left) or a misconfiguration (generated unit tests never seen).
+func TestDockerTest_noTestFilesIsOkWithSuffix(t *testing.T) {
+	sb, repo := fakeDockerSandboxJS(t, `case "$*" in
+  *"npm test"*|*vitest*) printf ' RUN  v4.1.11 /workspace\n\nNo test files found, exiting with code 1\n\ninclude: **/*.{test,spec}.{js,ts,tsx}\nexclude:  **/node_modules/**, e2e/**\n'; exit 1;;
+  *) exit 0;;
+esac`)
+
+	res := sb.Test(context.Background(), repo, "typescript")
+
+	if !res.OK {
+		t.Fatalf("an empty vitest run must not fail the step at the runner: %q", res.Summary)
+	}
+	if !strings.Contains(res.Summary, evaluator.NoTestFilesSuffix) {
+		t.Errorf("summary must carry NoTestFilesSuffix for the evaluator; got %q", res.Summary)
+	}
+	if strings.Contains(res.Summary, jsExitCodeIgnoredSuffix) {
+		t.Errorf("no-tests must not be reported as the zero-failures case: %q", res.Summary)
+	}
+	if !strings.Contains(res.Output, "No test files found") {
+		t.Errorf("runner output must be preserved: %q", res.Output)
+	}
+}

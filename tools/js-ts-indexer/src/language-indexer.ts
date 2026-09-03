@@ -24,6 +24,7 @@ import {
 import { enrichFileE2ESpec, isLikelyE2ESpecPath } from "./enrichers-e2e";
 import { enrichFileHttpClient } from "./enrichers-http-client";
 import { indexHtmlTemplateFile } from "./enrichers-html-hooks";
+import { enrichFileJsxHooks } from "./enrichers-jsx-hooks";
 import { enrichAngularTemplateAst } from "./enrichers-angular-template-ast";
 import { enrichNestDtoGuardsPipes } from "./enrichers-nest-dto-guards";
 import { enrichNestModuleGraph } from "./enrichers-nest-graph";
@@ -590,6 +591,12 @@ export function indexProjectStreaming(
       enrichFileNest(sf, entry, moduleId);
       enrichNestModuleGraph(sf, entry, moduleId, moduleFq);
       enrichNestDtoGuardsPipes(sf, entry, moduleId, moduleFq);
+    }
+    // JSX test hooks for every .tsx/.jsx production file, whatever the framework: React, Solid
+    // and Preact all put their markup here rather than in a template, and the E2E generator's
+    // selector inventory was empty for all of them (see enrichers-jsx-hooks.ts).
+    if (!isTest && (ext === ".tsx" || ext === ".jsx")) {
+      enrichFileJsxHooks(sf, entry, relPath);
     }
     if (isTest && wantE2EEnricher(fwMode)) {
       enrichFileE2ESpec(sf, entry, moduleFq, relPath);

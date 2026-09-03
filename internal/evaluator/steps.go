@@ -71,6 +71,7 @@ func RunFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorOutput
 		AttemptsConsumed: counter,
 		SkippedReason:    skipReason,
 		Retryable:        skipReason == FixSkipResponseUnusable,
+		WidenPending:     loopState != nil && loopState.widenNextRound,
 	}
 }
 
@@ -88,6 +89,10 @@ type FixStepResult struct {
 	// ANY no-write outcome was terminal, so one unparseable JSON response ended a run with a
 	// non-compiling tree and max_fix_attempt=1 in the audit.
 	Retryable bool
+	// WidenPending is true when this round's outcome queued a scope widening for the next round
+	// (FixLoopState.widenNextRound): the next round will offer every writable artifact, so a
+	// caller counting consecutive unusable responses must not count this one as a repeat.
+	WidenPending bool
 }
 
 // Fix-skip reasons: why a fix round produced no write, split by whether a fresh turn could still
@@ -110,6 +115,13 @@ const (
 	FixSkipLoopNoProgress      = "fix_loop_no_progress"
 	FixSkipNoWritableArtifacts = "no_writable_artifacts"
 	FixSkipNoAcceptedWrites    = "no_accepted_writes"
+	// FixSkipTestOutsideWritableScope: the test step failed, but its output attributes the failure
+	// to no file the fixer may write and cites no source location at all. Terminal: a repair round
+	// cannot change a failure that names nothing it is allowed to touch. The case that motivated it
+	// is vitest's "No test files found, exiting with code 1" after a discard (asqs-go run
+	// api-72dad6bb281cacee338f43c48432a780), which the fixer was asked to repair three times and
+	// finally answered by rewriting an unrelated Playwright spec.
+	FixSkipTestOutsideWritableScope = "test_failure_outside_writable_scope"
 )
 
 // IsTerminalFixSkip reports whether a FixSkip* reason means the fixer is out of road for this step,

@@ -162,3 +162,59 @@ func TestApplyLLMFix_testStepNarrowsByFailingTestOnLaterAttempt(t *testing.T) {
 		t.Errorf("reason = %v, want failing_test_subset", p["reason"])
 	}
 }
+
+// F9. Narrowing to the cited file is right until the model shows it cannot progress there. The
+// React run of 2026-09-03 narrowed to one file on attempt 2, got it back byte-identical twice, and
+// stopped as "fixer unusable" with five other failing files never offered. After a stalled narrowed
+// round the next round must offer every writable artifact once, then narrow again.
+func TestApplyLLMFix_stalledNarrowedWriteWidensTheNextRound(t *testing.T) {
+	repo := t.TempDir()
+	cited := "src/a.test.ts"
+	writeRepoFile(t, repo, cited, "describe(\x27a\x27, () => { it(\x27x\x27, () => { expect(1).toBe(2); }); });\n")
+	other := "src/b.test.ts"
+	writeRepoFile(t, repo, other, "describe(\x27b\x27, () => { it(\x27y\x27, () => { expect(1).toBe(1); }); });\n")
+
+	// Round 1 writes a change to the narrowed file; the failure output of round 2 is identical,
+	// so the write achieved nothing the compiler can see.
+	fixer := &stubFixer{resp: FixResponse{Files: map[string]string{
+		cited: "describe(\x27a\x27, () => { it(\x27x\x27, () => { const v = 1; expect(v).toBe(2); }); });\n",
+	}}}
+	audit := &recordingAuditor{}
+	opts := EvalOptions{RepoPath: repo, Lang: "typescript", Fixer: fixer, ArtifactPaths: []string{cited, other}}
+	errOut := "src/a.test.ts(1,40): error TS2345: Argument of type \x27number\x27 is not assignable.\n"
+	ls := &FixLoopState{}
+	counter := 0
+
+	applyLLMFix(context.Background(), opts, StepCompile, errOut, audit, &counter, 5, ls, "")
+	if len(fixer.req.ArtifactPaths) != 1 {
+		t.Fatalf("round 1 must be narrowed to the cited file; got %v", fixer.req.ArtifactPaths)
+	}
+	if audit.hasStep("evaluator.fix_scope_widened") {
+		t.Fatal("nothing has stalled yet; round 1 must not widen")
+	}
+
+	// Round 2: same diagnostics for the file round 1 rewrote.
+	fixer.resp = FixResponse{Files: map[string]string{}}
+	applyLLMFix(context.Background(), opts, StepCompile, errOut, audit, &counter, 5, ls, "")
+	if !audit.hasStep("evaluator.fix_scope_widened") {
+		t.Fatal("a narrowed round whose write changed nothing must widen the next round")
+	}
+	if p := audit.lastPayload("evaluator.fix_scope_widened"); p == nil || p["reason"] != "stalled_write" {
+		t.Errorf("widen reason = %v, want stalled_write", p)
+	}
+	if len(fixer.req.ArtifactPaths) != 2 {
+		t.Fatalf("the widened round must offer every writable artifact; got %v", fixer.req.ArtifactPaths)
+	}
+
+	// Round 3 narrows again from its own output: widening lasts one round. A DIFFERENT failure
+	// this time, so the repeat breaker (three identical signatures) cannot return before the fixer
+	// is asked and leave a stale request behind.
+	errOut3 := "src/a.test.ts(2,10): error TS2304: Cannot find name 'expectt'.\n"
+	applyLLMFix(context.Background(), opts, StepCompile, errOut3, audit, &counter, 5, ls, "")
+	if len(fixer.req.ArtifactPaths) != 1 {
+		t.Fatalf("narrowing must resume after the widened round; got %v", fixer.req.ArtifactPaths)
+	}
+	if n := len(audit.payloads["evaluator.fix_scope_widened"]); n != 1 {
+		t.Errorf("widening must happen once per stall, got %d events", n)
+	}
+}

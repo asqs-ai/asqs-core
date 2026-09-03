@@ -70,6 +70,12 @@ type Contract struct {
 	Stack string `json:"stack"`
 	// TestEnvironment is node or jsdom. JS/TS only.
 	TestEnvironment string `json:"test_environment,omitempty"`
+	// ModuleType is "esm" when the package declares "type": "module", otherwise "commonjs". JS/TS
+	// only; optional, so contracts written before it existed still read. The generator turns
+	// "esm" into an explicit no-`require()` rule: run api-72dad6bb281cacee338f43c48432a780
+	// generated seven `require('./router')` calls in a Vite ESM package and every one failed with
+	// "Cannot find module", although the bootstrap had detected the module type and said nothing.
+	ModuleType string `json:"module_type,omitempty"`
 
 	// AvailablePackages are the coordinates on the test classpath, in the ecosystem's own notation.
 	AvailablePackages []string `json:"available_packages,omitempty"`

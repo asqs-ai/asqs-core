@@ -18,6 +18,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/evaluator/errclass"
+	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/evaluator/errout"
 	"github.com/asqs/asqs-core/internal/evaluator/fixslice"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
@@ -527,7 +528,7 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 
 		// ----- Step 2: Test (unit pass) -----
 		unitCmd := resolveUnitTestCommand(opts)
-		testRes := RunTest(ctx, runner, opts, unitCmd)
+		testRes := overrideNoTestFilesPass(ctx, RunTest(ctx, runner, opts, unitCmd), opts, audit)
 		out.StepResults = append(out.StepResults, testRes)
 		if audit != nil {
 			audit.Log(ctx, "evaluator.step", map[string]interface{}{
@@ -560,11 +561,18 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 				continue
 			}
 			if fixerCanAttempt(opts.Fixer, &testFixState, testFixAttempts, maxTestFix) {
-				if applied, touched, _ := applyLLMFix(ctx, opts, StepTest, testRes.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraKind); applied {
+				applied, touched, why := applyLLMFix(ctx, opts, StepTest, testRes.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraKind)
+				if applied {
 					if len(touched) > 0 {
 						out.IterationArtifacts = append(out.IterationArtifacts, touched)
 					}
 					continue
+				}
+				// The failure names nothing the fixer may write (audited inside applyLLMFix).
+				// Re-running the suite cannot change that, so stop here rather than spend the
+				// iteration budget re-running it — the compile step does the same.
+				if why == FixSkipTestOutsideWritableScope {
+					break
 				}
 			}
 			// RC3: the fixer can no longer make progress on this failing step (the circuit-breaker tripped,
@@ -623,11 +631,15 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 						continue
 					}
 					if fixerCanAttempt(opts.Fixer, &testFixState, testFixAttempts, maxTestFix) {
-						if applied, touched, _ := applyLLMFix(ctx, opts, StepTestE2E, testE2E.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraE2E); applied {
+						applied, touched, why := applyLLMFix(ctx, opts, StepTestE2E, testE2E.Output, audit, &testFixAttempts, maxTestFix, &testFixState, infraE2E)
+						if applied {
 							if len(touched) > 0 {
 								out.IterationArtifacts = append(out.IterationArtifacts, touched)
 							}
 							continue
+						}
+						if why == FixSkipTestOutsideWritableScope {
+							break
 						}
 					}
 					// RC3: fixer is stuck on the E2E suite — discard the offending artifact(s) (see StepTest).
@@ -1145,6 +1157,9 @@ func ParseFailingTestPaths(testOutput string, artifactPaths []string) []string {
 	if testOutput == "" || len(artifactPaths) == 0 {
 		return nil
 	}
+	// The pass-line filter below keys on a leading `✓`; a coloured vitest line starts with an
+	// escape code instead, and a passing file then counts as failing (see errloc.StripANSI).
+	testOutput = errloc.StripANSI(testOutput)
 	// Path / basename: do not search PASS lines (false positives for multi-artifact runs).
 	hay := strings.ReplaceAll(testOutputWithoutPassLines(testOutput), "\\", "/")
 	hayLower := strings.ToLower(hay)
@@ -1375,6 +1390,21 @@ func manifestPathsForFixer(repoPath, lang, monoWorkspace string, artifactAndRela
 type FixLoopState struct {
 	lastSignature string
 	streak        int
+	// lastRoundNarrowed records whether the previous round's writable set was a narrowed subset
+	// of the artifacts (error_cited_subset / failing_test_subset). Read by the next round together
+	// with widenNextRound to decide whether narrowing should be suspended once.
+	lastRoundNarrowed bool
+	// widenNextRound asks the next round to skip narrowing and ship every writable artifact.
+	//
+	// Narrowing exists so a model is not asked to rewrite healthy files, but once the single file
+	// it was narrowed to comes back byte-identical (asqs-go) or rewritten with the same
+	// diagnostics afterwards, that file is evidently not where the model can make progress. Run
+	// api-72dad6bb281cacee338f43c48432a780 narrowed to ExtrasLayout.test.tsx on attempt 2, got the
+	// file back unchanged on attempts 3 and 4, and the run-scope loop then stopped as "fixer
+	// unusable" while five other failing files had never been offered. One widened round gives
+	// the model the other failing files; narrowing resumes from the round after, re-derived from
+	// that round's own failure output.
+	widenNextRound bool
 	// tripped becomes true once the breaker has fired. It is THE stop signal for the step: the
 	// outer loop reads it through fixerCanAttempt, and subsequent calls here are no-ops. It
 	// replaced a counter bump that stopped the loop by faking an exhausted budget.
@@ -1778,6 +1808,22 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	if len(pathsToRead) == 0 {
 		return false, nil, FixSkipNoWritableArtifacts
 	}
+	// Test-step counterpart of the compile-step unwritable-scope guard: a test failure whose output
+	// attributes nothing to a writable file and cites no source location cannot be repaired by
+	// editing test files, and asking anyway produced writes to unrelated files. Checked here, inside
+	// applyLLMFix, so every caller gets the same answer.
+	if (step == StepTest || step == StepTestE2E) && !testFailureTouchesWritableScope(errorOutputRaw, opts, pathsToRead) {
+		if audit != nil {
+			audit.LogError(ctx, "evaluator.test_unrepairable_out_of_write_scope", map[string]interface{}{
+				"message":        "Skipping the fixer: the test failure output names no file the fixer may write and cites no source location. Repairing test files cannot clear it. Generated tests remain on disk.",
+				"step":           step,
+				"reason":         FixSkipTestOutsideWritableScope,
+				"writable_paths": writableFixPathsForFailure(opts, pathsToRead),
+				"output_excerpt": excerptRunes(strings.TrimSpace(errorOutputRaw), 400),
+			})
+		}
+		return false, nil, FixSkipTestOutsideWritableScope
+	}
 	// Repeat-failure circuit-breaker. Compute the signature now that errorOutput is sanitised and
 	// pathsToRead is finalised (includes any FailingTestCandidatePaths additions for test steps).
 	// We check BEFORE reading files / calling the LLM so a truly stuck loop wastes no further work.
@@ -1865,12 +1911,23 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		loadedRunes += len([]rune(c))
 	}
 	addedExtras := 0
+	var vendoredSkipped []string
 	for _, rel := range errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath)) {
 		if addedExtras >= maxFixerErrorCitedPaths {
 			break
 		}
 		if loadedRunes >= maxFixerDependencyContextRunes {
 			break
+		}
+		// A frame inside node_modules/ or vendor/ is a FRAME, not context: the file is third-party,
+		// unwritable, and typically enormous. asqs-go run api-72dad6bb281cacee338f43c48432a780 read
+		// react-dom.development.js (over a million runes) here on every round, and because it came
+		// first in the stack trace it consumed the whole dependency budget, so the repo files cited
+		// after it were never read. Checked BEFORE the budget accounting so a vendored frame can
+		// neither count against maxFixerErrorCitedPaths nor exhaust loadedRunes.
+		if pathIsVendored(rel) {
+			vendoredSkipped = append(vendoredSkipped, rel)
+			continue
 		}
 		key := normalizePathForFix(rel)
 		if alreadyPaths[key] {
@@ -1886,6 +1943,13 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		if body, ok := files[key]; ok {
 			loadedRunes += len([]rune(body))
 		}
+	}
+	if len(vendoredSkipped) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_context_vendored_skipped", map[string]interface{}{
+			"message": fmt.Sprintf("Skipped %d vendored path(s) the failure output cites (node_modules/, vendor/); third-party frames are not fixer context.", len(vendoredSkipped)),
+			"step":    step,
+			"paths":   vendoredSkipped,
+		})
 	}
 	// RC1: resolve type names the compiler could not find (e.g. `symbol: class PetType`, `constructor
 	// Pet in class …`) to their real repo sources — by package when the FQCN is correct, by basename
@@ -2100,7 +2164,20 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// FailingTestCandidatePaths matches, which require an on-disk test-shaped path under RepoPath.
 	// Dependency and source files reach the prompt through opts.ArtifactDependencies, never
 	// pathsToRead.
-	if (step == StepCompile || step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
+	// One-round widening after a stalled narrowed round: see FixLoopState.widenNextRound. The
+	// stalled-write trigger is evaluated here, before narrowing, from the same evidence the
+	// per-file no-progress audit below uses one round late.
+	widenThisRound, widenReason := shouldWidenScope(loopState, errorOutput)
+	if widenThisRound && audit != nil {
+		audit.Log(ctx, "evaluator.fix_scope_widened", map[string]interface{}{
+			"message": fmt.Sprintf("Suspending writable-scope narrowing for this round (%s): the previous narrowed round changed nothing the failure can see, so every writable artifact (%d) is offered once.",
+				widenReason, len(writableArtifacts)),
+			"step":           step,
+			"reason":         widenReason,
+			"artifact_paths": append([]string(nil), writableArtifacts...),
+		})
+	}
+	if !widenThisRound && (step == StepCompile || step == StepTest || step == StepTestE2E) && len(writableArtifacts) > 0 && strings.TrimSpace(errorOutput) != "" {
 		// A test step's FIRST attempt ships the full page: every writable artifact stays writable
 		// and every artifact-context block survives (within the prompt-side budget). Test-failure
 		// repairs are semantic — sibling tests' fixtures and patterns are evidence — and the
@@ -2291,6 +2368,8 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// than only the audit. It compares per-file diagnostics across the two failures and consults
 	// the paths that actually landed on disk last round, which is what recordFixAttempt stores.
 	if loopState != nil {
+		// Remembered for the next round's widening decision (shouldWidenScope).
+		loopState.lastRoundNarrowed = scopeNarrowed
 		nowDiagnostics := FileDiagnostics(errorOutput)
 		if n := len(loopState.attempts); n > 0 {
 			prev := loopState.attempts[n-1]
@@ -3035,4 +3114,42 @@ func sleepBetweenFixAttempts(ctx context.Context, d time.Duration, attempt int, 
 	case <-t.C:
 		return nil
 	}
+}
+
+// shouldWidenScope decides whether this round suspends narrowing, and why.
+//
+// Two triggers, both requiring that the PREVIOUS round was narrowed:
+//   - "unchanged_write": the previous round returned its narrowed file byte-identical to disk, so
+//     nothing was written (set by the write path; asqs-go only, since asqs-core does not detect
+//     identical bodies).
+//   - "stalled_write": the previous round wrote its narrowed file(s) and this round's diagnostics
+//     for them are identical — the same evidence evaluator.fix_file_no_progress reports.
+//
+// The flags are consumed here so widening lasts exactly one round; the next round narrows again
+// from its own failure output.
+func shouldWidenScope(loopState *FixLoopState, errorOutput string) (bool, string) {
+	if loopState == nil {
+		return false, ""
+	}
+	if loopState.widenNextRound {
+		loopState.widenNextRound = false
+		loopState.lastRoundNarrowed = false
+		return true, "unchanged_write"
+	}
+	if !loopState.lastRoundNarrowed || len(loopState.attempts) == 0 {
+		return false, ""
+	}
+	prev := loopState.attempts[len(loopState.attempts)-1]
+	written := make([]string, 0, len(prev.Changes))
+	for p := range prev.Changes {
+		written = append(written, p)
+	}
+	if len(written) == 0 {
+		return false, ""
+	}
+	if len(stalledFiles(loopState.lastFileDiagnostics, FileDiagnostics(errorOutput), written)) == 0 {
+		return false, ""
+	}
+	loopState.lastRoundNarrowed = false
+	return true, "stalled_write"
 }

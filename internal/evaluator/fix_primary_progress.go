@@ -223,12 +223,47 @@ var resolutionFailureRE = regexp.MustCompile(`(?i)` + strings.Join([]string{
 	`is not defined`,
 }, "|"))
 
-// ParsePrimaryFailureSite reads the first diagnostic location out of compiler output.
+// playwrightTestListLineRE matches the lines Playwright's list reporter prints per test:
+//
+//	✘  1 [chromium] › routes/announcements.spec.tsx:4:3 › Announcements Page › should display …
+//	  1) [chromium] › routes/announcements.spec.tsx:4:3 › Announcements Page › should display …
+//	    [chromium] › routes/home.spec.tsx:32:3 › Home Page Route › should navigate …
+//
+// The `file:line:col` there is where the `test(` call STARTS, not where anything failed. The
+// failing assertion is in the `at /workspace/e2e/routes/announcements.spec.tsx:8:24` frame that
+// follows. Run api-9f854a955e0110668e02fec8d45198a5 blamed `announcements.spec.tsx:4` on three
+// rounds — the header line — and reported every rewrite as having "left the blamed line
+// unchanged", which would have narrowed the next round onto a line no repair ever touches.
+var playwrightTestListLineRE = regexp.MustCompile(`(?m)^[^\n]*\[[\w-]+\] › [^\n]*:\d+:\d+ › `)
+
+// primaryDiagnosticLocations returns every primaryDiagnosticRE match that is a diagnostic rather
+// than a test-list header, in output order.
+func primaryDiagnosticLocations(errorOutput string) [][]int {
+	skip := playwrightTestListLineRE.FindAllStringIndex(errorOutput, -1)
+	inSkipped := func(pos int) bool {
+		for _, r := range skip {
+			if pos >= r[0] && pos < r[1] {
+				return true
+			}
+		}
+		return false
+	}
+	var out [][]int
+	for _, m := range primaryDiagnosticRE.FindAllStringSubmatchIndex(errorOutput, -1) {
+		if len(m) >= 6 && !inSkipped(m[0]) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// ParsePrimaryFailureSite reads the first diagnostic location out of compiler or test output.
 func ParsePrimaryFailureSite(errorOutput string) PrimaryFailureSite {
-	m := primaryDiagnosticRE.FindStringSubmatchIndex(errorOutput)
-	if len(m) < 6 {
+	locs := primaryDiagnosticLocations(errorOutput)
+	if len(locs) == 0 {
 		return PrimaryFailureSite{}
 	}
+	m := locs[0]
 	line := 0
 	for _, r := range errorOutput[m[4]:m[5]] {
 		line = line*10 + int(r-'0')

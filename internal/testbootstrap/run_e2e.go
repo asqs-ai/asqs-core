@@ -368,6 +368,7 @@ func e2eInstallAndVerify(ctx context.Context, p E2EParams, audit Auditor, repoRo
 		})
 		return fmt.Errorf("e2e_framework_bootstrap install: %w\n%s", err, truncate(string(out), 4000))
 	}
+	auditInstallRetried(audit, ctx, "e2e_bootstrap.install_retried_newer_npm", cmdLine, out)
 
 	vCtx, vCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer vCancel()

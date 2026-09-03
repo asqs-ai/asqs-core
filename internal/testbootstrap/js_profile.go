@@ -335,6 +335,8 @@ func buildJSTestProfile(det jsFrameworkDetection, nodeVersion string) jsTestProf
 				{"jsdom", jsdomVer},
 				{"@testing-library/react", rtl},
 				{"@testing-library/jest-dom", VersionTestingLibraryJestDom},
+				// Required by the generation prompt's React hint; see VersionTestingLibraryUserEvent.
+				{"@testing-library/user-event", VersionTestingLibraryUserEvent},
 			}
 			p.ConfigFile = "vitest.config.ts"
 			p.SetupFile = "vitest.setup.ts"
@@ -347,6 +349,8 @@ func buildJSTestProfile(det jsFrameworkDetection, nodeVersion string) jsTestProf
 				{"@types/jest", VersionTypesJest},
 				{"@testing-library/react", rtl},
 				{"@testing-library/jest-dom", VersionTestingLibraryJestDom},
+				// Required by the generation prompt's React hint; see VersionTestingLibraryUserEvent.
+				{"@testing-library/user-event", VersionTestingLibraryUserEvent},
 			}
 			if det.IsTS {
 				p.Deps = append(p.Deps, jsDep{"ts-jest", VersionTSJest})

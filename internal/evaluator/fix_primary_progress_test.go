@@ -171,3 +171,33 @@ func TestRunFix_breakerTripIsTerminal(t *testing.T) {
 		t.Error("an exhausted fixer must not be reported as retryable")
 	}
 }
+
+// Playwright's list reporter prints `[chromium] › file:line:col › title` per test, where the
+// position is the `test(` call, not the failure. The primary site must come from the assertion's
+// own stack frame, or every repair looks like it "left the blamed line unchanged".
+func TestParsePrimaryFailureSite_skipsPlaywrightTestListHeaders(t *testing.T) {
+	out := "Running 6 tests using 1 worker\n\n" +
+		"  ✘  1 [chromium] › routes/announcements.spec.tsx:4:3 › Announcements Page › should display announcements (5.1s)\n" +
+		"  ✘  2 [chromium] › routes/announcements.spec.tsx:4:3 › Announcements Page › should display announcements (retry #1) (5.6s)\n" +
+		"  ✓  3 [chromium] › smoke.spec.ts:6:3 › smoke › bootstrap smoke (1ms)\n\n\n" +
+		"  1) [chromium] › routes/announcements.spec.tsx:4:3 › Announcements Page › should display announcements \n\n" +
+		"    Error: Timed out 5000ms waiting for expect(locator).toHaveTitle(expected)\n\n" +
+		"       6 |\n       7 |     // Check that the page title is correct\n" +
+		"    >  8 |     await expect(page).toHaveTitle(/.*Announcements/);\n         |                        ^\n" +
+		"        at /workspace/e2e/routes/announcements.spec.tsx:8:24\n"
+	site := ParsePrimaryFailureSite(out)
+	if !site.OK {
+		t.Fatal("the assertion frame must yield a primary site")
+	}
+	if !sameDiagnosticFile(site.Path, "e2e/routes/announcements.spec.tsx") {
+		t.Errorf("path = %q, want the spec under e2e/routes", site.Path)
+	}
+	if site.Line != 8 {
+		t.Errorf("line = %d, want 8 (the assertion), not 4 (the test() header)", site.Line)
+	}
+	// Compiler output is untouched by the skip.
+	tsc := "src/app/AppLayout.test.tsx(34,22): error TS2339: Property 'toBeInTheDocument' does not exist.\n"
+	if s := ParsePrimaryFailureSite(tsc); !s.OK || s.Line != 34 {
+		t.Errorf("tsc shape regressed: %+v", s)
+	}
+}

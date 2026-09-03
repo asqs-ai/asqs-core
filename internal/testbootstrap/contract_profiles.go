@@ -140,7 +140,17 @@ func jsContract(p jsTestProfile, lang string) teststack.Contract {
 		Runner:            string(p.Runner),
 		Stack:             p.Stack,
 		TestEnvironment:   p.TestEnvironment,
+		ModuleType:        jsModuleType(p.IsESM),
 		AvailablePackages: dedupeSorted(pkgs),
 		AvailableImports:  dedupeSorted(imports),
 	}
+}
+
+// jsModuleType renders the contract's module_type from the profile's ESM detection
+// ("type": "module" in package.json).
+func jsModuleType(esm bool) string {
+	if esm {
+		return "esm"
+	}
+	return "commonjs"
 }

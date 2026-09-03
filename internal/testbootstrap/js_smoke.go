@@ -155,16 +155,27 @@ func renderJSFrameworkSmoke(p jsTestProfile) (source, ext string) {
 		var b strings.Builder
 		fmt.Fprintf(&b, "/* %s — safe to edit or delete.\n", asqsGeneratedHeader)
 		b.WriteString(" * Rendering a component is the assertion: it proves the JSX transform, the jsdom\n")
-		b.WriteString(" * environment and React Testing Library all work together in this package.\n */\n")
+		b.WriteString(" * environment and React Testing Library all work together in this package. The click\n")
+		b.WriteString(" * proves @testing-library/user-event resolves, since generated tests are told to use it.\n */\n")
 		if p.Runner == JSRunnerVitest {
 			b.WriteString("import { describe, it, expect } from 'vitest';\n")
 		}
-		b.WriteString("import { render, screen } from '@testing-library/react';\n\n")
-		b.WriteString("function AsqsSmokeComponent() {\n  return <span>asqs bootstrap ok</span>;\n}\n\n")
+		b.WriteString("import { useState } from 'react';\n")
+		b.WriteString("import { render, screen } from '@testing-library/react';\n")
+		b.WriteString("import userEvent from '@testing-library/user-event';\n\n")
+		b.WriteString("function AsqsSmokeComponent() {\n")
+		b.WriteString("  const [clicked, setClicked] = useState(false);\n")
+		b.WriteString("  return <button onClick={() => setClicked(true)}>{clicked ? 'asqs click ok' : 'asqs bootstrap ok'}</button>;\n")
+		b.WriteString("}\n\n")
 		b.WriteString("describe('asqs framework smoke (react)', () => {\n")
 		b.WriteString("  it('renders a component into jsdom', () => {\n")
 		b.WriteString("    render(<AsqsSmokeComponent />);\n")
 		b.WriteString("    expect(screen.getByText('asqs bootstrap ok')).toBeInTheDocument();\n")
+		b.WriteString("  });\n")
+		b.WriteString("  it('drives the component with user-event', async () => {\n")
+		b.WriteString("    render(<AsqsSmokeComponent />);\n")
+		b.WriteString("    await userEvent.click(screen.getByText('asqs bootstrap ok'));\n")
+		b.WriteString("    expect(screen.getByText('asqs click ok')).toBeInTheDocument();\n")
 		b.WriteString("  });\n});\n")
 		return b.String(), ext
 

@@ -24,10 +24,14 @@ type UISelectorLister interface {
 // selector found in a template (see tools/js-ts-indexer enrichers-html-hooks.ts, which tags
 // lang:"html" and kind:"UI_TEST_HOOK"). Kinds are stored lowercased; ListSymbolsByLang normalizes
 // its argument the same way, so the SCREAMING_CASE spelling here is safe.
-const (
-	uiSelectorHookKind = "UI_TEST_HOOK"
-	uiSelectorHookLang = "html"
-)
+const uiSelectorHookKind = "UI_TEST_HOOK"
+
+// uiSelectorHookLangs are the symbol languages a UI_TEST_HOOK can be stored under: "html" for
+// template files (enrichers-html-hooks.ts, java_html_hooks), and the JS/TS source languages for
+// hooks read from JSX attributes (enrichers-jsx-hooks.ts), which live in the .tsx/.jsx file's own
+// symbol list. Querying only "html" is why a React repository's inventory was empty in asqs-go run
+// api-9f854a955e0110668e02fec8d45198a5 and the generator guessed selectors.
+var uiSelectorHookLangs = []string{"html", "typescript", "javascript"}
 
 // Caps on the rendered block. A repository with hundreds of data-testid attributes must not push
 // the retrieved context out of the prompt; the inventory is an aid, not the payload.
@@ -136,9 +140,17 @@ type uiSelector struct {
 }
 
 func (g *LLMGenerator) buildUISelectorInventory(ctx context.Context) string {
-	syms, err := g.UISelectors.ListSymbolsByLang(ctx, g.RepoID, uiSelectorHookLang, uiSelectorHookKind)
-	if err != nil || len(syms) == 0 {
-		g.auditUISelectorInventory(ctx, 0, 0, 0, 0, errString(err))
+	var syms []*metadata.Symbol
+	for _, lang := range uiSelectorHookLangs {
+		got, err := g.UISelectors.ListSymbolsByLang(ctx, g.RepoID, lang, uiSelectorHookKind)
+		if err != nil {
+			g.auditUISelectorInventory(ctx, 0, 0, 0, 0, errString(err))
+			return ""
+		}
+		syms = append(syms, got...)
+	}
+	if len(syms) == 0 {
+		g.auditUISelectorInventory(ctx, 0, 0, 0, 0, "")
 		return ""
 	}
 	byTemplate := map[string][]uiSelector{}

@@ -15,6 +15,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/buildtool"
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
@@ -408,10 +409,19 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 	cmd.Env = append(os.Environ(), plan.EnvFor(step)...)
 	logLocalEvalStep(step, cmd)
 	out, runErr := runCommand(ctx, cmd, s.timeoutDuration())
+	// Same reason as the docker target: every parser downstream expects plain text (errloc.StripANSI).
+	out = errloc.StripANSI(out)
 	if runErr != nil {
 		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out) {
 			fmt.Fprintf(os.Stderr, "  %s: non-zero exit but the runner's own summary shows zero failures (treating as ok; often Jest open handles). %s\n", label, firstLines(out, 2))
 			return evaluator.StepResult{Step: step, OK: true, Summary: "tests ok" + jsExitCodeIgnoredSuffix, Output: out}
+		}
+		// A JS runner that exited non-zero because it found no test files has not failed anything;
+		// the evaluator decides whether an empty tree is fine (see evaluator.NoTestFilesSuffix).
+		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputReportsNoTestFiles(out) {
+			summary := stepSuccessSummary(step, plan, cwd) + evaluator.NoTestFilesSuffix
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", label, summary)
+			return evaluator.StepResult{Step: step, OK: true, Summary: summary, Output: out}
 		}
 		res := sandboxStepFailure(step, out, runErr, s.timeoutDuration())
 		fmt.Fprintf(os.Stderr, "  %s: failed. %s\n", label, firstLines(res.Summary, 2))

@@ -47,7 +47,9 @@ func driveBreaker(t *testing.T, calls int, errFor func(i int) string) (*recordin
 	ls := &FixLoopState{}
 	attempt := 0
 	for i := 0; i < calls; i++ {
-		applyLLMFix(context.Background(), opts, StepTest, errFor(i), audit, &attempt, 30, ls, "")
+		// Real test output always carries the failing file; without it the test-step writable-scope
+		// gate (testFailureTouchesWritableScope) would stop the round before the breaker sees it.
+		applyLLMFix(context.Background(), opts, StepTest, "src/test/java/FooTest.java:1: test failure\n"+errFor(i), audit, &attempt, 30, ls, "")
 	}
 	return audit, ls
 }

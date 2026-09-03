@@ -10,15 +10,38 @@ import (
 
 type fakeSelectorLister struct {
 	syms []*metadata.Symbol
-	err  error
-	got  struct{ repoID, lang, kind string }
-	// calls counts queries so the once-per-generator contract is testable.
+	// byLang, when set, answers per language the way the store does (hooks from HTML templates
+	// are stored under "html", hooks from JSX under the file's own language); syms is then ignored.
+	byLang map[string][]*metadata.Symbol
+	err    error
+	got    struct{ repoID, lang, kind string }
+	// calls counts queries so the once-per-generator contract is testable; langs records the
+	// language of every query in order.
 	calls int
+	langs []string
+}
+
+func (f *fakeSelectorLister) queried(lang string) bool {
+	for _, l := range f.langs {
+		if l == lang {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeSelectorLister) ListSymbolsByLang(_ context.Context, repoID, lang, kind string) ([]*metadata.Symbol, error) {
 	f.calls++
+	f.langs = append(f.langs, lang)
 	f.got.repoID, f.got.lang, f.got.kind = repoID, lang, kind
+	if f.byLang != nil {
+		return f.byLang[lang], f.err
+	}
+	// Without byLang every language answers the same list; the inventory dedupes, so callers
+	// written before the multi-language query see the same block they always did.
+	if lang != "html" {
+		return nil, f.err
+	}
 	return f.syms, f.err
 }
 
@@ -68,8 +91,9 @@ func TestUISelectorInventory_rendersIndexedSelectorsForE2E(t *testing.T) {
 	if strings.Count(block, "catalog-results") != 1 {
 		t.Errorf("duplicate selector was not deduped:\n%s", block)
 	}
-	if lister.got.lang != "html" || lister.got.kind != uiSelectorHookKind || lister.got.repoID != "org/repo" {
-		t.Errorf("queried (%q,%q,%q), want (org/repo, html, %s)", lister.got.repoID, lister.got.lang, lister.got.kind, uiSelectorHookKind)
+	// One query per hook language, "html" among them, all for this repo and kind.
+	if lister.got.repoID != "org/repo" || lister.got.kind != "UI_TEST_HOOK" || !lister.queried("html") {
+		t.Errorf("queried (%q,%v,%q), want org/repo, the html language among the queries, UI_TEST_HOOK", lister.got.repoID, lister.langs, lister.got.kind)
 	}
 }
 
@@ -84,8 +108,9 @@ func TestUISelectorInventory_resolvesOncePerGenerator(t *testing.T) {
 	if first != second {
 		t.Error("block is not stable across gaps; the system-prompt cache breakpoint depends on it")
 	}
-	if lister.calls != 1 {
-		t.Errorf("store queried %d times, want 1", lister.calls)
+	// One query per hook language, all on the first resolve; the second resolve must not query.
+	if lister.calls != len(uiSelectorHookLangs) {
+		t.Errorf("store queried %d times, want %d (once per hook language, once per generator)", lister.calls, len(uiSelectorHookLangs))
 	}
 }
 
@@ -274,4 +299,47 @@ func TestUISelectorInventory_toleratesSignaturesWithoutLifecycle(t *testing.T) {
 	if !strings.Contains(block, "getByTestId('catalog-search-input')") {
 		t.Errorf("selectors must still render:\n%s", block)
 	}
+}
+
+// Hooks read from JSX live under the .tsx file's own language, not "html". The React run of
+// 2026-09-03 reported "0 selector(s) across 0 template(s)" because only "html" was queried, and
+// the generator then asserted a title the page does not have and a link name that matched twice.
+func TestUISelectorInventory_includesJSXHooksFromSourceFiles(t *testing.T) {
+	jsx := func(path, kind, value string, conditional, repeated bool) *metadata.Symbol {
+		return &metadata.Symbol{
+			Kind: "ui_test_hook", Lang: "typescript", File: path,
+			SignatureJSON: []byte(`{"selector_kind":"` + kind + `","value":"` + value + `","framework":"jsx","template_path":"` + path + `","conditional":` + strconvBool(conditional) + `,"repeated":` + strconvBool(repeated) + `}`),
+		}
+	}
+	lister := &fakeSelectorLister{byLang: map[string][]*metadata.Symbol{
+		"html": nil,
+		"typescript": {
+			jsx("src/pages/HomePage.tsx", "data-testid", "home-nav", false, false),
+			jsx("src/pages/HomePage.tsx", "aria-label", "Main navigation", false, false),
+			jsx("src/pages/OrdersPage.tsx", "data-testid", "orders-item", false, true),
+		},
+	}}
+	g := &LLMGenerator{UISelectors: lister, RepoID: "org/repo", E2EFramework: "playwright"}
+	block := g.uiSelectorInventory(context.Background(), "typescript", true)
+	for _, want := range []string{
+		"src/pages/HomePage.tsx",
+		"getByTestId('home-nav')",
+		"locator('[aria-label=\"Main navigation\"]')",
+		"src/pages/OrdersPage.tsx",
+		"getByTestId('orders-item')",
+	} {
+		if !strings.Contains(block, want) {
+			t.Errorf("block missing %q:\n%s", want, block)
+		}
+	}
+	if !strings.Contains(block, "one per item") {
+		t.Errorf("repeated JSX hook must carry the lifecycle note:\n%s", block)
+	}
+}
+
+func strconvBool(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
 }

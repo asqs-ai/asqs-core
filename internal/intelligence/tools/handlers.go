@@ -194,6 +194,15 @@ func (r *Registry) getSymbol(ctx context.Context, args []byte) (string, error) {
 					return r.capped(out), nil
 				}
 			}
+			// The web rung answers questions about THIRD-PARTY types. A name whose first segment is
+			// a directory of this repository is a repo-local symbol the model mis-qualified, and no
+			// documentation site knows it: run api-72dad6bb281cacee338f43c48432a780 searched Brave
+			// for "src pages OrdersPage fetchOrdersPreview api reference" and waited 1.5 s for
+			// nothing. search_code on the bare name is the tool that can answer.
+			if r.fqLooksRepoLocal(miss.fq) {
+				return "", fmt.Errorf("%s; the index covers only this repository's sources, and %q looks like a path inside it — use search_code with the bare name instead",
+					err, miss.fq)
+			}
 			if out, ok := r.webSearchForSymbolMiss(ctx, miss.fq); ok {
 				return out, nil
 			}
@@ -608,4 +617,31 @@ func (r *Registry) readFileRange(args []byte) (string, error) {
 		fmt.Fprintf(&b, "%d\t%s\n", i, lines[i-1])
 	}
 	return r.capped(b.String()), nil
+}
+
+// fqLooksRepoLocal reports whether a fully-qualified name is really a path into this repository:
+// its first dotted segment (after the language-specific prefix BareFQName strips) names a directory
+// under RepoRoot. "src.pages.OrdersPage.fetchOrdersPreview" is local in a repo with a src/ dir;
+// "com.microsoft.playwright.Route" is not, because no com/ directory exists there. False when
+// RepoRoot is unset, so the web rung keeps its historical behaviour for registries built without
+// a repository.
+func (r *Registry) fqLooksRepoLocal(fq string) bool {
+	root := strings.TrimSpace(r.RepoRoot)
+	if root == "" {
+		return false
+	}
+	bare := metadata.BareFQName(fq)
+	if i := strings.IndexAny(bare, "#"); i >= 0 {
+		bare = bare[:i]
+	}
+	first := bare
+	if i := strings.IndexAny(bare, "./\\"); i >= 0 {
+		first = bare[:i]
+	}
+	first = strings.TrimSpace(first)
+	if first == "" || strings.HasPrefix(first, ".") {
+		return false
+	}
+	st, err := os.Stat(filepath.Join(root, first))
+	return err == nil && st.IsDir()
 }

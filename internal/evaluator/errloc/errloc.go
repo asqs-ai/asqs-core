@@ -50,6 +50,8 @@ func ParseLocations(log string) []Location {
 	if log == "" {
 		return nil
 	}
+	// Colour codes split `path.tsx:` from its line number (see StripANSI); parse plain text only.
+	log = StripANSI(log)
 	seen := make(map[string]bool)
 	var out []Location
 	add := func(file string, line int) {

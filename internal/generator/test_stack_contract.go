@@ -63,6 +63,15 @@ func testStackLLMBlock(repoPath string) string {
 		}
 	}
 
+	// The module system is a hard constraint the model keeps guessing wrong: seven
+	// `require('./router')` calls in one Vite ESM package on 2026-09-03, all "Cannot find module".
+	// State it once, from the detected package type, instead of repairing it per test.
+	if strings.EqualFold(strings.TrimSpace(c.ModuleType), "esm") {
+		b.WriteString("- **ESM package (`\"type\": \"module\"`): use `import` only.** `require()` is not defined here and " +
+			"fails at run time with `Cannot find module`; `vi.mock` / `jest.mock` with dynamic `import()` is the way to " +
+			"load a module after mocks are registered.\n")
+	}
+
 	if len(c.AvailableImports) > 0 {
 		fmt.Fprintf(&b, "- **Test libraries available to import:** %s\n", strings.Join(c.AvailableImports, ", "))
 		// The roots state which LIBRARIES are on the classpath. They are derived from build

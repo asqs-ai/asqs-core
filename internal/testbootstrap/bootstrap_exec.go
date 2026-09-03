@@ -218,6 +218,21 @@ func RunPackageManagerInstall(ctx context.Context, e *EphemeralDocker, repo stri
 	}
 	instName, instArgs := installCmd(pm, allowLockfileChange, hasLock, mustSyncLockfile, pnpmStore)
 	argv := append([]string{instName}, instArgs...)
+	out, err := runInstallArgv(ctx, e, repo, pm, argv, env)
+	// npm crashing inside its own resolver is not a dependency problem the repository can be
+	// blamed for, and a newer npm resolves the same manifest (see npmFallbackSpec). Retry once,
+	// through npx, and mark the output so the caller can audit that the retry happened.
+	if err != nil && pm == PMNpm && npmArboristCrash(out) {
+		retryOut, retryErr := runInstallArgv(ctx, e, repo, pm, npmFallbackInstallArgv(argv), env)
+		combined := append(append(append([]byte(nil), out...), []byte(npmRetryMarker)...), retryOut...)
+		return combined, retryErr
+	}
+	return out, err
+}
+
+// runInstallArgv runs one package-manager install argv, on the host or in the ephemeral
+// container with the corepack prelude the package manager needs.
+func runInstallArgv(ctx context.Context, e *EphemeralDocker, repo string, pm PackageManager, argv []string, env []string) ([]byte, error) {
 	if e == nil {
 		return RunArgv(ctx, nil, repo, argv, env)
 	}

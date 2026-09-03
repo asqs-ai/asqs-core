@@ -533,3 +533,65 @@ func TestWriteJSFrameworkSmokeTest_writesAndReportsTheCompanion(t *testing.T) {
 		}
 	}
 }
+
+// The React generation hint tells the model to use @testing-library/user-event, so the profile
+// has to install it on both runner lines and both React majors: run
+// api-72dad6bb281cacee338f43c48432a780 lost two suites at import time because it did not.
+func TestBuildJSTestProfile_reactInstallsUserEvent(t *testing.T) {
+	for name, det := range map[string]jsFrameworkDetection{
+		"vitest_react18": {Framework: JSFrameworkReact, FrameworkMajor: 18, ViteMajor: 6},
+		"jest_react18":   {Framework: JSFrameworkReact, FrameworkMajor: 18},
+		"jest_react17":   {Framework: JSFrameworkReact, FrameworkMajor: 17},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := buildJSTestProfile(det, testNodeVersion)
+			for _, d := range p.Deps {
+				if d.Name == "@testing-library/user-event" {
+					if d.Version != VersionTestingLibraryUserEvent {
+						t.Fatalf("user-event pinned to %s, want %s", d.Version, VersionTestingLibraryUserEvent)
+					}
+					return
+				}
+			}
+			t.Fatalf("%s profile does not install @testing-library/user-event: %v", p.Stack, describeJSDeps(p.Deps))
+		})
+	}
+}
+
+// The framework smoke is what makes Contract.Verified true, so it must exercise the package the
+// generated tests are told to use — an install that resolves RTL but not user-event must fail here,
+// not in the first generated suite.
+func TestRenderJSFrameworkSmokeSpec_reactExercisesUserEvent(t *testing.T) {
+	for _, runner := range []JSRunner{JSRunnerVitest, JSRunnerJest} {
+		p := jsTestProfile{Runner: runner, FrameworkSmoke: jsSmokeReact, IsTS: true}
+		src, _ := renderJSFrameworkSmoke(p)
+		for _, want := range []string{"from '@testing-library/user-event'", "userEvent.click("} {
+			if !strings.Contains(src, want) {
+				t.Errorf("%s React smoke does not contain %q:\n%s", runner, want, src)
+			}
+		}
+	}
+}
+
+// A React package that already has the runner, jsdom, RTL and jest-dom but not user-event is no
+// longer a complete stack: bootstrap adds the one missing package (missingDeps never overwrites
+// what is there). Stated as a test because it is a deliberate behaviour change for such repos.
+func TestDetectUnitJS_reactWithoutUserEventNeedsBootstrap(t *testing.T) {
+	dir := t.TempDir()
+	writePkgJSON(t, dir, `{"dependencies":{"react":"^18.3.1"},"devDependencies":{"vite":"^6.0.0","vitest":"^4.0.0","jsdom":"^30.0.0","@testing-library/react":"^16.3.2","@testing-library/jest-dom":"^7.0.1"}}`)
+	rep, err := DetectUnit(dir, "typescript")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.HasFramework {
+		t.Fatalf("a React package without user-event must be bootstrapped: %s", rep.Reason)
+	}
+	if !strings.Contains(rep.Reason, "@testing-library/user-event") {
+		t.Errorf("reason should name the missing package; got %s", rep.Reason)
+	}
+	for _, present := range []string{"vitest", "jsdom", "@testing-library/react", "@testing-library/jest-dom"} {
+		if strings.Contains(rep.Reason, "missing "+present) {
+			t.Errorf("%s is present and must not be reported missing: %s", present, rep.Reason)
+		}
+	}
+}

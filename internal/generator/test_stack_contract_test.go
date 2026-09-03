@@ -169,3 +169,18 @@ func TestTestStackBlock_nodeEnvironmentWarnsAboutTheDOM(t *testing.T) {
 		t.Errorf("node environment does not warn about the DOM:\n%s", got)
 	}
 }
+
+// F8. An ESM package gets an explicit no-require rule from the contract; a CommonJS one does not.
+func TestTestStackBlock_esmModuleTypeRendersTheNoRequireRule(t *testing.T) {
+	for moduleType, want := range map[string]bool{"esm": true, "commonjs": false, "": false} {
+		root := t.TempDir()
+		writeContract(t, root, teststack.Contract{
+			Language: "typescript", Framework: "react", Runner: "vitest", TestEnvironment: "jsdom",
+			ModuleType: moduleType, AvailableImports: []string{"vitest"},
+		})
+		got := testStackLLMBlock(root)
+		if strings.Contains(got, "use `import` only") != want {
+			t.Errorf("module_type=%q: no-require rule present=%v, want %v:\n%s", moduleType, !want, want, got)
+		}
+	}
+}
