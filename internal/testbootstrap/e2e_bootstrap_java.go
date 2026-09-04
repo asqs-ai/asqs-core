@@ -318,6 +318,10 @@ func verifyMavenPlaywright(ctx context.Context, repo, pomAbs string, timeout tim
 		return fmt.Errorf("e2e_framework_bootstrap: no pom.xml")
 	}
 	run := func(step string, args ...string) error {
+		// Same lint-skip properties as the unit bootstrap's javaGoalRunner. Without them the
+		// petclinic run of 2026-09-04 17:19 died in spring-javaformat:validate (bound to the
+		// validate phase, before compile) on the stub class this bootstrap had just written.
+		args = mavenBootstrapArgs(args...)
 		vCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		var out []byte

@@ -28,6 +28,14 @@ var mavenLintSkipProps = []string{
 	"-Denforcer.skip=true",
 }
 
+// mavenBootstrapArgs appends mavenLintSkipProps to a Maven goal list so every bootstrap
+// verification (unit and E2E) asks the same question — does the classpath resolve and does a test
+// run — with the repository's format and lint plugins out of the way. The properties are inert
+// for goals that do not run the lifecycle (exec:java, a plugin goal): Maven ignores unknown -D.
+func mavenBootstrapArgs(goals ...string) []string {
+	return append(append([]string(nil), goals...), mavenLintSkipProps...)
+}
+
 // reStyleViolation matches build failures that are about code style, not about the code working.
 //
 // Maven and Gradle report these through ordinary build failure, indistinguishable at the exit-code
