@@ -26,6 +26,10 @@ type Client struct {
 	endpoint    string
 	model       string
 	chatOptions map[string]any // JSON "options" object for POST /api/chat; nil if unset
+	// keepAlive and think are Ollama's two top-level latency controls, rendered once from
+	// general.llm.ollama_keep_alive / ollama_think; nil means "omit the field, server default".
+	keepAlive json.RawMessage
+	think     *bool
 	// toolCalling is the cached result of ProbeToolSupport. False until probed: an unprobed client
 	// falls back to prompted tools rather than sending definitions a template will ignore.
 	toolCalling bool
@@ -43,6 +47,11 @@ type chatRequest struct {
 	Format  json.RawMessage `json:"format,omitempty"`
 	Options map[string]any  `json:"options,omitempty"`
 	Tools   []ollamaTool    `json:"tools,omitempty"`
+	// KeepAlive and Think are TOP-LEVEL request fields, not entries of Options — Ollama ignores them
+	// inside options. KeepAlive is a number (seconds, negative = never unload) or a duration string;
+	// see config.OllamaKeepAliveJSON for why "-1" must go as a number.
+	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
+	Think     *bool           `json:"think,omitempty"`
 }
 
 // ollamaTool mirrors Ollama's tool definition, which follows the OpenAI function shape: the schema
@@ -130,6 +139,15 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, chatModel string)
 	if n := cfg.LLM.OllamaNumCtx; n > 0 {
 		opts = map[string]any{"num_ctx": n}
 	}
+	keepAlive, err := config.OllamaKeepAliveJSON(cfg.LLM.OllamaKeepAlive)
+	if err != nil {
+		return nil, fmt.Errorf("ollama: general.llm.ollama_keep_alive: %w", err)
+	}
+	var think *bool
+	if cfg.LLM.OllamaThink != nil {
+		v := *cfg.LLM.OllamaThink
+		think = &v
+	}
 	ep := chatEndpoint(cfg)
 	maybeLogResolvedOllama("chat", ep, modelID)
 	return &Client{
@@ -137,6 +155,8 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, chatModel string)
 		endpoint:    ep,
 		model:       modelID,
 		chatOptions: opts,
+		keepAlive:   keepAlive,
+		think:       think,
 	}, nil
 }
 
@@ -195,11 +215,13 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		opt = nil
 	}
 	payload := chatRequest{
-		Model:    c.model,
-		Messages: msgs,
-		Stream:   false,
-		Format:   structuredFormat(opts.Structured),
-		Options:  opt,
+		Model:     c.model,
+		Messages:  msgs,
+		Stream:    false,
+		Format:    structuredFormat(opts.Structured),
+		Options:   opt,
+		KeepAlive: c.keepAlive,
+		Think:     c.think,
 	}
 	if len(opts.Tools) > 0 {
 		// num_ctx is a hard prerequisite for tool use, not a tuning knob.

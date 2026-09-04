@@ -6,7 +6,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
-import { Project, SyntaxKind } from "ts-morph";
+import { Node, Project, SyntaxKind, type Symbol as MorphSymbol } from "ts-morph";
 import type { ProjectDiscovery } from "./discovery";
 import {
   parseFrameworksFlag,
@@ -127,21 +127,116 @@ function toForwardSlash(p: string): string {
   return p.split(path.sep).join("/");
 }
 
+/**
+ * Resolves the callee of a call expression to the FQ name this indexer gives the declaration —
+ * `<module>.<Class>.<method>`, `<module>.<function>` — or undefined when the callee is not a
+ * repository symbol (a library call, an unresolvable dynamic access, a declaration file).
+ */
+export type CalleeResolver = (expr: Node) => string | undefined;
+
+/**
+ * Builds a CalleeResolver for one project root.
+ *
+ * Why this exists: collectCalls used to emit the call expression's SOURCE TEXT as callee_fq_name
+ * (`this.catalog.search`, `helper`, `inject`). The Go ingester (indexer/run.go) can only store an
+ * edge whose callee resolves to an indexed FQ name, so every one of those was dropped — the
+ * metadata store for the Angular and React fixtures held ZERO CALLS edges on 2026-09-03, and every
+ * unit gap was retrieved with no dependency context at all (deps_count: 0 across the run). The
+ * type checker already knows which declaration a call binds to; asking it and rendering the same
+ * FQ shape the symbol emitters below use is what turns a call into a graph edge.
+ *
+ * Only repository declarations resolve. Anything under node_modules, a .d.ts, or a file the indexer
+ * skips yields undefined, and the caller keeps the raw text as before (which the ingester drops, as
+ * before) — so behaviour for library calls is unchanged.
+ */
+export function makeCalleeResolver(absRootNorm: string): CalleeResolver {
+  const fqForDeclaration = (decl: Node): string | undefined => {
+    const sf = decl.getSourceFile();
+    if (sf.isDeclarationFile() || sf.isFromExternalLibrary()) return undefined;
+    const fp = sf.getFilePath();
+    const abs = path.isAbsolute(fp) ? path.resolve(fp) : path.join(absRootNorm, fp);
+    const rel = toForwardSlash(path.relative(absRootNorm, abs));
+    if (rel.startsWith("..") || path.isAbsolute(rel)) return undefined;
+    if (shouldSkipFile(rel) || isConfigOrToolingPath(rel)) return undefined;
+    const moduleId = filePathToModuleId(rel);
+
+    if (
+      Node.isMethodDeclaration(decl) ||
+      Node.isPropertyDeclaration(decl) ||
+      Node.isGetAccessorDeclaration(decl) ||
+      Node.isSetAccessorDeclaration(decl)
+    ) {
+      const owner = decl.getParent();
+      if (Node.isClassDeclaration(owner)) {
+        const className = owner.getName();
+        const memberName = decl.getName();
+        if (className && memberName) return `${fqName(moduleId, className)}.${memberName}`;
+      }
+      return undefined;
+    }
+    if (Node.isMethodSignature(decl) || Node.isPropertySignature(decl)) {
+      const owner = decl.getParent();
+      if (Node.isInterfaceDeclaration(owner)) {
+        const ifaceName = owner.getName();
+        if (ifaceName) return `${fqName(moduleId, ifaceName)}.${decl.getName()}`;
+      }
+      return undefined;
+    }
+    if (Node.isFunctionDeclaration(decl) || Node.isClassDeclaration(decl)) {
+      const name = decl.getName();
+      return name ? fqName(moduleId, name) : undefined;
+    }
+    if (Node.isVariableDeclaration(decl)) {
+      const nameNode = decl.getNameNode();
+      return Node.isIdentifier(nameNode) ? fqName(moduleId, nameNode.getText()) : undefined;
+    }
+    return undefined;
+  };
+
+  return (expr) => {
+    let sym: MorphSymbol | undefined;
+    try {
+      sym = expr.getSymbol();
+    } catch {
+      return undefined;
+    }
+    if (!sym) return undefined;
+    try {
+      const aliased = sym.getAliasedSymbol();
+      if (aliased) sym = aliased;
+    } catch {
+      // not an alias
+    }
+    for (const decl of sym.getDeclarations()) {
+      try {
+        const fq = fqForDeclaration(decl);
+        if (fq) return fq;
+      } catch {
+        // an odd declaration shape must not lose the other candidates
+      }
+    }
+    return undefined;
+  };
+}
+
 function collectCalls(
   container: { getDescendantsOfKind: (k: number) => unknown[] },
   callerFq: string,
   edges: LangIndexerJSON["edges"],
+  resolveCallee?: CalleeResolver,
 ): void {
   const callNodes = container.getDescendantsOfKind(SyntaxKind.CallExpression);
   for (const call of callNodes) {
     try {
-      const c = call as { getExpression: () => { getText: () => string } };
+      const c = call as { getExpression: () => Node };
       const expr = c.getExpression();
       const calleeText = expr.getText().trim();
-      if (calleeText && !calleeText.startsWith("UNRESOLVED") && calleeText.length < 80 && !/[\r\n]/.test(calleeText)) {
+      const resolved = resolveCallee ? resolveCallee(expr) : undefined;
+      const callee = resolved ?? calleeText;
+      if (callee && !callee.startsWith("UNRESOLVED") && callee.length < 200 && !/[\r\n]/.test(callee)) {
         edges.push({
           caller_fq_name: callerFq,
-          callee_fq_name: calleeText,
+          callee_fq_name: callee,
           edge_type: "CALLS",
         });
       }
@@ -262,6 +357,8 @@ export function indexProjectStreaming(
   opts.onStarted?.(sourceFiles.length);
 
   const fwMode = parseFrameworksFlag(opts.frameworks);
+  // One resolver for the whole project: the type checker is shared, so cross-file callees bind.
+  const resolveCallee = makeCalleeResolver(absRootNorm);
 
   const progressInterval = 50;
   let indexedCount = 0;
@@ -400,7 +497,7 @@ export function indexProjectStreaming(
               signature: mSig,
             });
             addContains(classFq, methodFq);
-            collectCalls(member, methodFq, edges);
+            collectCalls(member, methodFq, edges, resolveCallee);
             enrichCallableTypeRefs(methodFq, member, edges);
           }
         }
@@ -468,7 +565,7 @@ export function indexProjectStreaming(
           signature: fnSig,
         });
         addContains(moduleFq, fq);
-        collectCalls(node, fq, edges);
+        collectCalls(node, fq, edges, resolveCallee);
         enrichCallableTypeRefs(fq, node, edges);
         if (node.isExported()) {
           pushExports(fq);
@@ -513,7 +610,7 @@ export function indexProjectStreaming(
               signature: vSig,
             });
             addContains(moduleFq, fq);
-            collectCalls(init, fq, edges);
+            collectCalls(init, fq, edges, resolveCallee);
             if (init.isKind(SyntaxKind.ArrowFunction)) {
               enrichCallableTypeRefs(fq, init, edges);
             }

@@ -29,6 +29,10 @@ type nativeOllamaEmbedder struct {
 	model  string
 	client *http.Client
 	apiURL string // e.g. http://127.0.0.1:11434/api/embed
+	// keepAlive is general.llm.ollama_keep_alive rendered once; nil omits the field. Without it the
+	// embedding model is evicted after the server's idle default and reloads on the next retrieval
+	// pass, which is the same latency the chat side pays.
+	keepAlive json.RawMessage
 }
 
 func ollamaEmbedAPIRoot(cfg *config.Config) string {
@@ -62,12 +66,17 @@ func NewOllamaEmbedderForModel(cfg *config.Config, apiKey, modelID string) (mode
 	}
 	root := ollamaEmbedAPIRoot(cfg)
 	apiURL := strings.TrimSuffix(root, "/") + "/embed"
+	keepAlive, err := config.OllamaKeepAliveJSON(cfg.LLM.OllamaKeepAlive)
+	if err != nil {
+		return nil, fmt.Errorf("ollama embeddings: general.llm.ollama_keep_alive: %w", err)
+	}
 	maybeLogResolvedOllamaEmbed(apiURL, modelID)
 	return &nativeOllamaEmbedder{
-		cfg:    cfg,
-		model:  modelID,
-		client: httpcfg.HTTPClientWithBearerForOllama(&cfg.LLM, apiKey),
-		apiURL: apiURL,
+		cfg:       cfg,
+		model:     modelID,
+		client:    httpcfg.HTTPClientWithBearerForOllama(&cfg.LLM, apiKey),
+		apiURL:    apiURL,
+		keepAlive: keepAlive,
 	}, nil
 }
 
@@ -82,6 +91,8 @@ type ollamaEmbedAPIRequest struct {
 	Model    string   `json:"model"`
 	Input    []string `json:"input"`
 	Truncate *bool    `json:"truncate,omitempty"`
+	// KeepAlive mirrors the chat client's field; see config.OllamaKeepAliveJSON.
+	KeepAlive json.RawMessage `json:"keep_alive,omitempty"`
 }
 
 type ollamaEmbedAPIResponse struct {
@@ -124,9 +135,10 @@ func (o *nativeOllamaEmbedder) Embed(ctx context.Context, texts []string) ([][]f
 func (o *nativeOllamaEmbedder) embedBatch(ctx context.Context, batch []string) ([][]float32, error) {
 	truncateTrue := true
 	payload := ollamaEmbedAPIRequest{
-		Model:    o.model,
-		Input:    batch,
-		Truncate: &truncateTrue,
+		Model:     o.model,
+		Input:     batch,
+		Truncate:  &truncateTrue,
+		KeepAlive: o.keepAlive,
 	}
 	raw, err := json.Marshal(&payload)
 	if err != nil {

@@ -154,6 +154,15 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	}
 	sum.FilesIndexed = len(files)
 	nJava, nJST, nCSharp := langCounts(files)
+	// The index is incremental on file content; fold the JS/TS indexer's build identity into the
+	// JS/TS file versions so a rebuilt indexer re-indexes files it would otherwise skip (see
+	// jstindexer.Fingerprint for the asqs-go run that reused a stale index).
+	if nJST > 0 && strings.TrimSpace(cfg.Indexer.JSTIndexerPath) != "" {
+		if fp := jstindexer.Fingerprint(cfg.Indexer.JSTIndexerPath); fp != "" {
+			stamped := indexer.StampLangIndexerFingerprint(files, fp)
+			fmt.Fprintf(os.Stderr, "asqs-core: js/ts indexer build %s stamped into %d file version(s)\n", fp, stamped)
+		}
+	}
 	lang := strings.TrimSpace(opts.Lang)
 	if lang == "" {
 		lang = detectPrimaryLang(nJava, nJST, nCSharp)
@@ -219,6 +228,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		return sum, fmt.Errorf("language indexer: %w", err)
 	}
 	runID := fmt.Sprintf("core_%d", time.Now().UnixNano())
+	// The E2E stack the evaluator must be told about — after bootstrap, so a stack the bootstrap
+	// just installed counts. See detectRunE2EFramework.
+	runE2EFramework := detectRunE2EFramework(ctx, repoAbs, lang, audit)
+
 	// Join this run to the exact configuration that produced it (the A/B report groups on it).
 	// Best-effort: a run without a recorded revision still runs, it is just invisible to ab-report.
 	configRevisionID, crErr := ensureConfigRevisionForRun(ctx, meta, cfg.SourcePath)
@@ -416,6 +429,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// Empty when the repository brought its own E2E setup: the bootstrap skips entirely in that
 	// case, so there are no ASQS helpers to point at and the notice must not invent one.
 	gen.E2ESupportModule = testbootstrap.PlaywrightSupportModule(repoAbs)
+	// The same detected stack the evaluator gets, so the suggested spec paths and the E2E prompt
+	// hints agree with the runner that will execute them.
+	gen.E2EFramework = runE2EFramework
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
@@ -579,6 +595,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	seen := map[string]bool{}
 	outcomeIdxByPath := map[string]int{} // normalized path -> index of the gap that first wrote it
 	anyE2E := false
+	var e2eArtifactPaths []string                // this run's E2E artifacts, for prepareGeneratedPlaywrightSpecs
 	docInsertsByFile := map[string][]docInsert{} // collected per-symbol docs, applied per file after the loop
 	for _, item := range plan.Items {
 		out := GapOutcome{Symbol: planItemSymbol(item)}
@@ -693,6 +710,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 				sum.GapsGenerated++
 				if isE2E(item) {
 					anyE2E = true
+					e2eArtifactPaths = append(e2eArtifactPaths, relPath)
 				}
 				if np := normPath(relPath); !seen[np] {
 					seen[np] = true
@@ -779,42 +797,27 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 		}
 	}
 
+	// Generated Playwright specs must be loadable and matched by the config before the E2E pass
+	// runs — see prepareGeneratedPlaywrightSpecs.
+	prepareGeneratedPlaywrightSpecs(ctx, repoAbs, lang, runE2EFramework, e2eArtifactPaths, audit)
+
 	// Phase 2 — evaluate the WHOLE project once: one compile + one test pass (+ optional E2E),
 	// with a single fix loop across all generated files.
 	fmt.Fprintf(os.Stderr, "asqs-core: evaluating %d generated test file(s) (whole-project compile + test)…\n", len(artifactPaths))
-	evalOpts := evaluator.EvalOptions{
-		RepoPath:         repoAbs,
-		Lang:             lang,
-		MaxFixIterations: maxFix,
-		// Per-step repair budgets, independent of the iteration budget above. Unset = maxFix.
-		MaxCompileFixAttempts: cfg.Runner.MaxCompileFixAttempts,
-		MaxTestFixAttempts:    cfg.Runner.MaxTestFixAttempts,
-		ArtifactPaths:         artifactPaths,
-		ExtendedArtifactPaths: extendedArtifactPaths,
-		Fixer:                 fixer,
-		// The fixer may now repair inherited breakage on evidence rather than on a regex guess
-		// over each round's diagnostic.
-		BaselineFailingPaths: append([]string(nil), baseline.Paths...),
-		APISurfaceProvider:   apiSurface,
-		// Keep the evaluator's view of the flag in step with the Fixer's, or the audit payload
-		// (structured_user_message_config / _forced) contradicts what the fixer actually did.
-		FixerStructuredUserMessage: cfg.Runner.FixerStructuredUserMessage,
-		RunE2ETestPass:             anyE2E,
-		CompileOncePerEval:         true,
-		FormatAfterFix:             formatAfterFixHook,
-		// Fix-loop bounds. The breaker thresholds were hardcoded, leaving an operator watching a
-		// loop give up after three rounds with no lever at all.
-		FixLoopRepeatStopThreshold:     cfg.Runner.FixLoopRepeatStopThreshold,
-		FixLoopRecurrenceStopThreshold: cfg.Runner.FixLoopRecurrenceStopThreshold,
-		FixLoopNoProgressStopThreshold: cfg.Runner.FixLoopNoProgressStopThreshold,
-		FixContextRunesMax:             cfg.Runner.FixContextRunesMax,
-		BackoffBetweenFixAttempts:      fixBackoffDuration(cfg.Runner.FixBackoff),
-		// runner.disable_error_log_llm_summary was declared and documented but never passed on, so
-		// the summariser below could not be turned off — another key the inert-field lint could not
-		// see, because EvalOptions declares an identically named field.
-		DisableErrorLogLLMSummary: cfg.Runner.DisableErrorLogLLMSummary,
-		ErrorLogSummarizer:        errorLogSummarizer(cfg, fixerChat),
-	}
+	// Config-derived fields first (see evalOptionsFromConfig), then this run's paths and artifacts.
+	evalOpts := evalOptionsFromConfig(cfg, runE2EFramework, anyE2E)
+	evalOpts.RepoPath = repoAbs
+	evalOpts.Lang = lang
+	evalOpts.MaxFixIterations = maxFix
+	evalOpts.ArtifactPaths = artifactPaths
+	evalOpts.ExtendedArtifactPaths = extendedArtifactPaths
+	evalOpts.Fixer = fixer
+	// The fixer may now repair inherited breakage on evidence rather than on a regex guess over
+	// each round's diagnostic.
+	evalOpts.BaselineFailingPaths = append([]string(nil), baseline.Paths...)
+	evalOpts.APISurfaceProvider = apiSurface
+	evalOpts.FormatAfterFix = formatAfterFixHook
+	evalOpts.ErrorLogSummarizer = errorLogSummarizer(cfg, fixerChat)
 	evalRes, eerr := evaluator.RunEvaluation(ctx, sandbox, evalOpts, audit)
 	if eerr != nil {
 		fmt.Fprintf(os.Stderr, "asqs-core: evaluation error: %v\n", eerr)

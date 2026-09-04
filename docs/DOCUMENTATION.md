@@ -499,6 +499,15 @@ sizing, section budgets, the project-intel scan shape, cache locations. A defaul
 through measurement, which an operator has no basis to do from a config file. A frozen key left in a
 config will fail the strict load; delete it.
 
+Two Ollama-only keys under `general.llm` trade VRAM for latency and reach every step, since
+generation, documentation and the fixer all build the same client. `general.llm.ollama_keep_alive`
+is sent as `keep_alive` on every chat and embed request: `-1` keeps the model loaded between calls
+instead of reloading it after the server's five-minute idle default; an integer is seconds, a
+duration such as `30m` also works, and anything else fails the load. `general.llm.ollama_think:
+false` is sent as `think` and stops a reasoning model from spending its output budget on a chain of
+thought before the answer; unset leaves the server default, and `true` is rejected by Ollama for
+models without the thinking capability.
+
 ### Upgrading from the pre-v2 schema
 
 **There is no automatic migration.** Start from `config.example.yaml` and move values across.

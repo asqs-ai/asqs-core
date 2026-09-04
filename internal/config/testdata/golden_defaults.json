@@ -88,6 +88,8 @@
     "HTTPDisableKeepAlives": false,
     "HTTPResponseHeaderTimeout": "",
     "OllamaNumCtx": 0,
+    "OllamaKeepAlive": "",
+    "OllamaThink": null,
     "MaxConcurrent": 0
   },
   "Runner": {

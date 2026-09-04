@@ -120,6 +120,7 @@ func (g *LLMGenerator) buildGeneratorSystem(item *retrieval.TestPlanItem, isE2E 
 			if mode != genModePhase1 {
 				system += behavioralUnitTestQualityHint(item)
 				system += reactTSXUnitTestHint(item)
+				system += angularUnitTestHint(item)
 			} else {
 				system += twoPhasePhase1LangHint(item)
 			}

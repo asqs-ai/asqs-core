@@ -204,6 +204,11 @@ func Validate(c *Config, mode string) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("config validation: missing required: %s", strings.Join(errs, ", "))
 	}
+	// A malformed keep_alive would otherwise surface as a 400 from Ollama on the first completion of
+	// the run, after indexing and planning have already been paid for.
+	if _, err := OllamaKeepAliveJSON(c.LLM.OllamaKeepAlive); err != nil {
+		return fmt.Errorf("config validation: general.llm.ollama_keep_alive: %w", err)
+	}
 	if c.Database.EmbeddingsURL == "" {
 		c.Database.EmbeddingsURL = c.Database.MetadataURL
 	}

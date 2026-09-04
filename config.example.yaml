@@ -29,6 +29,11 @@ general:
     api_key: "" # e.g. "sk-..."
     api_key_from_env: "" # e.g. OPENAI_API_KEY
     base_url: "" # e.g. http://127.0.0.1:11434 for a local Ollama (no key needed)
+    # Ollama only; other providers ignore both. keep_alive -1 keeps the model loaded between calls
+    # instead of reloading it after the server's 5-minute idle default; think false stops a reasoning
+    # model from spending its output budget on a chain of thought before the answer.
+    ollama_keep_alive: -1
+    ollama_think: false
     embeddings:
       model: "text-embedding-3-small"
       dimension: 1536 # must match the model's output width

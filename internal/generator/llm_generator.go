@@ -499,7 +499,7 @@ func suggestedE2EPathForPageRouteGap(item *retrieval.TestPlanItem, e2eFramework 
 	if isCypressE2EFramework(e2eFramework) {
 		return filepath.Join("cypress", "e2e", "routes", slug+".cy"+ext)
 	}
-	return filepath.Join("e2e", "routes", slug+".spec"+ext)
+	return filepath.Join(filepath.FromSlash(playwrightRouteSpecDir), slug+".spec"+ext)
 }
 
 // behavioralUnitTestQualityHint steers the model away from trivial “source substring” tests toward real behavior checks.
@@ -549,6 +549,47 @@ func reactTSXUnitTestHint(item *retrieval.TestPlanItem) string {
 		return ""
 	}
 	return "\n\n**React / .tsx target:** Treat this as a **UI unit** test. Follow **Similar tests** in context when they use Testing Library; otherwise use `@testing-library/react` + `@testing-library/user-event`: wrap with the same providers as production if needed, `render()` the exported component, query the document (`screen.getByRole`, `findByText`, etc.), and assert **user-visible** results or **mock** invocations. Mock framework modules (`next/navigation`, data fetching) instead of asserting route strings against themselves. **react-router:** a component that renders `Link`, `NavLink`, `Outlet` or calls `useNavigate` needs a router in the tree — wrap it in `MemoryRouter` (or `createMemoryRouter` + `RouterProvider` for data routers) rather than mocking `react-router-dom`; `Link` outside a router throws `Cannot destructure property 'basename'`."
+}
+
+// angularUnitTestHint adds Angular TestBed guidance for targets in Angular source files.
+//
+// Two failures of the asqs-core run of 2026-09-03 were deterministic Angular wiring mistakes, not
+// model misjudgement of behaviour: LegacyPortalComponent (`standalone: false`, declared by
+// LegacyModule) was placed in `imports:` and every case died with `Unexpected directive
+// 'LegacyPortalComponent' imported by the module 'DynamicTestModule'`; CatalogService calls
+// `inject(API_BASE_URL)` and no provider was registered, so `NullInjectorError: No provider for
+// InjectionToken API_BASE_URL` failed the suite. Both are visible in the decorator and the class
+// body the model is shown, and both have exactly one correct TestBed shape.
+//
+// Applies by file naming (Angular CLI's `*.component.ts`, `*.service.ts`, `*.pipe.ts`,
+// `*.directive.ts`, `*.guard.ts`, `*.resolver.ts`, `*.interceptor.ts`) or by an Angular symbol kind
+// from the indexer, and never to .tsx or non-TS targets.
+func angularUnitTestHint(item *retrieval.TestPlanItem) string {
+	if item == nil || item.Gap == nil || item.Gap.Symbol == nil {
+		return ""
+	}
+	lang := strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Lang))
+	if lang != "typescript" && lang != "ts" {
+		return ""
+	}
+	file := strings.ToLower(strings.TrimSpace(item.Gap.Symbol.File))
+	kind := strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Kind))
+	angularFile := false
+	for _, suffix := range []string{".component.ts", ".service.ts", ".pipe.ts", ".directive.ts", ".guard.ts", ".resolver.ts", ".interceptor.ts", ".module.ts"} {
+		if strings.HasSuffix(file, suffix) {
+			angularFile = true
+			break
+		}
+	}
+	if !angularFile && !strings.HasPrefix(kind, "angular_") {
+		return ""
+	}
+	return "\n\n**Angular target — read the decorator before wiring TestBed:**\n" +
+		"- A component/directive/pipe with `standalone: false`, or one listed in an NgModule's `declarations`, goes in `TestBed.configureTestingModule({ declarations: [X], imports: [/* the module's own imports it needs: CommonModule, FormsModule, RouterTestingModule… */] })`. Putting it in `imports:` throws `Unexpected directive 'X' imported by the module 'DynamicTestModule'. Please add an @NgModule annotation.`\n" +
+		"- A standalone component (`standalone: true`, or `standalone` omitted on Angular 19+) goes in `imports: [X]`, never in `declarations`.\n" +
+		"- Every `inject(TOKEN)` / constructor dependency the class declares needs a provider: `providers: [{ provide: TOKEN, useValue: … }]` for an `InjectionToken`, and `provideHttpClient(), provideHttpClientTesting()` (assert with `HttpTestingController`) when it injects `HttpClient` or `HttpBackend`. A missing one fails as `NullInjectorError: No provider for InjectionToken …`.\n" +
+		"- Do not `jest.spyOn(SomeClass.prototype, 'constructor', …)`; construct through TestBed and spy on the injected collaborator instead.\n" +
+		"- Angular CLI's default runner is Jasmine/Karma, but the runner here is whatever the test-stack contract says. Under **jest** there is no `jasmine` global: `jasmine.createSpyObj(...)` fails with `ReferenceError: jasmine is not defined` — use `jest.fn()`, `jest.spyOn()` and `{ provide: X, useValue: { m: jest.fn() } }` instead."
 }
 
 // e2eGenerationActiveTestsPolicy discourages default @Disabled / test.skip on new E2E (models mimic Spring samples)

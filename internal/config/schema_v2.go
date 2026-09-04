@@ -143,6 +143,16 @@ type LLMV2 struct {
 	// OllamaNumCtx sets options.num_ctx on Ollama chat calls. 0 = the model's own default. Native
 	// tool calling requires it, so leaving it unset disables tools on Ollama.
 	OllamaNumCtx int `yaml:"ollama_num_ctx"`
+	// OllamaKeepAlive is sent as keep_alive on every Ollama chat and embed request. An integer is
+	// seconds (-1 = keep the model loaded until the server exits, 0 = unload right after the reply);
+	// a duration such as "30m" is also accepted. Empty = the server's own default (5 minutes idle).
+	// Ollama only; other providers ignore it.
+	OllamaKeepAlive string `yaml:"ollama_keep_alive"`
+	// OllamaThink is sent as think on Ollama chat requests. false stops a reasoning model from
+	// spending its output budget on a chain of thought before the answer. Unset = the server decides
+	// (thinking on for models that support it). true is rejected by Ollama for models without the
+	// thinking capability. Ollama only; other providers ignore it.
+	OllamaThink *bool `yaml:"ollama_think"`
 	// HTTP tunes the transport. Client proxies are a documented deployment constraint, which is why
 	// these stay configurable rather than joining the constants freeze.
 	HTTP LLMHTTPV2 `yaml:"http"`

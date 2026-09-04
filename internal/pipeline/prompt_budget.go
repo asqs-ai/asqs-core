@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/generator"
@@ -48,10 +49,19 @@ func auditPromptBudget(ctx context.Context, audit runAuditor, fqName, prompt str
 		"prompt_bytes":  len(prompt),
 		"counter":       counter.Name(),
 	}
+	// A human-readable message, like every other audit line. Seventeen generate.prompt_budget rows
+	// in the asqs-core audit.log of 2026-09-03 rendered as blank lines in any view keyed on
+	// `message`, which is where an operator first looks.
+	msg := fmt.Sprintf("Generation prompt for %s: %d tokens (%d bytes, counter %s)", fqName, total, len(prompt), counter.Name())
 	if b != nil && !b.Unbounded() {
 		payload["budget_tokens"] = b.Total()
 		payload["sections"] = b.Breakdown()
 		payload["over_budget"] = total > b.Total()
+		msg += fmt.Sprintf(" of a %d-token budget", b.Total())
+		if total > b.Total() {
+			msg += " — OVER BUDGET"
+		}
 	}
+	payload["message"] = msg + "."
 	audit.Log(ctx, "generate.prompt_budget", payload)
 }

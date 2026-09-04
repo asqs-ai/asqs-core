@@ -259,7 +259,13 @@ func (s *Sandbox) TestE2EPass(ctx context.Context, repoPath, lang, testCommand, 
 	}
 	img := ""
 	if usePlaywrightDockerForJSE2E(lang, e2eFramework) {
-		img = s2.playwrightDockerImageRef()
+		// The image tag follows the @playwright/test the repository resolved (see
+		// InstalledPlaywrightTestVersion), read from the package directory the E2E step runs in.
+		pkgDir := strings.TrimSpace(repoPath)
+		if abs, err := filepath.Abs(pkgDir); err == nil {
+			pkgDir = s2.evalHostCwd(abs)
+		}
+		img = s2.playwrightDockerImageRefFor(pkgDir)
 	} else if usePlaywrightDockerForJavaE2E(lang, e2eFramework) {
 		img = s2.playwrightJavaDockerImageRef()
 	} else if usePlaywrightDockerForCSharpE2E(lang, e2eFramework) {

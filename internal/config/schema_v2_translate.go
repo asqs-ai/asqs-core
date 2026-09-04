@@ -104,6 +104,8 @@ func translateGeneral(s *SchemaV2, c *Config) {
 	c.LLM.BaseURL = g.LLM.BaseURL
 	c.LLM.MaxConcurrent = g.LLM.MaxConcurrent
 	c.LLM.OllamaNumCtx = g.LLM.OllamaNumCtx
+	c.LLM.OllamaKeepAlive = g.LLM.OllamaKeepAlive
+	c.LLM.OllamaThink = g.LLM.OllamaThink
 	c.LLM.HTTPTimeout = g.LLM.HTTP.Timeout
 	c.LLM.HTTPResponseHeaderTimeout = g.LLM.HTTP.ResponseHeaderTimeout
 	c.LLM.HTTPDisableKeepAlives = g.LLM.HTTP.DisableKeepAlives

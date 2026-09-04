@@ -183,9 +183,18 @@ func renderE2EBackendNotice(origins []string, supportModule string) string {
 	b.WriteString("on either can only fail — so assert on data-driven UI only in tests that supply the data.\n")
 	if supportModule != "" {
 		b.WriteString("Helpers for this are already in the repository at `" + supportModule + "`: ")
-		b.WriteString("`stubJson(page, pattern, body)`, `stubJsonAfter(page, pattern, body, delayMs)` for a state that only ")
-		b.WriteString("exists while a request is in flight, and `stubError(page, pattern, status)`. Import and use them ")
-		b.WriteString("rather than writing the route handler out by hand.\n")
+		b.WriteString("`stubJson(page, urlPattern, body, status = 200)`, `stubJsonAfter(page, urlPattern, body, delayMs, status = 200)` for a state that only ")
+		b.WriteString("exists while a request is in flight, and `stubError(page, urlPattern, status = 500, body?)`. Import and use them ")
+		b.WriteString("rather than writing the route handler out by hand. ")
+		// The exact import line, because the model has to compute a relative specifier from a
+		// directory it is told about only indirectly. In run 2026-09-03 it wrote `'../../support/api'`
+		// from e2e/routes/ — one level too many — and the whole first E2E round went to
+		// `Cannot find module`; it also spent a tool call on get_symbol("e2e.support.api"), which
+		// the index cannot answer because the helpers are not indexed symbols.
+		b.WriteString("From a spec under `" + playwrightRouteSpecDir + "/` the import is exactly ")
+		b.WriteString("`import { stubJson, stubJsonAfter, stubError } from '" + supportModuleImportSpecifier(playwrightRouteSpecDir, supportModule) + "';`")
+		b.WriteString(" (a spec directly under `" + filepath.ToSlash(filepath.Dir(filepath.Dir(supportModule))) + "/` uses `'" + supportModuleImportSpecifier(filepath.ToSlash(filepath.Dir(filepath.Dir(supportModule))), supportModule) + "'`). ")
+		b.WriteString("The helper module is not an indexed symbol: do not look it up with `get_symbol`; the signatures above are complete.\n")
 	} else {
 		b.WriteString("For example: `await page.route('**/api/catalog*', route => route.fulfill({ json: [ /* rows */ ] }));`\n")
 	}
@@ -217,4 +226,23 @@ func (g *LLMGenerator) auditE2EBackendNotice(ctx context.Context, origins []stri
 			len(origins), strings.Join(origins, ", "))
 	}
 	g.Audit.Log(ctx, "generate.e2e_backend_notice", payload)
+}
+
+// playwrightRouteSpecDir is where suggestedE2EPathForPageRouteGap places generated Playwright route
+// specs; the support-module import in the E2E notice is computed relative to it.
+const playwrightRouteSpecDir = "e2e/routes"
+
+// supportModuleImportSpecifier returns the module specifier a file in fromDir uses to import
+// supportModule (both repo-relative): extension stripped, always relative (`./` or `../`).
+func supportModuleImportSpecifier(fromDir, supportModule string) string {
+	rel, err := filepath.Rel(filepath.FromSlash(fromDir), filepath.FromSlash(supportModule))
+	if err != nil {
+		rel = supportModule
+	}
+	rel = filepath.ToSlash(rel)
+	rel = strings.TrimSuffix(rel, filepath.Ext(rel))
+	if !strings.HasPrefix(rel, ".") {
+		rel = "./" + rel
+	}
+	return rel
 }

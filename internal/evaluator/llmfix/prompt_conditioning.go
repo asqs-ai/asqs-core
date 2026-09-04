@@ -206,6 +206,14 @@ func fixAttemptConditioningBlock(attempt, maxAttempt int) string {
 // fixUserTurnFocusBlock is a short user-side recap (recency in long prompts; complements the system addenda).
 func fixUserTurnFocusBlock(req evaluator.FixRequest) string {
 	var b strings.Builder
+	// The primary-site directive leads the block: it exists only on a round forced onto the
+	// blamed file after repeated untouched rounds, and it names the one repair this round must
+	// make. Every builder emits this block, so the directive reaches all layouts.
+	if strings.TrimSpace(req.PrimarySiteDirective) != "" {
+		b.WriteString("=== PRIMARY SITE DIRECTIVE ===\n")
+		b.WriteString(strings.TrimSpace(req.PrimarySiteDirective))
+		b.WriteString("\n\n")
+	}
 	b.WriteString("=== TURN FOCUS ===\n")
 	switch req.Step {
 	case evaluator.StepCompile:

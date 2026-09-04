@@ -109,7 +109,27 @@ func primarySiteStreakSignature(lang string, site PrimaryFailureSite, errorOutpu
 // A column is still required after the line in the paren form (the trailing [,:] class), so
 // `foo.ts(3)` appearing in prose cannot open a bogus diagnostic bucket. tsc and MSBuild both always
 // emit line AND column on error lines.
-var primaryDiagnosticRE = regexp.MustCompile(`([\w./\\-]+\.(?:java|kt|cs|ts|tsx|js|jsx|go))(?::\[?|\()(\d+)[,:]`)
+//
+// `@` is in the path class because scoped npm packages put it mid-path: without it the token for
+// `node_modules/@jest/core/build/TestScheduler.js:133:18` began at `jest/…`, which no vendored-path
+// test could recognise. See vendoredDiagnosticFrame for the second line of defence.
+var primaryDiagnosticRE = regexp.MustCompile(`([\w./\\@-]+\.(?:java|kt|cs|ts|tsx|js|jsx|go))(?::\[?|\()(\d+)[,:]`)
+
+// vendoredFramePrefixRE matches a vendored tree opening a path earlier on the same line than the
+// token primaryDiagnosticRE captured — the case where the token started mid-path because of a
+// character the path class does not admit.
+var vendoredFramePrefixRE = regexp.MustCompile(`(?:^|[\s(\['"=:])(?:node_modules|vendor)/`)
+
+// vendoredDiagnosticFrame reports whether the diagnostic at match m is a frame inside a vendored
+// tree: either the captured path itself has a vendored segment, or the line it sits on opens a
+// vendored path before the token.
+func vendoredDiagnosticFrame(errorOutput string, m []int) bool {
+	if pathIsVendored(errorOutput[m[2]:m[3]]) {
+		return true
+	}
+	lineStart := strings.LastIndex(errorOutput[:m[0]], "\n") + 1
+	return vendoredFramePrefixRE.MatchString(errorOutput[lineStart:m[2]])
+}
 
 // PrimaryFailureSite is the file and line the first diagnostic blames.
 type PrimaryFailureSite struct {
@@ -237,7 +257,16 @@ var resolutionFailureRE = regexp.MustCompile(`(?i)` + strings.Join([]string{
 var playwrightTestListLineRE = regexp.MustCompile(`(?m)^[^\n]*\[[\w-]+\] › [^\n]*:\d+:\d+ › `)
 
 // primaryDiagnosticLocations returns every primaryDiagnosticRE match that is a diagnostic rather
-// than a test-list header, in output order.
+// than a test-list header or a vendored stack frame, in output order.
+//
+// Vendored frames are dropped for the same reason readFixContextFiles drops them from the fixer's
+// context: a path under node_modules/ or vendor/ is where a runtime error was REPORTED, not where
+// the fault is, and nothing the fixer writes can change it. The run of 2026-09-03 (Angular fixture,
+// jest) blamed `node_modules/@jest/core/build/TestScheduler.js:133` for five consecutive rounds —
+// the frame jest prints under "Your test suite must contain at least one test" — so every
+// fix_primary_site_untouched line named a file no round could have written, and the file jest
+// actually refused to run (checkout.component.test.ts, cited only by its FAIL header) was never the
+// primary site.
 func primaryDiagnosticLocations(errorOutput string) [][]int {
 	skip := playwrightTestListLineRE.FindAllStringIndex(errorOutput, -1)
 	inSkipped := func(pos int) bool {
@@ -250,20 +279,50 @@ func primaryDiagnosticLocations(errorOutput string) [][]int {
 	}
 	var out [][]int
 	for _, m := range primaryDiagnosticRE.FindAllStringSubmatchIndex(errorOutput, -1) {
-		if len(m) >= 6 && !inSkipped(m[0]) {
-			out = append(out, m)
+		if len(m) < 6 || inSkipped(m[0]) {
+			continue
 		}
+		if vendoredDiagnosticFrame(errorOutput, m) {
+			continue
+		}
+		out = append(out, m)
 	}
 	return out
 }
 
 // ParsePrimaryFailureSite reads the first diagnostic location out of compiler or test output.
 func ParsePrimaryFailureSite(errorOutput string) PrimaryFailureSite {
+	return ParsePrimaryFailureSiteAmong(errorOutput, nil)
+}
+
+// ParsePrimaryFailureSiteAmong is ParsePrimaryFailureSite with a preference: when `prefer` names
+// files (repo-relative, typically the writable artifacts), the first diagnostic located in one of
+// them wins over an earlier diagnostic located elsewhere. The first location overall remains the
+// fallback, so output that cites no preferred file behaves exactly as before.
+//
+// The preference exists because a test runner's first location is routinely a frame in the code
+// UNDER test: in the run of 2026-09-03 round 4 blamed `legacy-invoice-bridge.service.ts:22` — a
+// production file the fixer may not write — while the failing test file was cited four lines
+// later. A primary site the fixer cannot act on makes every downstream signal (untouched-site
+// streaks, enforcement) inert or wrong.
+func ParsePrimaryFailureSiteAmong(errorOutput string, prefer []string) PrimaryFailureSite {
 	locs := primaryDiagnosticLocations(errorOutput)
 	if len(locs) == 0 {
 		return PrimaryFailureSite{}
 	}
 	m := locs[0]
+	if len(prefer) > 0 {
+	pick:
+		for _, loc := range locs {
+			tok := errorOutput[loc[2]:loc[3]]
+			for _, p := range prefer {
+				if sameDiagnosticFile(tok, p) {
+					m = loc
+					break pick
+				}
+			}
+		}
+	}
 	line := 0
 	for _, r := range errorOutput[m[4]:m[5]] {
 		line = line*10 + int(r-'0')

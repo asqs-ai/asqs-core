@@ -1390,6 +1390,25 @@ func manifestPathsForFixer(repoPath, lang, monoWorkspace string, artifactAndRela
 type FixLoopState struct {
 	lastSignature string
 	streak        int
+	// Primary-site enforcement state (ported from asqs-go). primarySiteUntouchedStreak counts
+	// CONSECUTIVE rounds that wrote something while acting on neither the blamed line nor (for
+	// resolution failures) the import block of the file the first diagnostic blames — including
+	// rounds that never wrote the blamed file at all, which is the shape the 2026-08-29 run had
+	// (40 iterations blaming OwnerControllerTests.java:427, every write to VetsTests.java).
+	// Identity is (primarySiteKey, primarySiteStreakSig): the blamed path plus a line-insensitive
+	// signature of that file's own diagnostics, so a rewrite that only shifts line numbers
+	// continues the streak. At EnforcePrimarySiteAfterUntouchedRounds the round is forced onto the
+	// blamed file with an explicit directive; at StopPrimarySiteAfterUntouchedRounds — and only
+	// once a forced round has actually happened (primarySiteEnforced) — the loop stops with
+	// FixSkipPrimarySiteNeverTouched instead of discovering the stall by repetition.
+	primarySiteKey             string
+	primarySiteStreakSig       string
+	primarySiteUntouchedStreak int
+	primarySiteEnforced        bool
+	// enforcementPending is set by applyLLMFix for the one round that primary-site enforcement is
+	// about to force onto the blamed file, and consumed by checkFixLoopBreakers, which then lets
+	// that round through instead of tripping.
+	enforcementPending bool
 	// lastRoundNarrowed records whether the previous round's writable set was a narrowed subset
 	// of the artifacts (error_cited_subset / failing_test_subset). Read by the next round together
 	// with widenNextRound to decide whether narrowing should be suspended once.
@@ -1586,6 +1605,22 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 		tripReason, effectiveThreshold = FixSkipLoopNoProgress, opts.noProgressStopThreshold()
 	}
 	if tripReason == "" {
+		loopState.enforcementPending = false
+		return false, ""
+	}
+	if loopState.enforcementPending {
+		// One round of grace for the primary-site enforcement (see applyLLMFix). The counters keep
+		// counting, so if the forced round changes nothing the breaker fires on the next arrival —
+		// unless the streak's own terminal stop has fired first, which is the expected order.
+		loopState.enforcementPending = false
+		if audit != nil {
+			audit.Log(ctx, "evaluator.fix_loop_breaker_deferred_for_enforcement", map[string]interface{}{
+				"message":   fmt.Sprintf("Breaker %s would stop step %s now; deferred one round so primary-site enforcement can force the blamed file.", tripReason, step),
+				"step":      step,
+				"breaker":   tripReason,
+				"threshold": effectiveThreshold,
+			})
+		}
 		return false, ""
 	}
 	loopState.tripped = true
@@ -1832,6 +1867,56 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	// the per-round memory recorded at every exit, which must name the failure this round was
 	// handed rather than recomputing a possibly different one later.
 	roundSignature := fixLoopSignature(step, pathsToRead, errorOutput)
+	// Where the compiler says the problem is. Reported after the writes (TouchedPrimarySite) and
+	// enforced after repeated untouched rounds (below). Located among the writable paths first —
+	// see ParsePrimaryFailureSiteAmong.
+	primarySite := ParsePrimaryFailureSiteAmong(errorOutput, pathsToRead)
+	// Primary-site streak state for THIS failure; "" when the diagnostic has no usable site.
+	siteStreakSig := ""
+	siteStreakActive := false
+	if primarySite.OK && loopState != nil {
+		siteStreakSig = primarySiteStreakSignature(opts.Lang, primarySite, errorOutput)
+		siteStreakActive = loopState.primarySiteKey == filepath.ToSlash(primarySite.Path) &&
+			loopState.primarySiteStreakSig == siteStreakSig &&
+			loopState.primarySiteUntouchedStreak > 0
+	}
+	// Terminal: the FORCED round (single writable file + explicit directive, see the enforcement
+	// below) also came back without acting on the blamed site. Checked before file reads and the
+	// LLM call so the stop costs nothing further. Requires that a forced round actually happened:
+	// a blamed file outside the writable set can never be forced, and stopping on it would end
+	// the loop over a file the fixer was never allowed to touch.
+	if siteStreakActive && loopState.primarySiteEnforced && loopState.primarySiteUntouchedStreak >= StopPrimarySiteAfterUntouchedRounds {
+		loopState.tripped = true
+		loopState.trippedReason = FixSkipPrimarySiteNeverTouched
+		if audit != nil {
+			audit.LogError(ctx, "evaluator.fix_primary_site_never_touched", map[string]interface{}{
+				"message": fmt.Sprintf(
+					"Stopping: %d consecutive round(s) wrote around the blamed site %s:%d (neither the line nor the import block), including a round forced onto that file alone. The model will not perform this repair; further rounds cannot converge.",
+					loopState.primarySiteUntouchedStreak, primarySiteBase(primarySite), primarySite.Line),
+				"step":         step,
+				"primary_path": primarySite.Path,
+				"primary_line": primarySite.Line,
+				"streak":       loopState.primarySiteUntouchedStreak,
+				"threshold":    StopPrimarySiteAfterUntouchedRounds,
+			})
+		}
+		return false, nil, FixSkipPrimarySiteNeverTouched
+	}
+	// The forced round must be allowed to happen. This repository's default repeat threshold (3)
+	// is exactly the round enforcement fires on: two untouched rounds against one failure are two
+	// identical signatures, and the third arrival would trip the repeat breaker before the round
+	// the enforcement exists for. When the blamed file is writable and no forced round has taken
+	// place yet, the breakers stand down for this one round (enforcementPending, consumed by
+	// checkFixLoopBreakers); the streak's own terminal stop above bounds what follows.
+	if loopState != nil && siteStreakActive && !loopState.primarySiteEnforced &&
+		loopState.primarySiteUntouchedStreak >= EnforcePrimarySiteAfterUntouchedRounds {
+		for _, a := range pathsToRead {
+			if sameDiagnosticFile(primarySite.Path, a) {
+				loopState.enforcementPending = true
+				break
+			}
+		}
+	}
 	if stop, why := checkFixLoopBreakers(ctx, opts, step, errorOutput, roundSignature, pathsToRead, errorOutputSanitized, audit, attemptCounter, maxAttempts, loopState); stop {
 		return false, nil, why
 	}
@@ -2211,11 +2296,30 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			})
 		}
 		cited := errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath))
-		if len(cited) > 0 {
-			citedSet := make(map[string]bool, len(cited))
-			for _, p := range cited {
+		citedSet := make(map[string]bool, len(cited))
+		for _, p := range cited {
+			citedSet[normalizePathForFix(p)] = true
+		}
+		// Test steps: a failing file that the runner names WITHOUT a source location must stay in
+		// the subset. jest's "Your test suite must contain at least one test" block carries only a
+		// `FAIL <path>` header, so AllCitedRepoPaths never sees it; in the run of 2026-09-03 the
+		// cited-subset narrowing therefore dropped checkout.component.test.ts from round 2 on while
+		// it failed in every round, and the failing-test fallback below never ran because other
+		// files WERE cited. The union keeps cited-subset priority and merely adds what the
+		// failing-test parser attributes.
+		// The audit reason stays honest about the evidence: "error_cited_subset" when at least
+		// one compiler-shaped citation contributed, "failing_test_subset" when only the failing-test
+		// attribution did.
+		subsetReason := "error_cited_subset"
+		if len(cited) == 0 {
+			subsetReason = "failing_test_subset"
+		}
+		if step == StepTest || step == StepTestE2E {
+			for _, p := range ParseFailingTestPaths(errorOutput, writableArtifacts) {
 				citedSet[normalizePathForFix(p)] = true
 			}
+		}
+		if len(citedSet) > 0 {
 			// Scoped set must also dedupe: if opts.ArtifactPaths arrived with dups AND the
 			// error cited the same path, we'd otherwise carry the dup through.
 			scoped := make([]string, 0, len(writableArtifacts))
@@ -2236,11 +2340,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 			if len(scoped) > 0 && len(scoped) < uniqueArtifactCount {
 				if deferFirstTestAttempt {
-					auditDeferred("error_cited_subset", append([]string(nil), scoped...), append([]string(nil), writableArtifacts...))
+					auditDeferred(subsetReason, append([]string(nil), scoped...), append([]string(nil), writableArtifacts...))
 				} else {
 					writableArtifacts = scoped
 					scopeNarrowed = true
-					scopeNarrowReason = "error_cited_subset"
+					scopeNarrowReason = subsetReason
 					scopedAuditPaths = append([]string(nil), scoped...)
 				}
 			}
@@ -2263,6 +2367,52 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					scopeNarrowReason = "failing_test_subset"
 					scopedAuditPaths = append([]string(nil), failing...)
 				}
+			}
+		}
+	}
+	// Primary-site enforcement: EnforcePrimarySiteAfterUntouchedRounds consecutive rounds edited
+	// around the blamed site while the (line-insensitive) failure stayed the same. This round is
+	// forced onto that file ALONE, and the prompt carries a directive naming the site — the
+	// ordering-pressure variant of per-file scoping: the model loses every other writable outlet
+	// for churn, and the one legal repair (blamed line, or the import block for a resolution
+	// failure) is stated outright. Overrides any narrowing above: a stalled primary site outranks
+	// the cited-subset heuristics. Ported from asqs-go.
+	primarySiteDirective := ""
+	if siteStreakActive && loopState.primarySiteUntouchedStreak >= EnforcePrimarySiteAfterUntouchedRounds {
+		var primaryOnly []string
+		for _, a := range writableArtifacts {
+			if sameDiagnosticFile(primarySite.Path, a) {
+				primaryOnly = []string{a}
+				break
+			}
+		}
+		if len(primaryOnly) == 1 {
+			if len(writableArtifacts) > 1 {
+				preNarrowAuditPaths = append([]string(nil), writableArtifacts...)
+				scopedAuditPaths = append([]string(nil), primaryOnly...)
+				scopeNarrowed = true
+				scopeNarrowReason = "primary_site_enforced"
+			}
+			writableArtifacts = primaryOnly
+			loopState.primarySiteEnforced = true
+			repair := fmt.Sprintf("change line %d (and the sibling lines the errors name)", primarySite.Line)
+			if primarySite.ResolutionFailure {
+				repair = fmt.Sprintf("add the import or static import that binds the unresolved name, or change line %d", primarySite.Line)
+			}
+			primarySiteDirective = fmt.Sprintf(
+				"MANDATORY THIS ROUND: %d previous round(s) edited around the blamed site %s:%d, and the same failure returned each time. This round must %s. Any change that leaves the blamed site and the import block untouched will be rejected as churn, and the loop will stop.",
+				loopState.primarySiteUntouchedStreak, primarySiteBase(primarySite), primarySite.Line, repair)
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_primary_site_enforced", map[string]interface{}{
+					"message": fmt.Sprintf(
+						"Enforcing primary site after %d untouched round(s): writable scope collapsed to %s and the prompt now requires acting on %s:%d.",
+						loopState.primarySiteUntouchedStreak, primaryOnly[0], primarySiteBase(primarySite), primarySite.Line),
+					"step":         step,
+					"primary_path": primarySite.Path,
+					"primary_line": primarySite.Line,
+					"streak":       loopState.primarySiteUntouchedStreak,
+					"threshold":    EnforcePrimarySiteAfterUntouchedRounds,
+				})
 			}
 		}
 	}
@@ -2414,6 +2564,7 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 	req := FixRequest{
 		Step:                      step,
 		ErrorOutput:               errorOutput,
+		PrimarySiteDirective:      primarySiteDirective,
 		Files:                     files,
 		ArtifactPaths:             writableArtifacts,
 		ArtifactContexts:          artifactCtx,
@@ -2616,10 +2767,12 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		base := filepath.Base(norm)
 		artifactBaseToPaths[base] = append(artifactBaseToPaths[base], norm)
 	}
-	// The site the first diagnostic blames, and whether this round acted on it. Reported here;
-	// the streak that ENFORCES scope onto the blamed file arrives with CP52's breakers.
-	primarySite := ParsePrimaryFailureSite(errorOutput)
+	// primarySite (computed before the breakers) is the site the first diagnostic blames; these
+	// record whether this round's writes acted on it.
 	primarySiteKnown, primarySiteTouched := false, false
+	// Files the runner refused to execute (jest: "Your test suite must contain at least one
+	// test"); the coverage gate is waived for them, see testFilesWithNoRunnableTests.
+	noRunnableTests := testFilesWithNoRunnableTests(errorOutput)
 	pathsUpdated := make([]string, 0, len(resp.Files))
 	// Per-round memory: what actually landed, and what was refused and why. Both feed
 	// recordFixAttempt below so the NEXT round's prompt can say "you already tried this".
@@ -2711,7 +2864,19 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		// Refuse a "fix" that makes the compiler happy by removing the tests. The system prompt
 		// already forbids it; this is the check that makes the instruction binding.
 		if reason := coverageRegressionReason(relClean, files[relClean], content); reason != "" {
-			if !opts.AllowFixCoverageReduction {
+			switch {
+			case noRunnableTests[normalizePathForFix(relClean)]:
+				// The runner executed none of the tests the static count saw, so there is no
+				// coverage to regress from — see testFilesWithNoRunnableTests.
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_coverage_gate_waived", map[string]interface{}{
+						"message": fmt.Sprintf("LLM fix for %s lowers the static test count (%s), but the runner reported the suite contained no runnable test, so the count it drops from was never executed; the write is applied.", relClean, reason),
+						"path":    relClean,
+						"step":    step,
+						"reason":  reason,
+					})
+				}
+			case !opts.AllowFixCoverageReduction:
 				if audit != nil {
 					audit.Log(ctx, "evaluator.fix_rejected_coverage_regression", map[string]interface{}{
 						"message": fmt.Sprintf("LLM fix rejected for %s: %s. Deleting tests to satisfy the compiler makes the round worse than doing nothing; the file on disk is unchanged.", relClean, reason),
@@ -2722,14 +2887,15 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 				}
 				skippedPaths[relClean] = "would delete tests"
 				continue
-			}
-			if audit != nil {
-				audit.Log(ctx, "evaluator.fix_coverage_regression_allowed", map[string]interface{}{
-					"message": fmt.Sprintf("LLM fix for %s reduces test coverage (%s) but the coverage-reduction escape hatch is set, so it was applied.", relClean, reason),
-					"path":    relClean,
-					"step":    step,
-					"reason":  reason,
-				})
+			default:
+				if audit != nil {
+					audit.Log(ctx, "evaluator.fix_coverage_regression_allowed", map[string]interface{}{
+						"message": fmt.Sprintf("LLM fix for %s reduces test coverage (%s) but the coverage-reduction escape hatch is set, so it was applied.", relClean, reason),
+						"path":    relClean,
+						"step":    step,
+						"reason":  reason,
+					})
+				}
 			}
 		}
 		// Unused-import residue is the visible signature of a deletion-shaped fix. Reported, not
@@ -2806,15 +2972,42 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			break
 		}
 	}
-	if primarySite.OK && len(pathsUpdated) > 0 && audit != nil &&
-		(!primaryWritten || (primarySiteKnown && !primarySiteTouched)) {
+	// Primary-site streak accounting. An untouched round — the blamed file written around the
+	// blamed site, or never written at all while other files were — on the same (path,
+	// line-insensitive signature) extends the streak that drives enforcement and the terminal stop
+	// above; a round that touched the site, or a new failure identity, resets it. No-write rounds
+	// leave the streak alone: they carry no evidence either way.
+	untouchedRound := primarySite.OK && len(pathsUpdated) > 0 && (!primaryWritten || (primarySiteKnown && !primarySiteTouched))
+	if loopState != nil && primarySite.OK {
+		switch {
+		case untouchedRound:
+			if siteStreakActive {
+				loopState.primarySiteUntouchedStreak++
+			} else {
+				loopState.primarySiteKey = filepath.ToSlash(primarySite.Path)
+				loopState.primarySiteStreakSig = siteStreakSig
+				loopState.primarySiteUntouchedStreak = 1
+				loopState.primarySiteEnforced = false
+			}
+		case primarySiteKnown && primarySiteTouched:
+			loopState.primarySiteKey = ""
+			loopState.primarySiteStreakSig = ""
+			loopState.primarySiteUntouchedStreak = 0
+			loopState.primarySiteEnforced = false
+		}
+	}
+	if untouchedRound && audit != nil {
+		streak := 0
+		if loopState != nil {
+			streak = loopState.primarySiteUntouchedStreak
+		}
 		msg := fmt.Sprintf(
-			"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely.",
-			len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line)
+			"Round wrote %d file(s) but left %s:%d — the line the compiler blames — unchanged; the identical failure is likely. Banked anyway; enforcement narrows the next round at streak %d and stops the loop at streak %d (streak now %d).",
+			len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line, EnforcePrimarySiteAfterUntouchedRounds, StopPrimarySiteAfterUntouchedRounds, streak)
 		if !primaryWritten {
 			msg = fmt.Sprintf(
-				"Round wrote %d file(s), none of them %s — the file the compiler blames at line %d; the identical failure is likely.",
-				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line)
+				"Round wrote %d file(s), none of them %s — the file the compiler blames at line %d; the identical failure is likely. Enforcement narrows the next round at streak %d and stops the loop at streak %d (streak now %d).",
+				len(pathsUpdated), primarySiteBase(primarySite), primarySite.Line, EnforcePrimarySiteAfterUntouchedRounds, StopPrimarySiteAfterUntouchedRounds, streak)
 		}
 		audit.Log(ctx, "evaluator.fix_primary_site_untouched", map[string]interface{}{
 			"message":              msg,
@@ -2823,6 +3016,8 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			"primary_line":         primarySite.Line,
 			"primary_path_written": primaryWritten,
 			"paths":                pathsUpdated,
+			"streak":               streak,
+			"enforced":             primarySiteDirective != "",
 		})
 	}
 	if audit != nil && len(pathsUpdated) > 0 {

@@ -148,6 +148,11 @@ type FixRequest struct {
 	// the parser cannot prove — see fix_mockito_facts.go. Rendered beside MissingMemberFacts, in a
 	// separate block because these are runtime-verified, not compiler-verified.
 	TestFailureFacts []string
+	// PrimarySiteDirective is the enforcement text for a round forced onto the blamed file after
+	// EnforcePrimarySiteAfterUntouchedRounds consecutive rounds edited around the blamed site (see
+	// workflow.go primary-site enforcement). Empty on ordinary rounds. Builders render it
+	// prominently — it names the one repair the round is required to make.
+	PrimarySiteDirective string
 	// ErrorSummary is an LLM-written summary of an oversized error log, attached ALONGSIDE the raw
 	// text rather than replacing it ("dependencies" prose can be wrong, and the raw text stays
 	// authoritative). Empty when the log is small, the feature is off, or no summarizer is wired.

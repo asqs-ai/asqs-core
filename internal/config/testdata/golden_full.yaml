@@ -26,6 +26,8 @@ general:
     model: qwen3-coder
     max_concurrent: 3
     ollama_num_ctx: 32768
+    ollama_keep_alive: -1
+    ollama_think: false
     http:
       timeout: 10m
     embeddings:

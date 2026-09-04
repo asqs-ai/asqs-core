@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/asqs/asqs-core/internal/config"
@@ -96,6 +97,11 @@ func TestAuditPromptBudget_payloadShape(t *testing.T) {
 	if p["fq_name"] != "a.B#c" {
 		t.Errorf("fq_name = %v", p["fq_name"])
 	}
+	// Readable like every other audit line: 17 of these rendered blank in the run of 2026-09-03.
+	msg, _ := p["message"].(string)
+	if !strings.Contains(msg, "a.B#c") || !strings.Contains(msg, "tokens") || !strings.Contains(msg, "budget") {
+		t.Errorf("message = %q, want the symbol, the token count and the budget", msg)
+	}
 
 	a2 := &payloadAuditor{}
 	auditPromptBudget(ctx, a2, "a.B#c", prompt, nil)
@@ -107,5 +113,8 @@ func TestAuditPromptBudget_payloadShape(t *testing.T) {
 	}
 	if _, ok := p2["prompt_tokens"]; !ok {
 		t.Error("unbounded payload still needs prompt_tokens")
+	}
+	if msg, _ := p2["message"].(string); msg == "" || strings.Contains(msg, "budget") {
+		t.Errorf("unbounded message = %q, want a message that does not claim a budget", msg)
 	}
 }

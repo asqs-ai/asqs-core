@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -96,12 +97,20 @@ func detectPlaywrightWebServer(pkgDir, lang string) playwrightWebServer {
 //
 // stdout/stderr are piped so a dev server that fails to boot says so in the E2E failure output the
 // fixer reads, instead of surfacing as an unexplained navigation timeout.
-func renderPlaywrightConfig(ws playwrightWebServer) string {
+func renderPlaywrightConfig(ws playwrightWebServer, extraTestMatch []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "// %s — safe to edit or delete.\n", asqsE2EGeneratedHeader)
 	b.WriteString("import { defineConfig, devices } from '@playwright/test';\n\n")
 	b.WriteString("export default defineConfig({\n")
 	b.WriteString("  testDir: './e2e',\n")
+	if len(extraTestMatch) > 0 {
+		// Playwright's default restated first, so the extra patterns ADD to it.
+		pats := append([]string{playwrightDefaultTestMatch}, extraTestMatch...)
+		for i := range pats {
+			pats[i] = "'" + pats[i] + "'"
+		}
+		fmt.Fprintf(&b, "  testMatch: [%s],\n", strings.Join(pats, ", "))
+	}
 	b.WriteString("  fullyParallel: true,\n")
 	// process.env['CI'], not process.env['CI']: Angular's generated tsconfig sets
 	// noPropertyAccessFromIndexSignature, under which dotted access to an index-signature property
@@ -156,8 +165,146 @@ test.describe('smoke', () => {
 // and a bare existence check pinned every repository to the first version ASQS ever wrote for it.
 func writePlaywrightConfig(dir, lang string) error {
 	p := filepath.Join(dir, "playwright.config.ts")
-	_, err := writeIfAbsentOrOwnedMarked(p, renderPlaywrightConfig(detectPlaywrightWebServer(dir, lang)), asqsE2EGeneratedHeader)
+	_, err := writeIfAbsentOrOwnedMarked(p, renderPlaywrightConfig(detectPlaywrightWebServer(dir, lang), extraPlaywrightTestMatch(dir)), asqsE2EGeneratedHeader)
 	return err
+}
+
+// playwrightDefaultTestMatch is Playwright's own default testMatch, restated verbatim so a generated
+// config that needs one more pattern keeps everything the default already covered.
+const playwrightDefaultTestMatch = "**/*.@(spec|test).?(c|m)[jt]s?(x)"
+
+// playwrightE2ESpecSuffixTestMatch covers the `*.e2e-spec.ts` naming Angular CLI projects inherited
+// from Protractor and kept for their e2e/ folder.
+const playwrightE2ESpecSuffixTestMatch = "**/*.e2e-spec.?(c|m)[jt]s"
+
+// e2eSpecSuffixRE matches the file names playwrightE2ESpecSuffixTestMatch is for.
+var e2eSpecSuffixRE = regexp.MustCompile(`(?i)\.e2e-spec\.[cm]?[jt]s$`)
+
+// extraPlaywrightTestMatch returns the testMatch patterns the generated config needs beyond
+// Playwright's default so that every spec ASQS treats as an E2E artifact is actually executed.
+//
+// The indexer classifies `e2e/**/*.e2e-spec.ts` as an E2E spec and the planner hands it to the
+// generator as an E2E_SPEC gap, but Playwright's default testMatch — `*.@(spec|test).*` — does not
+// match that suffix. The asqs-core run of 2026-09-03 wrote `e2e/smoke.e2e-spec.ts` as an artifact,
+// ran 8 tests (the generated route specs plus the bootstrap smoke), and would have shipped that file
+// without it ever having been loaded.
+//
+// Only added when at least one such file under e2e/ imports `@playwright/test`, and never when one
+// of them is a Protractor spec (`from 'protractor'`): Protractor is the origin of the suffix, its
+// specs drive `browser`/`element` globals Playwright does not provide, and loading them would fail
+// the whole E2E run at import.
+//
+// The import requirement is what keeps the bootstrap's own verification honest. The run of
+// 2026-09-04 matched the fixture's `e2e/smoke.e2e-spec.ts` — a bare `test(` with no import — and
+// `playwright test --list` failed with `ReferenceError: test is not defined`, so the bootstrap
+// reported itself failed although every file it writes was in place. A file that gains the import
+// later (the generator extends it, see EnsurePlaywrightImport) is picked up by
+// RefreshPlaywrightConfig before the evaluation runs.
+func extraPlaywrightTestMatch(pkgDir string) []string {
+	root := filepath.Join(pkgDir, "e2e")
+	playwright := false
+	protractor := false
+	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if d.Name() == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !e2eSpecSuffixRE.MatchString(d.Name()) {
+			return nil
+		}
+		b, rerr := os.ReadFile(p)
+		if rerr != nil {
+			return nil
+		}
+		if protractorImportRE.Match(b) {
+			protractor = true
+		}
+		if playwrightTestImportRE.Match(b) {
+			playwright = true
+		}
+		return nil
+	})
+	if !playwright || protractor {
+		return nil
+	}
+	return []string{playwrightE2ESpecSuffixTestMatch}
+}
+
+// protractorImportRE matches an import or require of the protractor package.
+var protractorImportRE = regexp.MustCompile(`(?m)(?:from\s+|require\(\s*)['"]protractor['"]`)
+
+// playwrightTestImportRE matches an import or require of @playwright/test.
+var playwrightTestImportRE = regexp.MustCompile(`(?m)(?:from\s+|require\(\s*)['"]@playwright/test['"]`)
+
+// playwrightSpecUsesTestAPIRE matches the Playwright test API a spec file calls: `test(`,
+// `test.describe(`, `test.beforeEach(`, `expect(`.
+var playwrightSpecUsesTestAPIRE = regexp.MustCompile(`(?m)^\s*(?:test(?:\.\w+)*|expect)\s*\(`)
+
+// EnsurePlaywrightImport makes a Playwright spec file import the test API it calls.
+//
+// The generator extends an existing E2E spec in place, and a fixture file that opened with a bare
+// `test(` (no import) stayed that way after the merge: the run of 2026-09-04 loaded
+// `e2e/smoke.e2e-spec.ts` and failed with `ReferenceError: test is not defined`, spending the first
+// post-discard repair round on the one line this adds. Idempotent: a file that already imports
+// `@playwright/test`, or calls no test API, is returned unchanged. Returns whether it wrote.
+func EnsurePlaywrightImport(specPath string) (bool, error) {
+	b, err := os.ReadFile(specPath)
+	if err != nil {
+		return false, err
+	}
+	s := string(b)
+	if playwrightTestImportRE.MatchString(s) || !playwrightSpecUsesTestAPIRE.MatchString(s) {
+		return false, nil
+	}
+	if protractorImportRE.MatchString(s) {
+		return false, nil
+	}
+	line := "import { test, expect } from '@playwright/test';\n"
+	// After a leading comment block or directive, before the first statement.
+	out := line + s
+	if strings.HasPrefix(s, "//") || strings.HasPrefix(s, "/*") {
+		// Keep a file-opening comment where it is.
+		i := strings.Index(s, "\n")
+		if strings.HasPrefix(s, "/*") {
+			if j := strings.Index(s, "*/"); j >= 0 {
+				i = j + 2
+				if k := strings.Index(s[i:], "\n"); k >= 0 {
+					i += k
+				}
+			}
+		}
+		if i >= 0 {
+			out = s[:i+1] + line + s[i+1:]
+		}
+	}
+	return true, atomicWrite(specPath, []byte(out))
+}
+
+// RefreshPlaywrightConfig re-renders an ASQS-owned playwright.config.ts for the repository's JS
+// package directory, so that testMatch reflects the spec files as they are NOW — after generation
+// has extended or added them. A repository's own config is never touched, and nothing is created
+// where no owned config exists. Returns the repo-relative config path when it was rewritten.
+func RefreshPlaywrightConfig(repo, lang string) (string, error) {
+	pkgDir, err := resolveJSPackageDirForBootstrap(repo)
+	if err != nil {
+		return "", nil
+	}
+	p := filepath.Join(pkgDir, "playwright.config.ts")
+	b, rerr := os.ReadFile(p)
+	if rerr != nil || !strings.Contains(string(b), asqsE2EGeneratedHeader) {
+		return "", nil
+	}
+	wrote, werr := writeIfAbsentOrOwnedMarked(p, renderPlaywrightConfig(detectPlaywrightWebServer(pkgDir, lang), extraPlaywrightTestMatch(pkgDir)), asqsE2EGeneratedHeader)
+	if werr != nil || !wrote {
+		return "", werr
+	}
+	rel, _ := filepath.Rel(repo, p)
+	return filepath.ToSlash(rel), nil
 }
 
 // writePlaywrightSmokeSpec writes e2e/smoke.spec.ts if missing (matches testDir in generated config).

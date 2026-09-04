@@ -122,6 +122,12 @@ const (
 	// api-72dad6bb281cacee338f43c48432a780), which the fixer was asked to repair three times and
 	// finally answered by rewriting an unrelated Playwright spec.
 	FixSkipTestOutsideWritableScope = "test_failure_outside_writable_scope"
+	// FixSkipPrimarySiteNeverTouched means StopPrimarySiteAfterUntouchedRounds consecutive rounds
+	// edited around the blamed site (line or, for resolution failures, the import block) against
+	// an unchanged line-insensitive failure signature — including one round that was FORCED onto
+	// that file alone with an explicit directive. Terminal: the model has demonstrated it will not
+	// perform this specific repair. Ported from asqs-go.
+	FixSkipPrimarySiteNeverTouched = "fix_primary_site_never_touched"
 )
 
 // IsTerminalFixSkip reports whether a FixSkip* reason means the fixer is out of road for this step,
@@ -137,7 +143,7 @@ const (
 // can propose something the gates accept.
 func IsTerminalFixSkip(reason string) bool {
 	switch reason {
-	case FixSkipLoopRepeat, FixSkipLoopOscillation, FixSkipLoopNoProgress, FixSkipNoWritableArtifacts:
+	case FixSkipLoopRepeat, FixSkipLoopOscillation, FixSkipLoopNoProgress, FixSkipNoWritableArtifacts, FixSkipPrimarySiteNeverTouched:
 		return true
 	default:
 		return false

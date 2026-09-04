@@ -504,6 +504,10 @@ type LLMConfig struct {
 
 	// OllamaNumCtx is sent as POST /api/chat JSON options.num_ctx when > 0 (larger context window; subject to VRAM). 0 = omit options.num_ctx. Env: LLM_OLLAMA_NUM_CTX.
 	OllamaNumCtx int `yaml:"ollama_num_ctx"`
+	// OllamaKeepAlive is sent as the top-level keep_alive field on POST /api/chat and /api/embed. Integer seconds (-1 = never unload) or a duration ("30m"); empty = omit. Rendered by OllamaKeepAliveJSON.
+	OllamaKeepAlive string `yaml:"ollama_keep_alive"`
+	// OllamaThink is sent as the top-level think field on POST /api/chat when set; nil = omit (server default).
+	OllamaThink *bool `yaml:"ollama_think"`
 
 	// MaxConcurrent is the max concurrent requests to the API. 0 = default (e.g. 5).
 	MaxConcurrent int `yaml:"max_concurrent"`

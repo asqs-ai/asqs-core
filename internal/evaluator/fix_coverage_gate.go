@@ -138,3 +138,39 @@ func stripJavaImportLines(src string) string {
 	}
 	return b.String()
 }
+
+// testFilesWithNoRunnableTests returns the test files a jest run refused to execute because it
+// registered no test in them, keyed by normalized repo-relative path.
+//
+// jest reports that as
+//
+//	FAIL src/app/features/checkout/checkout.component.test.ts
+//	  ● Test suite failed to run
+//
+//	    Your test suite must contain at least one test.
+//
+// and the ONLY path in that block is the FAIL header — no `path:line`. The coverage gate below
+// counts `it(`/`test(` occurrences statically, and for such a file the "before" count is a fiction:
+// the six matches it found in checkout.component.test.ts (run of 2026-09-03) were never run, so a
+// rewrite carrying five real tests is not a regression, it is the repair. Rejecting it (which the
+// gate did, in the only round that file was writable) left the file to be discarded unexamined.
+func testFilesWithNoRunnableTests(output string) map[string]bool {
+	out := map[string]bool{}
+	current := ""
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case strings.HasPrefix(line, "FAIL "):
+			current = strings.TrimSpace(strings.TrimPrefix(line, "FAIL "))
+			// jest may append timing: "FAIL path (1.2 s)".
+			if i := strings.Index(current, " ("); i > 0 {
+				current = strings.TrimSpace(current[:i])
+			}
+		case strings.HasPrefix(line, "PASS "):
+			current = ""
+		case current != "" && strings.Contains(line, "Your test suite must contain at least one test"):
+			out[normalizePathForFix(current)] = true
+		}
+	}
+	return out
+}
