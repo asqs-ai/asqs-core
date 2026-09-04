@@ -27,6 +27,8 @@ func ApplyV2Defaults(s *SchemaV2) {
 	defaultTrue(&s.Generation.Policy.TwoPhase.Enabled)
 	defaultTrue(&s.Generation.Policy.StructuredOutput.Enabled)
 	defaultTrue(&s.Generation.Policy.ProjectIntel.Enabled)
+	// The test-id pass is on unless a project opts out (decision of 2026-09-04).
+	defaultTrue(&s.Generation.Policy.UITestHooks.Enabled)
 	defaultTrue(&s.Generation.Docs.Overview.Enabled)
 	defaultTrue(&s.Fixer.Policy.StructuredOutput.Enabled)
 	defaultTrue(&s.Fixer.Policy.ErrorLogLLMSummary.Enabled)
@@ -319,6 +321,10 @@ func translateGeneration(s *SchemaV2, c *Config) {
 	c.Generation.PromptedToolsEnabled = boolOr(g.Policy.Tools.PromptedFallback, false)
 	c.Generation.MaxToolTurns = g.Policy.Tools.MaxTurns
 	c.Generation.MaxToolCallsPerTurn = g.Policy.Tools.MaxCallsPerTurn
+	c.Generation.UITestHooksEnabled = boolOr(g.Policy.UITestHooks.Enabled, true)
+	c.Generation.UITestHooksMaxFiles = g.Policy.UITestHooks.MaxFiles
+	c.Generation.UITestHooksMaxPerFile = g.Policy.UITestHooks.MaxPerFile
+	c.Generation.UITestHooksTemplates = boolOr(g.Policy.UITestHooks.Templates, false)
 	c.Generation.MaxToolCallsPerRun = g.Policy.Tools.MaxCallsPerRun
 	c.Generation.MaxToolResultChars = g.Policy.Tools.MaxResultChars
 

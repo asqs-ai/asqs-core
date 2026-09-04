@@ -79,6 +79,7 @@ type Summary struct {
 	OverviewWritten bool // the whole-repo overview document was generated + written (--docs)
 	ProjectStable   bool // the whole project compiled + tests passed (possibly after discard)
 	Iterations      int  // fix-loop iterations used by the single whole-project evaluation
+	UITestHookFiles int  // UI sources given data-testid attributes by the opt-in test-id pass
 	Outcomes        []GapOutcome
 }
 
@@ -221,6 +222,13 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 			fmt.Fprintf(os.Stderr, "asqs-core: e2e bootstrap: %v (continuing)\n", err)
 		}
 	}
+
+	// --- UI test hooks (opt-in) ---------------------------------------------------------
+	// Before the index, so the JSX/HTML hook enrichers see the new attributes and the E2E
+	// generator's selector inventory reflects them. Journalled, compile-verified, rolled back on
+	// failure; see applyUITestHooks.
+	uiHooks := applyUITestHooks(ctx, cfg, repoAbs, lang, runner.NewSandboxFromConfig(cfg), audit)
+	sum.UITestHookFiles = len(uiHooks.Files)
 
 	// --- Index --------------------------------------------------------------------------
 	langIdx, indexable, err := buildLangIndexer(ctx, cfg, repoAbs, lang, nJava, nCSharp, nJST)

@@ -121,6 +121,15 @@ generation:
       # assembled up front. Needs a provider with tool calling; on Ollama it also needs
       # general.llm.ollama_num_ctx.
       enabled: false
+    ui_test_hooks:
+      # Adds data-testid attributes to the repository's UI sources (intrinsic JSX elements only;
+      # Angular templates only with templates: true) so E2E specs address real elements instead of
+      # guessing. Every write is journalled, compile-verified and rolled back when the tree stops
+      # compiling; files with a snapshot next to them are skipped.
+      enabled: true
+      max_files: 40
+      max_per_file: 25
+      templates: false
 
 fixer:
   iterations:

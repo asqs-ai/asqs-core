@@ -100,6 +100,12 @@ generation:
     # Fifth inversion.
     structured_output:
       enabled: false
+    # Inverted and bounded: off, tiny caps, templates on.
+    ui_test_hooks:
+      enabled: false
+      max_files: 7
+      max_per_file: 3
+      templates: true
 
 fixer:
   iterations:

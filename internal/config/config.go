@@ -531,6 +531,15 @@ type GenerationConfig struct {
 	// MaxToolCallsPerTurn caps parallel calls in one turn. 0 = tools.DefaultMaxToolCallsPerTurn (3).
 	// Env: GENERATION_MAX_TOOL_CALLS_PER_TURN.
 	MaxToolCallsPerTurn int `yaml:"max_tool_calls_per_turn"`
+	// UITestHooksEnabled turns on the pre-generation pass that adds data-testid attributes to the
+	// repository's UI sources so E2E specs have real selectors (generation.policy.ui_test_hooks).
+	UITestHooksEnabled bool `yaml:"ui_test_hooks_enabled"`
+	// UITestHooksMaxFiles caps the files that pass may touch; 0 = built-in default (40).
+	UITestHooksMaxFiles int `yaml:"ui_test_hooks_max_files"`
+	// UITestHooksMaxPerFile caps attributes per file; 0 = built-in default (25).
+	UITestHooksMaxPerFile int `yaml:"ui_test_hooks_max_per_file"`
+	// UITestHooksTemplates also edits Angular component templates (*.component.html).
+	UITestHooksTemplates bool `yaml:"ui_test_hooks_templates"`
 	// MaxToolCallsPerRun caps total calls for one gap, so a pathological gap cannot starve the
 	// shared LLM limiter. 0 = tools.DefaultMaxToolCallsPerRun (12).
 	// Env: GENERATION_MAX_TOOL_CALLS_PER_RUN.

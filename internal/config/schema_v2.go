@@ -605,6 +605,10 @@ type GenerationPolicyV2 struct {
 	// StructuredOutput requests a provider JSON schema for generation. Inverts v1's
 	// runner.disable_structured_generate_output. Off falls back to code-fence extraction.
 	StructuredOutput EnabledV2 `yaml:"structured_output"`
+	// UITestHooks adds data-testid attributes to the repository's UI sources before generation so
+	// E2E specs can address real elements. On by default; the edits are journalled, compile-verified
+	// and rolled back on a broken build, and they show in the PR diff.
+	UITestHooks UITestHooksV2 `yaml:"ui_test_hooks"`
 	// ProjectIntel injects the repository's own documentation and agent skill files into context.
 	ProjectIntel GenerationProjectIntelV2 `yaml:"project_intel"`
 	// Format controls the post-write formatting pass.
@@ -615,6 +619,20 @@ type GenerationPolicyV2 struct {
 	// ReconcileDuplicateTestArtifacts merges a generated artifact into the existing test file it
 	// duplicates, instead of leaving two files that test the same symbol. Report-only by default.
 	ReconcileDuplicateTestArtifacts bool `yaml:"reconcile_duplicate_test_artifacts"`
+}
+
+// UITestHooksV2 gates and bounds the test-id pass. Every write is journalled, compile-verified
+// and rolled back when the tree stops compiling.
+type UITestHooksV2 struct {
+	// Enabled turns the pass on. Unset = on; set false to keep production UI sources untouched.
+	Enabled *bool `yaml:"enabled"`
+	// MaxFiles caps the source files touched per run. 0 uses the built-in cap (40).
+	MaxFiles int `yaml:"max_files"`
+	// MaxPerFile caps attributes per file. 0 uses the built-in cap (25).
+	MaxPerFile int `yaml:"max_per_file"`
+	// Templates also edits Angular component templates (*.component.html); off by default because
+	// a template edit is not type-checked.
+	Templates *bool `yaml:"templates"`
 }
 
 // GenerationToolsV2 bounds the model→tool→model loop. Zero means "use the built-in cap"; the caps

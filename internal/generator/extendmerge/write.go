@@ -194,12 +194,23 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 				// the path. Recover the primary type's body instead of splicing package/import lines
 				// into a class body.
 				body, ok := unwrapCompilationUnit(g.Path, payload)
-				if !ok {
+				switch {
+				case ok:
+					fmt.Fprintf(os.Stderr, "  unwrapped extend payload (was a full compilation unit): %s\n", g.Path)
+					payload = body
+				case isJSExtendPath(g.Path) && jsSuiteKind(string(existing)) == "":
+					// Nothing to splice into: the target has no top-level suite, so a module-shaped
+					// payload is appended whole (imports were hoisted above and are unioned below).
+					// The asqs-core run of 2026-09-04 09:05 refused the E2E_SPEC gap for
+					// e2e/smoke.e2e-spec.ts — a two-line fixture with a bare `test(` — because the
+					// payload had more than one top-level suite and could not be reduced to one
+					// body; the artifact was lost and the spec never ran. A file with no suite has
+					// no body the unwrap could have targeted anyway.
+					fmt.Fprintf(os.Stderr, "  extend target has no top-level suite; appending the whole payload: %s\n", g.Path)
+				default:
 					noteSkip("extend payload is a full compilation unit and could not be unwrapped")
 					continue
 				}
-				fmt.Fprintf(os.Stderr, "  unwrapped extend payload (was a full compilation unit): %s\n", g.Path)
-				payload = body
 			}
 			if surviving, droppedNames := dropDuplicateMembers(g.Path, string(existing), payload); len(droppedNames) > 0 {
 				fmt.Fprintf(os.Stderr, "  dropped %d already-defined member(s) from extend payload (%s): %s\n",
