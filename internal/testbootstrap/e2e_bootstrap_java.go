@@ -351,7 +351,7 @@ func verifyMavenPlaywright(ctx context.Context, repo, pomAbs string, timeout tim
 		return nil
 	}
 	logAudit(audit, ctx, "e2e_bootstrap.install", map[string]interface{}{
-		"message": "Maven test-compile (download Playwright + JUnit)", "command": name + " test-compile",
+		"message": "Maven test-compile (download Playwright + JUnit)", "command": name + " " + strings.Join(mavenBootstrapArgs("test-compile"), " "),
 	})
 	if err := run("test-compile", "test-compile"); err != nil {
 		return err
