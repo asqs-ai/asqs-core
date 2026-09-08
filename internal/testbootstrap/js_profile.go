@@ -140,6 +140,7 @@ func nodeSemver(v string) (major, minor, patch int) {
 // jsPackageJSON is the subset of package.json detection needs.
 type jsPackageJSON struct {
 	Type            string            `json:"type"`
+	Main            string            `json:"main"`
 	Scripts         map[string]string `json:"scripts"`
 	Dependencies    map[string]string `json:"dependencies"`
 	DevDependencies map[string]string `json:"devDependencies"`

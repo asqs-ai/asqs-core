@@ -70,13 +70,41 @@ func primarySiteDiagnosticBlock(site PrimaryFailureSite, errorOutput string) str
 func primarySiteStreakSignature(lang string, site PrimaryFailureSite, errorOutput string) string {
 	basis := errorOutput
 	if block := primarySiteDiagnosticBlock(site, errorOutput); block != "" {
-		basis = block
+		basis = streakSignatureBasis(block)
 	}
 	h := sha1.New()
 	h.Write([]byte(filepath.ToSlash(site.Path)))
 	h.Write([]byte{0})
 	h.Write([]byte(errout.SignatureNormalize(lang, basis)))
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+// streakSignatureBasis keeps the diagnostic lines of a block and drops the source excerpt, caret
+// and stack-frame lines that runners print under them. Those lines describe where the cursor
+// landed, not what failed: in asqs-go run api-cfc3279416a7d8c7d2690799800c7647 the fixer inserted
+// and removed a statement above `billing.service.test.ts:45` on alternate rounds, the excerpt under
+// the blamed line changed every time while the error did not, the streak reset to 1 on four
+// consecutive rounds, and enforcement never engaged. Indented lines of four or more columns are
+// the excerpt/frame convention of jest, tsc, javac (`    at ...`) and dotnet alike; javac's own
+// two-space `symbol:`/`location:` lines stay in.
+func streakSignatureBasis(block string) string {
+	var kept []string
+	for _, ln := range strings.Split(block, "\n") {
+		t := strings.TrimRight(ln, " \t\r")
+		body := strings.TrimSpace(t)
+		if body == "" {
+			continue
+		}
+		indent := len(t) - len(strings.TrimLeft(t, " \t"))
+		if indent >= 4 || strings.Trim(body, "^~ ") == "" {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if len(kept) == 0 {
+		return block
+	}
+	return strings.Join(kept, "\n")
 }
 
 // Did the round touch the thing that was actually broken?

@@ -29,6 +29,8 @@ const (
 	VersionJUnitJupiter        = "5.11.3"
 	VersionJUnitPlatform       = "1.11.3"
 	VersionMavenSurefirePlugin = "3.5.2"
+	// VersionMavenFailsafePlugin is released in lockstep with Surefire.
+	VersionMavenFailsafePlugin = "3.5.2"
 	// Playwright Java (e2e_framework_bootstrap for JVM); align major with JS @playwright/test when possible.
 	VersionPlaywrightJava = "1.49.0"
 	// DefaultPlaywrightJavaDockerImage is mcr.microsoft.com/playwright/java for Java E2E bootstrap in Docker

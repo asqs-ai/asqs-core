@@ -207,21 +207,38 @@ func RunRunFinalEval(ctx context.Context, runner SandboxRunner, opts EvalOptions
 		return out
 	}
 
-	// Optional E2E test pass
+	// Optional E2E test pass.
+	//
+	// The command comes from resolveE2ETestCommand: the configured e2e_test_command when set,
+	// otherwise the stack's own E2E runner (Playwright for JS/TS, Failsafe for Maven,
+	// integrationTest for Gradle, a filtered `dotnet test` for C#). This used to fall back to
+	// the UNIT command, so on asqs-go run api-5a67a414d4ba22496fcc23e1143076fa (Java, no build
+	// commands configured) the "E2E pass" was `mvn -q -B test` a second time: Surefire's default
+	// includes exclude *E2EIT classes, the generated Playwright test never ran, and the audit
+	// showed two identical "test ok" rows with nothing to tell them apart.
 	if opts.RunE2ETestPass {
-		e2eCmd := opts.E2ETestCommand
-		if strings.TrimSpace(e2eCmd) == "" {
-			e2eCmd = opts.TestCommand
-		}
-		er := RunTestE2E(ctx, runner, opts, e2eCmd)
-		out.StepResults = append(out.StepResults, er)
-		auditFinalStep(ctx, audit, er)
-		if !er.OK {
-			out.Stable = false
-			out.LastFixAction = FixStabilize
-			out.FailingStep = StepTestE2E
-			out.FailingOutput = er.Output
-			return out
+		e2eCmd := strings.TrimSpace(resolveE2ETestCommand(opts))
+		unitCmd := strings.TrimSpace(testCmd)
+		switch {
+		case e2eCmd == "":
+			auditFinalE2ESkipped(ctx, audit, "no E2E command resolves for this language and framework", opts)
+		case e2eCmd == unitCmd:
+			auditFinalE2ESkipped(ctx, audit, "the resolved E2E command is the unit command; running it twice proves nothing", opts)
+		default:
+			er := RunTestE2E(ctx, runner, opts, e2eCmd)
+			er.Step = StepTestE2E
+			if er.Summary != "" && !strings.HasPrefix(strings.ToLower(er.Summary), "e2e") {
+				er.Summary = "e2e: " + er.Summary
+			}
+			out.StepResults = append(out.StepResults, er)
+			auditFinalStepExtra(ctx, audit, er, map[string]any{"pass": "e2e", "command": e2eCmd})
+			if !er.OK {
+				out.Stable = false
+				out.LastFixAction = FixStabilize
+				out.FailingStep = StepTestE2E
+				out.FailingOutput = er.Output
+				return out
+			}
 		}
 	}
 
@@ -514,6 +531,27 @@ func filterArtifactPaths(all, want []string) []string {
 }
 
 func auditFinalStep(ctx context.Context, audit Auditor, sr StepResult) {
+	auditFinalStepExtra(ctx, audit, sr, nil)
+}
+
+// auditFinalE2ESkipped records why the final evaluation ran no E2E pass. Said out loud because a
+// silent skip is indistinguishable in the audit from a pass that was never configured.
+func auditFinalE2ESkipped(ctx context.Context, audit Auditor, reason string, opts EvalOptions) {
+	if audit == nil {
+		return
+	}
+	audit.Log(ctx, "evaluator.final.test_e2e_skipped", map[string]any{
+		"message":       "E2E pass skipped: " + reason + ".",
+		"step":          string(StepTestE2E),
+		"pass":          "e2e",
+		"lang":          opts.Lang,
+		"e2e_framework": opts.E2EFramework,
+		"reason":        reason,
+	})
+}
+
+// auditFinalStepExtra is auditFinalStep with extra payload fields (e.g. the E2E pass's command).
+func auditFinalStepExtra(ctx context.Context, audit Auditor, sr StepResult, extra map[string]any) {
 	if audit == nil {
 		return
 	}
@@ -530,6 +568,9 @@ func auditFinalStep(ctx context.Context, audit Auditor, sr StepResult) {
 	}
 	if sr.Err != nil {
 		payload["error"] = sr.Err.Error()
+	}
+	for k, v := range extra {
+		payload[k] = v
 	}
 	if !sr.OK {
 		audit.LogError(ctx, fmt.Sprintf("evaluator.final.%s", string(sr.Step)), payload)

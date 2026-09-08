@@ -118,6 +118,37 @@ func insertMavenSurefirePlugin(pom string) (string, error) {
 	if strings.Contains(pom, "maven-surefire-plugin") {
 		return pom, nil
 	}
+	return insertMavenBuildPlugin(pom, mavenSurefirePlugin)
+}
+
+// mavenFailsafePlugin declares the Failsafe plugin the Java E2E pass invokes
+// (`mvn failsafe:integration-test failsafe:verify`, see evaluator/e2e_command.go). Declared
+// WITHOUT lifecycle executions on purpose: binding it would make the repository's own `mvn verify`
+// launch Playwright browsers, which the bootstrap only installs inside its container.
+const mavenFailsafePlugin = `
+      <!-- ASQS e2e_framework_bootstrap: Playwright E2E tests (*E2EIT.java) run through
+           mvn failsafe:integration-test failsafe:verify; plain mvn test / verify are unchanged. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>` + VersionMavenFailsafePlugin + `</version>
+        <configuration>
+          <includes>
+            <include>**/*E2EIT.java</include>
+            <include>**/*IT.java</include>
+          </includes>
+        </configuration>
+      </plugin>`
+
+func insertMavenFailsafePlugin(pom string) (string, error) {
+	if strings.Contains(pom, "maven-failsafe-plugin") {
+		return pom, nil
+	}
+	return insertMavenBuildPlugin(pom, mavenFailsafePlugin)
+}
+
+// insertMavenBuildPlugin appends snippet to <build><plugins>, creating either element when absent.
+func insertMavenBuildPlugin(pom, snippet string) (string, error) {
 	const openBuild = "<build>"
 	const closeBuild = "</build>"
 	const openPlugins = "<plugins>"
@@ -125,7 +156,7 @@ func insertMavenSurefirePlugin(pom string) (string, error) {
 
 	bidx := strings.Index(pom, openBuild)
 	if bidx < 0 {
-		block := "  <build>\n    <plugins>" + mavenSurefirePlugin + "\n    </plugins>\n  </build>\n\n"
+		block := "  <build>\n    <plugins>" + snippet + "\n    </plugins>\n  </build>\n\n"
 		return insertBeforeClosingProject(pom, block), nil
 	}
 	// Find first </build> after <build> (flat POM assumption).
@@ -140,7 +171,7 @@ func insertMavenSurefirePlugin(pom string) (string, error) {
 	pidx := strings.Index(buildInner, openPlugins)
 	if pidx < 0 {
 		// <build> without <plugins>: inject plugins block
-		insert := "\n    <plugins>" + mavenSurefirePlugin + "\n    </plugins>\n"
+		insert := "\n    <plugins>" + snippet + "\n    </plugins>\n"
 		return pom[:afterB] + insert + pom[afterB:], nil
 	}
 	afterP := afterB + pidx + len(openPlugins)
@@ -149,7 +180,7 @@ func insertMavenSurefirePlugin(pom string) (string, error) {
 		return "", fmt.Errorf("pom.xml: unclosed <plugins>")
 	}
 	relEnd += afterP
-	return pom[:relEnd] + mavenSurefirePlugin + "\n" + pom[relEnd:], nil
+	return pom[:relEnd] + snippet + "\n" + pom[relEnd:], nil
 }
 
 func insertBeforeClosingProject(pom, snippet string) string {

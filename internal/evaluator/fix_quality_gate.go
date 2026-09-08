@@ -505,3 +505,282 @@ func stripStringsAndComments(s, ext string) string {
 	}
 	return b.String()
 }
+
+// javaEscapeLeads / csharpEscapeLeads are the characters that may legally follow a backslash inside
+// a string or char literal. Octal escapes (`\0`-`\377`) are covered by the digits being present in
+// the Java set; accepting a slightly wider grammar than the spec is deliberate, because the cost of
+// the two error directions is not symmetric — see illegalEscapeReason.
+var javaEscapeLeads = map[byte]bool{
+	'b': true, 's': true, 't': true, 'n': true, 'f': true, 'r': true,
+	'"': true, '\'': true, '\\': true, 'u': true,
+	'0': true, '1': true, '2': true, '3': true, '4': true, '5': true, '6': true, '7': true,
+}
+
+var csharpEscapeLeads = map[byte]bool{
+	'\'': true, '"': true, '\\': true, '0': true, 'a': true, 'b': true, 'f': true,
+	'n': true, 'r': true, 't': true, 'v': true, 'u': true, 'U': true, 'x': true,
+}
+
+// IllegalEscapeReason is the FIX-PATH-ONLY escape gate. It is deliberately NOT part of
+// SyntacticShellReason, and that separation is the whole point of this comment.
+//
+// The two write paths have opposite consequences for a rejection, which is a distinction the first
+// version of this check got wrong and a run paid for. In the FIX path a rejected write leaves the
+// previous version of the file on disk: the artifact survives, the diagnostic repeats, and the next
+// round tries again — so refusing to write a body with an illegal escape costs one round and saves
+// a containerised compile. In the GENERATE path there is no previous version. A rejection there
+// means the file is never created at all, while the path stays in ArtifactPaths, so the evaluator
+// later reports `fix_missing_required_context` for an artifact it can neither read nor repair.
+//
+// asqs-go run api-c3e4a6ea003d0f9b1aeb487b4a8faec6 is what that looks like: 12 artifacts planned, 3 of them
+// (OwnerControllerE2EIT.java, OwnerTests.java, VetControllerE2EIT.java) generated successfully and
+// then dropped by writeGeneratedFiles, leaving the fix round with 5 artifacts instead of 8 and no
+// way to repair the missing three. An illegal escape is a one-line repair and precisely what the
+// fix loop exists for; destroying the artifact to avoid it is a strictly worse trade.
+//
+// SyntacticShellReason keeps its own checks in both paths because they detect content that is
+// unusable rather than broken — a markdown fence, a truncated body, no type declaration at all.
+// There is nothing in those to repair.
+func IllegalEscapeReason(path, content string) string {
+	if strings.TrimSpace(content) == "" {
+		return ""
+	}
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".java":
+		return illegalEscapeReason(content, ".java")
+	case ".cs":
+		return illegalEscapeReason(content, ".cs")
+	}
+	return ""
+}
+
+// EscapeRepair records one backslash the repair doubled.
+type EscapeRepair struct {
+	Line   int
+	Escape string // the illegal sequence as written, e.g. `\d`
+}
+
+// RepairIllegalEscapes doubles every backslash that javac/roslyn would reject inside a STRING
+// literal of a Java or C# file, and reports what it changed. Content is returned unchanged (with no
+// repairs) for other languages, for files carrying constructs the scanner does not model (text
+// blocks, verbatim strings) and for anything it cannot tokenize with confidence — the same bail
+// rules as illegalEscapeReason, so a repaired file is one the gate would then accept.
+//
+// The repair is deterministic and total for strings: `\d`, `\w`, `\.`, `\/` and every other
+// non-escape are regex or path notation the model forgot to double, and `\\d` is the only
+// reading javac has for what was meant. Char literals are left alone: `'\d'` doubled is a
+// two-character literal, which does not compile either, so that one stays a rejection.
+//
+// Why repair rather than reject: run api-5a67a414d4ba22496fcc23e1143076fa spent a containerised
+// compile and two fixer rounds (24 minutes on a local model) on a single `\d` — the first fixer
+// reply repeated the same escape and was refused. There is nothing for a model to decide here.
+func RepairIllegalEscapes(path, content string) (string, []EscapeRepair) {
+	if strings.TrimSpace(content) == "" {
+		return content, nil
+	}
+	var leads map[byte]bool
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".java":
+		leads = javaEscapeLeads
+	case ".cs":
+		leads = csharpEscapeLeads
+	default:
+		return content, nil
+	}
+	s := content
+	if strings.Contains(s, `"""`) || strings.Contains(s, `@"`) || strings.Contains(s, `@$"`) {
+		return content, nil
+	}
+	var b strings.Builder
+	var repairs []EscapeRepair
+	i, n := 0, len(s)
+	line := 1
+	for i < n {
+		c := s[i]
+		switch {
+		case c == '\n':
+			line++
+		case c == '/' && i+1 < n && s[i+1] == '/':
+			j := strings.IndexByte(s[i:], '\n')
+			if j < 0 {
+				return content, nil
+			}
+			b.WriteString(s[i : i+j])
+			i += j
+			continue
+		case c == '/' && i+1 < n && s[i+1] == '*':
+			j := strings.Index(s[i+2:], "*/")
+			if j < 0 {
+				return content, nil
+			}
+			end := i + 2 + j + 2
+			line += strings.Count(s[i:end], "\n")
+			b.WriteString(s[i:end])
+			i = end
+			continue
+		case c == '"' || c == '\'':
+			quote := c
+			start := i
+			i++
+			closed := false
+			var lit strings.Builder
+			lit.WriteByte(quote)
+			for i < n {
+				if s[i] == '\n' {
+					return content, nil
+				}
+				if s[i] == '\\' {
+					if i+1 >= n || s[i+1] == '\n' || s[i+1] == '\r' {
+						return content, nil
+					}
+					esc := s[i+1]
+					if !leads[esc] && quote == '"' {
+						repairs = append(repairs, EscapeRepair{Line: line, Escape: `\` + string(esc)})
+						lit.WriteString(`\\`)
+						lit.WriteByte(esc)
+						i += 2
+						continue
+					}
+					lit.WriteByte(s[i])
+					lit.WriteByte(esc)
+					i += 2
+					continue
+				}
+				lit.WriteByte(s[i])
+				if s[i] == quote {
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return content, nil
+			}
+			_ = start
+			b.WriteString(lit.String())
+			continue
+		}
+		b.WriteByte(c)
+		i++
+	}
+	if len(repairs) == 0 {
+		return content, nil
+	}
+	return b.String(), repairs
+}
+
+// DescribeEscapeRepairs renders repairs for a log line: `\d at line 55; \w at line 60`.
+func DescribeEscapeRepairs(repairs []EscapeRepair) string {
+	parts := make([]string, 0, len(repairs))
+	for _, r := range repairs {
+		parts = append(parts, fmt.Sprintf("%s at line %d", r.Escape, r.Line))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// illegalEscapeReason reports a backslash escape that javac/roslyn will reject inside a string or
+// char literal, or "" when the file is clean or cannot be tokenized with confidence.
+//
+// This closes the last gap in the pre-write gate. A fixer round rewrote OwnerControllerE2EIT.java —
+// a file the diagnostic had not blamed — and returned a body containing an escape javac rejects
+// (`illegal escape character` at 81:84). The gate passed it because stripStringsAndComments
+// deliberately DISCARDS literal contents, so nothing here ever looked inside a string. The file
+// reached disk, cost a full 22-second containerised compile to discover, and the round that tried
+// to repair it is the round that ended the run.
+//
+// The two error directions cost very different amounts, and the implementation is asymmetric to
+// match. A false negative costs one compile cycle — exactly what happens today. A false positive
+// silently discards a CORRECT repair and burns a whole LLM round, which is strictly worse than the
+// bug being fixed. So this bails out (returns "") on every construct it cannot tokenize exactly:
+//
+//   - Java text blocks and C# raw strings (`"""`), which stripStringsAndComments also skips;
+//   - C# verbatim strings (`@"…"`, `$@"…"`, `@$"…"`), where a backslash is a literal backslash and
+//     `C:\dir` is correct code. Both orderings are excluded: `@$"` does not contain the substring
+//     `@"`, so testing for that alone would scan a verbatim literal under non-verbatim rules;
+//   - any literal left unterminated at EOF or across a newline, which means the tokenizer lost
+//     sync — including a trailing backslash, which javac reports as an unclosed literal rather
+//     than as an illegal escape.
+//
+// Interpolated non-verbatim strings (`$"…"`) are NOT skipped: they process escapes under the normal
+// rules, so the ordinary scan is correct for them.
+func illegalEscapeReason(s, ext string) string {
+	var leads map[byte]bool
+	var lang string
+	switch ext {
+	case ".java":
+		leads, lang = javaEscapeLeads, "Java"
+	case ".cs":
+		leads, lang = csharpEscapeLeads, "C#"
+	default:
+		return ""
+	}
+	// Bail on whole-file constructs this scanner does not model. Cheap, and it keeps the loop below
+	// free of state it would get subtly wrong.
+	if strings.Contains(s, `"""`) || strings.Contains(s, `@"`) || strings.Contains(s, `@$"`) {
+		return ""
+	}
+
+	i, n := 0, len(s)
+	line := 1
+	for i < n {
+		c := s[i]
+		switch {
+		case c == '\n':
+			line++
+			i++
+			continue
+		case c == '/' && i+1 < n && s[i+1] == '/':
+			j := strings.IndexByte(s[i:], '\n')
+			if j < 0 {
+				return ""
+			}
+			i += j // leave the newline for the counter above
+			continue
+		case c == '/' && i+1 < n && s[i+1] == '*':
+			j := strings.Index(s[i+2:], "*/")
+			if j < 0 {
+				return ""
+			}
+			line += strings.Count(s[i:i+2+j+2], "\n")
+			i += 2 + j + 2
+			continue
+		case c == '"' || c == '\'':
+			quote := c
+			i++
+			closed := false
+			for i < n {
+				if s[i] == '\n' {
+					// An unterminated literal at end of line means the tokenizer lost sync
+					// (or the source is truncated); either way, stop guessing.
+					return ""
+				}
+				if s[i] == '\\' {
+					if i+1 >= n || s[i+1] == '\n' || s[i+1] == '\r' {
+						return ""
+					}
+					esc := s[i+1]
+					if !leads[esc] {
+						return fmt.Sprintf(
+							"illegal escape character %q in %s string literal at line %d; %s rejects this and the file will not compile",
+							`\`+string(esc), lang, line, lang)
+					}
+					i += 2
+					continue
+				}
+				if s[i] == quote {
+					i++
+					closed = true
+					break
+				}
+				i++
+			}
+			if !closed {
+				return ""
+			}
+			continue
+		}
+		i++
+	}
+	return ""
+}

@@ -63,6 +63,30 @@ func testFailureTouchesWritableScope(errorOutput string, opts EvalOptions, paths
 	return len(errout.AllCitedRepoPaths(errorOutput, filepath.Clean(opts.RepoPath))) > 0
 }
 
+// buildOutputSegments are directory names that hold compiler output or dependencies. A segment
+// counts only when no `src` segment precedes it, so `packages/api/src/build/x.test.ts` (a source
+// directory that happens to be called build) stays a test path while `packages/api/dist/x.test.js`
+// and `app/build/classes/...` do not.
+var buildOutputSegments = map[string]bool{
+	"node_modules": true, "dist": true, "build": true, "out": true, "target": true,
+	"bin": true, "obj": true, "coverage": true, ".next": true, ".nuxt": true, ".output": true,
+	".angular": true,
+}
+
+// isBuildOutputPath reports whether rel (forward slashes) lives under a build-output or
+// dependency directory.
+func isBuildOutputPath(rel string) bool {
+	for _, seg := range strings.Split(strings.ToLower(rel), "/") {
+		switch {
+		case seg == "src":
+			return false
+		case buildOutputSegments[seg]:
+			return true
+		}
+	}
+	return false
+}
+
 // pathLooksLikeTestArtifact reports whether rel (repo-relative) is a path where test code may be written.
 // Mirrors cmd/qualitybot/run.go looksLikeTestPath plus __tests__/ so Jest/Vitest layouts are recognized.
 func pathLooksLikeTestArtifact(rel string, lang string) bool {
@@ -72,6 +96,13 @@ func pathLooksLikeTestArtifact(rel string, lang string) bool {
 	}
 	base := strings.ToLower(filepath.Base(rel))
 	lang = strings.ToLower(strings.TrimSpace(lang))
+	// Compiler output and dependencies are never artifacts the fixer may own. asqs-go run
+	// api-d01f66ab5b4c58f8e129844d98f8e370 adopted dist/__tests__/asqs-bootstrap-smoke.test.d.ts
+	// and its compiled .js from the failure output and spent two rounds asking the LLM to repair a
+	// declaration file.
+	if isBuildOutputPath(rel) || strings.HasSuffix(base, ".d.ts") {
+		return false
+	}
 
 	if strings.Contains(base, ".test.") || strings.Contains(base, ".spec.") || strings.Contains(base, ".cy.") {
 		return true

@@ -61,6 +61,24 @@ func (r jsGoalRunner) runScript(ctx context.Context, script string) (cmdLine str
 	return cmdLine, out, nil
 }
 
+// runArgv executes an arbitrary argv in the package directory (host or container) and returns the
+// command line, combined output and error. Used by the type-check gate's no-emit run.
+func (r jsGoalRunner) runArgv(ctx context.Context, argv []string) (cmdLine string, out []byte, err error) {
+	timeout := r.timeout
+	if timeout <= 0 {
+		timeout = defaultInstallTimeout
+	}
+	rCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmdLine = r.describe(argv)
+	out, err = RunArgv(rCtx, r.ed, r.workdir, argv, []string{"CI=true", "NPM_CONFIG_YES=true"})
+	if err != nil {
+		return cmdLine, out, fmt.Errorf("%s: %w", cmdLine, err)
+	}
+	return cmdLine, out, nil
+}
+
 // runTestFile executes one smoke test and returns the command line, combined output and error.
 func (r jsGoalRunner) runTestFile(ctx context.Context, rel string) (cmdLine string, out []byte, err error) {
 	timeout := r.timeout

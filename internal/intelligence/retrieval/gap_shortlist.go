@@ -151,7 +151,7 @@ func auditGapFilter(ctx context.Context, opts PlanOptions, byReason map[string]i
 		return
 	}
 	opts.Audit.Log(ctx, "plan.gaps_filtered_ineligible", map[string]interface{}{
-		"message":          "Dropped gap candidates that do not represent testable behaviour (interface members with no body, framework @Bean factories, trivial accessors).",
+		"message":          "Dropped gap candidates that do not represent testable behaviour (interface members with no body, framework @Bean factories, trivial accessors, unexported TypeScript functions).",
 		"by_reason":        byReason,
 		"total_candidates": totalCandidates,
 		"remaining":        remaining,

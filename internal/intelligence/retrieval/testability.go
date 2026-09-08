@@ -129,6 +129,9 @@ const (
 	// IneligibleBindingPattern is a candidate whose FQName is not a symbol name at all — a
 	// destructuring pattern the language indexer stored verbatim. See fqNameIsBindingPattern.
 	IneligibleBindingPattern = "binding_pattern"
+	// IneligibleUnexported is a TypeScript module-level function nothing can import. See
+	// isUnexportedTypeScriptFunction.
+	IneligibleUnexported = "unexported"
 )
 
 // fqNameIsBindingPattern reports whether a candidate's FQName is a destructuring pattern rather
@@ -191,6 +194,9 @@ func gapEligibility(sym *metadata.Symbol, enclosing *metadata.Symbol, outboundCa
 	if fqNameIsBindingPattern(sym.FQName) {
 		return false, IneligibleBindingPattern
 	}
+	if isUnexportedTypeScriptFunction(sym) {
+		return false, IneligibleUnexported
+	}
 	span := sym.EndLine - sym.StartLine
 
 	if enclosing != nil {
@@ -220,6 +226,33 @@ func gapEligibility(sym *metadata.Symbol, enclosing *metadata.Symbol, outboundCa
 	}
 
 	return true, ""
+}
+
+// isUnexportedTypeScriptFunction reports a TypeScript module-level function the indexer recorded
+// as not exported. A test file cannot import it, so no test can reach it without editing the
+// source: run api-a716cb7b25db5a880b4675a04b0b08c3 planned `src.main.bootstrap` — NestJS's entry
+// point, which calls app.listen at module load — and the generated test failed with "bootstrap is
+// not a function" in every one of nine fix rounds before the discard removed it.
+//
+// Module-level functions only (kind "function": declarations and arrow-function consts). Class
+// members carry their own visibility, and the planner's private-member rule is a separate decision.
+// TypeScript only: the flag is ESM syntax (ts-morph isExported), and a CommonJS
+// `module.exports = { helper }` reads as unexported — gating JavaScript on it would drop every CJS
+// helper. A row without the flag (older index rows) is kept.
+func isUnexportedTypeScriptFunction(sym *metadata.Symbol) bool {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(sym.Lang), "typescript") || !strings.EqualFold(strings.TrimSpace(sym.Kind), "function") {
+		return false
+	}
+	var parsed struct {
+		Exported *bool `json:"exported"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil || parsed.Exported == nil {
+		return false
+	}
+	return !*parsed.Exported
 }
 
 var frameworkConfigAnnotations = map[string]bool{

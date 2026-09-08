@@ -109,6 +109,15 @@ func RunE2EBootstrap(ctx context.Context, p E2EParams, audit Auditor) error {
 			"has_setup": true,
 		})
 		fmt.Fprintf(os.Stderr, "  e2e_framework_bootstrap: skipped — E2E stack already present (%s: %s)\n", rep.Framework, rep.Reason)
+		// The evaluator's Java E2E pass invokes a build-tool runner that the stack itself does
+		// not guarantee: Failsafe under Maven, an `integrationTest` task under Gradle
+		// (evaluator/e2e_command.go). A repository that already had Playwright never reached
+		// applyPlaywrightJavaBootstrap, so it never received either — asqs-go run
+		// api-0e0b356b780481deb471faa745dab0bc worked only because Maven resolves the goal by
+		// prefix and the parent POM pinned a version.
+		if lang == "java" {
+			ensureJavaE2ERunnerDeclared(ctx, audit, repo)
+		}
 		return nil
 	}
 

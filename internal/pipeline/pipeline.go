@@ -522,6 +522,12 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// inside FormatAfterFixForSandbox, so there is no non-empty guard any more.
 	formatAfterFixHook := func(ctx context.Context, repoPath string, updatedPaths []string) error {
 		resolved := runner.ResolveFormatCommand(repoPath, lang, cfg.Runner.FormatCommand, cfg.Runner.BuildTool, cfg.Runner.FormatOnlyAdded, formatTarget)
+		if strings.TrimSpace(resolved.Command) == "" {
+			// FormatAfterFixForSandbox treats an empty command as a no-op and returns nil, which
+			// the evaluator then logs as "Format applied after LLM fix." — the row both asqs-go
+			// runs of 2026-09-07 showed right under "after-fix formatting disabled".
+			return fmt.Errorf("%w: %s", evaluator.ErrFormatAfterFixSkipped, formatSkipReason(resolved))
+		}
 		err := runner.FormatAfterFixForSandbox(sandbox, ctx, repoPath, lang, resolved, updatedPaths, formatTimeout)
 		if err != nil && errors.Is(err, runner.ErrFormatSkippedNoDotnet) {
 			return fmt.Errorf("%w: %v", evaluator.ErrFormatAfterFixSkipped, err)
@@ -864,7 +870,18 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// longer on disk.
 	postDiscardVerified := true
 	if sum.Discarded > 0 && (evalRes.Stable || evalRes.EarlyExitStableAfterDiscard) {
-		postDiscardVerified = verifyAfterDiscard(ctx, sandbox, evalOpts, evalRes.EarlyExitDiscardPaths, audit)
+		var survivorsDiscarded []string
+		postDiscardVerified, survivorsDiscarded = verifyAfterDiscard(ctx, sandbox, evalOpts, evalRes.EarlyExitDiscardPaths, audit)
+		// A survivor the verification removed is gone whether or not the remainder then
+		// verified; the summary must say so either way.
+		for _, p := range survivorsDiscarded {
+			np := normPath(p)
+			sum.Discarded++
+			if idx, ok := outcomeIdxByPath[np]; ok && idx < len(sum.Outcomes) {
+				sum.Outcomes[idx].Discarded = true
+				sum.Outcomes[idx].Err = "discarded: failed post-discard verification"
+			}
+		}
 	}
 
 	// The project is green when the eval passed outright, or stayed stable after discarding AND the

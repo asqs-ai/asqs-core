@@ -21,7 +21,7 @@ func TestEffectiveE2ETestCommandFromOpts_javaMaven(t *testing.T) {
 		BuildTool:    "mvn",
 		E2EFramework: "playwright-java",
 	})
-	want := "mvn -q -B failsafe:integration-test"
+	want := "mvn -q -B failsafe:integration-test failsafe:verify"
 	if got != want {
 		t.Errorf("got %q; want %q", got, want)
 	}

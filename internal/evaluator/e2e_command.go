@@ -50,7 +50,9 @@ func defaultJavaE2EShellCommand(repoPath, buildTool, fw string) string {
 	}
 	switch tool.Kind {
 	case buildtool.Maven:
-		return tool.Binary + " -q -B failsafe:integration-test"
+		// `integration-test` records failures; only `verify` turns them into a non-zero exit.
+		// Without the second goal a failing Playwright test reported "e2e: tests ok".
+		return tool.Binary + " -q -B failsafe:integration-test failsafe:verify"
 	case buildtool.Gradle:
 		return tool.Binary + " --no-daemon -q integrationTest"
 	}

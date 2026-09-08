@@ -75,6 +75,9 @@ func applyPlaywrightJavaBootstrap(ctx context.Context, p E2EParams, audit Audito
 			filesChanged = append(filesChanged, relPathForBootstrap(repo, jbf.Abs))
 		}
 	case javaBuildGradleGroovy:
+		if _, err := ensureGradleIntegrationTestTask(jbf.Abs, false); err != nil {
+			return fmt.Errorf("e2e_framework_bootstrap: gradle integrationTest task: %w", err)
+		}
 		ch, err := applyGradlePlaywrightE2E(jbf.Abs, false)
 		if err != nil {
 			logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
@@ -89,6 +92,9 @@ func applyPlaywrightJavaBootstrap(ctx context.Context, p E2EParams, audit Audito
 			return fmt.Errorf("e2e_framework_bootstrap gradle playwright install args: %w", err)
 		}
 	case javaBuildGradleKotlin:
+		if _, err := ensureGradleIntegrationTestTask(jbf.Abs, true); err != nil {
+			return fmt.Errorf("e2e_framework_bootstrap: gradle integrationTest task: %w", err)
+		}
 		ch, err := applyGradlePlaywrightE2E(jbf.Abs, true)
 		if err != nil {
 			logAuditError(audit, ctx, "e2e_bootstrap.apply_failed", map[string]interface{}{
@@ -175,6 +181,12 @@ func applyMavenPlaywrightE2E(pomPath string) (bool, error) {
 	}
 	if !strings.Contains(s, "maven-surefire-plugin") {
 		s, err2 = insertMavenSurefirePlugin(s)
+		if err2 != nil {
+			return false, err2
+		}
+	}
+	if !strings.Contains(s, "maven-failsafe-plugin") {
+		s, err2 = insertMavenFailsafePlugin(s)
 		if err2 != nil {
 			return false, err2
 		}

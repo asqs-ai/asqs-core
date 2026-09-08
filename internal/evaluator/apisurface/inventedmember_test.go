@@ -1,6 +1,9 @@
 package apisurface
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func playwrightSurfaces() []TypeSurface {
 	return []TypeSurface{
@@ -115,5 +118,42 @@ func TestInventedAssertionMemberReason_answersFromTheCompleteListNotTheRenderedO
 	}
 	if got := InventedAssertionMemberReason("class T { void a() { assertThat(locator).hasText(\"x\"); } }", surfaces); got != "" {
 		t.Errorf("false rejection %q: hasText is in the complete list, just not the rendered one", got)
+	}
+}
+
+// asqs-go run api-5a67a414d4ba22496fcc23e1143076fa: isEqualTo()/contains()/isNotEmpty() were rejected on
+// a file without an AssertJ import that compiled and passed once an unrelated escape error was
+// fixed. A bare assertThat bound by a non-Playwright static import belongs to that library.
+func TestInventedAssertionMemberReason_respectsForeignStaticImports(t *testing.T) {
+	chain := "class T { void a() { assertThat(name).isEqualTo(\"x\"); assertThat(list).contains(\"y\"); } }"
+	for _, imp := range []string{
+		"import static com.google.common.truth.Truth.assertThat;\n",
+		"import static org.hamcrest.MatcherAssert.assertThat;\n",
+		"import static com.example.testing.Asserts.*;\n",
+		// Both bound: ambiguous, so no claim.
+		"import static com.microsoft.playwright.assertions.PlaywrightAssertions.assertThat;\nimport static com.google.common.truth.Truth.assertThat;\n",
+	} {
+		if got := InventedAssertionMemberReason(imp+chain, playwrightSurfaces()); got != "" {
+			t.Errorf("foreign static import %q produced %q, want no claim", strings.TrimSpace(imp), got)
+		}
+	}
+	// Playwright's own static import, and the qualified call, remain attributable.
+	for _, src := range []string{
+		"import static com.microsoft.playwright.assertions.PlaywrightAssertions.assertThat;\nclass T { void a() { assertThat(response).hasStatus(200); } }",
+		"import static com.microsoft.playwright.assertions.PlaywrightAssertions.*;\nclass T { void a() { assertThat(response).hasStatus(200); } }",
+		"import static com.google.common.truth.Truth.assertThat;\nclass T { void a() { PlaywrightAssertions.assertThat(response).hasStatus(200); } }",
+	} {
+		if got := InventedAssertionMemberReason(src, playwrightSurfaces()); got == "" {
+			t.Errorf("no violation reported for %q", src)
+		}
+	}
+}
+
+// The rejection names the line and the code it is about.
+func TestInventedAssertionMemberReason_namesTheSourceLine(t *testing.T) {
+	src := "class T {\n\tvoid a() {\n\t\tassertThat(response).hasStatus(200);\n\t}\n}\n"
+	got := InventedAssertionMemberReason(src, playwrightSurfaces())
+	if !strings.Contains(got, "hasStatus()") || !strings.Contains(got, "(line 3: assertThat(response).hasStatus(200);)") {
+		t.Fatalf("reason = %q", got)
 	}
 }

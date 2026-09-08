@@ -75,6 +75,7 @@ func (s *Sandbox) planJS(plan *StepPlan, absCwd string) {
 		if plan.Target == TargetLocal {
 			env = append(env, s.localCredentialEnv(plan.Toolchain)...)
 		}
+		env = append(env, jsStepExtraEnv(plan.Toolchain, step, plan.Target)...)
 		plan.Env[step] = env
 
 		if !hasPackageJSON {

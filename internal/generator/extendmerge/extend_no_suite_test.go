@@ -53,14 +53,31 @@ test.describe('checkout', () => {
 	}
 }
 
-// A target that HAS a suite keeps the strict behaviour: a payload that cannot be reduced to one
-// body is still refused rather than appended beside the existing suite.
-func TestExtendExisting_stillRefusesUnwrappableJSPayloadWhenTargetHasSuite(t *testing.T) {
+// A target that HAS a suite used to keep the strict behaviour: a payload that could not be reduced
+// to one body was refused. asqs-go run api-d01f66ab5b4c58f8e129844d98f8e370 lost a generated test
+// to that refusal. Two top-level suites are valid at module level, so the payload is appended
+// beside the existing suite with its imports merged (see jsAppendModulePayload); the refusal
+// remains only for a payload that would redeclare a binding the file already has.
+func TestExtendExisting_appendsMultiSuiteJSPayloadBesideExistingSuite(t *testing.T) {
 	rel := "e2e/routes/home.spec.ts"
-	repo := writeTemp(t, rel, "import { test, expect } from '@playwright/test';\n\ntest.describe('home', () => {\n  test('loads', async ({ page }) => { await page.goto('/'); });\n});\n")
+	existing := "import { test, expect } from '@playwright/test';\n\ntest.describe('home', () => {\n  test('loads', async ({ page }) => { await page.goto('/'); });\n});\n"
+	repo := writeTemp(t, rel, existing)
 	payload := "import { test, expect } from '@playwright/test';\n\ntest.describe('a', () => {\n  test('x', async () => {});\n});\n\ntest.describe('b', () => {\n  test('y', async () => {});\n});\n"
 	n, _, skips := Write(repo, []Item{{Path: rel, Content: payload, ExtendExisting: true, SourceSymbolFile: "src/app/app.routes.ts"}})
-	if n != 0 || len(skips) == 0 || !strings.Contains(strings.Join(skips, "\n"), "could not be unwrapped") {
-		t.Fatalf("expected the refusal to stand for a target with a suite; wrote %d, skips=%v", n, skips)
+	if n != 1 {
+		t.Fatalf("expected the append to land; wrote %d, skips=%v", n, skips)
+	}
+	b, err := os.ReadFile(filepath.Join(repo, filepath.FromSlash(rel)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	for _, want := range []string{"test.describe('home'", "test.describe('a'", "test.describe('b'"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged file lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "from '@playwright/test'") != 1 {
+		t.Errorf("the shared import was duplicated:\n%s", got)
 	}
 }

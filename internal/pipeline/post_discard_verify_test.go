@@ -100,7 +100,7 @@ func TestVerifyAfterDiscard_runsTheStepsTheDiscardUnblocked(t *testing.T) {
 	r := &verifyRunner{compileOK: true, testOK: true, e2eOK: false}
 	aud := &capturingAuditor{}
 
-	ok := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud)
+	ok, _ := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud)
 
 	if !r.e2eRan.Load() {
 		t.Fatal("the E2E pass never ran; the discard's claim was still unverified")
@@ -118,7 +118,7 @@ func TestVerifyAfterDiscard_passesWhenTheRemainderIsGreen(t *testing.T) {
 	r := &verifyRunner{compileOK: true, testOK: true, e2eOK: true}
 	aud := &capturingAuditor{}
 
-	if ok := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud); !ok {
+	if ok, _ := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud); !ok {
 		t.Fatal("a green remainder must verify")
 	}
 	if !aud.has("pipeline.post_discard_verification_pass") {
@@ -132,7 +132,7 @@ func TestVerifyAfterDiscard_cannotDiscardAgain(t *testing.T) {
 	r := &verifyRunner{compileOK: true, testOK: false, e2eOK: true}
 	aud := &capturingAuditor{}
 
-	ok := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud)
+	ok, _ := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts"}, aud)
 
 	if ok {
 		t.Error("a failing remainder must not verify")
@@ -169,7 +169,7 @@ func TestVerifyAfterDiscard_e2eOnlySurvivorsRunTheE2EPass(t *testing.T) {
 	r := &verifyRunner{compileOK: true, noTestFiles: true, e2eOK: true}
 	aud := &capturingAuditor{}
 
-	ok := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts", "src/app/b.test.ts"}, aud)
+	ok, _ := verifyAfterDiscard(context.Background(), r, verifyOpts(), []string{"src/app/a.test.ts", "src/app/b.test.ts"}, aud)
 
 	if !r.e2eRan.Load() {
 		t.Fatal("the E2E pass never ran; the surviving spec was never executed")
@@ -200,7 +200,7 @@ func TestVerifyAfterDiscard_unseenUnitSurvivorFailsBeforeE2E(t *testing.T) {
 	r := &verifyRunner{compileOK: true, noTestFiles: true, e2eOK: true}
 	aud := &capturingAuditor{}
 
-	ok := verifyAfterDiscard(context.Background(), r, opts, []string{"src/app/a.test.ts"}, aud)
+	ok, _ := verifyAfterDiscard(context.Background(), r, opts, []string{"src/app/a.test.ts"}, aud)
 
 	if ok {
 		t.Error("a generated unit test the runner never executed must not verify")

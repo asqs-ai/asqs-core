@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -107,7 +108,8 @@ func runJSTypecheckGate(ctx context.Context, runner jsGoalRunner, pkgDir string,
 		return jsTypecheckSkipped, "", "", nil
 	}
 	script := jsTypecheckScript(pkgDir)
-	if script == "" {
+	noEmit := jsNoEmitTypecheckArgv(pkgDir, script)
+	if script == "" && noEmit == nil {
 		return jsTypecheckSkipped, "", "", nil
 	}
 	dir, ok := jsTypecheckProbeDir(pkgDir)
@@ -151,7 +153,27 @@ func runJSTypecheckGate(ctx context.Context, runner jsGoalRunner, pkgDir string,
 	}
 	staged = append(staged, probe)
 
+	if noEmit != nil {
+		// A no-emit type-check compiles the same program the build would, without writing its
+		// output. asqs-go run api-d01f66ab5b4c58f8e129844d98f8e370: `npm run build` (nest build)
+		// type-checked the probe and left dist/src/asqs-typecheck-probe.test.js behind, which Jest
+		// then ran.
+		cmdLine, out, rerr := runner.runArgv(ctx, noEmit)
+		if rerr == nil {
+			return jsTypecheckOK, cmdLine, probe.Rel, out
+		}
+		if script == "" {
+			// Nothing to fall back to. The build script is what the evaluator runs, so only its
+			// verdict may stop a bootstrap; a tsc-only failure is reported, not blamed.
+			return jsTypecheckInconclusive, cmdLine, probe.Rel, out
+		}
+		// Fall through to the package's own script: a program difference between `tsc -p` and
+		// the build (types, includes, project references) must never turn a pass into a failure.
+	}
 	cmdLine, out, rerr := runner.runScript(ctx, script)
+	if script == "build" {
+		defer removeEmittedProbeOutput(pkgDir)
+	}
 	if rerr == nil {
 		return jsTypecheckOK, cmdLine, probe.Rel, out
 	}
@@ -161,6 +183,72 @@ func runJSTypecheckGate(ctx context.Context, runner jsGoalRunner, pkgDir string,
 		return jsTypecheckProbeFailed, cmdLine, probe.Rel, out
 	}
 	return jsTypecheckInconclusive, cmdLine, probe.Rel, out
+}
+
+// jsNoEmitTypecheckArgv returns the `tsc --noEmit` invocation to try before the build script, or
+// nil when the package's own script is the right gate: a dedicated typecheck/type-check/tsc script
+// already exists, there is no tsconfig.json, the local TypeScript compiler is not installed, or the
+// tsconfig is a solution file with project references (where `tsc -p` compiles nothing).
+func jsNoEmitTypecheckArgv(pkgDir, script string) []string {
+	switch script {
+	case "typecheck", "type-check", "tsc":
+		return nil
+	}
+	tsconfig := filepath.Join(pkgDir, "tsconfig.json")
+	b, err := os.ReadFile(tsconfig)
+	if err != nil {
+		return nil
+	}
+	if jsTSConfigReferencesRE.Match(b) {
+		return nil
+	}
+	if _, err := os.Stat(filepath.Join(pkgDir, "node_modules", ".bin", "tsc")); err != nil {
+		return nil
+	}
+	return []string{"npx", "--no-install", "tsc", "--noEmit", "-p", "tsconfig.json"}
+}
+
+// jsTSConfigReferencesRE spots a solution-style tsconfig (Vite scaffolds: references to
+// tsconfig.app.json / tsconfig.node.json). Lenient on purpose: tsconfig allows comments and
+// trailing commas, so a strict JSON parse is the wrong tool.
+var jsTSConfigReferencesRE = regexp.MustCompile(`(?m)^\s*"references"\s*:`)
+
+// jsTSConfigOutDirRE reads compilerOptions.outDir the same lenient way.
+var jsTSConfigOutDirRE = regexp.MustCompile(`"outDir"\s*:\s*"([^"]+)"`)
+
+// removeEmittedProbeOutput deletes what a build script emitted for the type-check probe. The probe
+// source is removed by the gate's own defer; its compiled .js/.d.ts/.map twins under outDir are
+// not, and the Jest glob matched them. Only files named after the probe are touched — never the
+// rest of the build output, which may be the repository's own.
+func removeEmittedProbeOutput(pkgDir string) {
+	var outDirs []string
+	for _, name := range []string{"tsconfig.json", "tsconfig.build.json"} {
+		b, err := os.ReadFile(filepath.Join(pkgDir, name))
+		if err != nil {
+			continue
+		}
+		if m := jsTSConfigOutDirRE.FindSubmatch(b); m != nil {
+			outDirs = append(outDirs, string(m[1]))
+		}
+	}
+	if len(outDirs) == 0 {
+		outDirs = []string{"dist"}
+	}
+	for _, od := range outDirs {
+		root := filepath.Clean(filepath.Join(pkgDir, filepath.FromSlash(od)))
+		if rel, err := filepath.Rel(pkgDir, root); err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+			continue // never walk outside the package or the package itself
+		}
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if strings.HasPrefix(d.Name(), jsTypecheckProbeBase+".") {
+				_ = os.Remove(path)
+			}
+			return nil
+		})
+	}
 }
 
 // jsOutputNamesPath reports whether compiler output blames the given repo-relative path. Both

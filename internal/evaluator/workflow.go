@@ -2861,6 +2861,38 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			skippedPaths[relClean] = reason
 			continue
 		}
+		// An illegal escape inside a string literal has exactly one repair (double the
+		// backslash), so it is applied here rather than sent back to the model: asqs-go run
+		// api-5a67a414d4ba22496fcc23e1143076fa's first fixer reply repeated the same `\d` and
+		// was refused, costing a round. What remains after the repair (char literals, text
+		// blocks the scanner cannot model) still goes through the gate below.
+		if repaired, repairs := RepairIllegalEscapes(relClean, content); len(repairs) > 0 {
+			content = repaired
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_escape_repaired", map[string]interface{}{
+					"message": fmt.Sprintf("Doubled %d illegal string escape(s) in the fixer's %s before writing (%s).", len(repairs), relClean, DescribeEscapeRepairs(repairs)),
+					"path":    relClean,
+					"step":    step,
+					"repairs": DescribeEscapeRepairs(repairs),
+					"count":   len(repairs),
+				})
+			}
+		}
+		// Escape validation is fix-path only: rejecting here keeps the previous version of the
+		// file on disk, so the artifact survives and the next round retries. See
+		// IllegalEscapeReason for why the generate path repairs instead.
+		if reason := IllegalEscapeReason(relClean, content); reason != "" {
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
+					"message": fmt.Sprintf("LLM fix rejected for %s: %s.", relClean, reason),
+					"path":    relClean,
+					"step":    step,
+					"reason":  reason,
+				})
+			}
+			skippedPaths[relClean] = reason
+			continue
+		}
 		// Refuse a "fix" that makes the compiler happy by removing the tests. The system prompt
 		// already forbids it; this is the check that makes the instruction binding.
 		if reason := coverageRegressionReason(relClean, files[relClean], content); reason != "" {

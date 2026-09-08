@@ -130,6 +130,26 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 			noteSkip("not a test path; tests go to test files only")
 			continue
 		}
+		// A regex or path escape the model forgot to double is repaired, not rejected: the
+		// generate path has no previous version to fall back on, and the fix is mechanical. asqs-go
+		// run api-5a67a414d4ba22496fcc23e1143076fa paid a compile round and two fixer rounds for one
+		// `\d` in OrderControllerE2EIT.java.
+		if repaired, repairs := evaluator.RepairIllegalEscapes(g.Path, g.Content); len(repairs) > 0 {
+			fmt.Fprintf(os.Stderr, "  repaired %d illegal string escape(s) in %s: %s\n", len(repairs), g.Path, evaluator.DescribeEscapeRepairs(repairs))
+			g.Content = repaired
+		}
+		full := filepath.Join(repoRoot, filepath.FromSlash(g.Path))
+		if g.ExtendExisting {
+			if _, err := os.Stat(full); err != nil && os.IsNotExist(err) {
+				// The follower of a shared test path was told to extend a file its owner never
+				// created (the owner's write was refused). asqs-go run
+				// api-5a67a414d4ba22496fcc23e1143076fa lost OrderService#cancelOrder exactly this
+				// way. Nothing exists to extend, so the payload is treated as a new file and goes
+				// through the create-path gates below.
+				fmt.Fprintf(os.Stderr, "  extend target does not exist; creating %s instead\n", g.Path)
+				g.ExtendExisting = false
+			}
+		}
 		// Reject empty test-file shells (e.g. `class OwnerControllerE2EIT {}` with no @Test method) —
 		// they compile but exercise nothing. Also reject markdown fences and truncated bodies, which
 		// would otherwise only surface as a compile failure two phases later.
@@ -158,11 +178,21 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 				continue
 			}
 			if reason := evaluator.SyntacticShellReason(g.Path, g.Content); reason != "" {
-				noteSkip(reason)
-				continue
+				// A methods-only body for a NEW Java file has everything but its shell; the
+				// package and class name follow from the path. asqs-go run
+				// api-5a67a414d4ba22496fcc23e1143076fa dropped OrderService#createOrder here.
+				wrapped, declined, ok := wrapJavaMembersAsTestClass(g.Path, g.Content)
+				if !ok && strings.ToLower(filepath.Ext(g.Path)) == ".cs" {
+					wrapped, declined, ok = wrapCSharpMembersAsTestClass(g.Path, g.Content)
+				}
+				if !ok {
+					noteSkip(reason + "; wrap declined: " + declined)
+					continue
+				}
+				fmt.Fprintf(os.Stderr, "  wrapped methods-only payload into a test class: %s\n", g.Path)
+				g.Content = wrapped
 			}
 		}
-		full := filepath.Join(repoRoot, filepath.FromSlash(g.Path))
 		if g.ExtendExisting {
 			existing, err := os.ReadFile(full)
 			if err != nil {
@@ -184,6 +214,7 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 				noteSkip("extend payload uses a different test dialect than the file it would extend")
 				continue
 			}
+			appendWhole := false
 			switch kind := classifyExtendPayload(g.Path, payload); kind {
 			case payloadUnusable:
 				noteSkip("extend payload unusable: empty or markdown-fenced")
@@ -207,8 +238,20 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 					// body; the artifact was lost and the spec never ran. A file with no suite has
 					// no body the unwrap could have targeted anyway.
 					fmt.Fprintf(os.Stderr, "  extend target has no top-level suite; appending the whole payload: %s\n", g.Path)
+				case isJSExtendPath(g.Path) && jsPayloadAppendableToSuite(string(existing), payload):
+					// Two or more top-level suites have no primary to splice into, but they are
+					// valid at module level: append the module after the existing one, with its
+					// imports merged into the file's own. asqs-go run
+					// api-d01f66ab5b4c58f8e129844d98f8e370 lost OrdersService.createOrder to this
+					// exact shape.
+					fmt.Fprintf(os.Stderr, "  extend payload has several top-level suites; appending it whole: %s\n", g.Path)
+					appendWhole = true
 				default:
-					noteSkip("extend payload is a full compilation unit and could not be unwrapped")
+					cause := "no primary type body located"
+					if isJSExtendPath(g.Path) {
+						cause = jsUnwrapFailureCause(payload)
+					}
+					noteSkip("extend payload is a full compilation unit and could not be unwrapped (" + cause + ")")
 					continue
 				}
 			}
@@ -307,7 +350,17 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 					Inferred: inferredNames,
 				})
 			}
-			combined := insertInsideClassBody([]byte(base), payload)
+			var combined string
+			if appendWhole {
+				merged, ok := jsAppendModulePayload(base, payload)
+				if !ok {
+					noteSkip("extend payload has several top-level suites and redeclares a binding the file already has; refusing to append")
+					continue
+				}
+				combined = merged
+			} else {
+				combined = insertInsideClassBody([]byte(base), payload)
+			}
 			// SyntacticShellReason runs on the COMBINED result: a payload can never satisfy its
 			// "must declare a top-level type" clause. Note this is a backstop for fences and
 			// truncation — a full file spliced into a class body is brace-balanced and does declare
@@ -318,8 +371,9 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 			}
 			// Positional check: the payload must be inside the type body, not after its closing
 			// brace. A merge that appends at EOF stays brace-balanced and keeps its type
-			// declaration, so no syntactic gate can see it — only position can.
-			if !mergedPayloadInsideTypeBody(g.Path, string(existing), combined) {
+			// declaration, so no syntactic gate can see it — only position can. An intentional
+			// module-level append is the one shape that legitimately lands outside the suite.
+			if !appendWhole && !mergedPayloadInsideTypeBody(g.Path, string(existing), combined) {
 				noteSkip("merge placed the new tests outside the type body; refusing to write")
 				continue
 			}

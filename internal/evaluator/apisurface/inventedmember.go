@@ -1,6 +1,7 @@
 package apisurface
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -28,6 +29,28 @@ var chainedCallRE = regexp.MustCompile(`^\.\s*([A-Za-z_]\w*)\s*\(`)
 // assertJImportRE matches any AssertJ import. Its presence disables the check — see
 // InventedAssertionMemberReason.
 var assertJImportRE = regexp.MustCompile(`(?m)^\s*import\s+(?:static\s+)?org\.assertj\.`)
+
+// staticAssertThatImportRE matches a static import that can bind a bare `assertThat`: the member
+// itself or an on-demand `.*` from its declaring class. Group 1 is the declaring class.
+var staticAssertThatImportRE = regexp.MustCompile(`(?m)^\s*import\s+static\s+([\w.$]+)\.(?:assertThat|\*)\s*;`)
+
+// playwrightAssertionsClass is the only static factory whose assertThat this check can attribute.
+const playwrightAssertionsClass = "com.microsoft.playwright.assertions.PlaywrightAssertions"
+
+// bareAssertThatIsForeign reports whether a static import binds `assertThat` to something other
+// than Playwright's factory (Truth, Hamcrest, a project helper, ...). A bare `assertThat(...)`
+// chain then belongs to that library, whose members this check never resolved, so the only honest
+// answer is no claim. asqs-go run api-5a67a414d4ba22496fcc23e1143076fa rejected isEqualTo()/
+// contains()/isNotEmpty() on a file that compiled and passed once its unrelated escape error was
+// fixed.
+func bareAssertThatIsForeign(content string) bool {
+	for _, m := range staticAssertThatImportRE.FindAllStringSubmatch(content, -1) {
+		if m[1] != playwrightAssertionsClass {
+			return true
+		}
+	}
+	return false
+}
 
 // playwrightAssertionTypes are the types a Playwright `assertThat(...)` can return. The chain
 // members must come from one of these; the static factory itself is not one of them.
@@ -69,6 +92,7 @@ func InventedAssertionMemberReason(content string, surfaces []TypeSurface) strin
 	if assertJImportRE.MatchString(content) {
 		return ""
 	}
+	foreign := bareAssertThatIsForeign(content)
 	members := map[string]bool{}
 	saw := 0
 	for _, s := range surfaces {
@@ -92,6 +116,11 @@ func InventedAssertionMemberReason(content string, surfaces []TypeSurface) strin
 	var reasons []string
 	reported := map[string]bool{}
 	for _, start := range assertThatCallStarts(content) {
+		// A bare assertThat bound by a non-Playwright static import is not a Playwright chain.
+		// The qualified form `PlaywrightAssertions.assertThat(` is attributable regardless.
+		if foreign && !strings.HasPrefix(content[max(0, start-len("PlaywrightAssertions.assertThat")):start], "PlaywrightAssertions.assertThat") {
+			continue
+		}
 		i, ok := skipBalancedArgs(content, start)
 		if !ok {
 			continue
@@ -103,7 +132,7 @@ func InventedAssertionMemberReason(content string, surfaces []TypeSurface) strin
 			}
 			if !members[name] && !declaredLocally[name] && !reported[name] {
 				reported[name] = true
-				reasons = append(reasons, "call to "+name+"() on a Playwright assertion, which declares no such member")
+				reasons = append(reasons, "call to "+name+"() on a Playwright assertion, which declares no such member"+sourceLineNote(content, next))
 			}
 			j, ok := skipBalancedArgs(content, next)
 			if !ok {
@@ -116,6 +145,27 @@ func InventedAssertionMemberReason(content string, surfaces []TypeSurface) strin
 		return strings.Join(reasons, "; also ")
 	}
 	return ""
+}
+
+// sourceLineNote renders ` (line N: <trimmed source line>)` for the offset, so a rejection names
+// the code it is about — the next post-mortem should not have to guess which chain was flagged.
+func sourceLineNote(content string, offset int) string {
+	if offset < 0 || offset > len(content) {
+		return ""
+	}
+	line := 1 + strings.Count(content[:offset], "\n")
+	start := strings.LastIndexByte(content[:offset], '\n') + 1
+	end := strings.IndexByte(content[offset:], '\n')
+	if end < 0 {
+		end = len(content)
+	} else {
+		end += offset
+	}
+	text := strings.TrimSpace(content[start:end])
+	if len(text) > 120 {
+		text = text[:117] + "..."
+	}
+	return fmt.Sprintf(" (line %d: %s)", line, text)
 }
 
 // assertThatCallStarts returns the index of the '(' that opens each assertThat call, skipping

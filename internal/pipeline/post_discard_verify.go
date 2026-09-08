@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
@@ -38,7 +39,9 @@ const PostDiscardRepairBudget = 3
 //     the run's own result with no bound on how much.
 //   - the discarded paths leave the writable set. They are gone from disk; leaving them in invites
 //     the fixer to "repair" a file that is not there.
-func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, opts evaluator.EvalOptions, discarded []string, audit evaluator.Auditor) bool {
+// It also returns the survivors it discarded itself (see discardFailingSurvivors); those files are
+// off disk whether or not the tree then verified, and the caller records them as discarded.
+func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, opts evaluator.EvalOptions, discarded []string, audit evaluator.Auditor) (bool, []string) {
 	opts.MaxFixIterations = PostDiscardRepairBudget
 	opts.RepeatedTestFailureThreshold = -1
 	opts.ArtifactPaths = withoutDiscarded(opts.ArtifactPaths, discarded)
@@ -75,10 +78,141 @@ func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, op
 			audit.LogError(ctx, "pipeline.post_discard_verification_fail", payload)
 		}
 	}
+	if ok {
+		return true, nil
+	}
+	// Repair is over. A failure that attributes to a strict subset of the survivors gets the
+	// answer the first discard gave: those artifacts go, and the remainder is verified once, with
+	// no repair.
+	extra := discardFailingSurvivors(ctx, opts, res.StepResults, audit)
+	if len(extra) > 0 {
+		opts.ArtifactPaths = withoutDiscarded(opts.ArtifactPaths, extra)
+		opts.ExtendedArtifactPaths = withoutDiscarded(opts.ExtendedArtifactPaths, extra)
+		opts.Fixer = nil
+		opts.MaxFixIterations = 1
+		fmt.Fprintf(os.Stderr, "asqs-core: discarded %d surviving test file(s) the verification still attributed; verifying the remaining %d once more…\n", len(extra), len(opts.ArtifactPaths))
+		again, aerr := evaluator.RunEvaluation(ctx, sandbox, opts, audit)
+		ok = aerr == nil && again.Stable
+		if audit != nil {
+			payload := map[string]interface{}{
+				"stable":             ok,
+				"survivor_discarded": extra,
+				"steps":              evaluator.StepSummary(again.StepResults),
+			}
+			if aerr != nil {
+				payload["error"] = aerr.Error()
+			}
+			if ok {
+				payload["message"] = fmt.Sprintf("Post-discard verification passed after discarding %d surviving artifact(s).", len(extra))
+				audit.Log(ctx, "pipeline.post_discard_verification_pass", payload)
+			} else {
+				payload["message"] = fmt.Sprintf("Post-discard verification failed again after discarding %d surviving artifact(s); the run is not stable and must not ship.", len(extra))
+				audit.LogError(ctx, "pipeline.post_discard_verification_fail", payload)
+			}
+		}
+	}
 	if !ok {
 		fmt.Fprintln(os.Stderr, "asqs-core: post-discard verification failed; the run is not stable.")
 	}
-	return ok
+	return ok, extra
+}
+
+// discardFailingSurvivors removes from disk the surviving artifacts the verification's last
+// failure attributes, when they are a strict, non-empty subset of the survivors. Returns the
+// paths removed.
+//
+// The asqs-go run of 2026-09-08 (api-a716cb7b25db5a880b4675a04b0b08c3): the unit discard went
+// green, the never-executed E2E survivors failed every repair round on a failure no spec edit could
+// fix, and six healthy unit files shipped nothing because the run was reported unstable. Those
+// survivors were the case the first discard exists for, one step later.
+//
+// The same gates as the first tier: the failing step must be one whose output names files (test,
+// E2E, compile); extended files are the repository's own and discard is os.Remove, so they are
+// never removed; and a failure naming every survivor leaves nothing to keep, so nothing is removed.
+func discardFailingSurvivors(ctx context.Context, opts evaluator.EvalOptions, results []evaluator.StepResult, audit evaluator.Auditor) []string {
+	var failing evaluator.StepResult
+	found := false
+	for i := len(results) - 1; i >= 0 && !found; i-- {
+		if results[i].OK {
+			continue
+		}
+		switch results[i].Step {
+		case evaluator.StepTest, evaluator.StepTestE2E, evaluator.StepCompile:
+			failing, found = results[i], true
+		default:
+			return nil
+		}
+	}
+	if !found || strings.TrimSpace(opts.RepoPath) == "" {
+		return nil
+	}
+	survivors := uniqueNormPaths(opts.ArtifactPaths)
+	if len(survivors) == 0 {
+		return nil
+	}
+	extended := make(map[string]bool, len(opts.ExtendedArtifactPaths))
+	for _, p := range opts.ExtendedArtifactPaths {
+		extended[normPath(p)] = true
+	}
+	attributed := uniqueNormPaths(evaluator.ParseFailingTestPaths(failing.Output, survivors))
+	var discard, protected []string
+	for _, p := range attributed {
+		if extended[p] {
+			protected = append(protected, p)
+			continue
+		}
+		discard = append(discard, p)
+	}
+	if len(discard) == 0 || len(attributed) >= len(survivors) {
+		if audit != nil {
+			why := "the failure output attributes no discardable surviving artifact"
+			if len(attributed) >= len(survivors) {
+				why = "every surviving artifact is failing, so there is nothing to keep"
+			}
+			audit.Log(ctx, "pipeline.post_discard_survivors_kept", map[string]interface{}{
+				"message":            fmt.Sprintf("No survivor discard after step %s failed: %s.", failing.Step, why),
+				"step":               string(failing.Step),
+				"survivors":          survivors,
+				"attributed":         attributed,
+				"protected_extended": protected,
+			})
+		}
+		return nil
+	}
+	var removed []string
+	for _, p := range discard {
+		if err := os.Remove(filepath.Join(opts.RepoPath, filepath.FromSlash(p))); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "asqs-core: discard %s: %v\n", p, err)
+			continue
+		}
+		removed = append(removed, p)
+	}
+	if len(removed) > 0 && audit != nil {
+		audit.Log(ctx, "pipeline.post_discard_survivors_discarded", map[string]interface{}{
+			"message": fmt.Sprintf("Post-discard repair is exhausted and step %s still attributes %d of %d surviving artifact(s); discarding them and verifying the rest once more (no repair).",
+				failing.Step, len(removed), len(survivors)),
+			"step":               string(failing.Step),
+			"paths":              removed,
+			"survivors":          len(survivors),
+			"protected_extended": protected,
+		})
+	}
+	return removed
+}
+
+// uniqueNormPaths normalizes paths and drops duplicates, order kept.
+func uniqueNormPaths(paths []string) []string {
+	seen := make(map[string]bool, len(paths))
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		n := normPath(p)
+		if n == "" || n == "." || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
 }
 
 // withoutDiscarded removes the discarded paths from an artifact list, comparing on the same

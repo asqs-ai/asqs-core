@@ -90,7 +90,7 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 		network = netRestore
 	}
 	fmt.Fprintf(os.Stderr, "[asqs-eval] step=%s phase=main argv=[%s] network=%s\n", label, strings.Join(argv, " "), network)
-	res, runErr := s.runDockerJob(ctx, abs, p, argv, network, dockerImageNeedsPlaywrightIPC(p.Image))
+	res, runErr := s.runDockerJobForStep(ctx, abs, p, argv, network, dockerImageNeedsPlaywrightIPC(p.Image), stepEval)
 	// Captured text is the source of every downstream parse (excerpt, discard attribution, scope
 	// narrowing, the fixer prompt); strip terminal colour once, here, so all of them see plain text.
 	out := errloc.StripANSI(res.CombinedOutput)
@@ -140,13 +140,25 @@ func (s *Sandbox) runDockerJob(ctx context.Context, hostWorkDir string, p profil
 	return s.runDockerJobWithTimeout(ctx, hostWorkDir, p, command, network, ipcHost, 0)
 }
 
+// runDockerJobForStep is runDockerJob plus the environment a specific evaluation step needs (see
+// jsStepExtraEnv). Restore, format and bootstrap jobs keep the plain profile environment.
+func (s *Sandbox) runDockerJobForStep(ctx context.Context, hostWorkDir string, p profile.ToolchainProfile, command []string, network string, ipcHost bool, step evaluator.SandboxStep) (jobrunner.JobResult, error) {
+	return s.runDockerJobWithTimeoutEnv(ctx, hostWorkDir, p, command, network, ipcHost, 0, jsStepExtraEnv(p.ID, step, TargetDocker))
+}
+
 // runDockerJobWithTimeout runs one docker job; if jobTimeout is 0, uses sandbox job timeout from config.
 func (s *Sandbox) runDockerJobWithTimeout(ctx context.Context, hostWorkDir string, p profile.ToolchainProfile, command []string, network string, ipcHost bool, jobTimeout time.Duration) (jobrunner.JobResult, error) {
+	return s.runDockerJobWithTimeoutEnv(ctx, hostWorkDir, p, command, network, ipcHost, jobTimeout, nil)
+}
+
+// runDockerJobWithTimeoutEnv is runDockerJobWithTimeout with extra environment entries appended
+// after the profile's own.
+func (s *Sandbox) runDockerJobWithTimeoutEnv(ctx context.Context, hostWorkDir string, p profile.ToolchainProfile, command []string, network string, ipcHost bool, jobTimeout time.Duration, extraEnv []string) (jobrunner.JobResult, error) {
 	t := s.jobTimeout()
 	if jobTimeout > 0 {
 		t = jobTimeout
 	}
-	env := dockerJobEnv(p, s.DockerEvalExtraEnv)
+	env := append(dockerJobEnv(p, s.DockerEvalExtraEnv), extraEnv...)
 	spec := jobrunner.JobSpec{
 		Image:          p.Image,
 		HostWorkDir:    hostWorkDir,
@@ -207,6 +219,38 @@ func baseStepEnv() []string { return []string{"CI=true", "NO_COLOR=1"} }
 // and the step planner so the plan cannot disagree with what the container actually receives.
 func dockerJobEnv(p profile.ToolchainProfile, extra []string) []string {
 	return stepEnv(p.ID, TargetDocker, extra)
+}
+
+// nodeUnhandledRejectionsFlag keeps a rejected promise nobody awaited from killing the whole Jest
+// process. Node 22 exits on such a rejection; in asqs-go run api-cfc3279416a7d8c7d2690799800c7647
+// one generated test did exactly that from round 3 on, so only one suite ever reported, and the
+// failures in two other suites surfaced only after a discard. With `warn` the rejection is logged
+// and the test's own assertions decide the verdict.
+const nodeUnhandledRejectionsFlag = "--unhandled-rejections=warn"
+
+// jsStepExtraEnv returns the environment a JS/TS test step needs beyond stepEnv: the Node flag
+// above on the test steps of the Node toolchains, nothing anywhere else. On the host the flag is
+// merged into whatever NODE_OPTIONS the operator already has, because a second NODE_OPTIONS entry
+// would shadow the first rather than combine with it.
+func jsStepExtraEnv(id profile.ToolchainID, step evaluator.SandboxStep, target Target) []string {
+	if step != evaluator.StepTest && step != evaluator.StepTestE2E {
+		return nil
+	}
+	switch id {
+	case profile.TypeScriptNPM, profile.TypeScriptPNPM, profile.TypeScriptYarn:
+	default:
+		return nil
+	}
+	value := nodeUnhandledRejectionsFlag
+	if target == TargetLocal {
+		if existing := strings.TrimSpace(os.Getenv("NODE_OPTIONS")); existing != "" {
+			if strings.Contains(existing, "--unhandled-rejections=") {
+				return nil // the operator decided; do not override
+			}
+			value = existing + " " + value
+		}
+	}
+	return []string{"NODE_OPTIONS=" + value}
 }
 
 func (s *Sandbox) dockerBin() string {
