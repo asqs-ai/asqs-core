@@ -75,3 +75,45 @@ func prepareGeneratedPlaywrightSpecs(ctx context.Context, repoAbs, lang, e2eFram
 		})
 	}
 }
+
+// refreshPlaywrightConfigAfterDiscard re-renders the ASQS-owned playwright.config.ts once discarded
+// artifacts are off disk, so testMatch describes the specs that remain.
+//
+// A discard changes the spec set exactly as generation does, and testMatch is derived from that set
+// — but nothing re-derived it. Run asqs-go run api-97ae558d51c11770e1fb82310419f5d8 ended there: the survivor
+// discard removed the two generated route specs and restored `e2e/smoke.e2e-spec.ts` to the
+// repository's own import-less body, while the config kept the `*.e2e-spec.*` pattern that
+// extraPlaywrightTestMatch had granted only because that file imported `@playwright/test` at the
+// time. The verification then loaded a file that cannot run and failed with "ReferenceError: test
+// is not defined", so a tree whose compile, unit tests and surviving smoke spec were green shipped
+// nothing.
+//
+// Only the config is rewritten. EnsurePlaywrightImport is deliberately NOT run here: adding the
+// import back to a file the discard just restored would undo the discard, which is the one thing
+// this must not do.
+func refreshPlaywrightConfigAfterDiscard(ctx context.Context, repoAbs, lang, e2eFramework string, audit runAuditor) {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "javascript", "typescript", "js", "ts":
+	default:
+		return
+	}
+	if !strings.EqualFold(strings.TrimSpace(e2eFramework), "playwright") {
+		return
+	}
+	rel, err := testbootstrap.RefreshPlaywrightConfig(repoAbs, lang)
+	if err != nil {
+		if audit != nil {
+			audit.LogError(ctx, "pipeline.post_discard_playwright_config_refresh", map[string]interface{}{
+				"message": "Could not re-render the ASQS-owned playwright.config.ts after the discard: " + err.Error(),
+				"error":   err.Error(),
+			})
+		}
+		return
+	}
+	if rel != "" && audit != nil {
+		audit.Log(ctx, "pipeline.post_discard_playwright_config_refresh", map[string]interface{}{
+			"message": fmt.Sprintf("Re-rendered %s after the discard so testMatch describes the specs still on disk; a discarded or restored spec no longer decides which files the E2E pass loads.", rel),
+			"path":    rel,
+		})
+	}
+}

@@ -31,7 +31,7 @@ func TestPlaywrightConfig_nestUsesStartScriptAndEntryPointPort(t *testing.T) {
 	for _, want := range []string{
 		"baseURL: 'http://localhost:3005'",
 		"webServer: {",
-		"command: 'npm run start'",
+		"command: 'npm run build && npm run start'",
 		"port: 3005,",
 		"env: { PORT: '3005' }",
 		"stdout: 'pipe'",
@@ -126,5 +126,96 @@ func TestE2EAppPort_reportsAPIServerPort(t *testing.T) {
 	})
 	if got := E2EAppPort(dir, "typescript"); got != 3100 {
 		t.Errorf("E2EAppPort = %d, want 3100", got)
+	}
+}
+
+// Run api-28d3ef973a77afb7cad1302c44181c0d: the E2E web server ran the repository's `start` script,
+// `node dist/main.js`, and died with "Cannot find module '/workspace/dist/main.js'" — the build
+// output is produced by the compile step, in a different container, and nothing about the E2E step
+// guarantees it is there. A start script that runs a build artifact therefore builds first.
+func TestPlaywrightConfig_apiServerBuildsBeforeStartingABuildArtifact(t *testing.T) {
+	dir := writePkg(t, map[string]string{
+		"package.json": `{"name":"n","scripts":{"build":"nest build","start":"node dist/main.js"},
+"dependencies":{"@nestjs/core":"^10.4.15"}}`,
+		"src/main.ts": "await app.listen(3000);\n",
+	})
+	if err := writePlaywrightConfig(dir, "typescript"); err != nil {
+		t.Fatalf("writePlaywrightConfig: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "playwright.config.ts"))
+	got := string(b)
+	if !strings.Contains(got, "command: 'npm run build && npm run start'") {
+		t.Errorf("want the build before the start:\n%s", got)
+	}
+	if !strings.Contains(got, "port: 3000,") {
+		t.Errorf("the port must be unchanged:\n%s", got)
+	}
+}
+
+// A start script that boots the app from source needs no build, and paying for one on every E2E
+// step would be waste.
+func TestPlaywrightConfig_apiServerStartsDirectlyWhenNoArtifactIsNeeded(t *testing.T) {
+	cases := map[string]string{
+		"nest start, build script present": `{"name":"n","scripts":{"build":"nest build","start":"nest start"},"dependencies":{"@nestjs/core":"^10.4.15"}}`,
+		"no build script at all":           `{"name":"n","scripts":{"start":"node dist/main.js"},"dependencies":{"@nestjs/core":"^10.4.15"}}`,
+		"ts-node entry":                    `{"name":"n","scripts":{"build":"tsc","start":"ts-node src/main.ts"},"dependencies":{"@nestjs/core":"^10.4.15"}}`,
+	}
+	for name, pkg := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := writePkg(t, map[string]string{"package.json": pkg, "src/main.ts": "await app.listen(3000);\n"})
+			if err := writePlaywrightConfig(dir, "typescript"); err != nil {
+				t.Fatal(err)
+			}
+			b, _ := os.ReadFile(filepath.Join(dir, "playwright.config.ts"))
+			got := string(b)
+			if !strings.Contains(got, "command: 'npm run start'") {
+				t.Errorf("want a plain start:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestPlaywrightConfig_apiServerBuildUsesThePackageManager(t *testing.T) {
+	dir := writePkg(t, map[string]string{
+		"package.json": `{"name":"n","scripts":{"build":"nest build","start":"node dist/main.js"},
+"dependencies":{"@nestjs/core":"^10.4.15"}}`,
+		"src/main.ts": "await app.listen(3000);\n",
+		"yarn.lock":   "",
+	})
+	if err := writePlaywrightConfig(dir, "typescript"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "playwright.config.ts"))
+	if !strings.Contains(string(b), "command: 'yarn build && yarn start'") {
+		t.Errorf("want the yarn spelling of both halves:\n%s", b)
+	}
+}
+
+// A front-end dev server is unaffected: it compiles as it serves.
+func TestPlaywrightConfig_devServerCommandGainsNoBuild(t *testing.T) {
+	dir := writePkg(t, map[string]string{"package.json": angularPkgJSON})
+	if err := writePlaywrightConfig(dir, "typescript"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "playwright.config.ts"))
+	if strings.Contains(string(b), "build &&") {
+		t.Errorf("a dev server must not build first:\n%s", b)
+	}
+}
+
+func TestStartScriptRunsBuildArtifact(t *testing.T) {
+	for script, want := range map[string]bool{
+		"node dist/main.js":                  true,
+		"node ./dist/src/main.js":            true,
+		"node build/server.js":               true,
+		"node -r dotenv/config dist/main.js": true,
+		"nest start":                         false,
+		"ts-node src/main.ts":                false,
+		"node src/server.js":                 false,
+		"":                                   false,
+	} {
+		if got := startScriptRunsBuildArtifact(script); got != want {
+			t.Errorf("startScriptRunsBuildArtifact(%q) = %v, want %v", script, got, want)
+		}
 	}
 }

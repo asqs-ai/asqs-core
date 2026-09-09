@@ -142,9 +142,22 @@ func detectNodeAPIServer(pkgDir string, pkg jsPackageJSON, det jsFrameworkDetect
 		return playwrightWebServer{}
 	}
 	pm := detectPackageManager(pkgDir)
-	cmd := string(pm) + " run start"
-	if pm == PMYarn {
-		cmd = "yarn start"
+	run := func(script string) string {
+		if pm == PMYarn {
+			return "yarn " + script
+		}
+		return string(pm) + " run " + script
+	}
+	cmd := run("start")
+	// A start script that runs a build artifact needs that artifact to exist. The E2E step runs in
+	// its own container and produces nothing itself, so it cannot inherit the compile step's output
+	// as a precondition: run api-28d3ef973a77afb7cad1302c44181c0d died with "Cannot find module
+	// '/workspace/dist/main.js'" although the compile step had reported success seconds earlier.
+	// Building here makes the web server self-sufficient. Only for this shape — a dev server
+	// compiles as it serves, and a start script that boots from source (`nest start`, `ts-node`)
+	// needs nothing built.
+	if strings.TrimSpace(pkg.Scripts["build"]) != "" && startScriptRunsBuildArtifact(pkg.Scripts["start"]) {
+		cmd = run("build") + " && " + cmd
 	}
 	return playwrightWebServer{Command: cmd, Port: port, API: true}
 }
@@ -187,6 +200,25 @@ func apiServerPort(pkgDir string, pkg jsPackageJSON) int {
 // startScriptEntryFileRE matches the file a `node` start script runs: `node dist/main.js`,
 // `node -r dotenv/config server.js`, `node ./index.js`.
 var startScriptEntryFileRE = regexp.MustCompile(`\bnode\b(?:\s+-\S+(?:\s+\S+)?)*\s+(\S+\.[cm]?[jt]s)\b`)
+
+// buildOutputDirs are the conventional emit directories; a start script that runs a file from one
+// of them depends on a build having happened.
+var buildOutputDirs = []string{"dist/", "build/", "out/", "lib/", ".output/"}
+
+// startScriptRunsBuildArtifact reports whether the start script executes a file that a build
+// produces, rather than booting the application from source.
+func startScriptRunsBuildArtifact(script string) bool {
+	entry := startScriptEntryFile(script)
+	if entry == "" {
+		return false
+	}
+	for _, d := range buildOutputDirs {
+		if strings.HasPrefix(entry, d) {
+			return true
+		}
+	}
+	return false
+}
 
 func startScriptEntryFile(script string) string {
 	m := startScriptEntryFileRE.FindStringSubmatch(script)

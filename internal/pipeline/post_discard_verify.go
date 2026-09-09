@@ -46,6 +46,9 @@ func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, op
 	opts.RepeatedTestFailureThreshold = -1
 	opts.ArtifactPaths = withoutDiscarded(opts.ArtifactPaths, discarded)
 	opts.ExtendedArtifactPaths = withoutDiscarded(opts.ExtendedArtifactPaths, discarded)
+	// The caller has just removed the discarded files, so testMatch no longer describes what is on
+	// disk; derive it again before this verification loads anything.
+	refreshPlaywrightConfigAfterDiscard(ctx, opts.RepoPath, opts.Lang, opts.E2EFramework, audit)
 
 	if audit != nil {
 		audit.Log(ctx, "pipeline.post_discard_verification_start", map[string]interface{}{
@@ -86,6 +89,9 @@ func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, op
 	// no repair.
 	extra := discardFailingSurvivors(ctx, opts, res.StepResults, audit)
 	if len(extra) > 0 {
+		// The spec set on disk just changed; testMatch has to be derived again before the
+		// verification loads anything.
+		refreshPlaywrightConfigAfterDiscard(ctx, opts.RepoPath, opts.Lang, opts.E2EFramework, audit)
 		opts.ArtifactPaths = withoutDiscarded(opts.ArtifactPaths, extra)
 		opts.ExtendedArtifactPaths = withoutDiscarded(opts.ExtendedArtifactPaths, extra)
 		opts.Fixer = nil

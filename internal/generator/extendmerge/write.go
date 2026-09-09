@@ -181,12 +181,25 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 				// A methods-only body for a NEW Java file has everything but its shell; the
 				// package and class name follow from the path. asqs-go run
 				// api-5a67a414d4ba22496fcc23e1143076fa dropped OrderService#createOrder here.
-				wrapped, declined, ok := wrapJavaMembersAsTestClass(g.Path, g.Content)
-				if !ok && strings.ToLower(filepath.Ext(g.Path)) == ".cs" {
+				//
+				// Only where the recovery exists. The wrap is Java and C# only, so on any other
+				// path its decline is a fact about the recovery ("not a .java file") rather than
+				// about the payload: asqs-go run api-fd5599a24f84dbe71e0c831b3266e4f4 refused a
+				// fenced .ts spec with that suffix attached, pointing the reader at a recovery
+				// nobody attempted.
+				var wrapped, declined string
+				ok := false
+				switch strings.ToLower(filepath.Ext(g.Path)) {
+				case ".java":
+					wrapped, declined, ok = wrapJavaMembersAsTestClass(g.Path, g.Content)
+				case ".cs":
 					wrapped, declined, ok = wrapCSharpMembersAsTestClass(g.Path, g.Content)
 				}
 				if !ok {
-					noteSkip(reason + "; wrap declined: " + declined)
+					if declined != "" {
+						reason += "; wrap declined: " + declined
+					}
+					noteSkip(reason)
 					continue
 				}
 				fmt.Fprintf(os.Stderr, "  wrapped methods-only payload into a test class: %s\n", g.Path)

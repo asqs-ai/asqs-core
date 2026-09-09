@@ -313,6 +313,14 @@ func primaryDiagnosticLocations(errorOutput string) [][]int {
 		if vendoredDiagnosticFrame(errorOutput, m) {
 			continue
 		}
+		// A frame in build output is a line no repair can touch: the file is generated from a
+		// source this run does not edit, and it is rewritten by the next build. They reach the
+		// failure text as soon as the application itself runs during the E2E pass — asqs-go run
+		// api-f246dd9ba0642ba07187f9207c44680a blamed `dist/main.js` from the web server's own
+		// stack trace while the spec that failed was cited four lines later.
+		if isBuildOutputPath(normalizePathForFix(errorOutput[m[2]:m[3]])) {
+			continue
+		}
 		out = append(out, m)
 	}
 	return out
