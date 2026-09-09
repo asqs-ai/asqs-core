@@ -161,6 +161,7 @@ func runJSBootstrap(ctx context.Context, repo string, cfg *config.TestFrameworkB
 			return fmt.Errorf("test_framework_bootstrap typescript: %w", terr)
 		}
 		filesChanged = append(filesChanged, tsconfigPatches...)
+		filesChanged = append(filesChanged, excludeBootstrapPathsFromBuild(ctx, audit, "test_bootstrap", repo, pkgDir, unitBuildExcludes)...)
 	}
 
 	unitSmoke, err := writeJSUnitSmokeTest(pkgDir, prof)

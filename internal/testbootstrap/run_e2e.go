@@ -240,6 +240,8 @@ func applyPlaywrightBootstrap(ctx context.Context, p E2EParams, audit Auditor, r
 		return fmt.Errorf("e2e_framework_bootstrap playwright smoke spec: %w", err)
 	}
 
+	buildExcluded := excludeBootstrapPathsFromBuild(ctx, audit, "e2e_bootstrap", repo, pkgDir, playwrightBuildExcludes)
+
 	npmWorkdir := npmInstallWorkdir(repo, pkgDir)
 	if err := e2eInstallAndVerify(ctx, p, audit, repo, npmWorkdir, cfg, ed, "playwright", func(vCtx context.Context) error {
 		vName, vArgs := playwrightVerifyArgs()
@@ -262,7 +264,7 @@ func applyPlaywrightBootstrap(ctx context.Context, p E2EParams, audit Auditor, r
 	pm := detectPackageManager(npmWorkdir)
 	logAudit(audit, ctx, "e2e_bootstrap.apply_ok", map[string]interface{}{
 		"message":         fmt.Sprintf("Playwright bootstrap complete (%s); package.json, playwright.config.ts, e2e/smoke.spec.ts, %s", string(pm), playwrightSupportRel),
-		"files_changed":   []string{"package.json", "playwright.config.ts", "e2e/smoke.spec.ts", playwrightSupportRel},
+		"files_changed":   append([]string{"package.json", "playwright.config.ts", "e2e/smoke.spec.ts", playwrightSupportRel}, buildExcluded...),
 		"package_manager": string(pm),
 		"stack":           "playwright",
 		"package_root":    relPathForBootstrap(repo, pkgDir),
@@ -305,6 +307,8 @@ func applyCypressBootstrap(ctx context.Context, p E2EParams, audit Auditor, repo
 		return fmt.Errorf("e2e_framework_bootstrap cypress spec: %w", err)
 	}
 
+	buildExcluded := excludeBootstrapPathsFromBuild(ctx, audit, "e2e_bootstrap", repo, pkgDir, cypressBuildExcludes)
+
 	npmWorkdir := npmInstallWorkdir(repo, pkgDir)
 	if err := e2eInstallAndVerify(ctx, p, audit, repo, npmWorkdir, cfg, ed, "cypress", func(vCtx context.Context) error {
 		vArgv := []string{"npx", "--yes", "cypress", "verify"}
@@ -326,7 +330,7 @@ func applyCypressBootstrap(ctx context.Context, p E2EParams, audit Auditor, repo
 	pm := detectPackageManager(npmWorkdir)
 	logAudit(audit, ctx, "e2e_bootstrap.apply_ok", map[string]interface{}{
 		"message":         fmt.Sprintf("Cypress bootstrap complete (%s); package.json, cypress.config.ts, cypress/e2e/", string(pm)),
-		"files_changed":   []string{"package.json", "cypress.config.ts", "cypress/e2e/smoke.cy.ts"},
+		"files_changed":   append([]string{"package.json", "cypress.config.ts", "cypress/e2e/smoke.cy.ts"}, buildExcluded...),
 		"package_manager": string(pm),
 		"stack":           "cypress",
 		"package_root":    relPathForBootstrap(repo, pkgDir),

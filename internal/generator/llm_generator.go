@@ -184,6 +184,12 @@ func (g *LLMGenerator) Generate(ctx context.Context, item *retrieval.TestPlanIte
 	// model had the right member and the wrong capitalisation, and a whole extra round to say so
 	// costs more than the substitution.
 	content = g.repairMemberCase(ctx, content, item, itemLang, isE2E)
+	// THEN the check for a member that does not exist at all (order as in asqs-go: the case
+	// repair settles one-character slips for free, the existence check spends a model turn).
+	content, path, err = g.retryInventedMembers(ctx, item, contextStr, content, path, itemLang, isE2E, runSinglePass)
+	if err != nil {
+		return "", "", err
+	}
 	if reason := lowValueGeneratedTestReason(item, isE2E, content); reason != "" {
 		retryUser := contextStr + "\n\n---\nQuality retry: your previous output was rejected because it produced low-value tests (" + reason + "). " +
 			"Replace reflection/existence/tautology checks with behavioral tests that invoke the production API and assert outcomes or verified mock interactions. " +
