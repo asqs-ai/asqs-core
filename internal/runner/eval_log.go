@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,7 +26,7 @@ import (
 // resolution on the other.
 
 // logEvalEnvOnce prints the evaluation environment once per run.
-func (s *Sandbox) logEvalEnvOnce(plan StepPlan, gitRootAbs string) {
+func (s *Sandbox) logEvalEnvOnce(ctx context.Context, plan StepPlan, gitRootAbs string) {
 	once := &s.runState().localEvalEnvOnce
 	if plan.Target == TargetDocker {
 		once = &s.runState().dockerEvalEnvOnce
@@ -53,12 +54,72 @@ func (s *Sandbox) logEvalEnvOnce(plan StepPlan, gitRootAbs string) {
 			planArgvDesc(plan, evaluator.StepCoverage))
 		fmt.Fprintf(os.Stderr, "  environment: %s\n", planEnvDesc(plan))
 
+		s.auditEvalPlan(ctx, plan, cwd)
+
 		if plan.Target == TargetDocker {
 			s.logDockerEvalEnvTail(plan, abs)
 			return
 		}
 		s.logLocalEvalEnvTail(cwd)
 	})
+}
+
+// auditEvalPlan mirrors the stderr block above into the audit log.
+//
+// Same facts, same StepPlan, different reader: stderr is the operator's terminal in the moment,
+// audit.log is what a post-mortem has weeks later. An asqs-go React run reported `compile ok` on
+// six consecutive rounds against a tree where `npm run build` fails in about a second, and the
+// audit could not answer the first question that verdict raises: what did the compile step run? A
+// skipped step and a passing step both surface as `evaluator.compile` with ok=true, and a config
+// override is invisible.
+//
+// Once per target per run (it shares logEvalEnvOnce's sync.Once), so a long fix loop adds one row
+// rather than one per round.
+func (s *Sandbox) auditEvalPlan(ctx context.Context, plan StepPlan, cwd string) {
+	if s.Audit == nil {
+		return
+	}
+	steps := make(map[string]interface{}, len(planSteps))
+	for _, step := range planSteps {
+		d := plan.DecisionFor(step)
+		entry := map[string]interface{}{"action": string(d.Action)}
+		if d.Action == ActionRun {
+			entry["argv"] = strings.Join(plan.ArgvFor(step), " ")
+		} else if d.Reason != "" {
+			entry["reason"] = d.Reason
+		}
+		steps[string(step)] = entry
+	}
+	payload := map[string]interface{}{
+		"message": fmt.Sprintf("Evaluation plan resolved (%s, %s): compile=[%s] test=[%s] coverage=[%s].",
+			plan.Target, plan.Lang,
+			planArgvDesc(plan, evaluator.StepCompile),
+			planArgvDesc(plan, evaluator.StepTest),
+			planArgvDesc(plan, evaluator.StepCoverage)),
+		"target":       string(plan.Target),
+		"lang":         plan.Lang,
+		"toolchain":    string(plan.Toolchain),
+		"build_tool":   strings.TrimSpace(s.BuildTool),
+		"workdir":      cwd,
+		"step_timeout": s.timeoutDuration().String(),
+		"restore_argv": strings.Join(plan.Restore, " "),
+		"steps":        steps,
+	}
+	if plan.Image != "" {
+		payload["image"] = plan.Image
+	}
+	if sub := strings.TrimSpace(s.EvalWorkSubpath); sub != "" {
+		payload["mono_repo_workspace"] = sub
+	}
+	// Only when set: an absent key reads as "no override", which is the common case and the one a
+	// reader should not have to distinguish from an empty string.
+	if v := strings.TrimSpace(s.CompileCommand); v != "" {
+		payload["compile_command_override"] = v
+	}
+	if v := strings.TrimSpace(s.TestCommand); v != "" {
+		payload["test_command_override"] = v
+	}
+	s.Audit.Log(ctx, "runner.eval_plan_resolved", payload)
 }
 
 // planArgvDesc renders a step's argv, or the reason it will not run. A skipped step has no argv,

@@ -3,7 +3,10 @@ package evaluator
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 )
 
 // Coverage-preserving gate for fixer writes.
@@ -139,26 +142,53 @@ func stripJavaImportLines(src string) string {
 	return b.String()
 }
 
-// testFilesWithNoRunnableTests returns the test files a jest run refused to execute because it
-// registered no test in them, keyed by normalized repo-relative path.
+// vitestZeroTestFileRE matches vitest's per-file summary line for a suite it executed no test
+// from:
 //
-// jest reports that as
+//	❯ src/app/AppLayout.test.tsx (0 test)
 //
-//	FAIL src/app/features/checkout/checkout.component.test.ts
-//	  ● Test suite failed to run
+// Anchored on the parenthesised count rather than on the `❯` marker, which vitest also prints on
+// stack frames. A suite that ran reads `(4 tests | 4 failed)` and cannot match.
+var vitestZeroTestFileRE = regexp.MustCompile(`(?:^|\s)(\S+)\s+\(0 tests?\)`)
+
+// testFilesWithNoRunnableTests returns the test files the runner executed no test from, keyed by
+// normalized repo-relative path.
 //
-//	    Your test suite must contain at least one test.
+// The coverage gate below counts `it(`/`test(` occurrences statically, and for such a file the
+// "before" count is a fiction: nothing in it ran, so a rewrite carrying fewer real tests is not a
+// regression, it is the repair. Rejecting it leaves the file to be discarded unexamined.
 //
-// and the ONLY path in that block is the FAIL header — no `path:line`. The coverage gate below
-// counts `it(`/`test(` occurrences statically, and for such a file the "before" count is a fiction:
-// the six matches it found in checkout.component.test.ts (run of 2026-09-03) were never run, so a
-// rewrite carrying five real tests is not a regression, it is the repair. Rejecting it (which the
-// gate did, in the only round that file was writable) left the file to be discarded unexamined.
+// Two dialects, because the runners disagree about how to say it and the gate is language-blind:
+//
+//   - jest prints a block whose ONLY path is the FAIL header — no `path:line`:
+//
+//     FAIL src/app/features/checkout/checkout.component.test.ts
+//     ● Test suite failed to run
+//
+//     Your test suite must contain at least one test.
+//
+//     The six matches the gate found in checkout.component.test.ts (run of 2026-09-03) were never
+//     run, and it was rejected in the only round that file was writable.
+//
+//   - vitest never prints that sentence. It scores the file `(0 test)` instead, which also covers
+//     the case jest has no equivalent for: a suite that failed to COLLECT. In run
+//     an asqs-go React run src/app/AppLayout.test.tsx died on
+//     `ReferenceError: src is not defined` before any test registered, so vitest reported
+//     `(0 test)` while the file still statically declared six. Understanding only jest's spelling,
+//     this returned an empty map on every vitest project, the waiver could not fire, and the gate
+//     refused the same 6 → 5 repair on six consecutive rounds across 91 minutes.
+//
+// ANSI is stripped first: both runners colour these lines, and both branches match on literal
+// prefixes that an escape code would hide.
 func testFilesWithNoRunnableTests(output string) map[string]bool {
 	out := map[string]bool{}
 	current := ""
-	for _, raw := range strings.Split(output, "\n") {
+	for _, raw := range strings.Split(errloc.StripANSI(output), "\n") {
 		line := strings.TrimSpace(raw)
+		if m := vitestZeroTestFileRE.FindStringSubmatch(line); m != nil {
+			out[normalizePathForFix(m[1])] = true
+			continue
+		}
 		switch {
 		case strings.HasPrefix(line, "FAIL "):
 			current = strings.TrimSpace(strings.TrimPrefix(line, "FAIL "))

@@ -40,7 +40,7 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	// An empty Image means the toolchain did not resolve, in which case every step is a skip and
 	// the pre-plan code did not log the env block either.
 	if plan.Image != "" {
-		s.logEvalEnvOnce(plan, abs)
+		s.logEvalEnvOnce(ctx, plan, abs)
 	}
 
 	switch dec := plan.DecisionFor(stepEval); dec.Action {

@@ -24,6 +24,17 @@ type Sandbox struct {
 	CompileCommand string
 	TestCommand    string
 
+	// Audit receives runner.eval_plan_resolved: the effective per-step argv and run/skip/fail
+	// decision, once per target per run. Optional — a caller that leaves it nil reads the same
+	// facts from the stderr block logEvalEnvOnce prints.
+	//
+	// The two are not the same artifact. An asqs-go React run reported `compile ok` on six
+	// consecutive rounds against a tree where `npm run build` fails in about a second, and nothing
+	// in the audit could say which command produced that verdict, whether config had overridden
+	// it, or whether the step ran at all — the block that knew went to a process stderr nobody
+	// kept.
+	Audit evaluator.Auditor
+
 	EvalProfile              string
 	DockerBinary             string
 	ImageJavaMaven           string

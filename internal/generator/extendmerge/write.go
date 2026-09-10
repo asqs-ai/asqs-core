@@ -138,6 +138,15 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 			fmt.Fprintf(os.Stderr, "  repaired %d illegal string escape(s) in %s: %s\n", len(repairs), g.Path, evaluator.DescribeEscapeRepairs(repairs))
 			g.Content = repaired
 		}
+		// The model sometimes opens the artifact with the artifact's own path, as if labelling a
+		// code block. Removed here, ahead of the gates, because the shape fails differently in
+		// every language and usefully in none: on Java it is a compile error above the type
+		// declaration, and on TypeScript nothing rejects it — the echo is valid TS — so it reaches
+		// disk and vitest cannot collect the suite. One deleted line answers both.
+		if repaired, stripped := evaluator.StripLeadingPathEcho(g.Path, g.Content); stripped {
+			fmt.Fprintf(os.Stderr, "  removed the leading path echo from %s\n", g.Path)
+			g.Content = repaired
+		}
 		full := filepath.Join(repoRoot, filepath.FromSlash(g.Path))
 		if g.ExtendExisting {
 			if _, err := os.Stat(full); err != nil && os.IsNotExist(err) {

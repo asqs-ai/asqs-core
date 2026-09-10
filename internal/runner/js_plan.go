@@ -105,6 +105,19 @@ func (s *Sandbox) jsStepScript(plan *StepPlan, meta jsPackageMeta, step evaluato
 		if step == evaluator.StepCompile && meta.BuildRunsStartOrInstall && isPlainBuildInvocation(line) {
 			return "", skipStep(jsBuildRunsStartSkipReason)
 		}
+		// The test override must not become the COVERAGE command on a package that declares no
+		// coverage script. It is the same test invocation, so it cannot produce a report — the
+		// skip below says exactly that — and running it here re-runs the whole unit suite for
+		// nothing. An asqs-go NestJS run resolved test and coverage to the identical
+		// `npm run test:asqs`: the test step passed five times, then the coverage step ran the same
+		// command, failed, and put coverage=fail on an otherwise green run.
+		//
+		// The Java planner already behaves this way — its JaCoCo skip returns before
+		// profileArgvForStep, so an override never reaches a coverage step that has no report to
+		// produce. This gives the JS planner the same guard rather than a new rule.
+		if step == evaluator.StepCoverage && firstPresentScript(meta, jsCoverageScriptNames) == "" {
+			return "", skipStep(jsNoCoverageScriptSkipReason)
+		}
 		return line, runStep()
 	}
 	pm := meta.PackageManager
@@ -148,12 +161,17 @@ func (s *Sandbox) jsStepScript(plan *StepPlan, meta jsPackageMeta, step evaluato
 		}
 		// Same reasoning as the Java JaCoCo gate: with no coverage script the only thing left to
 		// run is the unit suite, which the test step already ran and which produces no report.
-		return "", skipStep("skip (no coverage script declared in package.json)")
+		return "", skipStep(jsNoCoverageScriptSkipReason)
 	}
 	return "", skipStep("skip")
 }
 
 const jsBuildRunsStartSkipReason = "skip (build script runs start/install; it would not compile)"
+
+// jsNoCoverageScriptSkipReason is shared by the two places that reach it: the default coverage
+// resolution and the test-override branch above, which must not turn the unit suite into a
+// coverage run just because a test_command is configured.
+const jsNoCoverageScriptSkipReason = "skip (no coverage script declared in package.json)"
 
 // isPlainBuildInvocation reports whether a configured compile command is just "<pm> run build".
 func isPlainBuildInvocation(line string) bool {

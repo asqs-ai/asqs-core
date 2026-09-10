@@ -1087,12 +1087,36 @@ func isObviousPassSummaryLine(line string) bool {
 	return false
 }
 
-// testOutputWithoutPassLines drops lines that only report passing suites/files. Remaining text is used for
-// path and basename matching against artifactPaths.
+// runnerStreamBannerRE matches the header vitest prints above whatever a test wrote to stdout or
+// stderr:
+//
+//	stderr | src/pages/HomePage.test.tsx > HomePage > should render the home page
+//	stdout | src/pages/OrdersPage.test.tsx
+//
+// The line names the file the output came FROM and says nothing about whether it passed — vitest
+// prints it for green and red files alike — so it belongs out of the path-matching corpus for the
+// same reason the `✓ file` line does.
+//
+// Left in place, it is the ONLY surviving mention of a passing noisy file once
+// isObviousPassSummaryLine has dropped that file's `✓` line, and ParseFailingTestPaths' path
+// containment check then matches it: an asqs-go run attributed src/pages/HomePage.test.tsx — 3
+// tests, all green — to a router.test.tsx failure on the strength of one React Router deprecation
+// warning, and deleted it. A file that genuinely failed is still named by its `❯ … | n failed`
+// line and its FAIL header, so nothing is lost by dropping the banner.
+var runnerStreamBannerRE = regexp.MustCompile(`^(?:stderr|stdout)\s*\|\s`)
+
+// isRunnerStreamBannerLine is true for a vitest stdout/stderr banner (see runnerStreamBannerRE).
+func isRunnerStreamBannerLine(line string) bool {
+	return runnerStreamBannerRE.MatchString(strings.TrimSpace(line))
+}
+
+// testOutputWithoutPassLines drops lines that name a file without reporting a failure in it —
+// passing-suite summaries and runner stdout/stderr banners. Remaining text is used for path and
+// basename matching against artifactPaths.
 func testOutputWithoutPassLines(testOutput string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(testOutput, "\n") {
-		if isObviousPassSummaryLine(line) {
+		if isObviousPassSummaryLine(line) || isRunnerStreamBannerLine(line) {
 			continue
 		}
 		b.WriteString(line)
@@ -1442,6 +1466,11 @@ type FixLoopState struct {
 	bestMagnitude    int
 	magnitudeKnown   bool
 	noProgressStreak int
+	// stalledWriteStreak counts consecutive rounds whose writes ALL came back to
+	// byte-identical diagnostics — the evidence stalledFiles already computes for
+	// evaluator.fix_file_no_progress, which until now reached the model's prompt and the
+	// audit and nothing else. See FixLoopStalledWritesStopThreshold.
+	stalledWriteStreak int
 	// attempts is the compacted memory of rounds already completed for this step. It lives here
 	// rather than in the Fixer because llmfix's conversation retention cannot hold a real fix
 	// prompt (141-147k runes against a 64k budget upstream measured), so raw multi-turn history is
@@ -1495,6 +1524,26 @@ const FixLoopRecurrenceStopThreshold = 2
 // backstop for the pure moving-target case where every attempt produces a *different* error (so neither
 // the consecutive-streak nor the recurrence detector fires) yet the build never gets closer to green.
 const FixLoopNoProgressStopThreshold = 5
+
+// FixLoopStalledWritesStopThreshold is the number of consecutive rounds whose writes all left the
+// diagnostics for the written files byte-identical before the loop gives up.
+//
+// The gap the other three cannot cover. A fixer that rewrites one file to no effect every round
+// shifts the line numbers in the diagnostics, so the consecutive-identical breaker never matches
+// two rounds and the oscillation breaker never sees a signature reappear; the magnitude breaker
+// does advance, but it is the coarsest and slowest of the three. Meanwhile the round LOOKS
+// productive — a file was written every time.
+//
+// Three, not two: the fixer's context-hygiene escalation fires at
+// FixAttemptAutoEscalationThreshold, and a breaker that stops on the second report retires the
+// loop before the escalated prompt shape — its one remaining idea — has been tried. Three reports
+// means a full-context round, an escalated round, and the per-file stall named to the model in
+// between, all of which moved nothing.
+//
+// A package constant rather than a config-backed threshold like its three siblings: this breaker
+// reads a direct observation ("the write changed no diagnostic") rather than a heuristic, so there
+// is no calibration for a deployment to do.
+const FixLoopStalledWritesStopThreshold = 3
 
 // fixLoopDiagnosticLineRe matches lines that carry a compiler/test diagnostic across the languages the
 // evaluator drives (javac/Maven, Gradle, dotnet/MSBuild, tsc, Jest/JUnit/Mockito). It is deliberately
@@ -1603,6 +1652,8 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 		tripReason, effectiveThreshold = FixSkipLoopOscillation, opts.recurrenceStopThreshold()
 	case loopState.noProgressStreak >= opts.noProgressStopThreshold():
 		tripReason, effectiveThreshold = FixSkipLoopNoProgress, opts.noProgressStopThreshold()
+	case loopState.stalledWriteStreak >= FixLoopStalledWritesStopThreshold:
+		tripReason, effectiveThreshold = FixSkipLoopWritesStalled, FixLoopStalledWritesStopThreshold
 	}
 	if tripReason == "" {
 		loopState.enforcementPending = false
@@ -1635,6 +1686,8 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 		switch tripReason {
 		case FixSkipLoopOscillation:
 			msg = fmt.Sprintf("Fix loop oscillating: previously-seen error signatures reappeared %d time(s) for step %s (the fixer is cycling through the same error states). Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.recurrences, step, maxAttempts-*attemptCounter, maxAttempts)
+		case FixSkipLoopWritesStalled:
+			msg = fmt.Sprintf("Fix loop writing to no effect: on %d consecutive round(s) for step %s, every file the fixer wrote came back with byte-identical diagnostics. The edits are landing and changing nothing the compiler can see. Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.stalledWriteStreak, step, maxAttempts-*attemptCounter, maxAttempts)
 		case FixSkipLoopNoProgress:
 			msg = fmt.Sprintf("Fix loop not converging: error magnitude failed to improve for %d consecutive attempt(s) on step %s (best=%d, current=%d) — each fix swaps one error for another. Skipping further fix attempts so the remaining %d of %d attempts are not burned.", loopState.noProgressStreak, step, loopState.bestMagnitude, mag, maxAttempts-*attemptCounter, maxAttempts)
 		default:
@@ -1652,6 +1705,7 @@ func checkFixLoopBreakers(ctx context.Context, opts EvalOptions, step SandboxSte
 			"streak":                 loopState.streak,
 			"recurrences":            loopState.recurrences,
 			"no_progress_streak":     loopState.noProgressStreak,
+			"stalled_write_streak":   loopState.stalledWriteStreak,
 			"error_magnitude":        mag,
 			"best_error_magnitude":   loopState.bestMagnitude,
 			"threshold":              effectiveThreshold,
@@ -2521,6 +2575,9 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 		// Remembered for the next round's widening decision (shouldWidenScope).
 		loopState.lastRoundNarrowed = scopeNarrowed
 		nowDiagnostics := FileDiagnostics(errorOutput)
+		// A round that produced no candidate write is not a stalled write; the streak resets and
+		// the other breakers own that case. Set unconditionally so it survives the n == 0 path.
+		priorRoundStalled := false
 		if n := len(loopState.attempts); n > 0 {
 			prev := loopState.attempts[n-1]
 			written := make([]string, 0, len(prev.Changes))
@@ -2529,6 +2586,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 			sort.Strings(written)
 			if stalled := stalledFiles(loopState.lastFileDiagnostics, nowDiagnostics, written); len(stalled) > 0 {
+				// Only the TOTAL case counts towards the breaker: a round that repaired one file
+				// and left another alone is ordinary progress, and the per-file prompt hint below
+				// is the right response to it. stalledFiles returns nil when either diagnostic map
+				// is empty, so an empty or unparseable failure output can never read as a stall.
+				priorRoundStalled = len(stalled) == len(written)
 				noteFileNoProgress(loopState, stalled)
 				if audit != nil {
 					audit.Log(ctx, "evaluator.fix_file_no_progress", map[string]interface{}{
@@ -2541,6 +2603,11 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 					})
 				}
 			}
+		}
+		if priorRoundStalled {
+			loopState.stalledWriteStreak++
+		} else {
+			loopState.stalledWriteStreak = 0
 		}
 		loopState.lastFileDiagnostics = nowDiagnostics
 	}
@@ -2813,6 +2880,22 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			}
 			skippedPaths[relClean] = "not a writable artifact path in this round's scope"
 			continue
+		}
+		// A reply that opens with the file's own path is labelling a code block whose fence it did
+		// not write. Removed before any gate reads the content: the shape is valid TypeScript (a
+		// chain of divisions over undeclared identifiers), so nothing downstream refuses it and it
+		// lands, breaking the file the round was repairing — vitest then cannot collect the suite
+		// and reports it as `(0 test)`. Ahead of the empty check too, so a reply that is ONLY the
+		// echo is reported as empty rather than written.
+		if repaired, stripped := StripLeadingPathEcho(relClean, content); stripped {
+			content = repaired
+			if audit != nil {
+				audit.Log(ctx, "evaluator.fix_path_echo_stripped", map[string]interface{}{
+					"message": fmt.Sprintf("LLM fix for %s opened with the file's own path; the line was removed before the content gates.", relClean),
+					"path":    relClean,
+					"step":    step,
+				})
+			}
 		}
 		if strings.TrimSpace(content) == "" {
 			if audit != nil {

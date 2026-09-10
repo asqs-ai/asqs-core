@@ -500,7 +500,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	fixMode, fixReason := effectiveToolMode(fixLoop, fixReason, fixTools != nil)
 	auditFixerToolMode(ctx, audit, fixMode,
 		appendStructuredDeferralNote(fixReason, trackedFixer, !cfg.Runner.DisableStructuredFixOutput))
-	sandbox := runner.NewSandboxFromConfig(cfg)
+	sandbox := newEvalSandbox(cfg, audit)
 	maxFix := orDefault(cfg.Runner.StartMaxIteration, 3)
 
 	// Formatting: format generated tests post-generate and after each LLM fix so they satisfy the

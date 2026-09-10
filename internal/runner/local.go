@@ -370,7 +370,7 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 	if err != nil {
 		return evaluator.StepResult{Step: step, OK: false, Summary: err.Error()}
 	}
-	s.logEvalEnvOnce(plan, gitRootAbs)
+	s.logEvalEnvOnce(ctx, plan, gitRootAbs)
 	if plan.Toolchain == profile.CSharpDotnet {
 		// Said before the restore that would otherwise fail with NU1301 and no stated cause.
 		s.warnLocalNuGetCredentialProviderMissing()

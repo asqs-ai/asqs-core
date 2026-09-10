@@ -110,9 +110,12 @@ const (
 	// previously-seen error signatures reappeared 2 time(s)" on one line and a generic
 	// "fix_loop_repeat" on the next — two names for one event, and the name an operator sees was
 	// not the breaker they would need to tune. All three remain terminal.
-	FixSkipLoopRepeat          = "fix_loop_repeat"
-	FixSkipLoopOscillation     = "fix_loop_oscillation"
-	FixSkipLoopNoProgress      = "fix_loop_no_progress"
+	FixSkipLoopRepeat      = "fix_loop_repeat"
+	FixSkipLoopOscillation = "fix_loop_oscillation"
+	FixSkipLoopNoProgress  = "fix_loop_no_progress"
+	// FixSkipLoopWritesStalled is the fourth: every file the fixer wrote came back to
+	// byte-identical diagnostics, on enough consecutive rounds to rule out coincidence.
+	FixSkipLoopWritesStalled   = "fix_loop_writes_stalled"
 	FixSkipNoWritableArtifacts = "no_writable_artifacts"
 	FixSkipNoAcceptedWrites    = "no_accepted_writes"
 	// FixSkipTestOutsideWritableScope: the test step failed, but its output attributes the failure
@@ -143,7 +146,7 @@ const (
 // can propose something the gates accept.
 func IsTerminalFixSkip(reason string) bool {
 	switch reason {
-	case FixSkipLoopRepeat, FixSkipLoopOscillation, FixSkipLoopNoProgress, FixSkipNoWritableArtifacts, FixSkipPrimarySiteNeverTouched:
+	case FixSkipLoopRepeat, FixSkipLoopOscillation, FixSkipLoopNoProgress, FixSkipLoopWritesStalled, FixSkipNoWritableArtifacts, FixSkipPrimarySiteNeverTouched:
 		return true
 	default:
 		return false

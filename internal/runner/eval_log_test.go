@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -44,7 +45,7 @@ func TestLogEvalEnvOnce_sharedCoreOnBothTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := captureRunnerStderr(t, func() { sb.logEvalEnvOnce(plan, dir) })
+	out := captureRunnerStderr(t, func() { sb.logEvalEnvOnce(context.Background(), plan, dir) })
 
 	for _, want := range []string{
 		"[asqs-eval] evaluation runner: type=local",
@@ -72,7 +73,7 @@ func TestLogEvalEnvOnce_sharedCoreOnBothTargets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dout := captureRunnerStderr(t, func() { dsb.logEvalEnvOnce(dplan, dir) })
+	dout := captureRunnerStderr(t, func() { dsb.logEvalEnvOnce(context.Background(), dplan, dir) })
 	for _, want := range []string{
 		"[asqs-eval] evaluation runner: type=docker",
 		"lang=java", "toolchain=java-maven", "effective_argv:", "CI=true",
@@ -101,8 +102,8 @@ func TestLogEvalEnvOnce_OnlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := captureRunnerStderr(t, func() {
-		sb.logEvalEnvOnce(plan, dir)
-		sb.logEvalEnvOnce(plan, dir)
+		sb.logEvalEnvOnce(context.Background(), plan, dir)
+		sb.logEvalEnvOnce(context.Background(), plan, dir)
 	})
 	if n := strings.Count(out, "evaluation runner: type=local"); n != 1 {
 		t.Errorf("env block printed %d times, want 1", n)
