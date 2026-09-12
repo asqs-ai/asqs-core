@@ -1017,9 +1017,35 @@ func findInsertLineAboveAnnotations(lines []string, declarationLine1Based int) i
 	return insertLine
 }
 
+// isAnnotationLine reports whether a line decorates the declaration below it rather than being part
+// of it — a Java annotation or a C# attribute.
+//
+// Documentation belongs ABOVE the decorations. C# attributes were not recognised, so an XML doc
+// comment landed between `[Fact]` and the method it documents: legal, but it reads as documenting
+// nothing, and a second pass would not find it where it looks for existing docs.
+//
+// `[assembly: …]` is excluded because it decorates the ASSEMBLY, not whatever follows it — treating
+// it as a declaration's decoration would push a doc comment above a file-level attribute and attach
+// it to the wrong thing. A continuation line of a wrapped attribute list counts too: an attribute
+// argument list spans lines routinely.
 func isAnnotationLine(s string) bool {
 	s = strings.TrimSpace(s)
-	return len(s) > 0 && s[0] == '@'
+	if s == "" {
+		return false
+	}
+	if s[0] == '@' {
+		return true
+	}
+	if s[0] != '[' {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, target := range []string{"[assembly:", "[module:"} {
+		if strings.HasPrefix(lower, target) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasExistingDocAbove reports whether the symbol at insertLine1Based already has a doc comment
@@ -1160,6 +1186,10 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 		// An OpenAPI or Swagger document declares routes no C# source states — a spec-first
 		// project's controllers are generated, and the spec is the only place the contract lives.
 		indexer.MergeOpenAPISpecFilesIntoMap(repoAbs, parsed)
+		// Razor pages, MVC views and Blazor components: the route a page answers at, the controls
+		// a test can address, and the text it can assert on. None of it is in a .cs file, so a
+		// generated UI test had no selector to use and no URL to navigate to, and invented both.
+		indexer.MergeCSharpMarkupIntoMap(repoAbs, parsed)
 		// Markup reaches indexing too. A Razor page or Blazor component is where a UI surface's
 		// routes, its rendered text and its test hooks live, and IndexablePaths built from the
 		// PARSED map alone could never contain one: the Roslyn indexer reads .cs and nothing else,

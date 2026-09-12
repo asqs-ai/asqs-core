@@ -120,6 +120,17 @@ type EvalOptions struct {
 	E2ETestCommand string
 	// E2EFramework: JS/TS playwright|cypress; Java playwright-java|selenium|selenide; C# playwright-dotnet|selenium.
 	E2EFramework string
+	// E2ESurface is what an E2E test can drive: none, api, ui or mixed.
+	//
+	// It decides whether the C# E2E pass needs the application RUNNING. A browser test does, and
+	// Playwright .NET has no webServer block to start one — so ASQS starts it and exports
+	// ASQS_BASE_URL. An api surface does not: WebApplicationFactory hosts the application inside
+	// the test process, and starting a second copy would only contend for a port.
+	//
+	// Empty means "not detected", which is treated as possibly having a UI: the surface is a
+	// refinement, and refusing to start the application because nobody detected one would break
+	// exactly the case this exists for.
+	E2ESurface string
 	// RunE2ETestPass when true: after the unit test step succeeds, run a second test step (JS/TS, Java, C# when enabled).
 	RunE2ETestPass bool
 	// RepeatedTestFailureThreshold: after this many consecutive evaluation iterations with the same failing generated test fingerprint (unit or E2E), stop the fix loop early. 0 = default 5; negative = disabled. See EvalWorkflowResult.EarlyExitDiscardPaths.
@@ -595,7 +606,13 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 		if opts.RunE2ETestPass && dualE2EPassSupportedLang(opts.Lang) {
 			e2eCmd := resolveE2ETestCommand(opts)
 			if strings.TrimSpace(e2eCmd) != "" {
+				// A browser-driven C# E2E pass needs the application RUNNING, and Playwright .NET
+				// has no webServer block to start one. Without this a generated
+				// page.GotoAsync(baseUrl) has no URL: the test fails on an empty variable, which
+				// says nothing about the application and which no fix round can repair.
+				restoreEnv := applyCSharpE2EAppServerEnv(ctx, opts, audit)
 				testE2E := RunTestE2E(ctx, runner, opts, e2eCmd)
+				restoreEnv()
 				testE2E.Step = StepTestE2E
 				if testE2E.Summary != "" && !strings.HasPrefix(strings.ToLower(testE2E.Summary), "e2e") {
 					testE2E.Summary = "e2e: " + testE2E.Summary

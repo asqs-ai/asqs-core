@@ -190,6 +190,22 @@ var csharpInferredUsings = map[string]string{
 	"List<": "System.Collections.Generic", "Dictionary<": "System.Collections.Generic", "IEnumerable<": "System.Collections.Generic", "IList<": "System.Collections.Generic",
 	".ToList()": "System.Linq", ".Select(": "System.Linq", ".Where(": "System.Linq", ".Any(": "System.Linq", ".First(": "System.Linq", ".Count()": "System.Linq",
 	"Exception": "System", "Console.": "System", "DateTime": "System", "Guid.": "System", "Guid ": "System", "TimeSpan": "System",
+	// The libraries a .NET test reaches for once it stops being a pure unit test. Every one of
+	// these was missing, so a recovered fragment using them compiled to CS0246 and the round that
+	// wrote it spent its budget on an import the table already knew how to supply.
+	".Should()": "FluentAssertions", "Substitute.For<": "NSubstitute", "A.Fake<": "FakeItEasy",
+	"WebApplicationFactory<": "Microsoft.AspNetCore.Mvc.Testing",
+	"TestServer":             "Microsoft.AspNetCore.TestHost",
+	"HttpClient":             "System.Net.Http",
+	"GetFromJsonAsync":       "System.Net.Http.Json", "PostAsJsonAsync": "System.Net.Http.Json",
+	"JsonSerializer.":         "System.Text.Json",
+	"DbContextOptionsBuilder": "Microsoft.EntityFrameworkCore", "UseInMemoryDatabase(": "Microsoft.EntityFrameworkCore",
+	".ToListAsync()":    "Microsoft.EntityFrameworkCore",
+	"ServiceCollection": "Microsoft.Extensions.DependencyInjection",
+	"AddScoped<":        "Microsoft.Extensions.DependencyInjection", "GetRequiredService<": "Microsoft.Extensions.DependencyInjection",
+	"NullLogger": "Microsoft.Extensions.Logging.Abstractions", "ILogger<": "Microsoft.Extensions.Logging",
+	"File.ReadAllText(": "System.IO", "Path.Combine(": "System.IO", "Stream": "System.IO",
+	"IPage": "Microsoft.Playwright", "PageTest": "Microsoft.Playwright.NUnit",
 }
 
 // inferredImportsFor returns the imports in table whose token appears in body, minus those already

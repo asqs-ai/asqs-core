@@ -194,8 +194,12 @@ func Apply(ctx context.Context, repoRoot string, plan Plan, opts Options, before
 			continue
 		}
 		switch t.Kind {
-		case "html":
-			out := ApplyHTML(string(raw), FilePrefix(t.Rel), opts.MaxPerFile)
+		case "html", "razor":
+			apply := ApplyHTML
+			if t.Kind == "razor" {
+				apply = ApplyRazor
+			}
+			out := apply(string(raw), FilePrefix(t.Rel), opts.MaxPerFile)
 			if !out.Changed {
 				res.Unchanged = append(res.Unchanged, t.Rel)
 				continue

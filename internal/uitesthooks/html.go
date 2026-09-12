@@ -45,10 +45,17 @@ type HTMLResult struct {
 // The first hookable element in the file is the root. Idempotent: elements that already carry a
 // hook are skipped, so a second run returns Changed=false.
 func ApplyHTML(source, prefix string, maxPerFile int) HTMLResult {
+	return applyMarkupHooks(source, prefix, maxPerFile, nil)
+}
+
+// applyMarkupHooks is the shared element scan. extraProtected names byte ranges the caller knows
+// must not be edited — for Razor, its own comment syntax and its C# blocks, neither of which an
+// HTML scanner can see.
+func applyMarkupHooks(source, prefix string, maxPerFile int, extraProtected [][]int) HTMLResult {
 	if maxPerFile <= 0 {
 		maxPerFile = DefaultMaxPerFile
 	}
-	comments := htmlCommentRE.FindAllStringIndex(source, -1)
+	comments := append(htmlCommentRE.FindAllStringIndex(source, -1), extraProtected...)
 	inComment := func(pos int) bool {
 		for _, c := range comments {
 			if pos >= c[0] && pos < c[1] {

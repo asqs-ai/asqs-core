@@ -78,18 +78,30 @@ func TestabilityScore(sym *metadata.Symbol, outboundCalls int, branchIntents []s
 	return score
 }
 
-// signatureArity counts declared parameters from signature_json's "signature" text. Returns 0 when
-// the signature is absent or has no parameter list — a conservative default, since over-counting
-// would inflate the score of symbols we know least about.
+// signatureArity counts a callable's declared parameters. Returns 0 when nothing says — a
+// conservative default, since over-counting would inflate the score of the symbols we know least
+// about.
+//
+// The structured `params` list is preferred where an indexer writes one, because counting commas in
+// a signature's text is a parse of a parse: a default value containing a comma, a tuple type, an
+// attribute on a parameter each cost it accuracy the structured list does not have. The text
+// remains the fallback for the indexers that emit no list.
 func signatureArity(sym *metadata.Symbol) int {
 	if sym == nil || len(sym.SignatureJSON) == 0 {
 		return 0
 	}
 	var parsed struct {
 		Signature string `json:"signature"`
+		Params    *[]struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"params"`
 	}
 	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil {
 		return 0
+	}
+	if parsed.Params != nil {
+		return len(*parsed.Params)
 	}
 	sig := strings.TrimSpace(parsed.Signature)
 	open := strings.Index(sig, "(")
@@ -220,7 +232,10 @@ func gapEligibility(sym *metadata.Symbol, enclosing *metadata.Symbol, outboundCa
 		if span <= 1 && outboundCalls == 0 {
 			return false, IneligibleNoBody
 		}
-		if isTrivialAccessorName(sym.FQName) && span <= 3 && outboundCalls == 0 {
+		// Arity is what separates an accessor from a calculation that happens to be named like one.
+		// `GetTotal()` returns a field; `GetTotal(int qty, decimal unit)` computes something, and
+		// excluding it would drop exactly the method worth a test.
+		if isTrivialAccessorName(sym.FQName) && span <= 3 && outboundCalls == 0 && signatureArity(sym) == 0 {
 			return false, IneligibleTrivialAccessor
 		}
 	}
@@ -301,8 +316,14 @@ func isTrivialAccessorName(fqName string) bool {
 	} else if i := strings.LastIndex(name, "."); i >= 0 {
 		name = name[i+1:]
 	}
+	// Matched case-insensitively on the PREFIX and strictly on the boundary. C# names members in
+	// PascalCase — GetTotal, IsEmpty, HasLines — and `strings.HasPrefix("GetTotal", "get")` is
+	// false, so every C# accessor read as a normal method and competed for plan budget with the
+	// code actually worth testing. The capital after the prefix is what keeps `Setup`, `Issue` and
+	// `Hash` out.
+	lower := strings.ToLower(name)
 	for _, p := range []string{"get", "set", "is", "has"} {
-		if len(name) > len(p) && strings.HasPrefix(name, p) {
+		if len(name) > len(p) && strings.HasPrefix(lower, p) {
 			r := rune(name[len(p)])
 			if r >= 'A' && r <= 'Z' {
 				return true

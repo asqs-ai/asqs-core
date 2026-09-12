@@ -174,7 +174,10 @@ func Retrieve(ctx context.Context, meta MetaReader, chunks ChunkReader, req Cont
 	// Config is ranked by PATH PROXIMITY, not vector distance: application-test.yml shares almost no
 	// vocabulary with a service method body, so cosine between them is noise.
 	out.Config = configChunksByPathProximity(ctx, chunks, targetChunk, req.RepoID, req.Lang,
-		[]string{"config", "context", "spring", "test-config"}, req.MaxConfigChunks)
+		[]string{
+			"config", "context", "spring", "test-config",
+			"appsettings", "startup", "program", "hostbuilder", "application.",
+		}, req.MaxConfigChunks)
 	annotateChunkGroupProvenance(out.Config, "config", "configuration/DI/runtime context likely needed for wiring")
 
 	applyFailureLocalizedRetrieval(out, req.FailureHint)

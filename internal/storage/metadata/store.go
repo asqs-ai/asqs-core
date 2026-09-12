@@ -434,14 +434,15 @@ func (s *Store) ListSymbolsByTypeSimpleName(ctx context.Context, repoID, simpleN
 		FROM symbols
 		WHERE repo_id = $3
 		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
-		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1)
+		  AND (fq_name = $1 OR fq_name LIKE '%.' || $1
+		       OR fq_name LIKE $1 || '<%' OR fq_name LIKE '%.' || $1 || '<%')
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`
 	if s.hasSimpleNameColumn(ctx) {
 		query = `
 		SELECT id, lang, kind, fq_name, file, start_line, end_line, start_column, end_column, signature_json, in_degree, out_degree, in_degree_non_test
 		FROM symbols
-		WHERE repo_id = $3 AND simple_name = $1
+		WHERE repo_id = $3 AND (simple_name = $1 OR simple_name LIKE $1 || '<%')
 		  AND lower(kind) IN ('class','interface','struct','record','enum','type','type_alias','object')
 		ORDER BY length(fq_name), fq_name
 		LIMIT $2`

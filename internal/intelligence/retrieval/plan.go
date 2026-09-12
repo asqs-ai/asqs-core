@@ -112,6 +112,11 @@ type PlanOptions struct {
 	// a repo of getters still produces a plan rather than an empty run. Raise it to make the
 	// planner abstain on genuinely untestable candidates.
 	MinGapTestabilityScore int
+	// RepoPath is the repository's absolute path on disk. Optional: it is used only where a fact
+	// lives in the working tree rather than in the index — currently the C# test project's
+	// ProjectReference closure, which decides whether a symbol is reachable from a test at all.
+	// Empty means "do not apply rules that need the tree", never "nothing is reachable".
+	RepoPath string
 	// RetrievalProfileE2E selects retrieval profile for E2E items. Empty in PlanOptions is unusual (orchestrator sets DefaultRetrievalProfileE2E: http_api for Java/C#, e2e_playwright for JS/TS when config omits both profile fields).
 	RetrievalProfileE2E string
 	// E2EFramework is the detected stack for audit/context hints (playwright, cypress, playwright-java, playwright-dotnet, selenium, …).
@@ -204,10 +209,16 @@ func symbolQueryLangs(lang string) []string {
 	return []string{langid.Canonical(lang)}
 }
 
-// isPrivateJavaMethod returns true if the symbol is a Java method with visibility "private" (from signature_json).
-// We do not generate tests for private members; only public (and protected) API.
-func isPrivateJavaMethod(sym *metadata.Symbol) bool {
-	if sym == nil || sym.Lang != "java" || sym.Kind != "method" || len(sym.SignatureJSON) == 0 {
+// isPrivateMethod reports whether a symbol is a private member, from the `visibility` its indexer
+// stored. A test cannot call one, so proposing it as a gap spends the budget on something that
+// cannot be closed.
+//
+// The gate read `sym.Lang != "java"` and answered false for every other language. C# stores the
+// same key and always has, so a private C# method was proposed and the generated test could not
+// reach it — the loop then spent its rounds discovering that, which is not a thing any round can
+// fix. A language that stores no visibility answers false, which is the old behaviour for it.
+func isPrivateMethod(sym *metadata.Symbol) bool {
+	if sym == nil || sym.Kind != "method" || len(sym.SignatureJSON) == 0 {
 		return false
 	}
 	var parsed struct {
@@ -217,6 +228,25 @@ func isPrivateJavaMethod(sym *metadata.Symbol) bool {
 		return false
 	}
 	return strings.TrimSpace(strings.ToLower(parsed.Visibility)) == "private"
+}
+
+// symbolParamCount returns how many parameters a callable declares, or -1 when the indexer did not
+// record them. Absent and zero are different claims: "takes nothing" is a fact about the method,
+// "not recorded" is a fact about the index.
+func symbolParamCount(sym *metadata.Symbol) int {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return -1
+	}
+	var parsed struct {
+		Params *[]struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil || parsed.Params == nil {
+		return -1
+	}
+	return len(*parsed.Params)
 }
 
 // ListGaps returns a small set of test-gap candidates: public methods (or functions for JS/TS) with no tests, optionally
@@ -277,6 +307,7 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	var allSymbols []*metadata.Symbol
 	// For JS/TS, query both "javascript" and "typescript" so we get all symbols (indexer may store .ts as "typescript", .js as "javascript"; legacy data may be "javascript" only).
 	langsToQuery := symbolQueryLangs(opts.Lang)
+	reachable := csharpReachableFilter(opts)
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {
@@ -286,6 +317,9 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 			}
 			for _, s := range symbols {
 				if s == nil || seenID[s.ID] {
+					continue
+				}
+				if !reachable.allows(s.File) {
 					continue
 				}
 				if indexer.IsTypeScriptDeclarationPath(s.File) {
@@ -309,7 +343,7 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	for _, sym := range allSymbols {
 		sym := sym
 		g.Go(func() error {
-			if isPrivateJavaMethod(sym) {
+			if isPrivateMethod(sym) {
 				return nil
 			}
 			if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {

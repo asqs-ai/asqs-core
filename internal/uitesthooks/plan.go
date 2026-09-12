@@ -93,6 +93,10 @@ func targetKind(rel string, opts Options) string {
 		return "jsx"
 	case opts.Templates && strings.HasSuffix(base, ".component.html"):
 		return "html"
+	case opts.Templates && RazorFileIsHookable(rel):
+		// Razor pages, MVC views and Blazor components. Gated on the same Templates option the
+		// Angular templates are: both edit a file in the APPLICATION rather than a test.
+		return "razor"
 	}
 	return ""
 }

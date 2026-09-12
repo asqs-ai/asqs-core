@@ -13,33 +13,34 @@ import (
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
+// The language gate is gone: any indexer that stores `visibility` is read.
 func TestIsPrivateJavaMethod(t *testing.T) {
-	t.Run("nil_or_non_java", func(t *testing.T) {
-		if isPrivateJavaMethod(nil) {
+	t.Run("nil_or_unreadable", func(t *testing.T) {
+		if isPrivateMethod(nil) {
 			t.Error("nil: want false")
 		}
-		if isPrivateJavaMethod(&metadata.Symbol{Lang: "csharp", Kind: "method"}) {
+		if isPrivateMethod(&metadata.Symbol{Lang: "csharp", Kind: "method"}) {
 			t.Error("csharp: want false")
 		}
-		if isPrivateJavaMethod(&metadata.Symbol{Lang: "java", Kind: "class"}) {
+		if isPrivateMethod(&metadata.Symbol{Lang: "java", Kind: "class"}) {
 			t.Error("java class: want false")
 		}
 	})
 	t.Run("private", func(t *testing.T) {
 		sym := &metadata.Symbol{Lang: "java", Kind: "method", SignatureJSON: []byte(`{"signature":"void run()","visibility":"private"}`)}
-		if !isPrivateJavaMethod(sym) {
+		if !isPrivateMethod(sym) {
 			t.Error("private method: want true")
 		}
 	})
 	t.Run("public", func(t *testing.T) {
 		sym := &metadata.Symbol{Lang: "java", Kind: "method", SignatureJSON: []byte(`{"signature":"void run()","visibility":"public"}`)}
-		if isPrivateJavaMethod(sym) {
+		if isPrivateMethod(sym) {
 			t.Error("public method: want false")
 		}
 	})
 	t.Run("no_visibility_in_json", func(t *testing.T) {
 		sym := &metadata.Symbol{Lang: "java", Kind: "method", SignatureJSON: []byte(`{"signature":"void run()"}`)}
-		if isPrivateJavaMethod(sym) {
+		if isPrivateMethod(sym) {
 			t.Error("no visibility: want false")
 		}
 	})

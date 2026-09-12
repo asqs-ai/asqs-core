@@ -31,7 +31,9 @@ const uiSelectorHookKind = "UI_TEST_HOOK"
 // hooks read from JSX attributes (enrichers-jsx-hooks.ts), which live in the .tsx/.jsx file's own
 // symbol list. Querying only "html" is why a React repository's inventory was empty in asqs-go run
 // api-9f854a955e0110668e02fec8d45198a5 and the generator guessed selectors.
-var uiSelectorHookLangs = []string{"html", "typescript", "javascript"}
+// csharp joins the list because the Razor enricher stores a `.cshtml`/`.razor` file's hooks under
+// that language: markup a C# run indexes is C#'s, the way JSX hooks are TypeScript's.
+var uiSelectorHookLangs = []string{"html", "typescript", "javascript", "csharp"}
 
 // Caps on the rendered block. A repository with hundreds of data-testid attributes must not push
 // the retrieved context out of the prompt; the inventory is an aid, not the payload.
@@ -62,7 +64,7 @@ func (g *LLMGenerator) uiSelectorInventory(ctx context.Context, lang string, isE
 	if !isE2E || g.UISelectors == nil || strings.TrimSpace(g.RepoID) == "" {
 		return ""
 	}
-	if !isJSTSLangForSelectors(lang) {
+	if !langSupportsUISelectorInventory(lang) {
 		return ""
 	}
 	g.uiSelectorOnce.Do(func() {
@@ -297,4 +299,19 @@ type uiSelectorState struct {
 	// property of the repository, identical for every gap in the run.
 	e2eBackendOnce  sync.Once
 	e2eBackendBlock string
+}
+
+// langSupportsUISelectorInventory reports whether a run's language has a UI whose selectors this
+// can inventory.
+//
+// C# joins JS/TS now that Razor Pages, MVC views and Blazor components are indexed. The gate is not
+// on the SURFACE: an application with no UI simply has no UI_TEST_HOOK symbols, so the inventory is
+// empty and the block renders as "" — checking the surface as well would add a way to be wrong
+// about a question the data already answers.
+func langSupportsUISelectorInventory(lang string) bool {
+	switch strings.ToLower(strings.TrimSpace(lang)) {
+	case "javascript", "typescript", "js", "ts", "csharp", "cs":
+		return true
+	}
+	return false
 }
