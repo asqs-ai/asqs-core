@@ -411,7 +411,11 @@ func RenderSurfaces(surfaces []TypeSurface) string {
 			// an annotation arrives — @WebMvcTest and @LocalServerPort have no members worth
 			// showing, and the fully-qualified name is the entire fact the model is missing.
 			b.WriteString(fmt.Sprintf("--- %s ---\n", s.FQCN))
-			b.WriteString(fmt.Sprintf("  (import %s — this is the correct package for this type in THIS project)\n\n", s.FQCN))
+			hint := strings.TrimSpace(s.ImportHint)
+			if hint == "" {
+				hint = "import " + s.FQCN
+			}
+			b.WriteString(fmt.Sprintf("  (%s — this is the correct package for this type in THIS project)\n\n", hint))
 			continue
 		}
 		origin := ""
@@ -419,6 +423,11 @@ func RenderSurfaces(surfaces []TypeSurface) string {
 			origin = " [" + s.Origin + "]"
 		}
 		b.WriteString(fmt.Sprintf("--- %s%s ---\n", s.FQCN, origin))
+		// A resolved SIMPLE name carries its import line even when members are shown: the model
+		// asked about `Assert`, and knowing which `Assert` is half the answer.
+		if hint := strings.TrimSpace(s.ImportHint); hint != "" {
+			b.WriteString("  " + hint + "\n")
+		}
 		for _, m := range s.Members {
 			b.WriteString("  " + m + "\n")
 		}

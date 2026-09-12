@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -84,6 +85,14 @@ func (p *CSharpProvider) Lookup(ctx context.Context, repoPath string, targets []
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
+		// A BARE name is the whole reason KindSymbol exists: the diagnostic says
+		// `'Assert' does not contain a definition for 'Equl'`, and the model's problem is that it
+		// does not know the namespace. Resolving it needs a simple-name index rather than the
+		// assembly-narrowed path a dotted name takes.
+		if t.Kind == KindSymbol && !strings.Contains(t.Name, ".") {
+			out = append(out, p.resolveBareSymbol(ctx, docs, t)...)
+			continue
+		}
 		members, origin := p.membersOf(ctx, docs, t.Name)
 		if len(members) == 0 {
 			continue
@@ -124,18 +133,26 @@ func (p *CSharpProvider) membersOf(ctx context.Context, docs []string, typeName 
 // Microsoft.Playwright.ILocatorAssertions does not read every XML file in a large package cache.
 func (p *CSharpProvider) candidateDocFiles(ctx context.Context, repoPath string, targets []Target) []string {
 	wanted := map[string]bool{}
+	anyBareName := false
 	for _, t := range targets {
 		// Microsoft.Playwright.ILocatorAssertions -> the doc file is Microsoft.Playwright.xml, but
 		// an assembly may be any prefix of the namespace, so match on prefix rather than equality.
 		if i := strings.LastIndex(t.Name, "."); i > 0 {
 			wanted[strings.ToLower(t.Name[:i])] = true
+			continue
 		}
+		// A bare name carries no namespace to narrow by — which is the whole reason it needs
+		// resolving. Narrowing by namespace therefore matched nothing and every bare-name lookup
+		// ended in "no NuGet XML documentation found".
+		anyBareName = true
 	}
 	var out []string
 	seen := map[string]bool{}
 	add := func(path string) bool {
 		base := strings.ToLower(strings.TrimSuffix(filepath.Base(path), ".xml"))
-		match := false
+		// With a bare name in the batch every assembly is a candidate; maxDocFileScan is what keeps
+		// that from turning a prompt step into a disk crawl.
+		match := anyBareName
 		for ns := range wanted {
 			if ns == base || strings.HasPrefix(ns, base+".") || strings.HasPrefix(base, ns) {
 				match = true
@@ -234,6 +251,11 @@ func (p *CSharpProvider) parseDocFile(path string) (map[string][]string, error) 
 	}
 
 	p.mu.Lock()
+	if p.cache == nil {
+		// A zero-value CSharpProvider is a shape callers can construct — the type is exported — and
+		// writing to its nil cache panicked. A prompt-building step must degrade, not crash.
+		p.cache = map[string]map[string][]string{}
+	}
 	p.cache[path] = byType
 	p.mu.Unlock()
 	return byType, nil
@@ -374,4 +396,68 @@ func simpleDocName(t string) string {
 		return t[i+1:]
 	}
 	return t
+}
+
+// resolveBareSymbol maps a simple type name to every fully-qualified type that declares it.
+//
+// Several candidates are ALL returned rather than one picked: `Assert` is a real type in both
+// Xunit and NUnit.Framework, and silently choosing is how a model ends up with a using line for the
+// framework this project does not reference. Ambiguity is a fact the prompt can state.
+//
+// Ordering is deterministic (by FQCN) so two runs on the same repository render the same prompt.
+func (p *CSharpProvider) resolveBareSymbol(ctx context.Context, docs []string, t Target) []TypeSurface {
+	type candidate struct {
+		fqcn    string
+		members []string
+		origin  string
+	}
+	var found []candidate
+	seen := map[string]bool{}
+	for _, doc := range docs {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		byType, err := p.parseDocFile(doc)
+		if err != nil {
+			continue
+		}
+		for fq, members := range byType {
+			if simpleTypeNameOf(fq) != t.Name || seen[fq] {
+				continue
+			}
+			seen[fq] = true
+			found = append(found, candidate{fqcn: fq, members: members, origin: filepath.Base(doc)})
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].fqcn < found[j].fqcn })
+
+	out := make([]TypeSurface, 0, len(found))
+	for _, c := range found {
+		if len(out) >= maxBareSymbolCandidates {
+			break
+		}
+		s := NewTypeSurface(c.fqcn, c.members, t.Member, c.origin)
+		// The namespace, not the type, is what a using directive names.
+		if i := strings.LastIndex(c.fqcn, "."); i > 0 {
+			s.ImportHint = "using " + c.fqcn[:i] + ";"
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// maxBareSymbolCandidates bounds how many types one simple name may offer. A name that matches more
+// than a handful of types is not a resolution, it is noise — and the prompt budget is finite.
+const maxBareSymbolCandidates = 4
+
+// simpleTypeNameOf returns the last dotted segment, which is how a compiler prints a type name in a
+// diagnostic. Nested types use `+` in documentation IDs, so that separator counts too.
+func simpleTypeNameOf(fq string) string {
+	if i := strings.LastIndexAny(fq, ".+"); i >= 0 {
+		return fq[i+1:]
+	}
+	return fq
 }

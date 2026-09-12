@@ -49,8 +49,13 @@ func TestRepoDeclaredSimpleNames_collectsEverySourceRoot(t *testing.T) {
 func TestRepoDeclaredSimpleNames_refusesToTestifyWhenItCannot(t *testing.T) {
 	full := javaSourceRepo(t, "src/main/java/org/example/Vet.java")
 
-	if _, ok := RepoDeclaredSimpleNames(LangCSharp, full); ok {
-		t.Error("C# sources live anywhere under the repo; the scan cannot answer for them")
+	// C# used to answer false here for the same reason TS/JS still does. It now walks the source
+	// itself, so the honest assertion is that a repo with no C# in it yields an empty set, not that
+	// the question is unanswerable.
+	if names, ok := RepoDeclaredSimpleNames(LangCSharp, full); !ok {
+		t.Error("C# can answer from source; the walk reported unsupported")
+	} else if len(names) != 0 {
+		t.Errorf("a Java-only repository declared C# types: %v", names)
 	}
 	if _, ok := RepoDeclaredSimpleNames(LangNode, full); ok {
 		t.Error("TS/JS module names are not filenames; the scan cannot answer for them")

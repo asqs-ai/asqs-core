@@ -36,6 +36,10 @@ func ResolveMissingTypeFiles(raw, repoRoot, lang string, limit int) []string {
 	}
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "java", "kotlin", "kt":
+	case "csharp", "cs":
+		// C# resolves by walking the repository's own sources: there is no path-to-namespace
+		// convention to key on the way src/main/java gives Java one.
+		return csharpMissingTypeFiles(raw, repoRoot, limit)
 	default:
 		return nil
 	}
