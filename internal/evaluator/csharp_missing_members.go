@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/dotnetproj"
@@ -87,14 +86,6 @@ var (
 	reCSharpConstructorArity = regexp.MustCompile(
 		`'([A-Za-z_][A-Za-z0-9_.<>]*)' does not contain a constructor that takes`)
 
-	// Members worth offering as call targets: public and internal, never private. Offering a
-	// private member would send the next round into a compile error of a different kind.
-	reCSharpPublicMember = regexp.MustCompile(
-		`(?m)^\s*(?:public|internal|protected internal)\s+(?:static\s+|virtual\s+|override\s+|sealed\s+|async\s+|readonly\s+|required\s+)*(?:[\w.<>\[\],?]+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:[({=;]|=>)`)
-
-	// Enum members are bare identifiers in a comma-separated body, with no modifier to key on.
-	reCSharpEnumBody = regexp.MustCompile(`(?s)\benum\s+[A-Za-z_][A-Za-z0-9_]*[^{]*\{(.*?)\}`)
-
 	// A constructor declaration: a public member whose name equals the type's and which is followed
 	// by a parameter list with no return type of its own.
 	reCSharpCtorParams = `(?m)^\s*(?:public|internal|protected internal|protected)\s+%s\s*\(([^)]*)\)`
@@ -172,48 +163,13 @@ func csharpConstructorFact(typeName, path, body string) string {
 	return b.String()
 }
 
-// csharpDeclaredMemberNames lists the members a caller may actually use: public and internal
-// methods, properties and fields, plus enum members. Private members are excluded on purpose —
-// offering one would trade CS1061 for CS0122.
+// csharpDeclaredMemberNames lists the members a caller may actually use on a repo-owned type.
+//
+// It delegates to dotnetproj so the fixer and the generator's invented-member gate read the same
+// declarations. They used to be two scans of the same source: a member the generator allowed and
+// the fixer then called absent would have put the loop into an argument with itself.
 func csharpDeclaredMemberNames(typeName, body string) []string {
-	src := dotnetproj.StripCSharpCommentsAndStrings(body)
-
-	if m := reCSharpEnumBody.FindStringSubmatch(src); len(m) > 1 && strings.Contains(src, "enum "+typeName) {
-		var out []string
-		for _, part := range strings.Split(m[1], ",") {
-			name := strings.TrimSpace(part)
-			if i := strings.Index(name, "="); i >= 0 {
-				name = strings.TrimSpace(name[:i])
-			}
-			if name != "" {
-				out = append(out, name)
-			}
-		}
-		return out
-	}
-
-	seen := map[string]bool{}
-	var out []string
-	for _, m := range reCSharpPublicMember.FindAllStringSubmatch(src, -1) {
-		name := strings.TrimSpace(m[1])
-		switch {
-		case name == "" || seen[name]:
-			continue
-		case name == typeName:
-			continue // the constructor; described by its own fact
-		case csharpTypeKeywords[name]:
-			continue // `public class Foo` — the declaration line, not a member
-		}
-		seen[name] = true
-		out = append(out, name)
-	}
-	sort.Strings(out)
-	return out
-}
-
-var csharpTypeKeywords = map[string]bool{
-	"class": true, "struct": true, "interface": true, "enum": true, "record": true,
-	"delegate": true, "event": true, "const": true,
+	return dotnetproj.DeclaredMemberNames(typeName, body)
 }
 
 // auditMissingMemberFacts records the C# facts on the same event the Java path uses, so a

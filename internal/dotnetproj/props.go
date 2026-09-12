@@ -47,6 +47,11 @@ type Facts struct {
 	CPMPath string
 
 	packages map[string]string // lower-cased package id -> version ("" = referenced, version unknown)
+	// packageNames maps the same lower-cased key back to the id AS WRITTEN. NuGet ids are matched
+	// case-insensitively, which is why the lookup key is folded — but the id is also the namespace
+	// a `using` names, and `using moq;` does not compile. Rendering the folded key into a prompt
+	// would be teaching the model a spelling that fails.
+	packageNames map[string]string
 }
 
 var (
@@ -81,11 +86,12 @@ func ResolveFacts(repoRoot, csprojAbs string) (Facts, error) {
 	projectXML := StripXMLComments(string(body))
 
 	f := Facts{
-		ProjectPath: csprojAbs,
-		SDK:         SDKName(projectXML),
-		IsWebSDK:    IsWebSDK(projectXML),
-		IsSDKStyle:  IsSDKStyle(projectXML),
-		packages:    map[string]string{},
+		ProjectPath:  csprojAbs,
+		SDK:          SDKName(projectXML),
+		IsWebSDK:     IsWebSDK(projectXML),
+		IsSDKStyle:   IsSDKStyle(projectXML),
+		packages:     map[string]string{},
+		packageNames: map[string]string{},
 	}
 
 	// MSBuild's import order, which is what the effective value actually depends on:
@@ -248,6 +254,12 @@ func (f *Facts) readPackageReferences(xml string) {
 			if prev, ok := f.packages[key]; !ok || version != "" || prev == "" {
 				f.packages[key] = version
 			}
+			if f.packageNames == nil {
+				f.packageNames = map[string]string{}
+			}
+			if _, seen := f.packageNames[key]; !seen {
+				f.packageNames[key] = id
+			}
 		}
 	}
 }
@@ -347,10 +359,15 @@ func (f Facts) ReferencesAnyPackage(ids ...string) (string, bool) {
 	return "", false
 }
 
-// PackageIDs returns every referenced package id, lower-cased, for rendering a dependency block.
+// PackageIDs returns every referenced package id as the project spells it, for rendering a
+// dependency block. Lookups stay case-insensitive; only the rendering is faithful.
 func (f Facts) PackageIDs() []string {
 	out := make([]string, 0, len(f.packages))
 	for id := range f.packages {
+		if name, ok := f.packageNames[id]; ok && name != "" {
+			out = append(out, name)
+			continue
+		}
 		out = append(out, id)
 	}
 	return out

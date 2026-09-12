@@ -422,7 +422,7 @@ func (p *CSharpProvider) resolveBareSymbol(ctx context.Context, docs []string, t
 			continue
 		}
 		for fq, members := range byType {
-			if simpleTypeNameOf(fq) != t.Name || seen[fq] {
+			if !csharpBareNameMatches(fq, t.Name) || seen[fq] {
 				continue
 			}
 			seen[fq] = true
@@ -455,6 +455,27 @@ const maxBareSymbolCandidates = 4
 
 // simpleTypeNameOf returns the last dotted segment, which is how a compiler prints a type name in a
 // diagnostic. Nested types use `+` in documentation IDs, so that separator counts too.
+// csharpBareNameMatches reports whether a documented type is the one a bare name refers to.
+//
+// Two C# spelling conventions stand between the name a model writes and the name in a doc ID, and
+// both of them made the exact-match comparison resolve nothing:
+//
+//   - An attribute is applied without its suffix. `[Fact]` is the FactAttribute type, and the doc
+//     file only ever says FactAttribute. The framework list exists to tell the model which
+//     namespace an attribute lives in, so this convention was load-bearing for all of it.
+//   - A generic type carries its arity. `Mock<T>` is documented as Mock`1, and neither the bare
+//     name nor the written form is that string.
+//
+// The suffix rule only ADDS a spelling: a name given in full still matches itself, so a repository
+// that declares both Foo and FooAttribute resolves each under its own name.
+func csharpBareNameMatches(fq, want string) bool {
+	simple := simpleTypeNameOf(fq)
+	if i := strings.IndexByte(simple, '`'); i >= 0 {
+		simple = simple[:i] // Mock`1 -> Mock
+	}
+	return simple == want || simple == want+"Attribute"
+}
+
 func simpleTypeNameOf(fq string) string {
 	if i := strings.LastIndexAny(fq, ".+"); i >= 0 {
 		return fq[i+1:]

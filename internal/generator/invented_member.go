@@ -93,6 +93,12 @@ func (g *LLMGenerator) inventedMemberReason(ctx context.Context, content, itemLa
 		if g.APISurface != nil {
 			add(apisurface.UnresolvedDependencyReason(ctx, g.APISurface, g.RepoPath, content))
 		}
+	case apisurface.LangCSharp:
+		// The same claim, bounded harder: C# has extension methods, partial classes and base types
+		// that live in packages, and each of those makes a member reachable without the receiver's
+		// own declaration showing it. The gate stays silent wherever it cannot see the whole set.
+		add(apisurface.RepoInventedMemberReasonCS(g.RepoPath, content))
+		add(apisurface.CSharpUnresolvedRepoUsingReason(g.RepoPath, content))
 	case apisurface.LangNode:
 		// Repo classes reached through relative imports: typed calls, jest.spyOn names and the
 		// keys of mocks shaped against the class (`useValue: { create: jest.fn() }`), which tsc

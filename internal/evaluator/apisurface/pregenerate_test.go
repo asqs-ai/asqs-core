@@ -14,8 +14,10 @@ func TestPregenerateTargets_scope(t *testing.T) {
 		isE2E     bool
 		wantCount int
 	}{
-		// Three independent groups. Java carries 5 framework-annotation symbols on EVERY gap
-		// (the Boot 3 -> Boot 4 package moves); Playwright E2E adds the assertion types —
+		// Three independent groups. Java carries 5 framework-type symbols on EVERY gap (the Boot 3
+		// -> Boot 4 package moves) and C# carries 10 (three competing runners' attributes, the
+		// xUnit v3 ITestOutputHelper move, and the fixture types a .NET test constructs);
+		// Playwright E2E adds the assertion types —
 		// 4 for Java and .NET (static factory + three assertion types), 3 for TypeScript
 		// (expect() is a function, so there is no factory type), and Java adds a fifth, AssertJ's
 		// Assertions, because the Playwright four cannot assert on a plain value and the block
@@ -29,9 +31,9 @@ func TestPregenerateTargets_scope(t *testing.T) {
 		{name: "java unit gap keeps the annotations", lang: "java", framework: "playwright", isE2E: false, wantCount: 5},
 		{name: "java unit gap with no framework", lang: "java", framework: "", isE2E: false, wantCount: 5},
 		{name: "cypress java keeps annotations, drops assertions", lang: "java", framework: "cypress", isE2E: true, wantCount: 5},
-		{name: "csharp", lang: "csharp", framework: "playwright-dotnet", isE2E: true, wantCount: 4 + 4 + 2},
-		{name: "csharp cs alias", lang: "cs", framework: "playwright", isE2E: true, wantCount: 4 + 4 + 2},
-		{name: "csharp unit gap has no annotation group", lang: "csharp", framework: "playwright", isE2E: false, wantCount: 0},
+		{name: "csharp", lang: "csharp", framework: "playwright-dotnet", isE2E: true, wantCount: 10 + 4 + 4 + 2},
+		{name: "csharp cs alias", lang: "cs", framework: "playwright", isE2E: true, wantCount: 10 + 4 + 4 + 2},
+		{name: "csharp unit gap keeps the framework types", lang: "csharp", framework: "playwright", isE2E: false, wantCount: 10},
 		{name: "typescript", lang: "typescript", framework: "playwright", isE2E: true, wantCount: 3 + 2},
 		{name: "javascript alias", lang: "js", framework: "playwright", isE2E: true, wantCount: 3 + 2},
 		{name: "unknown language is out of scope", lang: "python", framework: "playwright", isE2E: true, wantCount: 0},
@@ -240,14 +242,28 @@ func TestPregenerateTargets_coversSpringBootPackageMoves(t *testing.T) {
 	}
 }
 
-// The annotation group is Java-only: .NET and TypeScript have no equivalent stale-package problem
-// in this codebase's evidence, and adding speculative targets would spend lookup budget for nothing.
-func TestPregenerateTargets_annotationsAreJavaOnly(t *testing.T) {
-	for _, lang := range []string{"csharp", "typescript", "python"} {
+// The framework-type group is for languages where a test type's NAMESPACE is the thing the model
+// gets wrong. Java and C# both qualify — C# on the evidence that a repository picks one runner of
+// three and that xUnit v3 moved ITestOutputHelper out of Xunit.Abstractions. TypeScript and Python
+// have no such list in this codebase's evidence, and speculative targets there would spend lookup
+// budget for nothing.
+func TestPregenerateTargets_frameworkTypesOnlyWhereTheNamespaceIsTheUnknown(t *testing.T) {
+	for _, lang := range []string{"typescript", "python"} {
 		for _, tgt := range PregenerateTargets(lang, "playwright", false) {
 			if tgt.Kind == KindSymbol {
-				t.Errorf("%s: unexpected annotation target %+v", lang, tgt)
+				t.Errorf("%s: unexpected framework-type target %+v", lang, tgt)
 			}
 		}
+	}
+	// C#'s targets are resolved by simple name for the same reason Java's are: a fully-qualified
+	// target would be asserting the namespace this list exists to discover.
+	sawSymbol := false
+	for _, tgt := range PregenerateTargets("csharp", "playwright", false) {
+		if tgt.Kind == KindSymbol {
+			sawSymbol = true
+		}
+	}
+	if !sawSymbol {
+		t.Error("csharp resolved no framework type by simple name")
 	}
 }
