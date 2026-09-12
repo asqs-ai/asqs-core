@@ -322,7 +322,7 @@ func detectCSharpFramework(repo, fallbackTFM string) (csharpFrameworkDetection, 
 		}
 	}
 
-	det.TargetFramework = inferCSharpTestTFM(prod, fallbackTFM)
+	det.TargetFramework = inferCSharpTestTFM(repo, prod, fallbackTFM)
 	det.NetMajor = netMajorFromTFM(det.TargetFramework)
 
 	sort.Strings(prod)

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
@@ -43,11 +44,6 @@ func dotnetRepoRelDepth(repo, absPath string) int {
 		return 0
 	}
 	return strings.Count(rel, string(filepath.Separator))
-}
-
-func isSdkStyleCsprojContent(content string) bool {
-	s := strings.ToLower(content)
-	return strings.Contains(s, `sdk="microsoft.net.sdk"`) || strings.Contains(s, `sdk='microsoft.net.sdk'`)
 }
 
 func rootSlnRel(repo string) (rel string, ok bool, err error) {
@@ -131,7 +127,7 @@ func discoverSDKStyleCsprojPathsForDotnet(repo string) ([]string, error) {
 		if err != nil {
 			continue
 		}
-		if isSdkStyleCsprojContent(string(b)) {
+		if dotnetproj.IsSDKStyle(string(b)) {
 			out = append(out, p)
 		}
 	}

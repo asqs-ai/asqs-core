@@ -101,12 +101,12 @@ func TestPlaywrightConfig_expressWithoutPortEvidenceStaysUndecidable(t *testing.
 func TestParseListenPort(t *testing.T) {
 	cases := map[string]int{
 		"await app.listen(port);\nconst port = Number(process.env.PORT ?? 3000);": 3000,
-		"app.listen(process.env.PORT || 8081, () => {})":                           8081,
-		"app.listen(+process.env['PORT'] || 5000)":                                 5000,
-		"server.listen(4040);":                                                     4040,
-		"await app.listen({ port: 7070, host: '0.0.0.0' });":                       7070,
-		"app.listen(config.port);":                                                 0,
-		"":                                                                         0,
+		"app.listen(process.env.PORT || 8081, () => {})":                          8081,
+		"app.listen(+process.env['PORT'] || 5000)":                                5000,
+		"server.listen(4040);":                                                    4040,
+		"await app.listen({ port: 7070, host: '0.0.0.0' });":                      7070,
+		"app.listen(config.port);":                                                0,
+		"":                                                                        0,
 		// A port outside the valid range is not a port.
 		"app.listen(99999);": 0,
 	}

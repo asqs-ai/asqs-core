@@ -169,8 +169,8 @@ func TestRepoInventedMemberReasonTS_providerUseValueLiteral(t *testing.T) {
   listOrders: jest.fn(),
 };
 const providers = [{ provide: OrdersService, useValue: mockOrdersService }];`,
-		"cast literal": `const svc = { create: jest.fn() } as unknown as OrdersService;`,
-		"mocked annotation": `const svc: jest.Mocked<OrdersService> = { create: jest.fn() } as any;`,
+		"cast literal":       `const svc = { create: jest.fn() } as unknown as OrdersService;`,
+		"mocked annotation":  `const svc: jest.Mocked<OrdersService> = { create: jest.fn() } as any;`,
 		"partial annotation": `const svc: Partial<OrdersService> = { create: jest.fn() };`,
 	}
 	for name, body := range cases {

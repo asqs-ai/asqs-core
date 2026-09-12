@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
@@ -22,8 +23,6 @@ const PlaywrightDotnetImageBundledRuntimeMajor = 8
 const PlaywrightDotnetBundledSDKMajor = 8
 
 var (
-	reCsprojMultitargetTF            = regexp.MustCompile(`(?i)<TargetFramework>\s*([^<]*?)\s*</TargetFramework>`)
-	reCsprojMultitargetTFs           = regexp.MustCompile(`(?i)<TargetFrameworks>\s*([^<]*?)\s*</TargetFrameworks>`)
 	reDotnetInstallNetTFMChannel     = regexp.MustCompile(`(?i)^net(\d+)\.(\d+)`)
 	reDotnetInstallNetCoreAppChannel = regexp.MustCompile(`(?i)^netcoreapp(\d+)\.(\d+)`)
 )
@@ -52,33 +51,65 @@ func DotnetSDKRunnableTestTFM(tfm string) bool {
 		strings.HasPrefix(t, "net9.")
 }
 
-// ParseCsprojTargetFrameworksList returns TFMs from TargetFramework or TargetFrameworks (split on ';').
+// ParseCsprojTargetFrameworksList returns the TFMs a project effectively targets, including monikers
+// it inherits from a Directory.Build.props above it. The inheritance matters here specifically: this
+// list drives the multi-target pin that stops `dotnet test` in a Linux container from trying to
+// build a net48 target.
 func ParseCsprojTargetFrameworksList(csprojPath string) ([]string, error) {
-	b, err := os.ReadFile(csprojPath)
+	facts, err := dotnetproj.ResolveFacts(repoRootForProject(csprojPath), csprojPath)
 	if err != nil {
 		return nil, err
 	}
-	s := string(b)
-	if m := reCsprojMultitargetTF.FindStringSubmatch(s); len(m) >= 2 {
-		v := strings.TrimSpace(m[1])
-		if v != "" && !strings.HasPrefix(v, "$(") {
-			return []string{v}, nil
+	return facts.TFMs, nil
+}
+
+// repoRootForProject bounds the ancestor walk for props inheritance, for the callers that hold only
+// a project path.
+//
+// A .git directory is a hard stop: a checkout boundary is absolute and a Directory.Build.props above
+// it belongs to somebody else. Short of that, the walk follows MSBuild's own rule — it searches
+// upward through the filesystem for shared property files regardless of version control — and
+// returns the highest ancestor that still looks like part of this build: a solution, a global.json,
+// a NuGet.config, or a shared props file. With no marker at all the project's own directory bounds
+// the search, which is exactly the old read-the-csproj-alone behaviour.
+func repoRootForProject(csprojPath string) string {
+	projDir := filepath.Dir(filepath.Clean(csprojPath))
+	dir, highest := projDir, projDir
+	for i := 0; i < 24; i++ {
+		if st, err := os.Stat(filepath.Join(dir, ".git")); err == nil && (st.IsDir() || st.Mode().IsRegular()) {
+			return dir
+		}
+		if dirHoldsBuildRootMarker(dir) {
+			highest = dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return highest
+}
+
+func dirHoldsBuildRootMarker(dir string) bool {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+	for _, e := range ents {
+		if e.IsDir() {
+			continue
+		}
+		switch strings.ToLower(e.Name()) {
+		case "global.json", "nuget.config", "directory.build.props", "directory.build.targets", "directory.packages.props":
+			return true
+		}
+		switch strings.ToLower(filepath.Ext(e.Name())) {
+		case ".sln", ".slnx":
+			return true
 		}
 	}
-	if m := reCsprojMultitargetTFs.FindStringSubmatch(s); len(m) >= 2 {
-		v := strings.TrimSpace(m[1])
-		if v == "" || strings.HasPrefix(v, "$(") {
-			return nil, nil
-		}
-		var out []string
-		for _, p := range strings.Split(v, ";") {
-			if t := strings.TrimSpace(p); t != "" && !strings.HasPrefix(t, "$(") {
-				out = append(out, t)
-			}
-		}
-		return out, nil
-	}
-	return nil, nil
+	return false
 }
 
 // PickDotnetMultiTargetTestTargetFramework picks a TFM for `dotnet test`/`dotnet build` in Linux Docker when the project
