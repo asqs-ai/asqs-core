@@ -37,7 +37,9 @@ type Facts struct {
 	SDK        string
 	IsWebSDK   bool
 	IsSDKStyle bool
-	// PropsPaths lists the Directory.Build.props / .targets files that contributed, nearest last.
+	// PropsPaths lists the Directory.Build.props / .targets files that contributed, in the order
+	// MSBuild applies them: the props chain (farthest first), then the targets chain. The project
+	// itself is evaluated between the two and is not listed here.
 	PropsPaths []string
 	// CentralPackageManagement is true when a Directory.Packages.props opts in.
 	CentralPackageManagement bool
@@ -240,13 +242,10 @@ func (f *Facts) readPackageReferences(xml string) {
 			}
 			// Last concrete version wins, matching the property rule: files are applied in
 			// MSBuild's import order, so a nearer declaration overwrites an inherited one. A
-			// reference with no version never erases one that has it — that is a versionless
-			// reference waiting for central package management, not a downgrade.
+			// versionless reference never erases a version already recorded — that is a reference
+			// waiting for central package management, not a downgrade.
 			key := strings.ToLower(id)
 			if prev, ok := f.packages[key]; !ok || version != "" || prev == "" {
-				if version == "" && ok && prev != "" {
-					continue
-				}
 				f.packages[key] = version
 			}
 		}

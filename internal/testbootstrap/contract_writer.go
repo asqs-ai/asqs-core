@@ -110,7 +110,7 @@ func contractForCompleteStack(repo, lang string) (teststack.Contract, bool) {
 		}
 		return javaContract(prof), true
 	case isCSharpLang(lang):
-		prof, err := resolveCSharpTestProfile(repo, "", "")
+		prof, err := resolveCSharpTestProfile(repo, "", nil)
 		if err != nil || prof.Declined {
 			return teststack.Contract{}, false
 		}

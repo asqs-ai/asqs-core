@@ -10,7 +10,6 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/dotnetproj"
-	"github.com/asqs/asqs-core/internal/langid"
 )
 
 // CSharpUISurface is what an E2E test can drive against this application.
@@ -142,7 +141,6 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 			return nil
 		}
 		rel := filepath.ToSlash(mustRel(root, path))
-		lowRel := strings.ToLower(rel)
 		switch strings.ToLower(filepath.Ext(d.Name())) {
 		case ".csproj":
 			body, ok := readHeadLower(path, buf)
@@ -161,23 +159,11 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 				hasBlazorWasm = true
 				note("Blazor WebAssembly SDK in " + rel)
 			}
-		case ".cshtml":
-			if strings.Contains(lowRel, "/pages/") || strings.HasPrefix(lowRel, "pages/") {
-				hasRazorMarkup = true
-				note("Razor Pages markup " + rel)
-			} else if strings.Contains(lowRel, "/views/") || strings.HasPrefix(lowRel, "views/") {
-				hasViewsMarkup = true
-				note("MVC view " + rel)
-			} else {
-				hasRazorMarkup = true
-				note("Razor markup " + rel)
-			}
-		case ".razor":
-			hasBlazorMarkup = true
-			note("Blazor component " + rel)
-		case ".cs":
-			// Deferred: whether this file counts depends on the test-project directories, and a
-			// .csproj deeper in the walk can still add one.
+		case ".cshtml", ".razor", ".cs":
+			// Deferred, all three: whether a file counts depends on the test-project directories,
+			// and a .csproj deeper in the walk can still add one. Markup was classified inline here
+			// and so escaped the filter entirely — a Web API with golden .cshtml fixtures under
+			// tests/ read as an MVC application, and a bUnit repo as a Blazor one.
 			sources = append(sources, pending{path: path, rel: rel})
 		}
 		return nil
@@ -190,6 +176,30 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		// A test project's own fixtures are not the application's surface: a WebApplicationFactory
 		// smoke test mentions MapControllers, and reading it would put every repo on the API path.
 		if underAnyDir(src.path, testDirs) {
+			continue
+		}
+		lowRel := strings.ToLower(src.rel)
+		switch strings.ToLower(filepath.Ext(src.path)) {
+		case ".cshtml":
+			// A file whose name begins with `_` is not a routable page by ASP.NET convention — it is
+			// a layout, a view-start or a Blazor host shell — so it is not evidence of one.
+			if strings.HasPrefix(strings.ToLower(filepath.Base(src.path)), "_") {
+				continue
+			}
+			if strings.Contains(lowRel, "/pages/") || strings.HasPrefix(lowRel, "pages/") {
+				hasRazorMarkup = true
+				note("Razor Pages markup " + src.rel)
+			} else if strings.Contains(lowRel, "/views/") || strings.HasPrefix(lowRel, "views/") {
+				hasViewsMarkup = true
+				note("MVC view " + src.rel)
+			} else {
+				hasRazorMarkup = true
+				note("Razor markup " + src.rel)
+			}
+			continue
+		case ".razor":
+			hasBlazorMarkup = true
+			note("Blazor component " + src.rel)
 			continue
 		}
 		body, ok := readHeadLower(src.path, buf)
@@ -254,10 +264,11 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		// where nothing is in git — was missed entirely.
 		uiFramework = CSharpUISPAStatic
 	}
-	// Razor Pages wins over Blazor Server when both are present: its routes are plain URLs a browser
-	// test navigates directly, while a Blazor circuit needs the page that hosts it — and that page
-	// is a Razor Page. The mixed fixture has both, and either answer is defensible; this one names
-	// the thing a generated test would actually open.
+	// Razor Pages wins over Blazor Server only when the application has ROUTABLE Razor Pages: those
+	// are plain URLs a browser test navigates directly. The stock Blazor Server template registers
+	// Razor Pages purely to serve its host shell (Pages/_Host.cshtml), and calling that a Razor
+	// Pages application sends a generated test looking for page routes that do not exist —
+	// hasRazorMarkup excludes `_`-prefixed files for exactly this reason.
 	if hasRazorPages && hasRazorMarkup && uiFramework == CSharpUIBlazorServer {
 		uiFramework = CSharpUIRazorPages
 	}
@@ -314,6 +325,9 @@ func csprojReferencesTestFrameworkLower(lower string) bool {
 	for _, m := range []string{
 		"microsoft.net.test.sdk", "xunit", "nunit", "mstest.testframework", "mstest",
 		"microsoft.aspnetcore.mvc.testing",
+		// bUnit is a Blazor component test library and appears in no production project. Without
+		// it, a bUnit project's .razor fixtures counted as the application's own components.
+		"bunit",
 	} {
 		if strings.Contains(lower, `include="`+m) || strings.Contains(lower, `include='`+m) {
 			return true
@@ -370,23 +384,6 @@ func readHeadLower(path string, buf []byte) (string, bool) {
 	return strings.ToLower(string(buf[:n])), true
 }
 
-// E2ESurfaceForBootstrap resolves the surface the E2E bootstrap should act on: the operator's
-// override when set, otherwise detection. Non-C# languages return "" — they have no surface
-// detection, and claiming one would put them on a path built for C#.
-//
-// The E2E bootstrap runs before the indexer and therefore before the run's own DetectE2E call, so it
-// resolves the surface itself rather than receiving one.
-func E2ESurfaceForBootstrap(repoAbs, lang string, rc *config.RunnerConfig) string {
-	if !langid.IsCSharp(lang) {
-		return ""
-	}
-	detected, err := detectCSharpUISurface(repoAbs)
-	if err != nil {
-		return ""
-	}
-	return string(resolveCSharpUISurface(csharpForcedE2ESurface(rc), detected).Surface)
-}
-
 // csharpForcedE2ESurface reads bootstrap.policy.e2e_framework.surface. "auto" and the empty string
 // both mean "detect it", which is the default.
 func csharpForcedE2ESurface(rc *config.RunnerConfig) string {
@@ -399,3 +396,7 @@ func csharpForcedE2ESurface(rc *config.RunnerConfig) string {
 	}
 	return v
 }
+
+// ptrTo is the one-line helper that lets a caller say "I consulted the configuration and this is
+// what it said", where nil says "I could not".
+func ptrTo(s string) *string { return &s }

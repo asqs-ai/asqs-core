@@ -155,11 +155,6 @@ func (s *Sandbox) planProfileStep(plan *StepPlan, p profile.ToolchainProfile, st
 	if err != nil {
 		return failStep(err.Error())
 	}
-	if p.ID == profile.CSharpDotnet && step == evaluator.StepCoverage {
-		// Every test project otherwise writes TestResults beside itself, and the report ends up at a
-		// path no fixed glob from the eval cwd can name.
-		argv = dotnetCoverageResultsDirArgv(argv, dotnetCoverageResultsDir(absGitRoot, absCwd))
-	}
 	if p.ID == profile.CSharpDotnet && (step == evaluator.StepTest || step == evaluator.StepCoverage) {
 		argv = ApplyDotnetTestHangMitigationProps(argv)
 		argv = ApplyDotnetTestVSTestCLIArgs(argv, s.jobTimeout())

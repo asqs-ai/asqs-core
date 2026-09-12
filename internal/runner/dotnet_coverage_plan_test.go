@@ -31,8 +31,9 @@ func TestPlanProfileStep_coverageSkippedWithoutCoverlet(t *testing.T) {
 	}
 }
 
-// With coverlet present the step runs, and its argv pins a results directory so every test
-// project's report lands under one known root.
+// With coverlet present the step runs and collects. It deliberately does NOT relocate TestResults:
+// see dotnet_coverage_gate.go — findCoverageReport walks for the report, and moving build output to
+// the git root can escape a repository's own ignore rules and ship coverage XML in the PR.
 func TestPlanProfileStep_coverageRunsWithCoverlet(t *testing.T) {
 	repo := t.TempDir()
 	mustWriteProj(t, filepath.Join(repo, "tests", "App.Tests", "App.Tests.csproj"),
@@ -51,8 +52,11 @@ func TestPlanProfileStep_coverageRunsWithCoverlet(t *testing.T) {
 		t.Fatalf("coverage step skipped with coverlet present: %+v", dec)
 	}
 	argv := plan.Coverage
-	if !argvHasFlag(argv, "--results-directory") {
-		t.Fatalf("coverage argv %v does not pin --results-directory", argv)
+	if !argvHasFlag(argv, "--collect") {
+		t.Fatalf("coverage argv %v does not collect coverage", argv)
+	}
+	if argvHasFlag(argv, "--results-directory") {
+		t.Fatalf("coverage argv relocates TestResults, which can escape the repo's ignore rules: %v", argv)
 	}
 }
 

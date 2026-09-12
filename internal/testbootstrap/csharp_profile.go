@@ -310,7 +310,7 @@ func packageReferenceVersionMajor(csprojLower, prefix string) int {
 }
 
 // detectCSharpFramework classifies a solution from its production and test projects.
-func detectCSharpFramework(repo, fallbackTFM, forcedSurface string) (csharpFrameworkDetection, error) {
+func detectCSharpFramework(repo, fallbackTFM string, forcedSurface *string) (csharpFrameworkDetection, error) {
 	prod, test, err := splitCSharpProdAndTestCsprojs(repo)
 	if err != nil {
 		return csharpFrameworkDetection{}, err
@@ -340,11 +340,13 @@ func detectCSharpFramework(repo, fallbackTFM, forcedSurface string) (csharpFrame
 	det.NetMajor = netMajorFromTFM(det.TargetFramework)
 
 	// What an E2E test can drive here. Detected from the project's own files, never assumed.
-	if surface, serr := detectCSharpUISurface(repo); serr == nil {
-		surface = resolveCSharpUISurface(forcedSurface, surface)
-		det.UISurface = surface.Surface
-		det.UIFramework = surface.UIFramework
-		det.UISurfaceEvidence = surface.Evidence
+	if forcedSurface != nil {
+		if surface, serr := detectCSharpUISurface(repo); serr == nil {
+			surface = resolveCSharpUISurface(*forcedSurface, surface)
+			det.UISurface = surface.Surface
+			det.UIFramework = surface.UIFramework
+			det.UISurfaceEvidence = surface.Evidence
+		}
 	}
 
 	sort.Strings(prod)

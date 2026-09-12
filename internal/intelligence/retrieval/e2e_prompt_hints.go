@@ -126,13 +126,21 @@ func e2eHintsCSharp(fw string) string {
 	}
 }
 
-// e2eHintsCSharpForSurface adds the surface dimension to the framework one. A framework the repo
-// already uses always wins: a Selenium solution gets Selenium guidance whatever its pages look like.
+// e2eHintsCSharpForSurface combines the surface with the framework the repo already uses.
+//
+// A detected framework normally wins — a Selenium solution gets Selenium guidance whatever its
+// pages look like — with one exception: an `api` surface means the application has no pages at all,
+// and that fact outranks a BROWSER framework's presence. ASQS's own E2E bootstrap installs
+// Microsoft.Playwright for every C# repository today, so on the second run of any bootstrapped Web
+// API the framework reads as playwright-dotnet and the API guidance was suppressed again, telling
+// the model to drive pages that do not exist. A browser package in a pageless application is a
+// mis-bootstrap, not evidence of a browser surface.
 func e2eHintsCSharpForSurface(fw, surface string, frameworkExplicit bool) string {
-	if frameworkExplicit {
+	normSurface := strings.ToLower(strings.TrimSpace(surface))
+	if frameworkExplicit && !(normSurface == "api" && isBrowserE2EFramework(fw)) {
 		return e2eHintsCSharp(fw)
 	}
-	switch strings.ToLower(strings.TrimSpace(surface)) {
+	switch normSurface {
 	case "api":
 		return csharpAPIE2EHints
 	case "ui", "mixed":
@@ -142,12 +150,23 @@ func e2eHintsCSharpForSurface(fw, surface string, frameworkExplicit bool) string
 	}
 }
 
+// isBrowserE2EFramework reports whether a stack drives a real browser, as opposed to exercising the
+// application in process.
+func isBrowserE2EFramework(fw string) bool {
+	switch strings.ToLower(strings.TrimSpace(fw)) {
+	case "playwright", "playwright-dotnet", "playwright-java", "cypress", "selenium", "selenide":
+		return true
+	default:
+		return false
+	}
+}
+
 // csharpAPIE2EHints describes an in-process HTTP E2E test: no browser, no server to start, and the
 // real middleware pipeline. This is what an ASP.NET Core API's end-to-end test is.
 const csharpAPIE2EHints = "- **This application has no browser-drivable pages** (detected E2E surface: `api`). Write an in-process HTTP end-to-end test, not a browser test.\n" +
 	"- **Canonical imports:** `using Microsoft.AspNetCore.Mvc.Testing;` `using System.Net.Http.Json;` — derive from **`WebApplicationFactory<Program>`** (or inject it via `IClassFixture<WebApplicationFactory<Program>>`), call **`CreateClient()`** for an **`HttpClient`** bound to the in-memory server, and assert on the real pipeline: status code, headers, and the deserialised body.\n" +
 	"- **Top-level statements:** `Program` is internal unless the web project declares `public partial class Program { }`. When it does not, use the entry-point type the project does expose rather than inventing one.\n" +
-	"- **Typical runner:** `dotnet test -c Release --filter \"FullyQualifiedName~E2E\"` — the same heuristic as **`defaultCSharpE2EShellCommand`** when **`general.build.e2e_test_command`** is unset.\n" +
+	"- **Typical runner:** `dotnet test -c Release --filter \"FullyQualifiedName~E2E\"` — the same heuristic as **`defaultCSharpE2EShellCommand`** when **`runner.e2e_test_command`** is unset.\n" +
 	"- **Reference:** Integration tests in ASP.NET Core — [https://learn.microsoft.com/aspnet/core/test/integration-tests](https://learn.microsoft.com/aspnet/core/test/integration-tests)"
 
 // csharpUIE2EHints describes a Playwright .NET browser test against a running application. The

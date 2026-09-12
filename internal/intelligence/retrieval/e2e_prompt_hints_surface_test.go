@@ -37,12 +37,15 @@ func TestE2EPromptCanonicalHints_csharpUISurface(t *testing.T) {
 	}
 }
 
-// An explicitly detected framework still wins over the surface: a repo that already uses Selenium
-// gets Selenium guidance whatever its pages look like.
+// A detected framework wins over the surface on every surface but `api`, where the application has
+// no pages for a browser stack to drive — see
+// TestE2EPromptCanonicalHints_apiSurfaceOutranksADetectedBrowserFramework.
 func TestE2EPromptCanonicalHints_detectedFrameworkWinsOverSurface(t *testing.T) {
-	got := E2EPromptCanonicalHintsForSurface("csharp", "selenium", "api")
-	if !strings.Contains(got, "OpenQA.Selenium") {
-		t.Errorf("detected selenium lost to the surface:\n%s", got)
+	for _, surface := range []string{"ui", "mixed", "none", ""} {
+		got := E2EPromptCanonicalHintsForSurface("csharp", "selenium", surface)
+		if !strings.Contains(got, "OpenQA.Selenium") {
+			t.Errorf("surface %q: detected selenium lost to the surface:\n%s", surface, got)
+		}
 	}
 }
 
@@ -61,5 +64,30 @@ func TestE2EPromptCanonicalHints_otherLanguagesIgnoreSurface(t *testing.T) {
 		if got, want := E2EPromptCanonicalHintsForSurface(lang, "", "ui"), E2EPromptCanonicalHints(lang, ""); got != want {
 			t.Errorf("%s hints changed with a surface:\n%s", lang, got)
 		}
+	}
+}
+
+// An `api` surface means the application has no pages. That fact outranks a detected browser
+// framework, because ASQS's own E2E bootstrap installs Microsoft.Playwright for every C# repo today
+// (CS21 is not done): on the second run of any bootstrapped Web API the framework is "explicitly"
+// playwright-dotnet, and the API hints this exists to deliver were suppressed again — telling the
+// model to drive pages that do not exist.
+func TestE2EPromptCanonicalHints_apiSurfaceOutranksADetectedBrowserFramework(t *testing.T) {
+	for _, fw := range []string{"playwright-dotnet", "playwright"} {
+		got := E2EPromptCanonicalHintsForSurface("csharp", fw, "api")
+		if !strings.Contains(got, "WebApplicationFactory") {
+			t.Errorf("framework %q suppressed the api-surface guidance:\n%s", fw, got)
+		}
+		if strings.Contains(got, "IPage") {
+			t.Errorf("framework %q reinstated browser guidance on a pageless application:\n%s", fw, got)
+		}
+	}
+}
+
+// A non-browser framework the repo already uses is still described on its own terms.
+func TestE2EPromptCanonicalHints_apiSurfaceKeepsANonBrowserFramework(t *testing.T) {
+	got := E2EPromptCanonicalHintsForSurface("csharp", "selenium", "ui")
+	if !strings.Contains(got, "OpenQA.Selenium") {
+		t.Errorf("a detected selenium stack lost to the ui surface:\n%s", got)
 	}
 }

@@ -108,7 +108,7 @@ func csharpContract(p csharpTestProfile) teststack.Contract {
 		FrameworkVersion:  p.TargetFramework,
 		Runner:            string(p.TestFramework),
 		Stack:             p.Stack,
-		E2ESurface:        string(csharpContractSurface(p)),
+		E2ESurface:        string(p.UISurface),
 		UIFramework:       csharpContractUIFramework(p),
 		AvailablePackages: dedupeSorted(pkgs),
 		AvailableImports:  dedupeSorted(imports),
@@ -157,14 +157,10 @@ func jsModuleType(esm bool) string {
 	return "commonjs"
 }
 
-// csharpContractSurface records an explicit "none" so a reader can tell "a library has no E2E
-// surface" from "written before this field existed".
-func csharpContractSurface(p csharpTestProfile) CSharpUISurface {
-	if p.UISurface == "" {
-		return CSharpSurfaceNone
-	}
-	return p.UISurface
-}
+// An empty surface means it was not resolved — a contract written by a path that cannot see
+// bootstrap.policy.e2e_framework.surface — and is recorded as empty, which the field documents as
+// "unknown". Asserting a detected value there would let the persisted artifact contradict what the
+// run itself resolved.
 
 func csharpContractUIFramework(p csharpTestProfile) string {
 	if p.UIFramework == "" || p.UIFramework == CSharpUINone {

@@ -78,27 +78,12 @@ func dotnetCoverageSkipReason() string {
 		"`dotnet test --collect \"XPlat Code Coverage\"` produces no report without it)"
 }
 
-// dotnetCoverageResultsDirArgv appends --results-directory so every test project writes its
-// TestResults under one known root instead of beside each project, which is what made the report
-// unfindable from the eval cwd. No-op when the argv already names one.
-func dotnetCoverageResultsDirArgv(argv []string, resultsDir string) []string {
-	if strings.TrimSpace(resultsDir) == "" || len(argv) < 2 || !dotnetFirstArgIsCLI(argv) {
-		return argv
-	}
-	for _, a := range argv {
-		if strings.EqualFold(a, "--results-directory") || strings.EqualFold(a, "-r") {
-			return argv
-		}
-	}
-	return append(append([]string(nil), argv...), "--results-directory", resultsDir)
-}
-
-// dotnetCoverageResultsDir is the single directory every test project writes its TestResults into.
-// Relative to the eval cwd, so it is valid inside the container as well as on the host.
-func dotnetCoverageResultsDir(absGitRoot, absCwd string) string {
-	rel, err := filepath.Rel(absCwd, filepath.Join(absGitRoot, "TestResults"))
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return "TestResults"
-	}
-	return filepath.ToSlash(rel)
-}
+// Deliberately no --results-directory.
+//
+// An earlier version relocated every project's TestResults under <gitRoot>/TestResults so discovery
+// had one place to look. Two reasons it is gone: findCoverageReport now walks for the report
+// wherever dotnet put it, so the relocation bought nothing; and ship stages with `git add "."`,
+// which honours .gitignore — a repository whose ignore rule is anchored at the old per-project
+// location (src/App.Tests/TestResults/) would have had coverage XML appear in its pull request.
+// Moving build output somewhere a repository's own ignore rules do not name is not a change a
+// quality tool should make on its behalf.

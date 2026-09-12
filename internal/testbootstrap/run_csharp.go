@@ -13,7 +13,11 @@ import (
 
 // resolveCSharpTestProfile reads the solution's projects and derives the required test stack.
 // forcedSurface is bootstrap.policy.e2e_framework.surface; empty or "auto" means detect it.
-func resolveCSharpTestProfile(repo, fallbackTFM, forcedSurface string) (csharpTestProfile, error) {
+// forcedSurface is bootstrap.policy.e2e_framework.surface ("" or "auto" meaning detect it), or NIL
+// for a caller that cannot see the configuration. Nil is not the same as "auto": those callers skip
+// surface detection entirely and the contract they write records no surface, rather than a detected
+// one that could contradict what the run resolved with the operator's override applied.
+func resolveCSharpTestProfile(repo, fallbackTFM string, forcedSurface *string) (csharpTestProfile, error) {
 	det, err := detectCSharpFramework(repo, fallbackTFM, forcedSurface)
 	if err != nil {
 		return csharpTestProfile{}, err
@@ -34,7 +38,7 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 	_ = cfg // pin_versions / lockfile N/A for .NET bootstrap
 
 	fallbackTFM := dotnetTFMFallbackFromRunner(runnerCfg)
-	prof, err := resolveCSharpTestProfile(repo, fallbackTFM, csharpForcedE2ESurface(runnerCfg))
+	prof, err := resolveCSharpTestProfile(repo, fallbackTFM, ptrTo(csharpForcedE2ESurface(runnerCfg)))
 	if err != nil {
 		return fmt.Errorf("test_framework_bootstrap: resolve C# profile: %w", err)
 	}
