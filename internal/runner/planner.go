@@ -139,6 +139,14 @@ func (s *Sandbox) planProfileStep(plan *StepPlan, p profile.ToolchainProfile, st
 		// prefix 'jacoco'". Local has always skipped; Docker appended jacoco:report regardless.
 		return skipStep("skip (no JaCoCo plugin declared in the build file)")
 	}
+	if step == evaluator.StepCoverage && p.ID == profile.CSharpDotnet {
+		// The C# twin of the JaCoCo gate. --collect "XPlat Code Coverage" needs a registered
+		// collector; without coverlet the step is a byte-identical re-run of the test step that
+		// produces no report.
+		if _, ok := dotnetCoverageCollectorDeclared(absGitRoot); !ok {
+			return skipStep(dotnetCoverageSkipReason())
+		}
+	}
 	argv := profileArgvForStep(p, step)
 	if len(argv) == 0 {
 		return skipStep("skip (no command)")
@@ -146,6 +154,11 @@ func (s *Sandbox) planProfileStep(plan *StepPlan, p profile.ToolchainProfile, st
 	argv, err := s.patchDotnetEvalArgv(p, argv, absGitRoot, absCwd, target)
 	if err != nil {
 		return failStep(err.Error())
+	}
+	if p.ID == profile.CSharpDotnet && step == evaluator.StepCoverage {
+		// Every test project otherwise writes TestResults beside itself, and the report ends up at a
+		// path no fixed glob from the eval cwd can name.
+		argv = dotnetCoverageResultsDirArgv(argv, dotnetCoverageResultsDir(absGitRoot, absCwd))
 	}
 	if p.ID == profile.CSharpDotnet && (step == evaluator.StepTest || step == evaluator.StepCoverage) {
 		argv = ApplyDotnetTestHangMitigationProps(argv)

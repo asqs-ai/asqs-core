@@ -1,11 +1,13 @@
 package runner
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
@@ -58,6 +60,13 @@ func coverageReportPathsFor(id profile.ToolchainID) []string {
 
 // findCoverageReport returns the first report path that exists under repoPath, or "".
 // Entries may be plain paths or globs; both are resolved relative to repoPath.
+//
+// A glob that does not match at the configured location is retried as a suffix anywhere in the tree.
+// This is what makes the dotnet pattern work: `dotnet test --collect "XPlat Code Coverage"` writes
+// <test project>/TestResults/<random guid>/coverage.cobertura.xml, which is neither at the eval cwd
+// nor at a fixed depth, and filepath.Glob's single-level `*` could only ever find it in the one
+// layout where the eval cwd happened to be the test project itself. Every other C# run reported
+// "coverage report not found" while the report sat two directories away.
 func findCoverageReport(repoPath string, paths []string) string {
 	root := filepath.Clean(strings.TrimSpace(repoPath))
 	for _, rel := range paths {
@@ -73,15 +82,93 @@ func findCoverageReport(repoPath string, paths []string) string {
 			continue
 		}
 		matches, err := filepath.Glob(full)
-		if err != nil || len(matches) == 0 {
-			continue
+		if err == nil {
+			matches = keepRegularFiles(matches)
+			if len(matches) > 0 {
+				sort.Strings(matches)
+				if r, rerr := filepath.Rel(root, matches[0]); rerr == nil {
+					return filepath.ToSlash(r)
+				}
+			}
 		}
-		sort.Strings(matches)
-		if r, rerr := filepath.Rel(root, matches[0]); rerr == nil {
-			return filepath.ToSlash(r)
+		if found := findCoverageReportBySuffix(root, rel); found != "" {
+			return found
 		}
 	}
 	return ""
+}
+
+func keepRegularFiles(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// maxCoverageReportWalkDepth bounds the fallback walk. Reports live a handful of directories below
+// a project; anything deeper is not the build output of this repository.
+const maxCoverageReportWalkDepth = 10
+
+// findCoverageReportBySuffix walks the repo for a file whose tail matches the glob pattern, and
+// returns the lexicographically first match so two test projects cannot make the result depend on
+// directory order. Build-output trees are skipped except the one the pattern itself names.
+func findCoverageReportBySuffix(root, pattern string) string {
+	pattern = filepath.ToSlash(strings.TrimPrefix(pattern, "./"))
+	if pattern == "" {
+		return ""
+	}
+	first := strings.SplitN(pattern, "/", 2)[0]
+	var matches []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			// The pattern's own first segment (TestResults, target, …) is where reports live, so it
+			// is never pruned even when it looks like build output.
+			if !strings.EqualFold(d.Name(), first) &&
+				(dotnetproj.WalkSkipDir(d.Name()) || dotnetproj.WalkDepth(root, path) > maxCoverageReportWalkDepth) {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		if coveragePathMatchesSuffix(filepath.ToSlash(rel), pattern) {
+			matches = append(matches, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Strings(matches)
+	return matches[0]
+}
+
+// coveragePathMatchesSuffix reports whether rel ends with a path matching pattern, segment-aligned.
+func coveragePathMatchesSuffix(rel, pattern string) bool {
+	relSegs := strings.Split(rel, "/")
+	patSegs := strings.Split(pattern, "/")
+	if len(relSegs) < len(patSegs) {
+		return false
+	}
+	tail := relSegs[len(relSegs)-len(patSegs):]
+	for i, p := range patSegs {
+		ok, err := filepath.Match(p, tail[i])
+		if err != nil || !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // coverageSummaryFromPlan builds the coverage step's summary for either target.
