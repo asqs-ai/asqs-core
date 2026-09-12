@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -177,5 +178,131 @@ func TestResolveCanonicalImports_csharp(t *testing.T) {
 	// Absent from this project's packages: saying nothing is the only honest answer.
 	if v, ok := got["TestMethod"]; ok {
 		t.Errorf("TestMethod resolved to %q in a project with no MSTest package", v)
+	}
+}
+
+// The framework group is ALL bare names, which left `wanted` — the namespace set the packages-folder
+// search iterates — completely empty. Step 1 walks the repository's build output; step 2 never ran
+// at all, so a project whose bin/ carries no XML documentation resolved nothing.
+//
+// Run run-1789245041122 against the NUnit fixture is the case: nunit.framework.xml sat in the
+// package cache the whole time, and the block reported "no NuGet XML documentation found for Fact,
+// Theory, Test, …" having never looked there.
+//
+// The narrowing that replaces it is the repository's own package closure: exactly the packages this
+// project references, which is both precise and already resolved by dotnetproj.
+func TestCSharpProvider_searchesThePackageCacheForBareNames(t *testing.T) {
+	repo := t.TempDir()
+	// A project referencing NUnit, with NO build output of its own.
+	if err := os.WriteFile(filepath.Join(repo, "Shop.Tests.csproj"), []byte(`<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="NUnit" Version="4.2.2" /></ItemGroup>
+</Project>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A stand-in package cache, laid out the way NuGet lays one out.
+	cache := t.TempDir()
+	docDir := filepath.Join(cache, "nunit", "4.2.2", "lib", "net6.0")
+	if err := os.MkdirAll(docDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(docDir, "nunit.framework.xml"), []byte(`<?xml version="1.0"?>
+<doc>
+  <assembly><name>nunit.framework</name></assembly>
+  <members>
+    <member name="T:NUnit.Framework.TestAttribute" />
+    <member name="T:NUnit.Framework.Assert" />
+    <member name="M:NUnit.Framework.Assert.That(System.Object)" />
+  </members>
+</doc>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NUGET_PACKAGES", cache)
+
+	p := NewCSharpProvider()
+	got, err := p.Lookup(context.Background(), repo, []Target{{Kind: KindSymbol, Name: "Test"}})
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if len(got) != 1 || got[0].FQCN != "NUnit.Framework.TestAttribute" {
+		t.Fatalf("Lookup(Test) = %+v, want one NUnit.Framework.TestAttribute", got)
+	}
+	if got[0].ImportHint != "using NUnit.Framework;" {
+		t.Errorf("ImportHint = %q, want `using NUnit.Framework;`", got[0].ImportHint)
+	}
+}
+
+// The closure is the bound. A package the repository does not reference must not be read, or the
+// search degenerates into a crawl of a cache that holds every version of everything.
+func TestCSharpProvider_bareNameSearchStaysInsideThePackageClosure(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repo, "App.csproj"), []byte(`<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <ItemGroup><PackageReference Include="NUnit" Version="4.2.2" /></ItemGroup>
+</Project>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := t.TempDir()
+	for pkg, member := range map[string]string{
+		"nunit":   "T:NUnit.Framework.TestAttribute",
+		"someone": "T:Someone.TestAttribute",
+	} {
+		dir := filepath.Join(cache, pkg, "1.0.0", "lib", "net8.0")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		body := `<?xml version="1.0"?><doc><assembly><name>` + pkg + `</name></assembly><members><member name="` + member + `" /></members></doc>`
+		if err := os.WriteFile(filepath.Join(dir, pkg+".xml"), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("NUGET_PACKAGES", cache)
+
+	got, err := NewCSharpProvider().Lookup(context.Background(), repo, []Target{{Kind: KindSymbol, Name: "Test"}})
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	for _, s := range got {
+		if strings.HasPrefix(s.FQCN, "Someone.") {
+			t.Errorf("read %s from a package this repository does not reference", s.FQCN)
+		}
+	}
+}
+
+// A documented type with NO members never entered the index: parseDocMemberID drops every `T:`
+// entry, and only member IDs created a key. Attributes are exactly the types that have no members
+// worth documenting — [Test], [Theory], [TestMethod] — and resolving them is not about members at
+// all. It is about printing the namespace, which is what the import line needs.
+func TestCSharpProvider_resolvesATypeThatDocumentsNoMembers(t *testing.T) {
+	repo := t.TempDir()
+	out := filepath.Join(repo, "bin", "Release", "net8.0")
+	if err := os.MkdirAll(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "nunit.framework.xml"), []byte(`<?xml version="1.0"?>
+<doc>
+  <assembly><name>nunit.framework</name></assembly>
+  <members>
+    <member name="T:NUnit.Framework.TestAttribute" />
+    <member name="T:NUnit.Framework.Assert" />
+    <member name="M:NUnit.Framework.Assert.That(System.Object)" />
+  </members>
+</doc>`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := NewCSharpProvider().Lookup(context.Background(), repo, []Target{{Kind: KindSymbol, Name: "Test"}})
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if len(got) != 1 || got[0].FQCN != "NUnit.Framework.TestAttribute" {
+		t.Fatalf("Lookup(Test) = %+v, want one NUnit.Framework.TestAttribute", got)
+	}
+	if got[0].ImportHint != "using NUnit.Framework;" {
+		t.Errorf("ImportHint = %q, want `using NUnit.Framework;`", got[0].ImportHint)
+	}
+	// A zero-member surface is the point: RenderSurfaces emits it as an import line rather than a
+	// member dump, which is the fact the model is missing.
+	if len(got[0].Members) != 0 {
+		t.Errorf("Members = %v, want none for a type that documents none", got[0].Members)
 	}
 }

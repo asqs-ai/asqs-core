@@ -188,14 +188,28 @@ func (p *CSharpProvider) candidateDocFiles(ctx context.Context, repoPath string,
 		return out
 	}
 
-	// 2. Global packages folder, restricted to the package directories the namespaces name so the
-	// walk cannot wander the whole cache.
+	// 2. Global packages folder, restricted to named package directories so the walk cannot wander
+	// the whole cache.
 	root := p.nugetPackagesRoot()
 	if root == "" {
 		return out
 	}
+	dirs := make(map[string]bool, len(wanted))
 	for ns := range wanted {
-		dir := filepath.Join(root, strings.ToLower(ns))
+		dirs[strings.ToLower(ns)] = true
+	}
+	if anyBareName {
+		// A bare name contributes no namespace, so with a batch of them `wanted` is EMPTY and this
+		// loop never ran — the cache went unsearched however much documentation was sitting in it.
+		// The bound that replaces the namespace is the repository's OWN package closure: exactly
+		// the packages it references, which is both precise and already resolved from its project
+		// files. A cache holds every version of everything, so an unbounded walk is not an option.
+		for _, id := range csharpRepoPackageIDs(repoPath) {
+			dirs[strings.ToLower(id)] = true
+		}
+	}
+	for ns := range dirs {
+		dir := filepath.Join(root, ns)
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 			continue
 		}
@@ -243,6 +257,16 @@ func (p *CSharpProvider) parseDocFile(path string) (map[string][]string, error) 
 	}
 	byType := map[string][]string{}
 	for _, m := range doc.Members.Member {
+		// A `T:` entry declares the TYPE. It carries no member, but it is the only record that the
+		// type exists at all — and a type with nothing else documented would otherwise be absent
+		// from this index entirely. Attributes are precisely that case, and resolving one is about
+		// printing its namespace for the import line, not about its members.
+		if typeName, isType := parseDocTypeID(m.Name); isType {
+			if _, exists := byType[typeName]; !exists {
+				byType[typeName] = nil
+			}
+			continue
+		}
 		declType, decl, ok := parseDocMemberID(m.Name)
 		if !ok {
 			continue
@@ -269,6 +293,20 @@ func (p *CSharpProvider) parseDocFile(path string) (map[string][]string, error) 
 //
 // T: entries describe the type itself, not a member, and are skipped. F:/E: (fields, events) are
 // rendered like properties.
+// parseDocTypeID reads a `T:` documentation ID — the entry that declares a type rather than one of
+// its members.
+func parseDocTypeID(id string) (string, bool) {
+	id = strings.TrimSpace(id)
+	if len(id) < 3 || id[1] != ':' || id[0] != 'T' {
+		return "", false
+	}
+	name := strings.TrimSpace(id[2:])
+	if name == "" || !strings.Contains(name, ".") {
+		return "", false
+	}
+	return name, true
+}
+
 func parseDocMemberID(id string) (declType, decl string, ok bool) {
 	id = strings.TrimSpace(id)
 	if len(id) < 3 || id[1] != ':' {
