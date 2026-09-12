@@ -13,6 +13,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/langid"
 	"github.com/asqs/asqs-core/internal/layout"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 	"github.com/asqs/asqs-core/internal/workspace"
@@ -178,12 +179,24 @@ const maxConcurrencyListGaps = 16
 // gapSymbolKindsForLang returns the symbol kinds that represent testable units for the given language.
 // Java: "method". JavaScript/TS: "FUNCTION" (declarations + const arrow/async), "METHOD" (class methods), "VARIABLE" (legacy: const arrow before indexer emitted FUNCTION).
 func gapSymbolKindsForLang(lang string) []string {
-	switch lang {
-	case "javascript", "typescript", "js", "ts":
+	if langid.IsJSTS(lang) {
 		return []string{"FUNCTION", "METHOD", "VARIABLE"}
-	default:
-		return []string{"method"}
 	}
+	return []string{"method"}
+}
+
+// symbolQueryLangs returns the language values to query the symbol store with.
+//
+// The store holds what the indexer wrote, not what the caller asked for: the JS/TS indexer splits
+// .ts and .js across "typescript" and "javascript" (and legacy rows are all "javascript"), so both
+// have to be asked. C# has the opposite problem — one stored spelling, "csharp", but PlanOptions,
+// CLI flags and gap symbols variously carry "cs". Canonicalising covers both: a query for "cs"
+// used to match no row at all, which is a plan with zero gaps and no error anywhere.
+func symbolQueryLangs(lang string) []string {
+	if langid.IsJSTS(lang) {
+		return []string{"javascript", "typescript"}
+	}
+	return []string{langid.Canonical(lang)}
 }
 
 // isPrivateJavaMethod returns true if the symbol is a Java method with visibility "private" (from signature_json).
@@ -258,10 +271,7 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	kinds := gapSymbolKindsForLang(opts.Lang)
 	var allSymbols []*metadata.Symbol
 	// For JS/TS, query both "javascript" and "typescript" so we get all symbols (indexer may store .ts as "typescript", .js as "javascript"; legacy data may be "javascript" only).
-	langsToQuery := []string{opts.Lang}
-	if opts.Lang == "typescript" || opts.Lang == "javascript" || opts.Lang == "ts" || opts.Lang == "js" {
-		langsToQuery = []string{"javascript", "typescript"}
-	}
+	langsToQuery := symbolQueryLangs(opts.Lang)
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {

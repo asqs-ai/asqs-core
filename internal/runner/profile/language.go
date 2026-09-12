@@ -1,7 +1,11 @@
 // Package profile defines language-specific execution settings for sandbox jobs (images, caches, reports, heuristics).
 package profile
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/asqs/asqs-core/internal/langid"
+)
 
 // LanguageProfile configures how evaluation runs for one language in an isolated job.
 type LanguageProfile struct {
@@ -52,8 +56,11 @@ var Profiles = map[string]LanguageProfile{
 }
 
 // ForLang returns the profile for lang, or a minimal default.
+// The identifier is canonicalised first: the runner emits "csharp" but plan options, CLI flags and
+// the indexer all carry "cs", and the short form used to miss the table and take the minimal
+// default — which handed a C# repo the JDK image and Java's coverage report paths.
 func ForLang(lang string) LanguageProfile {
-	k := strings.ToLower(strings.TrimSpace(lang))
+	k := langid.Canonical(lang)
 	if p, ok := Profiles[k]; ok {
 		return p
 	}
@@ -65,17 +72,16 @@ func ForLang(lang string) LanguageProfile {
 
 // ImageFor resolves the container image: config override per language, else profile default.
 func ImageFor(lang, imageJava, imageDotNet, imageNode string) string {
-	k := strings.ToLower(strings.TrimSpace(lang))
-	switch k {
+	switch langid.Canonical(lang) {
 	case "java":
 		if s := strings.TrimSpace(imageJava); s != "" {
 			return s
 		}
-	case "csharp", "cs":
+	case "csharp":
 		if s := strings.TrimSpace(imageDotNet); s != "" {
 			return s
 		}
-	case "javascript", "typescript", "js", "ts":
+	case "javascript", "typescript":
 		if s := strings.TrimSpace(imageNode); s != "" {
 			return s
 		}

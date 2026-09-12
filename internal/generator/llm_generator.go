@@ -18,6 +18,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/intelligence/tools"
+	"github.com/asqs/asqs-core/internal/langid"
 	"github.com/asqs/asqs-core/internal/layout"
 	"github.com/asqs/asqs-core/internal/workspace"
 )
@@ -691,7 +692,7 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 		}
 		return suggestedJavaE2EPathForRouteGap(item)
 	case "PAGE_ROUTE":
-		if lang := strings.ToLower(strings.TrimSpace(item.Gap.Symbol.Lang)); lang == "csharp" || lang == "cs" {
+		if langid.IsCSharp(item.Gap.Symbol.Lang) {
 			return layout.SuggestedCSharpE2ETestPath(item.Gap.Symbol.File, repoPath)
 		}
 		return suggestedE2EPathForPageRouteGap(item, e2eFramework)
@@ -700,7 +701,10 @@ func SuggestedTestPath(item *retrieval.TestPlanItem, testFramework, e2eFramework
 	base := filepath.Base(f)
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
-	lang := item.Gap.Symbol.Lang
+	// Canonicalised: the E2E branch above already accepted "cs", but this one compared the canonical
+	// spelling exactly, so a unit gap carrying the short form fell through to the Java default and
+	// got Java's suffix and directory rule on a .cs file.
+	lang := langid.Canonical(item.Gap.Symbol.Lang)
 
 	// Java: put tests under src/test/java/... (same package layout as src/main/java/...)
 	if lang == "java" {
