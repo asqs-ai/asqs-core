@@ -1157,7 +1157,15 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 		}
 		parsed = indexer.FilterParsedMapBySkipPrefixes(parsed, cfg.Indexer.SkipPathPrefixes)
 		indexer.AddJavaParsedMapPathAliases(parsed)
-		return javaAdvancedLangIndexer(parsed), indexer.IndexablePathsFromParsedMap(parsed), nil
+		// An OpenAPI or Swagger document declares routes no C# source states — a spec-first
+		// project's controllers are generated, and the spec is the only place the contract lives.
+		indexer.MergeOpenAPISpecFilesIntoMap(repoAbs, parsed)
+		// Markup reaches indexing too. A Razor page or Blazor component is where a UI surface's
+		// routes, its rendered text and its test hooks live, and IndexablePaths built from the
+		// PARSED map alone could never contain one: the Roslyn indexer reads .cs and nothing else,
+		// so those files were filtered out before the index phase ever saw them.
+		return javaAdvancedLangIndexer(parsed),
+			appendCSharpMarkupPaths(indexer.IndexablePathsFromParsedMap(parsed), repoAbs), nil
 	case "java":
 		if strings.EqualFold(strings.TrimSpace(cfg.Indexer.Type), "advanced") && strings.TrimSpace(cfg.Indexer.AdvancedJarPath) != "" {
 			parsed, err := javaindexer.RunJAR(ctx, repoAbs, cfg.Indexer.AdvancedJarPath, javaindexerRunJARConfig(cfg, 0))
