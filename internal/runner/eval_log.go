@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
 // The evaluation environment block: one function for both targets (U8).
@@ -118,6 +119,16 @@ func (s *Sandbox) auditEvalPlan(ctx context.Context, plan StepPlan, cwd string) 
 	}
 	if v := strings.TrimSpace(s.TestCommand); v != "" {
 		payload["test_command_override"] = v
+	}
+	// ASQS injects MSBuild properties into every C# eval step, and keeping them is a decision, not
+	// an accident — a feed's audit warnings and a repo's warnings-as-errors policy must not fail a
+	// step for reasons unrelated to the generated test. It was also invisible: an operator reading a
+	// passing C# eval had no way to know their TreatWarningsAsErrors was being overridden. Stated
+	// here, behaviour unchanged. Absent for every other language, where the question does not arise.
+	if plan.Toolchain == profile.CSharpDotnet {
+		payload["msbuild_properties"] = DotnetEvalMSBuildProperties()
+		payload["message"] = fmt.Sprintf("%s MSBuild properties injected into every step: %s.",
+			payload["message"], strings.Join(DotnetEvalMSBuildProperties(), " "))
 	}
 	s.Audit.Log(ctx, "runner.eval_plan_resolved", payload)
 }

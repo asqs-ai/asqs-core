@@ -191,6 +191,12 @@ var dotnetTestFrameworkBootstrapMSBuildProps = []string{
 	"/p:TreatWarningsAsErrors=false",
 }
 
+// DotnetEvalMSBuildProperties returns the MSBuild properties ASQS injects into every C# eval step,
+// for the audit trail. Returning a copy keeps a reader from mutating the live list.
+func DotnetEvalMSBuildProperties() []string {
+	return append([]string(nil), dotnetTestFrameworkBootstrapMSBuildProps...)
+}
+
 // dotnetTestDockerHangMitigationProps disables Roslyn shared compilation and the Razor build server during
 // `dotnet test` in ephemeral Docker. On Linux/macOS the VBCSCompiler / Razor server processes have been
 // observed to keep the CLI alive long after xUnit/VSTest prints results (symptom: wall-clock timeout while
