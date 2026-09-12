@@ -297,6 +297,8 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 	unresolvedCallerByType := make(map[string]int64)
 	unresolvedCalleeByType := make(map[string]int64)
 	filesToIndex := append(changeSet.Added, changeSet.Changed...)
+	unresolvedByFile := map[string]*ParsedFile{}
+
 	for _, fv := range filesToIndex {
 		source, err := os.ReadFile(filepath.Join(opts.RepoPath, fv.Path))
 		if err != nil {
@@ -325,6 +327,13 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			}
 		}
 		parsed.Source = string(source)
+		// A file whose calls did not bind has incomplete project references. Only the offending
+		// files are kept — a repository normally has a handful, and the alternative is a
+		// repository-wide total that names nothing anybody can act on.
+		if parsed.UnresolvedInvocations != nil && *parsed.UnresolvedInvocations > 0 {
+			n := *parsed.UnresolvedInvocations
+			unresolvedByFile[filepath.ToSlash(fv.Path)] = &ParsedFile{UnresolvedInvocations: &n}
+		}
 		// Always use scan path as DB file key so symbols join ListSymbolsInTestFiles (JAR/map paths may differ in case or shape).
 		parsed.Path = filepath.ToSlash(fv.Path)
 		parsed.Module = fv.Module
@@ -825,6 +834,11 @@ func Run(ctx context.Context, meta MetadataWriter, emb EmbeddingsWriter, opts Ru
 			"run_id":  runID, "added": len(changeSet.Added), "changed": len(changeSet.Changed),
 			"removed": len(changeSet.Removed), "chunks_stored": chunksStored, "symbols_stored": symbolsStored, "edges_stored": edgesStored,
 			"duration_ms": finished - started,
+		}
+		if worst := WorstUnresolvedFiles(unresolvedByFile, 5); len(worst) > 0 {
+			finishPayload["worst_unresolved_files"] = worst
+			finishPayload["message"] = fmt.Sprintf("%s Most unresolved calls: %s.",
+				finishPayload["message"], strings.Join(worst, ", "))
 		}
 		if len(unresolvedCallerByType) > 0 || len(unresolvedCalleeByType) > 0 {
 			finishPayload["edges_unresolved_missing_caller"] = unresolvedCallerByType

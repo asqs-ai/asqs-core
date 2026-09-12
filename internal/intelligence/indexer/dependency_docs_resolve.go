@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 // Manifest parsing and per-ecosystem doc extraction for B55. Everything here is pure file reading
@@ -222,8 +224,15 @@ func javadocSummary(body string) string {
 
 type nugetRef struct{ id, version string }
 
-var csprojPkgRe = regexp.MustCompile(`<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)"`)
-
+// parseCsprojPackageRefs returns every NuGet package the repository's projects reference, with the
+// version each project actually resolves.
+//
+// It goes through dotnetproj rather than a regex of its own. The regex it replaces required
+// `Version` as an ATTRIBUTE immediately after `Include`, which missed three shapes a real solution
+// uses — the attributes in the other order, `<Version>` as a CHILD element, and central package
+// management, where the project file carries no version at all by design. Every miss has the same
+// consequence: the package's XML documentation is never located, so the API surface has nothing to
+// resolve that package's types against.
 func parseCsprojPackageRefs(repoPath string) []nugetRef {
 	seen := map[string]bool{}
 	var out []nugetRef
@@ -232,24 +241,27 @@ func parseCsprojPackageRefs(repoPath string) []nugetRef {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if name == "node_modules" || name == "bin" || name == "obj" || strings.HasPrefix(name, ".") {
+			if dotnetproj.WalkSkipDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !strings.HasSuffix(d.Name(), ".csproj") {
+		if !strings.EqualFold(filepath.Ext(d.Name()), ".csproj") {
 			return nil
 		}
-		b, rerr := os.ReadFile(path)
-		if rerr != nil {
+		facts, ferr := dotnetproj.ResolveFacts(repoPath, path)
+		if ferr != nil {
 			return nil
 		}
-		for _, m := range csprojPkgRe.FindAllStringSubmatch(string(b), -1) {
-			key := m[1] + "@" + m[2]
+		for _, id := range facts.PackageIDs() {
+			version, _ := facts.PackageVersion(id)
+			if version == "" {
+				continue // referenced but unresolvable: no version means no documentation path
+			}
+			key := id + "@" + version
 			if !seen[key] {
 				seen[key] = true
-				out = append(out, nugetRef{id: m[1], version: m[2]})
+				out = append(out, nugetRef{id: id, version: version})
 			}
 		}
 		return nil

@@ -40,3 +40,8 @@ internal/testbootstrap/testdata/csharp_aspnetcore_no_test_project/**/bin/
 # Generated patches / scratch
 *.patch
 /tmp/
+
+# Fixture build output: the indexer INDEXES testdata/minimal, so nothing here is ever built on
+# purpose — but pointing a dotnet command at the directory leaves obj/ and bin/ behind.
+tools/csharp-indexer/testdata/minimal/obj
+tools/csharp-indexer/testdata/minimal/bin

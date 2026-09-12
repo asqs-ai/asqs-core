@@ -120,13 +120,36 @@ internal static class Program
         }
     }
 
+    private static readonly string[] SkippedDirSegments =
+    {
+        "bin", "obj", "out", "dist", "build", "target", "packages", "testresults",
+        ".vs", ".git", ".idea", ".vscode", "node_modules",
+    };
+
+    // GeneratedFileSuffixes name files a tool wrote. Indexing them is worse than useless: the
+    // symbols are real, so they compete for plan budget and prompt space with the hand-written code
+    // the run exists to test, and nothing may edit them because the generator will overwrite them.
+    private static readonly string[] GeneratedFileSuffixes =
+    {
+        ".designer.cs", ".g.cs", ".g.i.cs", ".generated.cs", "globalusings.g.cs", "assemblyinfo.cs",
+    };
+
     private static bool IsInSkippedDir(string path)
     {
         var norm = path.Replace('\\', '/');
-        if (norm.Contains("/bin/", StringComparison.OrdinalIgnoreCase)) return true;
-        if (norm.Contains("/obj/", StringComparison.OrdinalIgnoreCase)) return true;
-        if (norm.Contains("/.vs/", StringComparison.OrdinalIgnoreCase)) return true;
-        if (norm.Contains("/node_modules/", StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var seg in SkippedDirSegments)
+        {
+            if (norm.Contains("/" + seg + "/", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        var name = Path.GetFileName(norm);
+        foreach (var suffix in GeneratedFileSuffixes)
+        {
+            if (name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        // An EF Core migration's designer file carries the model snapshot — thousands of lines of
+        // generated builder calls that resolve to nothing a test can use.
+        if (norm.Contains("/migrations/", StringComparison.OrdinalIgnoreCase)
+            && name.EndsWith(".designer.cs", StringComparison.OrdinalIgnoreCase)) return true;
         return false;
     }
 
@@ -403,6 +426,15 @@ internal static class Program
             });
         }
 
+        // A file with no namespace declaration still needs a module, or it has no container: every
+        // CONTAINS edge is dropped, chunking has nothing to group by, and the file's symbols are
+        // orphans. Top-level statements are the common case — Program.cs in every modern ASP.NET
+        // template declares no namespace at all — and it is the entry point, so losing it loses the
+        // one file that wires the application together.
+        if (string.IsNullOrEmpty(moduleNs))
+        {
+            moduleNs = TopLevelModuleName(root);
+        }
         if (!string.IsNullOrEmpty(moduleNs))
         {
             symbols.Add(new SymbolDto
@@ -416,14 +448,22 @@ internal static class Program
 
         foreach (var u in root.DescendantNodes().OfType<UsingDirectiveSyntax>())
         {
-            if (u.StaticKeyword.IsKind(SyntaxKind.StaticKeyword)) continue;
             var name = u.Name?.ToString().Trim();
             if (string.IsNullOrEmpty(name)) continue;
-            var line = u.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-            if (!string.IsNullOrEmpty(moduleNs))
+            if (string.IsNullOrEmpty(moduleNs)) continue;
+            // `using static Xunit.Assert;` and `using Sut = Shop.Core.Basket;` both name a TYPE, so
+            // the edge resolves to the type rather than to a namespace that does not exist. Skipping
+            // the static form outright — which is what happened before — lost the import edge for
+            // every file that gets its assertions that way, which in xUnit and NUnit is common.
+            var isStatic = u.StaticKeyword.IsKind(SyntaxKind.StaticKeyword);
+            var isAlias = u.Alias != null;
+            if (isStatic || isAlias)
             {
-                AddEdge(moduleNs, name, "IMPORTS");
+                var target = model.GetTypeInfo(u.Name!).Type as INamedTypeSymbol;
+                AddEdge(moduleNs, target != null ? TypeFqName(target) : name, "IMPORTS");
+                continue;
             }
+            AddEdge(moduleNs, name, "IMPORTS");
         }
 
         foreach (var typeDecl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
@@ -451,7 +491,7 @@ internal static class Program
                 EndLine = el,
                 StartColumn = sc,
                 EndColumn = ec,
-                Signature = BuildTypeSignature(sym),
+                Signature = BuildTypeSignature(sym, typeDecl),
             });
             if (!string.IsNullOrEmpty(moduleNs))
             {
@@ -504,13 +544,50 @@ internal static class Program
                     case EventFieldDeclarationSyntax efd:
                         IndexEventField(efd, typeFq, model, symbols, AddEdge);
                         break;
+                    case IndexerDeclarationSyntax ixd:
+                        IndexIndexer(ixd, typeFq, model, symbols, AddEdge);
+                        break;
+                    case OperatorDeclarationSyntax opd:
+                        IndexOperator(opd, typeFq, model, symbols, AddEdge);
+                        break;
+                    case ConversionOperatorDeclarationSyntax cod:
+                        IndexConversionOperator(cod, typeFq, model, symbols, AddEdge);
+                        break;
+                    case DelegateDeclarationSyntax dd:
+                        IndexNestedDelegate(dd, typeFq, model, symbols, AddEdge);
+                        break;
                 }
             }
 
+            // A record's positional parameters ARE its properties, and nothing in the body declares
+            // them. Without this a record indexes as a type with no members at all, so every gap
+            // against one is proposed blind and every member fact about one is empty.
+            IndexRecordPositionalProperties(typeDecl, typeFq, model, symbols, AddEdge);
+
             // DI extraction: constructor injection edges for the most activatable constructor.
             EmitConstructorInjectionEdges(typeDecl, typeFq, model, AddEdge);
+        }
 
-            CollectInvocations(typeDecl, model, edges, invStats);
+        // Once per compilation unit, not once per type. Called per type declaration this visited a
+        // NESTED type twice — once inside its parent's descendants and once on its own — so its
+        // invocations were counted twice in the resolution statistics. Scoping to the root also
+        // reaches the invocations that live outside a type declaration's member list: property and
+        // event accessor bodies, local functions, and a top-level-statement file's whole body.
+        CollectInvocations(root, model, edges, invStats);
+
+        // EnumDeclarationSyntax is a BaseTypeDeclarationSyntax and NOT a TypeDeclarationSyntax, so
+        // the walk above never saw one: every enum in every C# repository indexed to nothing. A
+        // switch over an enum is the single most common thing a generated test needs to enumerate.
+        foreach (var enumDecl in root.DescendantNodes().OfType<EnumDeclarationSyntax>())
+        {
+            IndexEnum(enumDecl, moduleNs, model, symbols, AddEdge);
+        }
+
+        // A delegate declared at namespace level rather than inside a type.
+        foreach (var dd in root.DescendantNodes().OfType<DelegateDeclarationSyntax>())
+        {
+            if (dd.Parent is TypeDeclarationSyntax) continue; // already emitted as a member
+            IndexNestedDelegate(dd, moduleNs, model, symbols, AddEdge);
         }
 
         if (isTest && text.Contains("Microsoft.Playwright", StringComparison.Ordinal))
@@ -558,7 +635,7 @@ internal static class Program
             EndLine = el,
             StartColumn = sc,
             EndColumn = ec,
-            Signature = BuildMethodSignature(ms),
+            Signature = BuildMethodSignature(ms, md),
         });
         addEdge(typeFq, fq, "CONTAINS");
         EmitCallableTypeSurfaceEdges(ms, fq, addEdge, includeReturnType: true);
@@ -580,7 +657,7 @@ internal static class Program
             EndLine = el,
             StartColumn = sc,
             EndColumn = ec,
-            Signature = BuildMethodSignature(cs),
+            Signature = BuildMethodSignature(cs, cd),
         });
         addEdge(typeFq, fq, "CONTAINS");
         EmitCallableTypeSurfaceEdges(cs, fq, addEdge, includeReturnType: false);
@@ -874,32 +951,435 @@ internal static class Program
         return b.ToString();
     }
 
-    private static JsonElement? BuildTypeSignature(INamedTypeSymbol t)
+    // The signature payloads below carry the keys the Java indexer emits, because every consumer
+    // downstream was written against those: retrieval's context builder, the testability scorer and
+    // the generator's per-symbol API surface all read `signature`, `params` and `return_type`. C#
+    // emitted none of them, so a C# symbol reached the prompt as a name and a line range — and
+    // apisurface.SignatureTargets, which resolves the third-party types in a signature, had nothing
+    // to read and returned nil for every C# gap.
+
+    // TopLevelModuleName names the container for a file that declares no namespace.
+    //
+    // The project's RootNamespace would be the truthful answer, but this scope has no csproj — so
+    // the fallback is the assembly-neutral "Global", which is what C# itself calls the namespace a
+    // top-level declaration lands in. Anything is better than "": an empty module drops every
+    // CONTAINS edge and leaves the file's symbols with no container to chunk by.
+    private static string TopLevelModuleName(SyntaxNode root)
     {
-        return JsonSerializer.SerializeToElement(new Dictionary<string, object>
+        var hasContent = root.DescendantNodes().OfType<GlobalStatementSyntax>().Any()
+            || root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>().Any()
+            || root.DescendantNodes().OfType<DelegateDeclarationSyntax>().Any();
+        return hasContent ? "Global" : "";
+    }
+
+    // IndexEnum emits the enum and its members. The member NAMES are the point: a test that
+    // switches over a state machine needs to know the states exist, and they are the one kind of
+    // member that carries no modifier for a scan to key on.
+    private static void IndexEnum(EnumDeclarationSyntax ed, string moduleNs, SemanticModel model,
+        List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var sym = model.GetDeclaredSymbol(ed);
+        if (sym == null) return;
+        var typeFq = TypeFqName(sym);
+        var (sl, el, sc, ec) = LineSpan(ed);
+
+        var members = ed.Members.Select(m => m.Identifier.Text).Where(n => n.Length > 0).ToList();
+        var payload = new Dictionary<string, object>
+        {
+            ["visibility"] = sym.DeclaredAccessibility.ToString().ToLowerInvariant(),
+            ["bare_fq_name"] = BareFqName(typeFq),
+            ["exported"] = IsExported(sym),
+            ["members"] = members,
+            ["signature"] = CollapseWhitespace("enum " + ed.Identifier.Text
+                + (ed.BaseList != null ? " " + ed.BaseList.ToString() : "")),
+        };
+        var attrs = AttributeSimpleNames(sym);
+        if (attrs.Count > 0) payload["attributes"] = attrs;
+        var doc = XmlDocSummary(sym);
+        if (!string.IsNullOrEmpty(doc)) payload["xmldoc"] = doc;
+
+        symbols.Add(new SymbolDto
+        {
+            Kind = "enum",
+            FqName = typeFq,
+            StartLine = sl,
+            EndLine = el,
+            StartColumn = sc,
+            EndColumn = ec,
+            Signature = JsonSerializer.SerializeToElement(payload),
+        });
+        if (!string.IsNullOrEmpty(moduleNs))
+        {
+            addEdge(moduleNs, typeFq, "CONTAINS");
+        }
+        // The underlying type is an implementation detail, so no EXTENDS edge: it says nothing
+        // about how the enum is used and would rank as inheritance evidence in retrieval.
+        foreach (var m in ed.Members)
+        {
+            var ms = model.GetDeclaredSymbol(m);
+            if (ms == null) continue;
+            var fq = typeFq + "#" + m.Identifier.Text;
+            var (msl, mel, msc, mec) = LineSpan(m);
+            symbols.Add(new SymbolDto
+            {
+                Kind = "field",
+                FqName = fq,
+                StartLine = msl,
+                EndLine = mel,
+                StartColumn = msc,
+                EndColumn = mec,
+                Signature = BuildMemberSignature(ms, isStatic: true),
+            });
+            addEdge(typeFq, fq, "CONTAINS");
+        }
+    }
+
+    // IndexRecordPositionalProperties emits a record's parameter list as properties.
+    //
+    // `public record Order(int Id, string Sku)` declares Id and Sku as properties and nothing in
+    // the body says so. A record indexed without them is a type with no members, so a gap against
+    // one is proposed blind.
+    private static void IndexRecordPositionalProperties(TypeDeclarationSyntax decl, string typeFq,
+        SemanticModel model, List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        if (decl is not RecordDeclarationSyntax rd || rd.ParameterList == null) return;
+        foreach (var p in rd.ParameterList.Parameters)
+        {
+            var name = p.Identifier.Text;
+            if (name.Length == 0) continue;
+            var fq = typeFq + "#" + name;
+            var (sl, el, sc, ec) = LineSpan(p);
+            var type = p.Type != null ? model.GetTypeInfo(p.Type).Type : null;
+            var payload = new Dictionary<string, object>
+            {
+                ["visibility"] = "public",
+                ["static"] = false,
+                ["exported"] = true,
+                ["positional"] = true,
+            };
+            if (type != null) payload["type"] = DisplayTypeName(type);
+            symbols.Add(new SymbolDto
+            {
+                Kind = "property",
+                FqName = fq,
+                StartLine = sl,
+                EndLine = el,
+                StartColumn = sc,
+                EndColumn = ec,
+                Signature = JsonSerializer.SerializeToElement(payload),
+            });
+            addEdge(typeFq, fq, "CONTAINS");
+        }
+    }
+
+    // An indexer is a property whose name is `this[]`; there is no other way to spell it.
+    private static void IndexIndexer(IndexerDeclarationSyntax ixd, string typeFq, SemanticModel model,
+        List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var sym = model.GetDeclaredSymbol(ixd);
+        if (sym == null) return;
+        var fq = typeFq + "#this[" + string.Join(",", sym.Parameters.Select(pr => ParamTypeName(pr.Type))) + "]";
+        var (sl, el, sc, ec) = LineSpan(ixd);
+        symbols.Add(new SymbolDto
+        {
+            Kind = "property",
+            FqName = fq,
+            StartLine = sl,
+            EndLine = el,
+            StartColumn = sc,
+            EndColumn = ec,
+            Signature = BuildMemberSignature(sym, sym.IsStatic),
+        });
+        addEdge(typeFq, fq, "CONTAINS");
+    }
+
+    // An operator is a method with a symbolic name. A test asserting `a + b` calls one, and without
+    // this the call resolves to nothing.
+    private static void IndexOperator(OperatorDeclarationSyntax opd, string typeFq, SemanticModel model,
+        List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var sym = model.GetDeclaredSymbol(opd);
+        if (sym == null) return;
+        EmitCallableSymbol(sym, opd, typeFq, symbols, addEdge);
+    }
+
+    private static void IndexConversionOperator(ConversionOperatorDeclarationSyntax cod, string typeFq,
+        SemanticModel model, List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var sym = model.GetDeclaredSymbol(cod);
+        if (sym == null) return;
+        EmitCallableSymbol(sym, cod, typeFq, symbols, addEdge);
+    }
+
+    private static void EmitCallableSymbol(IMethodSymbol sym, BaseMethodDeclarationSyntax decl, string typeFq,
+        List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var fq = MethodFqName(sym);
+        var (sl, el, sc, ec) = LineSpan(decl);
+        symbols.Add(new SymbolDto
+        {
+            Kind = "method",
+            FqName = fq,
+            StartLine = sl,
+            EndLine = el,
+            StartColumn = sc,
+            EndColumn = ec,
+            Signature = BuildMethodSignature(sym, decl),
+        });
+        addEdge(typeFq, fq, "CONTAINS");
+    }
+
+    // A delegate is a type, not a member, but it is declared like one and a callback parameter's
+    // shape is exactly what a test has to construct.
+    private static void IndexNestedDelegate(DelegateDeclarationSyntax dd, string containerFq, SemanticModel model,
+        List<SymbolDto> symbols, Action<string, string, string> addEdge)
+    {
+        var sym = model.GetDeclaredSymbol(dd);
+        if (sym == null) return;
+        var fq = TypeFqName(sym);
+        var (sl, el, sc, ec) = LineSpan(dd);
+        var payload = new Dictionary<string, object>
+        {
+            ["visibility"] = sym.DeclaredAccessibility.ToString().ToLowerInvariant(),
+            ["bare_fq_name"] = BareFqName(fq),
+            ["exported"] = IsExported(sym),
+            ["signature"] = CollapseWhitespace(dd.ToString().TrimEnd(';')),
+        };
+        if (sym.DelegateInvokeMethod != null)
+        {
+            payload["return_type"] = DisplayTypeName(sym.DelegateInvokeMethod.ReturnType);
+            payload["params"] = sym.DelegateInvokeMethod.Parameters.Select(p => new Dictionary<string, object>
+            {
+                ["name"] = p.Name,
+                ["type"] = DisplayTypeName(p.Type),
+            }).ToList();
+        }
+        var doc = XmlDocSummary(sym);
+        if (!string.IsNullOrEmpty(doc)) payload["xmldoc"] = doc;
+
+        symbols.Add(new SymbolDto
+        {
+            Kind = "delegate",
+            FqName = fq,
+            StartLine = sl,
+            EndLine = el,
+            StartColumn = sc,
+            EndColumn = ec,
+            Signature = JsonSerializer.SerializeToElement(payload),
+        });
+        if (!string.IsNullOrEmpty(containerFq))
+        {
+            addEdge(containerFq, fq, "CONTAINS");
+        }
+    }
+
+    private static JsonElement? BuildTypeSignature(INamedTypeSymbol t, TypeDeclarationSyntax? decl = null)
+    {
+        var payload = new Dictionary<string, object>
         {
             ["visibility"] = t.DeclaredAccessibility.ToString().ToLowerInvariant(),
             ["bare_fq_name"] = BareFqName(TypeFqName(t)),
-        });
+            ["exported"] = IsExported(t),
+        };
+        if (decl != null)
+        {
+            payload["signature"] = DeclarationHeaderText(decl);
+        }
+        var attrs = AttributeSimpleNames(t);
+        if (attrs.Count > 0)
+        {
+            payload["attributes"] = attrs;
+        }
+        var doc = XmlDocSummary(t);
+        if (!string.IsNullOrEmpty(doc))
+        {
+            payload["xmldoc"] = doc;
+        }
+        return JsonSerializer.SerializeToElement(payload);
     }
 
-    private static JsonElement? BuildMethodSignature(IMethodSymbol m)
+    private static JsonElement? BuildMethodSignature(IMethodSymbol m, BaseMethodDeclarationSyntax? decl = null)
     {
-        return JsonSerializer.SerializeToElement(new Dictionary<string, object>
+        var payload = new Dictionary<string, object>
         {
             ["visibility"] = m.DeclaredAccessibility.ToString().ToLowerInvariant(),
             ["static"] = m.IsStatic,
             ["bare_fq_name"] = BareFqName(MethodFqName(m)),
-        });
+            ["exported"] = IsExported(m),
+            ["params"] = m.Parameters.Select(p => new Dictionary<string, object>
+            {
+                ["name"] = p.Name,
+                ["type"] = DisplayTypeName(p.Type),
+            }).ToList(),
+        };
+        if (m.MethodKind != MethodKind.Constructor)
+        {
+            payload["return_type"] = DisplayTypeName(m.ReturnType);
+        }
+        payload["signature"] = decl != null ? DeclarationHeaderText(decl) : SynthesiseCallableSignature(m);
+        var attrs = AttributeSimpleNames(m);
+        if (attrs.Count > 0)
+        {
+            payload["attributes"] = attrs;
+        }
+        var doc = XmlDocSummary(m);
+        if (!string.IsNullOrEmpty(doc))
+        {
+            payload["xmldoc"] = doc;
+        }
+        return JsonSerializer.SerializeToElement(payload);
     }
 
     private static JsonElement? BuildMemberSignature(ISymbol s, bool isStatic)
     {
-        return JsonSerializer.SerializeToElement(new Dictionary<string, object>
+        var payload = new Dictionary<string, object>
         {
             ["visibility"] = s.DeclaredAccessibility.ToString().ToLowerInvariant(),
             ["static"] = isStatic,
-        });
+            ["exported"] = IsExported(s),
+        };
+        var t = s switch
+        {
+            IFieldSymbol f => f.Type,
+            IPropertySymbol pr => pr.Type,
+            IEventSymbol e => e.Type,
+            _ => null,
+        };
+        if (t != null)
+        {
+            payload["type"] = DisplayTypeName(t);
+        }
+        var attrs = AttributeSimpleNames(s);
+        if (attrs.Count > 0)
+        {
+            payload["attributes"] = attrs;
+        }
+        var doc = XmlDocSummary(s);
+        if (!string.IsNullOrEmpty(doc))
+        {
+            payload["xmldoc"] = doc;
+        }
+        return JsonSerializer.SerializeToElement(payload);
+    }
+
+    // IsExported is "visible outside its own assembly", the same question the Java indexer answers
+    // with `public`. Nested accessibility matters: a public method on an internal type is not
+    // reachable from a test assembly, and reporting it as exported would put it in front of a
+    // generator that cannot call it.
+    private static bool IsExported(ISymbol s)
+    {
+        for (var cur = s; cur != null; cur = cur.ContainingType)
+        {
+            switch (cur.DeclaredAccessibility)
+            {
+                case Accessibility.Public:
+                case Accessibility.Protected:
+                case Accessibility.ProtectedOrInternal:
+                    continue;
+                case Accessibility.NotApplicable:
+                    continue;
+                default:
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    // DeclarationHeaderText is the declaration with its body removed — what a reader needs to call
+    // the member and nothing more. Roslyn gives the whole node, so the body, the expression body
+    // and the trailing semicolon are trimmed, and the result is collapsed onto one line.
+    private static string DeclarationHeaderText(SyntaxNode decl)
+    {
+        var header = decl switch
+        {
+            MethodDeclarationSyntax m => m.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default).ToString(),
+            ConstructorDeclarationSyntax c => c.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default).ToString(),
+            OperatorDeclarationSyntax o => o.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default).ToString(),
+            ConversionOperatorDeclarationSyntax v => v.WithBody(null).WithExpressionBody(null).WithSemicolonToken(default).ToString(),
+            TypeDeclarationSyntax t => TypeHeaderText(t),
+            _ => decl.ToString(),
+        };
+        return CollapseWhitespace(header);
+    }
+
+    private static string TypeHeaderText(TypeDeclarationSyntax t)
+    {
+        // Everything up to the opening brace, or to the semicolon for a record with no body.
+        var text = t.ToString();
+        var brace = text.IndexOf('{');
+        if (brace >= 0)
+        {
+            text = text[..brace];
+        }
+        return text.TrimEnd().TrimEnd(';');
+    }
+
+    // SynthesiseCallableSignature rebuilds a declaration for a callable whose syntax this scope does
+    // not have — a primary constructor, or a record's generated members.
+    private static string SynthesiseCallableSignature(IMethodSymbol m)
+    {
+        var ps = string.Join(", ", m.Parameters.Select(p => DisplayTypeName(p.Type) + " " + p.Name));
+        var name = m.MethodKind == MethodKind.Constructor ? m.ContainingType.Name : m.Name;
+        var ret = m.MethodKind == MethodKind.Constructor ? "" : DisplayTypeName(m.ReturnType) + " ";
+        var vis = m.DeclaredAccessibility == Accessibility.Public ? "public " : "";
+        return CollapseWhitespace(vis + ret + name + "(" + ps + ")");
+    }
+
+    private static string CollapseWhitespace(string s)
+    {
+        return string.Join(" ", s.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).Trim();
+    }
+
+    // DisplayTypeName renders a type the way C# source spells it — `string`, `int?`,
+    // `List<Order>` — rather than the metadata form. This is read alongside source, and the
+    // keyword form is what a compiler error will quote back.
+    private static string DisplayTypeName(ITypeSymbol t)
+    {
+        var fmt = new SymbolDisplayFormat(
+            globalNamespaceStyle: SymbolDisplayGlobalNamespaceStyle.Omitted,
+            typeQualificationStyle: SymbolDisplayTypeQualificationStyle.NameAndContainingTypes,
+            genericsOptions: SymbolDisplayGenericsOptions.IncludeTypeParameters,
+            miscellaneousOptions: SymbolDisplayMiscellaneousOptions.UseSpecialTypes
+                | SymbolDisplayMiscellaneousOptions.IncludeNullableReferenceTypeModifier);
+        return t.ToDisplayString(fmt);
+    }
+
+    private static List<string> AttributeSimpleNames(ISymbol s)
+    {
+        var out_ = new List<string>();
+        foreach (var a in s.GetAttributes())
+        {
+            var name = a.AttributeClass?.Name;
+            if (string.IsNullOrEmpty(name)) continue;
+            // `[Fact]` is FactAttribute; the source spelling is the one a reader recognises.
+            if (name.EndsWith("Attribute", StringComparison.Ordinal) && name.Length > "Attribute".Length)
+            {
+                name = name[..^"Attribute".Length];
+            }
+            if (!out_.Contains(name)) out_.Add(name);
+        }
+        return out_;
+    }
+
+    private const int MaxXmlDocRunes = 512;
+
+    // XmlDocSummary extracts the <summary> text from a symbol's documentation comment. The comment
+    // is the author's own statement of intent, and it is the one piece of a C# file that says WHY
+    // rather than what.
+    private static string XmlDocSummary(ISymbol s)
+    {
+        var xml = s.GetDocumentationCommentXml();
+        if (string.IsNullOrWhiteSpace(xml)) return "";
+        var open = xml.IndexOf("<summary>", StringComparison.Ordinal);
+        if (open < 0) return "";
+        var close = xml.IndexOf("</summary>", open, StringComparison.Ordinal);
+        if (close < 0) return "";
+        var body = xml[(open + "<summary>".Length)..close];
+        // Inner elements (<see cref="..."/>, <paramref .../>) are dropped to their text.
+        body = System.Text.RegularExpressions.Regex.Replace(body, "<[^>]*>", " ");
+        body = System.Net.WebUtility.HtmlDecode(body);
+        body = CollapseWhitespace(body);
+        return body.Length > MaxXmlDocRunes ? body[..MaxXmlDocRunes] : body;
     }
 
     private static string GuessModuleNamespace(SyntaxNode root)

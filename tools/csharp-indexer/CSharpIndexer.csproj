@@ -9,6 +9,13 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <ItemGroup>
+    <!-- testdata holds FIXTURE projects that this tool indexes; they are not part of the tool.
+         Without this the SDK's **/*.cs glob compiles them into the indexer itself, and the fixture's
+         own obj/ output then collides with the tool's generated assembly attributes. -->
+    <Compile Remove="testdata/**" />
+    <None Remove="testdata/**" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
     <PackageReference Include="Basic.Reference.Assemblies.Net100" Version="1.8.4" />
   </ItemGroup>

@@ -535,6 +535,9 @@ var javaImportRE = regexp.MustCompile(`(?m)^\s*import\s+([\w.$]+\.[A-Z][\w$]*)\s
 // Returns nil for every non-Java language and for any input it cannot parse, which is the no-op
 // path: the caller renders no block and generation is exactly what it was before.
 func SignatureTargets(lang, signature, source string) []Target {
+	if NormalizeLang(lang) == LangCSharp {
+		return csharpSignatureTargets(signature, source)
+	}
 	if NormalizeLang(lang) != LangJava {
 		return nil
 	}
