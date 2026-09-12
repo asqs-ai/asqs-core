@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 // E2ERootDirCandidates are repo-root directory names that indicate a dedicated end-to-end test tree
@@ -15,13 +17,10 @@ var E2ERootDirCandidates = []string{
 
 const maxCsprojWalkDepth = 8
 
+// csprojWalkSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func csprojWalkSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case ".git", "bin", "obj", "node_modules", "packages", ".vs", ".vscode", "testresults",
-		"dist", "build", "out", "target", "__pycache__", ".next", ".idea":
-		return true
-	}
-	return false
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func relDirDepth(root, path string) int {

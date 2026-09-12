@@ -130,7 +130,7 @@ func lockMentionsPlaywrightTest(s string) bool {
 	return strings.Contains(low, `"@playwright/test"`) || strings.Contains(low, `"node_modules/@playwright/test"`)
 }
 
-func detectE2ECSharp(dir string) (E2EReport, error) {
+func detectE2ECSharp(dir, forcedSurface string) (E2EReport, error) {
 	dir = filepath.Clean(dir)
 	rep, err := detectE2ECSharpFrameworks(dir)
 	if err != nil {
@@ -138,10 +138,13 @@ func detectE2ECSharp(dir string) (E2EReport, error) {
 	}
 	// The surface is a property of the APPLICATION, not of whether an E2E project exists yet, so it
 	// is attached to every report — including the "no E2E found" ones bootstrap acts on.
-	if surface, uiFramework, _, serr := DetectCSharpUISurface(dir); serr == nil {
-		rep.Surface = string(surface)
-		if uiFramework != CSharpUINone {
-			rep.UIFramework = string(uiFramework)
+	// The operator's override is applied here, because this report is what every behavioural
+	// consumer of the surface reads.
+	if detected, serr := detectCSharpUISurface(dir); serr == nil {
+		resolved := resolveCSharpUISurface(forcedSurface, detected)
+		rep.Surface = string(resolved.Surface)
+		if resolved.UIFramework != CSharpUINone {
+			rep.UIFramework = string(resolved.UIFramework)
 		}
 	}
 	return rep, nil

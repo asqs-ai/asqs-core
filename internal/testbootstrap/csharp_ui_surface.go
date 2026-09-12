@@ -1,6 +1,7 @@
 package testbootstrap
 
 import (
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -94,13 +95,10 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 	if root == "" {
 		return csharpUISurfaceDetection{Surface: CSharpSurfaceNone, UIFramework: CSharpUINone}, nil
 	}
-	testDirs, err := csharpTestProjectDirs(root)
-	if err != nil {
-		return csharpUISurfaceDetection{}, err
-	}
 
 	var (
 		evidence         []string
+		testDirs         []string
 		hasRazorPages    bool
 		hasMvcViews      bool
 		hasBlazorServer  bool
@@ -113,7 +111,6 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		hasRazorMarkup   bool
 		hasBlazorMarkup  bool
 		hasViewsMarkup   bool
-		hasWwwrootIndex  bool
 	)
 	note := func(s string) {
 		for _, e := range evidence {
@@ -123,6 +120,13 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		}
 		evidence = append(evidence, s)
 	}
+
+	// One walk, collecting the project layout and the signals together. The scan used to make two
+	// passes over the whole tree — one to find the test projects, one to read the signals — and is
+	// called several times per run.
+	type pending struct{ path, rel string }
+	var sources []pending
+	buf := make([]byte, maxSurfaceScanFileBytes)
 
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -135,21 +139,23 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 			if dotnetproj.WalkSkipDir(d.Name()) || dotnetproj.WalkDepth(root, path) > maxSurfaceScanDepth {
 				return fs.SkipDir
 			}
-			// A test project's own fixtures are not the application's surface: a .cshtml under
-			// tests/ is a fixture, and treating it as a page would put a pure Web API on the
-			// browser path.
-			if underAnyDir(root, path, testDirs) {
-				return fs.SkipDir
-			}
 			return nil
 		}
 		rel := filepath.ToSlash(mustRel(root, path))
 		lowRel := strings.ToLower(rel)
 		switch strings.ToLower(filepath.Ext(d.Name())) {
 		case ".csproj":
-			body, ok := readHeadLower(path)
+			body, ok := readHeadLower(path, buf)
 			if !ok {
 				return nil
+			}
+			// A test project AT the repository root is not a "test directory": pruning it would
+			// prune the whole repository, which is what a single-project repo that also holds its
+			// own tests looks like — and the scan then found no surface at all.
+			if csprojReferencesTestFrameworkLower(body) {
+				if dir := filepath.Dir(path); filepath.Clean(dir) != root {
+					testDirs = append(testDirs, dir)
+				}
 			}
 			if containsAny(body, csharpBlazorSDKMarkers) {
 				hasBlazorWasm = true
@@ -169,53 +175,64 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		case ".razor":
 			hasBlazorMarkup = true
 			note("Blazor component " + rel)
-		case ".html":
-			if strings.Contains(lowRel, "wwwroot/") && strings.EqualFold(d.Name(), "index.html") {
-				hasWwwrootIndex = true
-				note("static SPA entry " + rel)
-			}
 		case ".cs":
-			body, ok := readHeadLower(path)
-			if !ok {
-				return nil
-			}
-			if containsAny(body, razorPagesRegistrations) {
-				hasRazorPages = true
-				note("Razor Pages registered in " + rel)
-			}
-			if containsAny(body, mvcViewRegistrations) {
-				hasMvcViews = true
-				note("MVC views registered in " + rel)
-			}
-			if containsAny(body, blazorServerMarkers) {
-				hasBlazorServer = true
-				note("Blazor Server registered in " + rel)
-			}
-			if containsAny(body, spaStaticMarkers) {
-				hasSPAStatic = true
-				note("static file fallback in " + rel)
-			}
-			if containsAny(body, apiControllerMarkers) {
-				hasAPIController = true
-				note("[ApiController] / ControllerBase in " + rel)
-			}
-			if containsAny(body, apiRegistrations) {
-				hasAPIRegistered = true
-				note("API controllers registered in " + rel)
-			}
-			if containsAny(body, minimalAPIMarkers) {
-				hasMinimalAPI = true
-				note("minimal API endpoints in " + rel)
-			}
-			if containsAny(body, grpcMarkers) {
-				hasGrpc = true
-				note("gRPC service in " + rel)
-			}
+			// Deferred: whether this file counts depends on the test-project directories, and a
+			// .csproj deeper in the walk can still add one.
+			sources = append(sources, pending{path: path, rel: rel})
 		}
 		return nil
 	})
 	if walkErr != nil {
 		return csharpUISurfaceDetection{}, walkErr
+	}
+
+	for _, src := range sources {
+		// A test project's own fixtures are not the application's surface: a WebApplicationFactory
+		// smoke test mentions MapControllers, and reading it would put every repo on the API path.
+		if underAnyDir(src.path, testDirs) {
+			continue
+		}
+		body, ok := readHeadLower(src.path, buf)
+		if !ok {
+			continue
+		}
+		// Markers describe CODE, so comments and string literals are removed first: a `// TODO:
+		// app.MapGet(...)` comment used to make a Razor Pages app read as mixed, and a class library
+		// holding a controller in a verbatim string read as a Web API.
+		body = dotnetproj.StripCSharpCommentsAndStrings(body)
+		rel := src.rel
+		if containsAny(body, razorPagesRegistrations) {
+			hasRazorPages = true
+			note("Razor Pages registered in " + rel)
+		}
+		if containsAny(body, mvcViewRegistrations) {
+			hasMvcViews = true
+			note("MVC views registered in " + rel)
+		}
+		if containsAny(body, blazorServerMarkers) {
+			hasBlazorServer = true
+			note("Blazor Server registered in " + rel)
+		}
+		if containsAny(body, spaStaticMarkers) {
+			hasSPAStatic = true
+			note("SPA static-file fallback in " + rel)
+		}
+		if containsAny(body, apiControllerMarkers) {
+			hasAPIController = true
+			note("[ApiController] / ControllerBase in " + rel)
+		}
+		if containsAny(body, apiRegistrations) {
+			hasAPIRegistered = true
+			note("API controllers registered in " + rel)
+		}
+		if containsAny(body, minimalAPIMarkers) {
+			hasMinimalAPI = true
+			note("minimal API endpoints in " + rel)
+		}
+		if containsAny(body, grpcMarkers) {
+			hasGrpc = true
+			note("gRPC service in " + rel)
+		}
 	}
 
 	// A UI needs both the markup and the registration that serves it, except for Blazor WASM (whose
@@ -230,7 +247,11 @@ func detectCSharpUISurface(repoAbs string) (csharpUISurfaceDetection, error) {
 		uiFramework = CSharpUIRazorPages
 	case hasMvcViews && hasViewsMarkup:
 		uiFramework = CSharpUIMvcViews
-	case (hasSPAStatic || hasWwwrootIndex) && hasWwwrootIndex:
+	case hasSPAStatic:
+		// The REGISTRATION is the signal, not a committed wwwroot/index.html. Requiring the file
+		// failed in both directions: a Web API that ships a static landing page read as a UI, and a
+		// real SPA host whose index.html is built at publish time — the normal ClientApp/ layout,
+		// where nothing is in git — was missed entirely.
 		uiFramework = CSharpUISPAStatic
 	}
 	// Razor Pages wins over Blazor Server when both are present: its routes are plain URLs a browser
@@ -286,35 +307,6 @@ func resolveCSharpUISurface(configured string, detected csharpUISurfaceDetection
 	return out
 }
 
-// csharpTestProjectDirs returns the directories of every project that references a test framework,
-// so the scan can skip their fixtures.
-func csharpTestProjectDirs(root string) ([]string, error) {
-	var out []string
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if path != root && (dotnetproj.WalkSkipDir(d.Name()) || dotnetproj.WalkDepth(root, path) > maxSurfaceScanDepth) {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if !strings.EqualFold(filepath.Ext(d.Name()), ".csproj") {
-			return nil
-		}
-		body, ok := readHeadLower(path)
-		if !ok {
-			return nil
-		}
-		if csprojReferencesTestFrameworkLower(body) {
-			out = append(out, filepath.Dir(path))
-		}
-		return nil
-	})
-	return out, err
-}
-
 // csprojReferencesTestFrameworkLower recognises the runner packages that make a project a test
 // project. Matches the unit-path detection in internal/layout so the two cannot disagree about
 // which directories hold tests.
@@ -330,14 +322,20 @@ func csprojReferencesTestFrameworkLower(lower string) bool {
 	return false
 }
 
-func underAnyDir(root, path string, dirs []string) bool {
+// underAnyDir reports whether path sits inside one of dirs. Strictly inside: when a repository's
+// only project is also its test project, its directory is the repository root, and treating that as
+// "a test directory" pruned every file in the repo and detected no surface at all.
+func underAnyDir(path string, dirs []string) bool {
+	fileDir := filepath.Dir(path)
 	for _, d := range dirs {
-		if path == d {
-			return true
+		rel, err := filepath.Rel(d, fileDir)
+		if err != nil {
+			continue
 		}
-		if rel, err := filepath.Rel(d, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			return true
+		if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue // outside d
 		}
+		return true
 	}
 	return false
 }
@@ -351,31 +349,25 @@ func mustRel(root, path string) string {
 }
 
 // readHeadLower reads up to maxSurfaceScanFileBytes and lower-cases it for substring matching.
-func readHeadLower(path string) (string, bool) {
+//
+// io.ReadFull rather than a bare Read: a single read(2) may legally return fewer bytes than asked
+// for, and does on FUSE-backed mounts — which includes Docker Desktop's bind mounts. A short read
+// would silently truncate the file and hand the same repository a different surface depending on
+// the filesystem it was checked out on. buf is reused across files by the caller.
+func readHeadLower(path string, buf []byte) (string, bool) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false
 	}
 	defer f.Close()
-	buf := make([]byte, maxSurfaceScanFileBytes)
-	n, err := f.Read(buf)
-	if n <= 0 && err != nil {
+	n, err := io.ReadFull(f, buf)
+	if n <= 0 {
+		return "", err == nil
+	}
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 		return "", false
 	}
 	return strings.ToLower(string(buf[:n])), true
-}
-
-// csharpForcedE2ESurface reads bootstrap.policy.e2e_framework.surface. "auto" and the empty string
-// both mean "detect it", which is the default.
-func csharpForcedE2ESurface(rc *config.RunnerConfig) string {
-	if rc == nil {
-		return ""
-	}
-	v := strings.ToLower(strings.TrimSpace(rc.E2EFrameworkBootstrap.Surface))
-	if v == "auto" {
-		return ""
-	}
-	return v
 }
 
 // E2ESurfaceForBootstrap resolves the surface the E2E bootstrap should act on: the operator's
@@ -393,4 +385,17 @@ func E2ESurfaceForBootstrap(repoAbs, lang string, rc *config.RunnerConfig) strin
 		return ""
 	}
 	return string(resolveCSharpUISurface(csharpForcedE2ESurface(rc), detected).Surface)
+}
+
+// csharpForcedE2ESurface reads bootstrap.policy.e2e_framework.surface. "auto" and the empty string
+// both mean "detect it", which is the default.
+func csharpForcedE2ESurface(rc *config.RunnerConfig) string {
+	if rc == nil {
+		return ""
+	}
+	v := strings.ToLower(strings.TrimSpace(rc.E2EFrameworkBootstrap.Surface))
+	if v == "auto" {
+		return ""
+	}
+	return v
 }

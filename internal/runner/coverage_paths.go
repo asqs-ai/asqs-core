@@ -4,8 +4,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/runner/profile"
@@ -83,10 +83,8 @@ func findCoverageReport(repoPath string, paths []string) string {
 		}
 		matches, err := filepath.Glob(full)
 		if err == nil {
-			matches = keepRegularFiles(matches)
-			if len(matches) > 0 {
-				sort.Strings(matches)
-				if r, rerr := filepath.Rel(root, matches[0]); rerr == nil {
+			if best := newestReport(keepRegularFiles(matches)); best != "" {
+				if r, rerr := filepath.Rel(root, best); rerr == nil {
 					return filepath.ToSlash(r)
 				}
 			}
@@ -143,15 +141,40 @@ func findCoverageReportBySuffix(root, pattern string) string {
 			return nil
 		}
 		if coveragePathMatchesSuffix(filepath.ToSlash(rel), pattern) {
-			matches = append(matches, filepath.ToSlash(rel))
+			matches = append(matches, path) // absolute: newestReport stats these
 		}
 		return nil
 	})
-	if len(matches) == 0 {
+	best := newestReport(matches)
+	if best == "" {
 		return ""
 	}
-	sort.Strings(matches)
-	return matches[0]
+	rel, err := filepath.Rel(root, best)
+	if err != nil {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+// newestReport picks the most recently written file, breaking ties by path.
+//
+// `dotnet test --collect` writes a fresh TestResults/<random guid>/coverage.cobertura.xml on every
+// invocation and never removes the previous one, so ordering by name orders by GUID — an arbitrary
+// run. In a fix loop that runs coverage more than once, or a workspace reused between runs, that
+// could name a report from an earlier iteration while reporting itself as deterministic.
+func newestReport(paths []string) string {
+	best, bestMod := "", time.Time{}
+	for _, p := range paths {
+		st, err := os.Stat(p)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		mod := st.ModTime()
+		if best == "" || mod.After(bestMod) || (mod.Equal(bestMod) && p < best) {
+			best, bestMod = p, mod
+		}
+	}
+	return best
 }
 
 // coveragePathMatchesSuffix reports whether rel ends with a path matching pattern, segment-aligned.

@@ -22,18 +22,10 @@ var (
 
 const maxDotnetWalkDepth = 12
 
+// dotnetEvalSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func dotnetEvalSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case "node_modules", ".git", "dist", "build", "bin", "obj", "target", "packages",
-		".vs", "venv", "__pycache__", "vendor", "coverage", "playwright-report",
-		"test-results", ".gradle", ".idea":
-		return true
-	default:
-		if len(name) > 0 && name[0] == '.' && name != "." && name != ".." {
-			return true
-		}
-		return false
-	}
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func dotnetRepoRelDepth(repo, absPath string) int {

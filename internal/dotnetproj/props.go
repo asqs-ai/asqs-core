@@ -86,20 +86,43 @@ func ResolveFacts(repoRoot, csprojAbs string) (Facts, error) {
 		packages:    map[string]string{},
 	}
 
-	// Ancestors first (farthest to nearest), then the project itself, so the nearest declaration wins.
-	for _, path := range ancestorPropsFiles(repoRoot, csprojAbs) {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			continue
+	// MSBuild's import order, which is what the effective value actually depends on:
+	// Directory.Build.props is imported at the TOP of a project and Directory.Build.targets at the
+	// BOTTOM. So .props loses to the project and .targets WINS over it — which is the whole reason
+	// a team reaches for .targets rather than .props in the first place.
+	props := ancestorImportChain(repoRoot, csprojAbs, "Directory.Build.props")
+	targets := ancestorImportChain(repoRoot, csprojAbs, "Directory.Build.targets")
+	for _, path := range props {
+		if body, ok := readStrippedXML(path); ok {
+			f.PropsPaths = append(f.PropsPaths, path)
+			f.applyProperties(body)
+			// Items are inherited too: factoring the test-harness PackageReferences into a shared
+			// tests/Directory.Build.props is the layout this function exists to support, and reading
+			// the project alone made the coverage gate report "no coverlet referenced by any
+			// project" for exactly that shape.
+			f.readPackageReferences(body)
 		}
-		f.PropsPaths = append(f.PropsPaths, path)
-		f.applyProperties(StripXMLComments(string(b)))
 	}
 	f.applyProperties(projectXML)
-
 	f.readPackageReferences(projectXML)
+	for _, path := range targets {
+		if body, ok := readStrippedXML(path); ok {
+			f.PropsPaths = append(f.PropsPaths, path)
+			f.applyProperties(body)
+			f.readPackageReferences(body)
+		}
+	}
+
 	f.resolveCentralPackageVersions(repoRoot, csprojAbs)
 	return f, nil
+}
+
+func readStrippedXML(path string) (string, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	return StripXMLComments(string(b)), true
 }
 
 // applyProperties overlays one file's unconditional property values onto the facts.
@@ -137,18 +160,31 @@ func unconditionalPropertyGroups(xml string) []string {
 	return out
 }
 
-// ancestorPropsFiles lists Directory.Build.props / .targets from repoRoot down to the project's own
-// directory, farthest first. A project outside repoRoot yields nothing.
-func ancestorPropsFiles(repoRoot, csprojAbs string) []string {
+// ancestorImportChain returns the shared MSBuild files that apply to a project, farthest first.
+//
+// MSBuild stops at the FIRST file of that name walking up, so a nearer one SHADOWS everything above
+// it unless it explicitly imports its parent — the GetPathOfFileAbove idiom. Reading every ancestor
+// unconditionally invents properties that do not apply: a legacy subtree with its own
+// Directory.Build.props was being handed the root file's Nullable and ImplicitUsings, and C#
+// generation reads both to decide what to emit.
+//
+// A file outside repoRoot is never read: it belongs to somebody else.
+func ancestorImportChain(repoRoot, csprojAbs, name string) []string {
 	root := filepath.Clean(strings.TrimSpace(repoRoot))
 	dir := filepath.Dir(csprojAbs)
-	var dirs []string
+	var chain []string
 	for i := 0; i < maxPropsWalkDepth; i++ {
 		rel, err := filepath.Rel(root, dir)
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			break // above the checkout
 		}
-		dirs = append(dirs, dir)
+		p := filepath.Join(dir, name)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			chain = append(chain, p)
+			if !importsParentOfSameName(p) {
+				break // MSBuild stops here
+			}
+		}
 		if rel == "." {
 			break
 		}
@@ -158,16 +194,21 @@ func ancestorPropsFiles(repoRoot, csprojAbs string) []string {
 		}
 		dir = parent
 	}
-	var out []string
-	for i := len(dirs) - 1; i >= 0; i-- { // farthest first
-		for _, name := range []string{"Directory.Build.props", "Directory.Build.targets"} {
-			p := filepath.Join(dirs[i], name)
-			if st, err := os.Stat(p); err == nil && !st.IsDir() {
-				out = append(out, p)
-			}
-		}
+	// Farthest first, so a nearer file's values overwrite the ones it inherits.
+	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
+		chain[i], chain[j] = chain[j], chain[i]
 	}
-	return out
+	return chain
+}
+
+// reImportFileAbove matches the documented way a Directory.Build.props chains to the one above it.
+// Matching the idiom rather than evaluating the import is deliberate: evaluating it would mean
+// running MSBuild, and every other rule in this package is file-level too.
+var reImportFileAbove = regexp.MustCompile(`(?i)<Import\b[^>]*GetPathOfFileAbove`)
+
+func importsParentOfSameName(path string) bool {
+	body, ok := readStrippedXML(path)
+	return ok && reImportFileAbove.MatchString(body)
 }
 
 // readPackageReferences records every PackageReference with the version it declares inline, whether
@@ -197,8 +238,15 @@ func (f *Facts) readPackageReferences(xml string) {
 					version = strings.TrimSpace(m[1])
 				}
 			}
+			// Last concrete version wins, matching the property rule: files are applied in
+			// MSBuild's import order, so a nearer declaration overwrites an inherited one. A
+			// reference with no version never erases one that has it — that is a versionless
+			// reference waiting for central package management, not a downgrade.
 			key := strings.ToLower(id)
-			if prev, ok := f.packages[key]; !ok || (prev == "" && version != "") {
+			if prev, ok := f.packages[key]; !ok || version != "" || prev == "" {
+				if version == "" && ok && prev != "" {
+					continue
+				}
 				f.packages[key] = version
 			}
 		}

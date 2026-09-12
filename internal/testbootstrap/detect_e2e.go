@@ -22,6 +22,22 @@ type E2EReport struct {
 
 // DetectE2E detects browser/E2E test stacks: JS/TS (Playwright/Cypress), Java (Playwright Java, Selenium, Selenide), C# (Microsoft.Playwright, Selenium).
 func DetectE2E(repoPath, lang string) (E2EReport, error) {
+	return DetectE2EForSurface(repoPath, lang, "")
+}
+
+// DetectE2EForSurface is DetectE2E with the operator's bootstrap.policy.e2e_framework.surface
+// applied to the detected E2E surface.
+//
+// It exists because the override reached nothing that changes behaviour. The surface detection is
+// a text scan over an application's own files, so it is wrong on some repository somewhere — that
+// is what the override is for — but every consumer that acts on the surface (the E2E retrieval
+// profile, the uncovered-anchor kinds, the generation hints) is fed from this report, and this
+// report was produced without ever consulting the configuration. The escape hatch reached the
+// audit row and the contract, and stopped there.
+//
+// forcedSurface is "" or "auto" for detection, or one of none|api|ui|mixed. An unrecognised value
+// is ignored rather than treated as a surface: a typo must not silently disable browser testing.
+func DetectE2EForSurface(repoPath, lang, forcedSurface string) (E2EReport, error) {
 	lang = strings.ToLower(strings.TrimSpace(lang))
 	dir := filepath.Clean(repoPath)
 	switch lang {
@@ -30,7 +46,7 @@ func DetectE2E(repoPath, lang string) (E2EReport, error) {
 	case "java":
 		return detectE2EJava(dir)
 	case "csharp", "cs":
-		return detectE2ECSharp(dir)
+		return detectE2ECSharp(dir, forcedSurface)
 	default:
 		return E2EReport{HasE2E: false, Reason: "E2E detection not implemented for " + lang}, nil
 	}

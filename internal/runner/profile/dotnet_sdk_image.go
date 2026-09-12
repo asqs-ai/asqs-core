@@ -51,15 +51,10 @@ func MaxNetTFMMajorFromRepo(repoRoot string) int {
 	return n
 }
 
+// dotnetWalkSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func dotnetWalkSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case "node_modules", ".git", "bin", "obj", "packages", "dist", "target",
-		"build", "coverage", ".vs", "venv", "__pycache__", "vendor",
-		"playwright-report", "test-results", ".gradle", ".idea":
-		return true
-	default:
-		return len(name) > 0 && name[0] == '.'
-	}
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func repoWalkDepth(root, abs string) int {

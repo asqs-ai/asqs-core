@@ -26,6 +26,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"github.com/asqs/asqs-core/internal/langid"
 	"github.com/asqs/asqs-core/internal/llm"
 	"github.com/asqs/asqs-core/internal/llm/tokens"
 	"github.com/asqs/asqs-core/internal/overview"
@@ -238,7 +239,8 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	runID := fmt.Sprintf("core_%d", time.Now().UnixNano())
 	// The E2E stack the evaluator must be told about — after bootstrap, so a stack the bootstrap
 	// just installed counts. See detectRunE2EFramework.
-	runE2EFramework := detectRunE2EFramework(ctx, repoAbs, lang, audit)
+	runE2EFramework, runE2ESurface := detectRunE2EFrameworkAndSurface(ctx, repoAbs, lang,
+		cfg.Runner.E2EFrameworkBootstrap.Surface, audit)
 
 	// Join this run to the exact configuration that produced it (the A/B report groups on it).
 	// Best-effort: a run without a recorded revision still runs, it is just invisible to ab-report.
@@ -278,7 +280,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// exists yet, so a duplicate found here is genuinely pre-existing.
 	reconcileDuplicateArtifacts(ctx, cfg, audit, repoAbs, lang, files)
 
-	planOpts := buildPlanOptions(cfg, lang, opts.RepoID)
+	planOpts := buildPlanOptions(cfg, lang, opts.RepoID, runE2ESurface)
 	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
 	planOpts.MaxGapsE2E = opts.MaxGapsE2E
 	planOpts.Audit = audit
@@ -372,6 +374,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
+	// The E2E surface decides whether the prompt's E2E guidance describes a browser test or an
+	// in-process HTTP one; without it every C# repository gets the browser shape, including Web
+	// APIs with no pages to open.
+	formatOpts.E2EFramework = runE2EFramework
+	formatOpts.E2ESurface = runE2ESurface
 	applyRetrievalContextCompactToFormat(&cfg.Retrieval, &formatOpts)
 	formatOpts = resolvePromptBudget(cfg, formatOpts)
 	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
@@ -440,6 +447,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// The same detected stack the evaluator gets, so the suggested spec paths and the E2E prompt
 	// hints agree with the runner that will execute them.
 	gen.E2EFramework = runE2EFramework
+	gen.E2ESurface = runE2ESurface
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
@@ -1269,7 +1277,7 @@ func pruneEmbeddingCache(store *embeddings.Store, retentionDays int) {
 // are deliberately LEFT AT ZERO here: retrieval substitutes its Default* constants for a zero,
 // which is exactly what every shipped config resolved to, and upstream's config restructure froze
 // those keys pending an A/B. Wiring them now would promote unmeasured defaults (rule 10).
-func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval.PlanOptions {
+func buildPlanOptions(cfg *config.Config, workflowLang, repoID, e2eSurface string) retrieval.PlanOptions {
 	lang := strings.TrimSpace(workflowLang)
 	if lang == "" {
 		lang = "java"
@@ -1284,7 +1292,8 @@ func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval
 		MaxGapsPerFile:            cfg.Indexer.MaxGapsPerFile,
 		MaxGapsE2E:                cfg.Indexer.MaxGapsE2E,
 		MaxGapsPerFileE2E:         cfg.Indexer.MaxGapsPerFileE2E,
-		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang),
+		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang, e2eSurface),
+		E2ESurface:                strings.TrimSpace(e2eSurface),
 		CriticalModulePrefixes:    cfg.Indexer.CriticalModulePrefixes,
 		SkipPathPrefixes:          cfg.Indexer.SkipPathPrefixes,
 		DependencyMaxDepth:        cfg.Retrieval.DependencyMaxDepth,
@@ -1303,7 +1312,10 @@ func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval
 
 // defaultRetrievalProfileE2E resolves the E2E retrieval profile: explicit profile_e2e, else the
 // unit profile, else a language default (http_api for backends, e2e_playwright otherwise).
-func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string {
+// e2eSurface is what an E2E test can drive against the application, detected at bootstrap. A C#
+// ui/mixed surface retrieves the full stack: http_api for every C# repo is right for a Web API and
+// wrong for a Razor Pages one, whose testable surface is pages. Empty = not detected.
+func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang, e2eSurface string) string {
 	if cfg == nil {
 		return string(retrieval.ProfileE2EPlaywright)
 	}
@@ -1313,12 +1325,17 @@ func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string 
 	if s := strings.TrimSpace(cfg.Retrieval.Profile); s != "" {
 		return s
 	}
-	switch strings.ToLower(strings.TrimSpace(workflowLang)) {
-	case "java", "csharp", "cs":
+	if langid.IsCSharp(workflowLang) {
+		switch strings.ToLower(strings.TrimSpace(e2eSurface)) {
+		case "ui", "mixed":
+			return string(retrieval.ProfileFullStack)
+		}
 		return string(retrieval.ProfileHTTPAPI)
-	default:
-		return string(retrieval.ProfileE2EPlaywright)
 	}
+	if langid.IsJava(workflowLang) {
+		return string(retrieval.ProfileHTTPAPI)
+	}
+	return string(retrieval.ProfileE2EPlaywright)
 }
 
 // applyRetrievalAbstentionDefaults sets PlanOptions sufficiency fields from config.

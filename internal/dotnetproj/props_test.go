@@ -95,7 +95,8 @@ func TestResolveFacts_csprojOverridesProps(t *testing.T) {
 	}
 }
 
-// The nearest props file wins over one higher up, and both are recorded.
+// The nearest props file shadows one higher up entirely, because MSBuild stops at the first file it
+// finds walking up. See TestResolveFacts_walkFollowsAnExplicitParentImport for the chained case.
 func TestResolveFacts_nearestPropsWins(t *testing.T) {
 	root := t.TempDir()
 	write(t, root, "Directory.Build.props", `<Project><PropertyGroup><TargetFramework>net6.0</TargetFramework></PropertyGroup></Project>`)
@@ -109,8 +110,8 @@ func TestResolveFacts_nearestPropsWins(t *testing.T) {
 	if !reflect.DeepEqual(f.TFMs, []string{"net8.0"}) {
 		t.Errorf("TFMs = %v, want [net8.0] from src/Directory.Build.props", f.TFMs)
 	}
-	if len(f.PropsPaths) != 2 {
-		t.Errorf("PropsPaths = %v, want both files recorded", f.PropsPaths)
+	if len(f.PropsPaths) != 1 {
+		t.Errorf("PropsPaths = %v, want only the nearest file: it does not import its parent", f.PropsPaths)
 	}
 }
 
