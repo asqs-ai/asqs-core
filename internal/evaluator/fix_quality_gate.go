@@ -12,7 +12,12 @@ import (
 var (
 	reFixLowValueTypeOfNotNull = regexp.MustCompile(`(?is)typeof\s*\(.*?\).*?Assert\.NotNull\s*\(`)
 	reFixLowValueSelfSmoke     = regexp.MustCompile(`(?is)Assert\.NotNull\s*\(\s*new\s+[A-Za-z_][A-Za-z0-9_]*Tests?\s*\(`)
-	reFixLowValueCSharpSkip    = regexp.MustCompile(`(?is)\[(?:Fact|Theory)\s*\(\s*Skip\s*=.*?\)\][\s\S]{0,160}?\{\s*(?://[^\n]*\n|\s)*\}`)
+	// A skipped test with an empty body, in all three runners' spellings. xUnit says
+	// [Fact(Skip="…")]; NUnit and MSTest both use [Ignore], with or without a reason, and NUnit
+	// adds [Explicit] for a test that only runs when named. All of them produce a shell that
+	// reports as a pass and asserts nothing.
+	reFixLowValueCSharpSkip = regexp.MustCompile(
+		`(?is)\[(?:(?:Fact|Theory)\s*\(\s*Skip\s*=[^)]*\)|Ignore(?:\s*\([^)]*\))?|Explicit(?:\s*\([^)]*\))?)\][\s\S]{0,160}?\{\s*(?://[^\n]*\n|\s)*\}`)
 	reFixLowValueJavaSkip      = regexp.MustCompile(`(?is)@(Disabled|Ignore|Ignored)\b[\s\S]{0,160}?\{\s*(?://[^\n]*\n|\s)*\}`)
 	reFixLowValueJSSkip        = regexp.MustCompile(`(?is)\b(?:it|test|describe)\.skip\s*\([^,]+,\s*(?:async\s*)?(?:\(\s*\)\s*=>|function\s*\(\s*\))\s*\{\s*(?://[^\n]*\n|\s)*\}\s*\)`)
 	reFixLowValueAssertTrue    = regexp.MustCompile(`(?i)\bAssert\.True\s*\(\s*true\s*\)`)
@@ -369,6 +374,12 @@ func csharpSyntacticShellReason(s string) string {
 	if !reCSharpTypeDecl.MatchString(stripped) {
 		return "no class/interface/struct/enum/record/delegate declaration, file will not parse as C#"
 	}
+	if reason := csharpStrayTokenBeforeTypeReason(stripped); reason != "" {
+		return reason
+	}
+	if reason := CSharpStatementStructureReason(s); reason != "" {
+		return reason
+	}
 	return ""
 }
 
@@ -548,6 +559,33 @@ func goSyntacticShellReason(s string) string {
 		return fmt.Sprintf("unbalanced braces ({=%d, }=%d), Go source is truncated or mis-nested", op, cl)
 	}
 	return ""
+}
+
+// csharpUnmodelledLiteralEnd returns the index just past a C# string literal whose escape rules the
+// escape scanners do not model, and whether the position starts one.
+//
+// Three forms qualify, and all three share one property: a backslash inside them is a literal
+// backslash, so `C:\dir` is correct code rather than an illegal escape.
+//
+//   - verbatim, in either modifier order: @"…", $@"…", @$"…"
+//   - raw string literals: """…"""
+//
+// `$"…"` is deliberately NOT one of them: an interpolated non-verbatim string processes escapes
+// under the ordinary rules, so the ordinary scan is correct for it.
+//
+// This replaces a whole-file bail. Seeing any of these anywhere switched the escape gate off for
+// the entire file, and a C# test of a repository layer contains a verbatim SQL string or Windows
+// path as a matter of course — so the check that exists to catch an unrepaired `\d` was disabled
+// in exactly the files most likely to have one.
+func csharpUnmodelledLiteralEnd(s string, i int) (int, bool) {
+	switch {
+	case s[i] == '@':
+	case s[i] == '$' && i+1 < len(s) && s[i+1] == '@':
+	case strings.HasPrefix(s[i:], `"""`):
+	default:
+		return 0, false
+	}
+	return stringLiteralEnd(s, i, true)
 }
 
 // stringLiteralEnd returns the index just past the string literal starting at i, or ok=false when
@@ -799,14 +837,22 @@ func RepairIllegalEscapes(path, content string) (string, []EscapeRepair) {
 		return content, nil
 	}
 	s := content
-	if strings.Contains(s, `"""`) || strings.Contains(s, `@"`) || strings.Contains(s, `@$"`) {
-		return content, nil
-	}
+	isCS := strings.EqualFold(filepath.Ext(path), ".cs")
 	var b strings.Builder
 	var repairs []EscapeRepair
 	i, n := 0, len(s)
 	line := 1
 	for i < n {
+		// A literal this scanner does not model is copied through untouched: inside it a backslash
+		// is a backslash, so there is nothing to repair and doubling one would corrupt the file.
+		if isCS {
+			if end, ok := csharpUnmodelledLiteralEnd(s, i); ok {
+				line += strings.Count(s[i:end], "\n")
+				b.WriteString(s[i:end])
+				i = end
+				continue
+			}
+		}
 		c := s[i]
 		switch {
 		case c == '\n':
@@ -926,15 +972,18 @@ func illegalEscapeReason(s, ext string) string {
 	default:
 		return ""
 	}
-	// Bail on whole-file constructs this scanner does not model. Cheap, and it keeps the loop below
-	// free of state it would get subtly wrong.
-	if strings.Contains(s, `"""`) || strings.Contains(s, `@"`) || strings.Contains(s, `@$"`) {
-		return ""
-	}
-
 	i, n := 0, len(s)
 	line := 1
 	for i < n {
+		// Skip the literal forms whose escape rules this scanner does not model, rather than
+		// abandoning the whole file the moment one appears.
+		if lang == "C#" {
+			if end, ok := csharpUnmodelledLiteralEnd(s, i); ok {
+				line += strings.Count(s[i:end], "\n")
+				i = end
+				continue
+			}
+		}
 		c := s[i]
 		switch {
 		case c == '\n':

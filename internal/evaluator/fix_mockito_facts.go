@@ -52,6 +52,11 @@ func testFailureFacts(ctx context.Context, step SandboxStep, errorOutput string,
 	if step != StepTest && step != StepTestE2E {
 		return nil
 	}
+	// The .NET mock frameworks have their own exceptions and their own root causes; the Mockito
+	// scan below reads Java stack frames and would find nothing in a VSTest failure.
+	if facts := csharpMockFailureFacts(errorOutput, files, artifactPaths); len(facts) > 0 {
+		return facts
+	}
 	if !mockitoStubOnNonMockRE.MatchString(errorOutput) && !mockitoUnnecessaryRE.MatchString(errorOutput) {
 		return nil
 	}
