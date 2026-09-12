@@ -14,7 +14,9 @@ import (
 func TestWrite_skipReasonOmitsTheWrapForLanguagesItCannotServe(t *testing.T) {
 	repo := t.TempDir()
 	rel := filepath.ToSlash(filepath.Join("e2e", "routes", "catalog.spec.ts"))
-	fenced := "```typescript\nimport { test, expect } from '@playwright/test';\ntest('x', async () => { expect(1).toBe(1); });\n```\n"
+	// Prose around the block, so UnwrapSingleCodeFence declines and the fence gate is what
+	// answers — which is the case this test is about.
+	fenced := "Here is the spec:\n```typescript\nimport { test, expect } from '@playwright/test';\ntest('x', async () => { expect(1).toBe(1); });\n```\nLet me know.\n"
 
 	n, _, skips := Write(repo, []Item{{Path: rel, Content: fenced}})
 
@@ -32,8 +34,8 @@ func TestWrite_skipReasonOmitsTheWrapForLanguagesItCannotServe(t *testing.T) {
 // Java and C# keep the decline: there the wrap IS attempted and why it failed is actionable.
 func TestWrite_skipReasonKeepsTheWrapWhereItIsAttempted(t *testing.T) {
 	for _, tc := range []struct{ rel, content string }{
-		{filepath.ToSlash(filepath.Join("src", "test", "java", "p", "FooTest.java")), "```java\n@Test void t() {}\n```\n"},
-		{filepath.ToSlash(filepath.Join("tests", "FooTests.cs")), "```csharp\n[Fact] public void T() {}\n```\n"},
+		{filepath.ToSlash(filepath.Join("src", "test", "java", "p", "FooTest.java")), "Here you go:\n```java\n@Test void t() {}\n```\nDone.\n"},
+		{filepath.ToSlash(filepath.Join("tests", "FooTests.cs")), "Here you go:\n```csharp\n[Fact] public void T() {}\n```\nDone.\n"},
 	} {
 		t.Run(filepath.Ext(tc.rel), func(t *testing.T) {
 			repo := t.TempDir()

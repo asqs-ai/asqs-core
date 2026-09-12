@@ -147,6 +147,21 @@ func WriteWithImportReport(repoRoot string, items []Item) (int, []string, []stri
 			fmt.Fprintf(os.Stderr, "  removed the leading path echo from %s\n", g.Path)
 			g.Content = repaired
 		}
+		// Same category of repair as the path echo above, and placed beside it so both gates and
+		// both branches below see real source rather than an envelope.
+		//
+		// A payload that is exactly one markdown fence and nothing else is the right file in the
+		// wrong wrapper. The fence gate is correct that it is unusable as written, but on the
+		// GENERATE path a refusal destroys the artifact instead of costing a round: asqs-go run
+		// api-8a6ad5508ad43b22f3ff969b2d1da5cd ended with no spec at all for the /checkout page
+		// route because e2e/routes/checkout.spec.ts arrived fenced. The fix path has unwrapped this
+		// shape since it existed. See evaluator.UnwrapSingleCodeFence for how narrow the match is —
+		// prose around the fence, a second block, or anything left inside the body declines — and
+		// note that the gates below still run on the unwrapped content.
+		if unwrapped, ok := evaluator.UnwrapSingleCodeFence(g.Content); ok {
+			fmt.Fprintf(os.Stderr, "  unwrapped a markdown-fenced payload for %s\n", g.Path)
+			g.Content = unwrapped
+		}
 		full := filepath.Join(repoRoot, filepath.FromSlash(g.Path))
 		if g.ExtendExisting {
 			if _, err := os.Stat(full); err != nil && os.IsNotExist(err) {

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 var (
@@ -224,10 +226,130 @@ func javaSyntacticShellReason(s string) string {
 	if op, cl := strings.Count(stripped, "{"), strings.Count(stripped, "}"); op != cl {
 		return fmt.Sprintf("unbalanced braces ({=%d, }=%d), Java source is truncated or mis-nested", op, cl)
 	}
+	// Parens, counted after the braces because a truncated file is short both and "truncated" is
+	// the more useful of the two diagnoses.
+	//
+	// Braces alone cannot see a dropped `)`: `if (result.contains("x") {` opens and closes its
+	// block correctly and is short exactly one paren. asqs-go run
+	// api-c7682cc0710205f1bed996c3095eaf8f wrote LegacyOrderFormatterTest.java with
+	// `[37,45] ')' expected` and `[52,47] ')' expected`, the fixer rewrote the file four times
+	// without touching either site, the loop stopped and the run shipped nothing. Nothing between
+	// the model and javac was looking.
+	//
+	// Safe because the count is taken from `stripped`: parens inside string literals, text blocks,
+	// char literals and comments are already gone, and every construct that legitimately nests
+	// them — calls, lambdas, casts, annotations, control-flow heads — balances by definition.
+	if op, cl := strings.Count(stripped, "("), strings.Count(stripped, ")"); op != cl {
+		return fmt.Sprintf("unbalanced parentheses ((=%d, )=%d), Java source will not parse", op, cl)
+	}
+	// Lexical, so it belongs beside the bracket counts and ahead of the structural checks below:
+	// a character javac will not accept is not a file with a missing declaration, it is a file the
+	// lexer never gets through.
+	if reason := javaStrayCharacterReason(stripped); reason != "" {
+		return reason
+	}
 	if !reJavaTypeDecl.MatchString(stripped) {
 		return "no class/interface/enum/record declaration, file will not parse as Java"
 	}
 	return ""
+}
+
+// javaCodePunct is every ASCII punctuation and operator character Java accepts in code position.
+// `->`, `::`, `...`, generics and annotations are all built from members of this set.
+const javaCodePunct = "(){}[];,.=<>!~?:+-*/&|^%@"
+
+// csharpCodePunct is the C# set: Java's plus `#` for preprocessor directives and `$` for the
+// interpolation marker, which survives stripStringsAndComments in code position. Ranges (`..`),
+// index-from-end (`^`), null-coalescing (`??=`), lambdas (`=>`) and attributes (`[Fact]`) are all
+// built from members already present.
+const csharpCodePunct = javaCodePunct + "#$"
+
+// javaStrayCharacterReason reports the first character javac would reject outright as an
+// `illegal character`, or "" when the file is clean or the scan declines.
+//
+// asqs-go run api-c7682cc0710205f1bed996c3095eaf8f's own audit carries a U+2026 — its refused fix anchor
+// read "…returnsFormatted…" — and asqs-go run api-f1d4227cb6db875a2e51c3100b3e1be8 shipped a `\ ` where
+// `\n` belonged, straight out of the structured-JSON envelope. Both reached disk.
+//
+// Whitespace is the JLS set and deliberately NOT unicode.IsSpace, which would admit the
+// non-breaking space javac refuses. This is where the C# arm diverges — see
+// csharpStrayCharacterReason.
+//
+// Text blocks need no special handling here: stripStringsAndComments consumes them, so their
+// contents never reach this scan.
+func javaStrayCharacterReason(stripped string) string {
+	return strayCharacterReason(stripped, javaCodePunct, isJLSWhitespace, "javac")
+}
+
+// csharpStrayCharacterReason is the C# counterpart. It is NOT the Java check with a different punct
+// set: Roslyn accepts the non-breaking space javac rejects (Unicode Zs is whitespace in C#), so it
+// uses unicode.IsSpace and a U+00A0 that would be refused on the Java side passes here. Verified
+// against dotnet rather than assumed.
+func csharpStrayCharacterReason(stripped string) string {
+	return strayCharacterReason(stripped, csharpCodePunct, unicode.IsSpace, "the C# compiler")
+}
+
+// isJLSWhitespace is the whitespace set JLS 3.6 defines: space, tab, form feed, and the line
+// terminators. Narrower than unicode.IsSpace on purpose.
+func isJLSWhitespace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\r' || r == '\f' || r == '\n'
+}
+
+// strayCharacterReason scans code-position text for a character the language's lexer rejects.
+//
+// The test is "not legal in code position", NOT "not ASCII": both languages allow Unicode letters
+// in identifiers, so `String café = …` is valid and rejecting it would destroy a correct artifact.
+// `\uXXXX` is legal in code position in both and is skipped rather than reported.
+func strayCharacterReason(stripped, punct string, space func(rune) bool, compiler string) string {
+	line, col := 1, 0
+	for i := 0; i < len(stripped); {
+		r, size := utf8.DecodeRuneInString(stripped[i:])
+		if r == '\n' {
+			line++
+			col = 0
+			i += size
+			continue
+		}
+		col++
+		switch {
+		case space(r):
+		case r == '_' || r == '$' || unicode.IsLetter(r) || unicode.IsDigit(r):
+		case strings.ContainsRune(punct, r):
+		case r == '\\':
+			if n := unicodeEscapeLen(stripped[i:]); n > 0 {
+				col += n - 1
+				i += n
+				continue
+			}
+			return fmt.Sprintf("stray backslash at line %d column %d, outside any string, char literal or comment; %s rejects it as an illegal character", line, col, compiler)
+		default:
+			return fmt.Sprintf("illegal character %q at line %d column %d, outside any string, char literal or comment; %s rejects it", r, line, col, compiler)
+		}
+		i += size
+	}
+	return ""
+}
+
+// unicodeEscapeLen returns the byte length of a `\uXXXX` escape at the start of s, or 0.
+// JLS 3.3 allows any number of `u`s after the backslash; C# accepts the single-`u` form.
+func unicodeEscapeLen(s string) int {
+	if len(s) < 2 || s[0] != '\\' || s[1] != 'u' {
+		return 0
+	}
+	i := 1
+	for i < len(s) && s[i] == 'u' {
+		i++
+	}
+	if i+4 > len(s) {
+		return 0
+	}
+	for j := i; j < i+4; j++ {
+		c := s[j]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return 0
+		}
+	}
+	return i + 4
 }
 
 func csharpSyntacticShellReason(s string) string {
@@ -237,6 +359,12 @@ func csharpSyntacticShellReason(s string) string {
 	stripped := stripStringsAndComments(s, ".cs")
 	if op, cl := strings.Count(stripped, "{"), strings.Count(stripped, "}"); op != cl {
 		return fmt.Sprintf("unbalanced braces ({=%d, }=%d), C# source is truncated or mis-nested", op, cl)
+	}
+	if op, cl := strings.Count(stripped, "("), strings.Count(stripped, ")"); op != cl {
+		return fmt.Sprintf("unbalanced parentheses ((=%d, )=%d), C# source will not parse", op, cl)
+	}
+	if reason := csharpStrayCharacterReason(stripped); reason != "" {
+		return reason
 	}
 	if !reCSharpTypeDecl.MatchString(stripped) {
 		return "no class/interface/struct/enum/record/delegate declaration, file will not parse as C#"
@@ -422,15 +550,106 @@ func goSyntacticShellReason(s string) string {
 	return ""
 }
 
+// stringLiteralEnd returns the index just past the string literal starting at i, or ok=false when
+// i does not start one. Handles the C#/Java forms the checks actually meet:
+//
+//   - a prefix of at most one `@` and one `$` in either order, C# only;
+//   - a raw string / Java text block, opened by three or more quotes and closed by a run of the
+//     same length — never with an `@` prefix, where `""` is an escaped quote instead;
+//   - a verbatim string (`@`-prefixed), in which `\` is an ordinary character and `""` is an
+//     escaped quote;
+//   - an ordinary string, in which `\` escapes the next character.
+//
+// An unterminated literal consumes to end of input, which is what the old scanner did and is the
+// safe direction: the tail is treated as string rather than as code.
+func stringLiteralEnd(s string, i int, javaOrCS bool) (int, bool) {
+	n := len(s)
+	j := i
+	verbatim := false
+	if javaOrCS {
+		seenAt, seenDollar := false, false
+		for j < n && (s[j] == '@' || s[j] == '$') {
+			if s[j] == '@' {
+				if seenAt {
+					break
+				}
+				seenAt, verbatim = true, true
+			} else {
+				if seenDollar {
+					break
+				}
+				seenDollar = true
+			}
+			j++
+		}
+	}
+	if j >= n || s[j] != '"' {
+		return 0, false
+	}
+	quotes := 0
+	for j+quotes < n && s[j+quotes] == '"' {
+		quotes++
+	}
+	if quotes >= 3 && !verbatim && javaOrCS {
+		// Raw string / text block. Java and C# only: Go has no such form, where `""` is an empty
+		// string and the third quote opens a new one, so claiming the run would swallow the rest of
+		// the file.
+		//
+		// Scan for a closing run of at least `quotes` quotes.
+		k := j + quotes
+		for k < n {
+			if s[k] != '"' {
+				k++
+				continue
+			}
+			run := 0
+			for k+run < n && s[k+run] == '"' {
+				run++
+			}
+			if run >= quotes {
+				return k + run, true
+			}
+			k += run
+		}
+		return n, true
+	}
+	k := j + 1
+	for k < n {
+		switch {
+		case !verbatim && s[k] == '\\' && k+1 < n:
+			k += 2
+		case s[k] == '"':
+			if verbatim && k+1 < n && s[k+1] == '"' {
+				k += 2
+				continue
+			}
+			return k + 1, true
+		default:
+			k++
+		}
+	}
+	return n, true
+}
+
 // stripStringsAndComments is a cheap approximate tokenizer that replaces the contents of string
-// literals, char literals, and // / /* */ comments with a placeholder byte so downstream brace
-// counting doesn't trip over legitimate "{"/"}" characters inside strings or comments. It does
-// NOT handle Java text blocks (`"""…"""`), C# verbatim strings (`@"…"`), C# raw strings
-// (`"""…"""`), or C# interpolated strings (`$"…{expr}…"`) — those are rare in generated test
-// files and false-positives from them would at worst make us MORE conservative (we'd see a
-// "}"-only tail and report unbalanced braces, which is exactly the failure mode we're trying
-// to catch anyway). Supported extensions: `.java`, `.cs` (with // and /* */ comments plus
-// double-quoted strings and single-quoted char literals), `.go` (adds backtick raw strings).
+// literals, char literals, and // / /* */ comments with a placeholder byte so the checks built on
+// it — brace and paren balance, stray characters, the type-declaration regexes — reason about code
+// and not about text that merely looks like code.
+//
+// It handles Java text blocks and C# verbatim, raw and interpolated strings, in any legal prefix
+// order (`@"`, `$"`, `@$"`, `$@"`, `"""`, `$"""`). It did not, and the gap was not cosmetic: the
+// old scanner read `\"` as an escape in every string form, so `@"C:\"` — legal C# whose content
+// is one backslash — ran past its real terminator and closed on the NEXT quote. Everything between
+// became code, which is how SyntacticShellReason came to refuse Roslyn-valid source with
+// "unbalanced braces ({=2, }=0)" and would have refused it again for a paren or a stray character
+// drawn from string contents.
+//
+// Supported extensions: `.java`, `.cs` (// and /* */ comments, the string forms above, and
+// single-quoted char literals), `.go` (adds backtick raw strings).
+//
+// Still approximate in one safe direction: the expression inside a `{…}` interpolation hole is
+// swallowed with the rest of the literal rather than kept as code, so a defect there is missed
+// rather than invented.
 func stripStringsAndComments(s, ext string) string {
 	javaOrCS := ext == ".java" || ext == ".cs"
 	goExt := ext == ".go"
@@ -457,21 +676,13 @@ func stripStringsAndComments(s, ext string) string {
 				return b.String()
 			}
 		}
-		if c == '"' {
-			b.WriteByte('_')
-			i++
-			for i < n {
-				if s[i] == '\\' && i+1 < n {
-					i += 2
-					continue
-				}
-				if s[i] == '"' {
-					i++
-					break
-				}
-				i++
+		if c == '"' || (javaOrCS && (c == '@' || c == '$')) {
+			if end, ok := stringLiteralEnd(s, i, javaOrCS); ok {
+				b.WriteByte('_')
+				i = end
+				continue
 			}
-			continue
+			// Not a literal: an `@class` keyword-identifier or a bare `$`. Fall through.
 		}
 		if c == '\'' && javaOrCS {
 			b.WriteByte('_')
