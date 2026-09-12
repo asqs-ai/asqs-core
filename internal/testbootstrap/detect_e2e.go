@@ -13,6 +13,11 @@ type E2EReport struct {
 	HasE2E    bool
 	Framework string // JS/TS: playwright, cypress; Java: playwright-java, selenium, selenide; C#: playwright-dotnet, selenium
 	Reason    string
+	// Surface is what an E2E test can drive: none, api, ui or mixed. Carried here so callers do not
+	// have to re-read the test-stack contract. Empty for languages that do not detect it.
+	Surface string
+	// UIFramework names how the UI is built when Surface is ui or mixed.
+	UIFramework string
 }
 
 // DetectE2E detects browser/E2E test stacks: JS/TS (Playwright/Cypress), Java (Playwright Java, Selenium, Selenide), C# (Microsoft.Playwright, Selenium).

@@ -823,6 +823,14 @@ type E2EFrameworkBootstrapConfig struct {
 	AllowLockfileChange bool `yaml:"allow_lockfile_change"`
 	// Execution: auto | docker | local. auto uses ephemeral Docker when runner.type is docker (same for C# as JS/Java).
 	Execution string `yaml:"execution"`
+	// Surface: auto | none | api | ui | mixed. What an E2E test can drive against this application.
+	// auto (default) detects it from the project's own files at bootstrap: pages a browser can drive
+	// (Razor Pages, MVC views, Blazor, a hosted SPA) make it ui, HTTP endpoints alone make it api,
+	// both make it mixed, and a library or worker makes it none. The surface decides the E2E
+	// retrieval profile, the generation hints, and whether uncovered page routes are listed as gaps.
+	// Set it explicitly when the scan guesses wrong; an unrecognised value is ignored rather than
+	// treated as a surface. C# only today.
+	Surface string `yaml:"surface"`
 }
 
 // TestFrameworkBootstrapConfig controls auto-setup of test tooling before indexing/generation.

@@ -37,6 +37,7 @@ type LLMGenerator struct {
 	ContractRules                   *contract.Contract // optional; if set, rules are appended to system prompt (prefer pure/utility first when dependencies are complicated).
 	TestFramework                   string             // optional; for JS/TS: "jasmine" => .spec.ts, else => .test.ts (jest, vitest, mocha, ava)
 	E2EFramework                    string             // optional; playwright, cypress, …
+	E2ESurface                      string             // optional; none | api | ui | mixed (detected at bootstrap, C# today)
 	DisableStructuredGenerateOutput bool
 	TwoPhaseTestGeneration          bool
 	// Tools optionally gives the model read-only access to the index during generation. Nil is the

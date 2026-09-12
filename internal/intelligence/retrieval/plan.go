@@ -116,7 +116,12 @@ type PlanOptions struct {
 	RetrievalProfileE2E string
 	// E2EFramework is the detected stack for audit/context hints (playwright, cypress, playwright-java, playwright-dotnet, selenium, …).
 	E2EFramework string
-	Audit        Auditor
+	// E2ESurface is what an E2E test can drive against the application: none, api, ui or mixed,
+	// detected at bootstrap (C# today). It decides whether uncovered PAGE_ROUTE anchors are listed
+	// beside uncovered API_ROUTEs. Empty means "not detected", which keeps the API-route-only
+	// behaviour rather than guessing.
+	E2ESurface string
+	Audit      Auditor
 	// SourceFilesWithExistingTest: source file paths (e.g. "src/foo.ts") that already have a test file. Their symbols are deprioritized (not excluded) so we pick "no test file" first, then extend those files with tests for uncovered symbols.
 	SourceFilesWithExistingTest map[string]struct{}
 	// ExistingTestPathsBySource maps a source repo-relative path to the sorted list of existing test
@@ -470,6 +475,45 @@ func e2eSymbolQueriesForWorkflowLang(workflowLang string) []e2eSymbolQuery {
 	return out
 }
 
+// e2eSymbolQueriesForWorkflowLangSurface is e2eSymbolQueriesForWorkflowLang plus the E2E surface
+// bootstrap detected.
+//
+// C# only listed E2E_SPEC, which is the right anchor set for a Web API and too narrow for an
+// application with pages: a Razor Pages or Blazor repo has page objects and user flows in exactly
+// the way Java does, and its E2E plan could only ever anchor on API routes. A `ui` or `mixed`
+// surface therefore gets the same kinds Java gets; an `api` or undetected surface keeps today's
+// behaviour rather than querying kinds a Web API has none of.
+func e2eSymbolQueriesForWorkflowLangSurface(workflowLang, e2eSurface string) []e2eSymbolQuery {
+	base := e2eSymbolQueriesForWorkflowLang(workflowLang)
+	if !langid.IsCSharp(workflowLang) || !e2eSurfaceHasUI(e2eSurface) {
+		return base
+	}
+	for _, k := range []string{"PAGE_OBJECT", "USER_FLOW"} {
+		base = append(base, e2eSymbolQuery{lang: "csharp", kind: k})
+	}
+	return base
+}
+
+// e2eSurfaceHasUI reports whether the detected surface includes pages a browser can drive.
+func e2eSurfaceHasUI(e2eSurface string) bool {
+	switch strings.ToLower(strings.TrimSpace(e2eSurface)) {
+	case "ui", "mixed":
+		return true
+	default:
+		return false
+	}
+}
+
+// pageRouteE2EGapLangsForSurface returns the languages whose PAGE_ROUTE symbols should be listed as
+// uncovered E2E anchors because of the C# surface. JS/TS page routes are governed by
+// pageRouteE2EGapsEnabledJS and are unaffected by this.
+func pageRouteE2EGapLangsForSurface(opts PlanOptions) []string {
+	if !langid.IsCSharp(opts.Lang) || !e2eSurfaceHasUI(opts.E2ESurface) {
+		return nil
+	}
+	return []string{"csharp"}
+}
+
 func e2eGapBaseReasonForSymbolKind(kind string) string {
 	switch strings.ToUpper(strings.TrimSpace(kind)) {
 	case "API_ROUTE":
@@ -543,7 +587,7 @@ func e2eSymbolQueriesForWorkflowLangWithSupplement(opts PlanOptions) []e2eSymbol
 		}
 	}
 	wl := strings.ToLower(strings.TrimSpace(opts.Lang))
-	add(e2eSymbolQueriesForWorkflowLang(opts.Lang))
+	add(e2eSymbolQueriesForWorkflowLangSurface(opts.Lang, opts.E2ESurface))
 	if (wl == "java" || wl == "csharp" || wl == "cs") && e2eProfileWantsJSTSSupplement(opts) {
 		add(e2eSymbolQueriesForWorkflowLang("typescript"))
 	}
@@ -744,8 +788,10 @@ func uncoveredAPIRouteE2EGapsForLang(
 // that no spec targets, whereas the main pass walks symbols already living in test files.
 func appendPageRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions, list []*TestGap) ([]*TestGap, error) {
 	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
-	if pageRouteE2EGapsEnabledJS(opts) {
-		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
+	// Razor Pages / Blazor routes join the JS/TS ones when bootstrap detected a C# ui or mixed
+	// surface: a page nothing drives is an uncovered E2E anchor whichever language rendered it.
+	if langs := pageRouteE2EGapLangs(opts); len(langs) > 0 {
+		{
 			seenID := make(map[string]bool)
 			for _, g := range list {
 				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
@@ -1398,4 +1444,14 @@ func TestPathToSourcePath(testFilePath string, lang string, testFramework string
 		sourceName := name[:len(name)-4] + ext
 		return filepath.Join(dir, sourceName)
 	}
+}
+
+// pageRouteE2EGapLangs is the union of the JS/TS page-route rule and the C# surface one.
+func pageRouteE2EGapLangs(opts PlanOptions) []string {
+	var out []string
+	if pageRouteE2EGapsEnabledJS(opts) {
+		out = append(out, effectiveJSTSLangsForE2EQuery(opts)...)
+	}
+	out = append(out, pageRouteE2EGapLangsForSurface(opts)...)
+	return out
 }

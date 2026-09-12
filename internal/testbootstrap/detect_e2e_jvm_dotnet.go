@@ -132,6 +132,22 @@ func lockMentionsPlaywrightTest(s string) bool {
 
 func detectE2ECSharp(dir string) (E2EReport, error) {
 	dir = filepath.Clean(dir)
+	rep, err := detectE2ECSharpFrameworks(dir)
+	if err != nil {
+		return E2EReport{}, err
+	}
+	// The surface is a property of the APPLICATION, not of whether an E2E project exists yet, so it
+	// is attached to every report — including the "no E2E found" ones bootstrap acts on.
+	if surface, uiFramework, _, serr := DetectCSharpUISurface(dir); serr == nil {
+		rep.Surface = string(surface)
+		if uiFramework != CSharpUINone {
+			rep.UIFramework = string(uiFramework)
+		}
+	}
+	return rep, nil
+}
+
+func detectE2ECSharpFrameworks(dir string) (E2EReport, error) {
 	if rep, ok := e2eNodePlaywrightAtRepoRoot(dir); ok {
 		return rep, nil
 	}

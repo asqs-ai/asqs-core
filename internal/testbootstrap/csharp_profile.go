@@ -72,6 +72,12 @@ type csharpTestProfile struct {
 	Evidence      string
 	Stack         string
 	Packages      []csharpPkg
+	// UISurface is what an E2E test can drive against this application, and UIFramework how the UI
+	// is built. Both are recorded in the test-stack contract so every consumer reads one answer.
+	UISurface   CSharpUISurface
+	UIFramework CSharpUIFramework
+	// UISurfaceEvidence is the file-level reasoning, for the bootstrap audit row.
+	UISurfaceEvidence string
 
 	FrameworkSmoke csharpFrameworkSmoke
 	// FrameworkSmokeRequired is false for ASP.NET Core.
@@ -147,6 +153,10 @@ func buildCSharpTestProfile(det csharpFrameworkDetection) csharpTestProfile {
 		UsesEFCore:      det.UsesEFCore,
 		EFCoreMajor:     det.EFCoreMajor,
 		Evidence:        det.Evidence,
+
+		UISurface:         det.UISurface,
+		UIFramework:       det.UIFramework,
+		UISurfaceEvidence: det.UISurfaceEvidence,
 	}
 
 	if det.Framework == CSharpFrameworkWorkload {
@@ -256,6 +266,10 @@ type csharpFrameworkDetection struct {
 	UsesEFCore      bool
 	EFCoreMajor     int
 	Evidence        string
+	// UISurface / UIFramework / UISurfaceEvidence answer "what can an E2E test drive here".
+	UISurface         CSharpUISurface
+	UIFramework       CSharpUIFramework
+	UISurfaceEvidence string
 }
 
 var (
@@ -296,7 +310,7 @@ func packageReferenceVersionMajor(csprojLower, prefix string) int {
 }
 
 // detectCSharpFramework classifies a solution from its production and test projects.
-func detectCSharpFramework(repo, fallbackTFM string) (csharpFrameworkDetection, error) {
+func detectCSharpFramework(repo, fallbackTFM, forcedSurface string) (csharpFrameworkDetection, error) {
 	prod, test, err := splitCSharpProdAndTestCsprojs(repo)
 	if err != nil {
 		return csharpFrameworkDetection{}, err
@@ -324,6 +338,14 @@ func detectCSharpFramework(repo, fallbackTFM string) (csharpFrameworkDetection, 
 
 	det.TargetFramework = inferCSharpTestTFM(repo, prod, fallbackTFM)
 	det.NetMajor = netMajorFromTFM(det.TargetFramework)
+
+	// What an E2E test can drive here. Detected from the project's own files, never assumed.
+	if surface, serr := detectCSharpUISurface(repo); serr == nil {
+		surface = resolveCSharpUISurface(forcedSurface, surface)
+		det.UISurface = surface.Surface
+		det.UIFramework = surface.UIFramework
+		det.UISurfaceEvidence = surface.Evidence
+	}
 
 	sort.Strings(prod)
 	for _, abs := range prod {

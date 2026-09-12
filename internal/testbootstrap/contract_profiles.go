@@ -108,6 +108,8 @@ func csharpContract(p csharpTestProfile) teststack.Contract {
 		FrameworkVersion:  p.TargetFramework,
 		Runner:            string(p.TestFramework),
 		Stack:             p.Stack,
+		E2ESurface:        string(csharpContractSurface(p)),
+		UIFramework:       csharpContractUIFramework(p),
 		AvailablePackages: dedupeSorted(pkgs),
 		AvailableImports:  dedupeSorted(imports),
 	}
@@ -153,4 +155,20 @@ func jsModuleType(esm bool) string {
 		return "esm"
 	}
 	return "commonjs"
+}
+
+// csharpContractSurface records an explicit "none" so a reader can tell "a library has no E2E
+// surface" from "written before this field existed".
+func csharpContractSurface(p csharpTestProfile) CSharpUISurface {
+	if p.UISurface == "" {
+		return CSharpSurfaceNone
+	}
+	return p.UISurface
+}
+
+func csharpContractUIFramework(p csharpTestProfile) string {
+	if p.UIFramework == "" || p.UIFramework == CSharpUINone {
+		return ""
+	}
+	return string(p.UIFramework)
 }

@@ -256,7 +256,7 @@ func detectCSharp(dir string) (Report, error) {
 		return Report{HasFramework: true, Reason: "no SDK-style .csproj under repo; skip csharp bootstrap"}, nil
 	}
 
-	prof, err := resolveCSharpTestProfile(dir, "")
+	prof, err := resolveCSharpTestProfile(dir, "", "")
 	if err != nil {
 		return Report{}, err
 	}

@@ -32,6 +32,11 @@ type FormatOptions struct {
 	TestFramework string
 	// E2EFramework is the detected Playwright/Cypress stack; used when the plan item Layer is e2e.
 	E2EFramework string
+	// E2ESurface is what an E2E test can drive against the application (none | api | ui | mixed),
+	// detected at bootstrap. It decides whether the E2E guidance describes a browser test or an
+	// in-process HTTP one — the hints used to describe a browser test for every C# repository,
+	// including Web APIs with no pages to open. Empty = not detected.
+	E2ESurface string
 	// DocGeneration when true: build user message for per-symbol documentation (JSDoc/TSDoc/XML), not test generation.
 	// Intro and section titles avoid "generate tests" / describe-it-expect instructions that contradict the doc system prompt.
 	DocGeneration bool
@@ -140,7 +145,7 @@ func BuildLLMContextForGap(item *TestPlanItem, opts FormatOptions) string {
 						intro.WriteString("**Paths:** Playwright expects specs under **`e2e/`** (or `testDir` in config) with **`*.spec.ts`** / **`*.spec.tsx`**—not `cypress/e2e/*.cy.ts`. ")
 					}
 				}
-				if hint := strings.TrimSpace(E2EPromptCanonicalHints(item.Gap.Symbol.Lang, fw)); hint != "" {
+				if hint := strings.TrimSpace(E2EPromptCanonicalHintsForSurface(item.Gap.Symbol.Lang, fw, opts.E2ESurface)); hint != "" {
 					intro.WriteString("\n\n")
 					intro.WriteString(hint)
 				}

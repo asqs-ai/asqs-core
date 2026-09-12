@@ -35,6 +35,21 @@ func normalizeLangCode(lang string) string {
 // detected E2E stack, aligned with evaluator default E2E commands (npx playwright test, npx cypress run,
 // Maven Failsafe / Gradle integrationTest, dotnet test ~E2E). Empty string if lang is unknown and fw is empty.
 func E2EPromptCanonicalHints(lang, e2eFramework string) string {
+	return E2EPromptCanonicalHintsForSurface(lang, e2eFramework, "")
+}
+
+// E2EPromptCanonicalHintsForSurface is E2EPromptCanonicalHints with the E2E surface bootstrap
+// detected (none | api | ui | mixed; C# today).
+//
+// The surface changes what a correct E2E test even looks like. The hints described a browser test
+// with Microsoft.Playwright for EVERY C# repository, so a Web API with no pages was asked for a test
+// that cannot be written: nothing to navigate to, and the model's only options are to invent a UI or
+// open about:blank. An `api` surface gets the shape that does test such an application —
+// WebApplicationFactory<Program> with an HttpClient — and a `ui` surface keeps the browser guidance
+// and names the base-URL convention a generated test needs to reach a running app.
+//
+// An empty surface means "not detected" and keeps the previous behaviour.
+func E2EPromptCanonicalHintsForSurface(lang, e2eFramework, e2eSurface string) string {
 	l := normalizeLangCode(lang)
 	fw := strings.ToLower(strings.TrimSpace(e2eFramework))
 	if fw == "" {
@@ -48,7 +63,7 @@ func E2EPromptCanonicalHints(lang, e2eFramework string) string {
 	case "java":
 		body = e2eHintsJava(fw)
 	case "csharp":
-		body = e2eHintsCSharp(fw)
+		body = e2eHintsCSharpForSurface(fw, e2eSurface, strings.TrimSpace(e2eFramework) != "")
 	default:
 		if strings.TrimSpace(e2eFramework) == "" {
 			return ""
@@ -110,3 +125,37 @@ func e2eHintsCSharp(fw string) string {
 			"- **Reference:** Microsoft.Playwright for .NET — [https://playwright.dev/dotnet/docs/intro](https://playwright.dev/dotnet/docs/intro)"
 	}
 }
+
+// e2eHintsCSharpForSurface adds the surface dimension to the framework one. A framework the repo
+// already uses always wins: a Selenium solution gets Selenium guidance whatever its pages look like.
+func e2eHintsCSharpForSurface(fw, surface string, frameworkExplicit bool) string {
+	if frameworkExplicit {
+		return e2eHintsCSharp(fw)
+	}
+	switch strings.ToLower(strings.TrimSpace(surface)) {
+	case "api":
+		return csharpAPIE2EHints
+	case "ui", "mixed":
+		return csharpUIE2EHints
+	default:
+		return e2eHintsCSharp(fw)
+	}
+}
+
+// csharpAPIE2EHints describes an in-process HTTP E2E test: no browser, no server to start, and the
+// real middleware pipeline. This is what an ASP.NET Core API's end-to-end test is.
+const csharpAPIE2EHints = "- **This application has no browser-drivable pages** (detected E2E surface: `api`). Write an in-process HTTP end-to-end test, not a browser test.\n" +
+	"- **Canonical imports:** `using Microsoft.AspNetCore.Mvc.Testing;` `using System.Net.Http.Json;` — derive from **`WebApplicationFactory<Program>`** (or inject it via `IClassFixture<WebApplicationFactory<Program>>`), call **`CreateClient()`** for an **`HttpClient`** bound to the in-memory server, and assert on the real pipeline: status code, headers, and the deserialised body.\n" +
+	"- **Top-level statements:** `Program` is internal unless the web project declares `public partial class Program { }`. When it does not, use the entry-point type the project does expose rather than inventing one.\n" +
+	"- **Typical runner:** `dotnet test -c Release --filter \"FullyQualifiedName~E2E\"` — the same heuristic as **`defaultCSharpE2EShellCommand`** when **`general.build.e2e_test_command`** is unset.\n" +
+	"- **Reference:** Integration tests in ASP.NET Core — [https://learn.microsoft.com/aspnet/core/test/integration-tests](https://learn.microsoft.com/aspnet/core/test/integration-tests)"
+
+// csharpUIE2EHints describes a Playwright .NET browser test against a running application. The
+// base URL is an environment variable because Playwright .NET has no webServer block: unlike the
+// JS config ASQS writes, nothing in the .NET stack starts the app, so the runner does.
+const csharpUIE2EHints = "- **This application serves browser-drivable pages** (detected E2E surface: `ui`/`mixed`).\n" +
+	"- **Canonical imports:** `using Microsoft.Playwright;` — obtain **`IPlaywright`**, **`IBrowser`**, **`IPage`** through the async Playwright .NET API, one `IPage` per test; match the repo's test adapter (**xUnit**, **NUnit** or **MSTest**).\n" +
+	"- **Base URL:** read **`ASQS_BASE_URL`** from the environment and navigate to paths relative to it (`await page.GotoAsync($\"{baseUrl}/orders\")`). Never navigate to a `data:` URL and never hard-code `http://localhost:5000`: the port is assigned per run.\n" +
+	"- **Selectors:** address elements by the `data-testid` attributes the page already carries (`page.GetByTestId(\"orders-search\")`), not by CSS structure or visible text.\n" +
+	"- **Typical runner:** `dotnet test -c Release --filter \"FullyQualifiedName~E2E\"`.\n" +
+	"- **Reference:** Playwright for .NET — [https://playwright.dev/dotnet/docs/intro](https://playwright.dev/dotnet/docs/intro)"

@@ -80,7 +80,7 @@ func verifyExistingCSharpStack(ctx context.Context, audit Auditor, repo, runnerT
 	if csproj == "" {
 		return existingStackVerification{Reason: "no .csproj under " + testDirRel}
 	}
-	prof, err := resolveCSharpTestProfile(repo, "")
+	prof, err := resolveCSharpTestProfile(repo, "", "")
 	if err != nil || prof.Declined {
 		return existingStackVerification{Reason: "no usable C# profile"}
 	}

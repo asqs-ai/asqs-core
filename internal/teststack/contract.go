@@ -77,6 +77,15 @@ type Contract struct {
 	// "Cannot find module", although the bootstrap had detected the module type and said nothing.
 	ModuleType string `json:"module_type,omitempty"`
 
+	// E2ESurface is what an E2E test can drive against this application: none, api, ui or mixed.
+	// Detected at bootstrap from the project's own files, or forced by
+	// bootstrap.policy.e2e_framework.surface. Empty in a contract written before this field existed,
+	// which readers must treat as "unknown" rather than "none" — C# only today.
+	E2ESurface string `json:"e2e_surface,omitempty"`
+	// UIFramework names how the UI is built when E2ESurface is ui or mixed (razor-pages, mvc-views,
+	// blazor-server, blazor-wasm, spa-static), which decides how a browser test reaches a page.
+	UIFramework string `json:"ui_framework,omitempty"`
+
 	// AvailablePackages are the coordinates on the test classpath, in the ecosystem's own notation.
 	AvailablePackages []string `json:"available_packages,omitempty"`
 	// AvailableImports are the import roots a generated test may reference. This is the field that

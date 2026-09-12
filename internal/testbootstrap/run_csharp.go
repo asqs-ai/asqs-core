@@ -12,8 +12,9 @@ import (
 )
 
 // resolveCSharpTestProfile reads the solution's projects and derives the required test stack.
-func resolveCSharpTestProfile(repo, fallbackTFM string) (csharpTestProfile, error) {
-	det, err := detectCSharpFramework(repo, fallbackTFM)
+// forcedSurface is bootstrap.policy.e2e_framework.surface; empty or "auto" means detect it.
+func resolveCSharpTestProfile(repo, fallbackTFM, forcedSurface string) (csharpTestProfile, error) {
+	det, err := detectCSharpFramework(repo, fallbackTFM, forcedSurface)
 	if err != nil {
 		return csharpTestProfile{}, err
 	}
@@ -33,7 +34,7 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 	_ = cfg // pin_versions / lockfile N/A for .NET bootstrap
 
 	fallbackTFM := dotnetTFMFallbackFromRunner(runnerCfg)
-	prof, err := resolveCSharpTestProfile(repo, fallbackTFM)
+	prof, err := resolveCSharpTestProfile(repo, fallbackTFM, csharpForcedE2ESurface(runnerCfg))
 	if err != nil {
 		return fmt.Errorf("test_framework_bootstrap: resolve C# profile: %w", err)
 	}
@@ -48,6 +49,11 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 		"evidence":          prof.Evidence,
 		"stack":             prof.Stack,
 		"required_packages": describeCSharpPackages(prof.Packages),
+		// What an E2E test can drive here, with the file-level reasoning behind it, so an operator
+		// can check the call rather than take it on faith.
+		"e2e_surface":          string(prof.UISurface),
+		"ui_framework":         string(prof.UIFramework),
+		"e2e_surface_evidence": prof.UISurfaceEvidence,
 	})
 
 	if prof.Declined {
