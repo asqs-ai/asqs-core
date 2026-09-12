@@ -1,0 +1,60 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  T -> /workspace/bin/Release/net10.0/T.dll
+Test run for /workspace/bin/Release/net10.0/T.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v2.8.2+699d445a1a (64-bit .NET 10.0.5)
+[xUnit.net 00:00:00.03]   Discovering: T
+[xUnit.net 00:00:00.04]   Discovered:  T
+[xUnit.net 00:00:00.05]   Starting:    T
+[xUnit.net 00:00:00.07]     Asqs.Probe.OrderServiceTests.Theory_that_fails(n: 1) [FAIL]
+[xUnit.net 00:00:00.07]       n was not greater than five
+[xUnit.net 00:00:00.07]       Stack Trace:
+[xUnit.net 00:00:00.07]         /workspace/T.cs(35,0): at Asqs.Probe.OrderServiceTests.Theory_that_fails(Int32 n)
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InvokeDirectByRefWithFewArgs(Object obj, Span`1 copyOfArgs, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.07]     Asqs.Probe.OrderServiceTests.Total_rejects_zero [FAIL]
+[xUnit.net 00:00:00.07]       System.ArgumentOutOfRangeException : quantity must be positive (Parameter 'qty')
+[xUnit.net 00:00:00.07]       Stack Trace:
+[xUnit.net 00:00:00.07]         /workspace/T.cs(10,0): at Asqs.Probe.OrderService.Total(Int32 qty, Decimal unit)
+[xUnit.net 00:00:00.07]         /workspace/T.cs(28,0): at Asqs.Probe.OrderServiceTests.Total_rejects_zero()
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.07]     Asqs.Probe.OrderServiceTests.Total_multiplies [FAIL]
+[xUnit.net 00:00:00.07]       Assert.Equal() Failure: Values differ
+[xUnit.net 00:00:00.07]       Expected: 20
+[xUnit.net 00:00:00.07]       Actual:   18
+[xUnit.net 00:00:00.07]       Stack Trace:
+[xUnit.net 00:00:00.07]         /workspace/T.cs(21,0): at Asqs.Probe.OrderServiceTests.Total_multiplies()
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:00.07]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.08]   Finished:    T
+  Failed Asqs.Probe.OrderServiceTests.Theory_that_fails(n: 1) [2 ms]
+  Error Message:
+   n was not greater than five
+  Stack Trace:
+     at Asqs.Probe.OrderServiceTests.Theory_that_fails(Int32 n) in /workspace/T.cs:line 35
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeDirectByRefWithFewArgs(Object obj, Span`1 copyOfArgs, BindingFlags invokeAttr)
+  Failed Asqs.Probe.OrderServiceTests.Total_rejects_zero [< 1 ms]
+  Error Message:
+   System.ArgumentOutOfRangeException : quantity must be positive (Parameter 'qty')
+  Stack Trace:
+     at Asqs.Probe.OrderService.Total(Int32 qty, Decimal unit) in /workspace/T.cs:line 10
+   at Asqs.Probe.OrderServiceTests.Total_rejects_zero() in /workspace/T.cs:line 28
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+  Failed Asqs.Probe.OrderServiceTests.Total_multiplies [3 ms]
+  Error Message:
+   Assert.Equal() Failure: Values differ
+Expected: 20
+Actual:   18
+  Stack Trace:
+     at Asqs.Probe.OrderServiceTests.Total_multiplies() in /workspace/T.cs:line 21
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+
+Test Run Failed.
+Total tests: 3
+     Failed: 3
+ Total time: 0,3376 Seconds

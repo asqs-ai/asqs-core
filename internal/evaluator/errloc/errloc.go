@@ -43,6 +43,21 @@ var (
 	// not in the delimiter class, and for "C:\proj\Svc.cs(33,12)" it can only begin after a
 	// backslash. Both forms appear in real logs — Docker sandbox paths and Windows MSBuild.
 	reFileParenLineCol = regexp.MustCompile(`(?:^|[\s(:'"[])([A-Za-z0-9_./\\~-]+\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|go|scala))\((\d+),\s*\d+\)`)
+	// .NET stack frame: `at Ns.Type.Method(Int32 a, Decimal b) in /workspace/src/File.cs:line 10`
+	//
+	// Nothing matched this, so every RUNTIME C# failure lost its file and line: no code window for
+	// the fixer, no scope narrowing, no primary-site attribution. Compile failures localised fine
+	// because the compiler emits `File.cs(12,5)`, which reFileParenLineCol already reads — so the
+	// gap was invisible unless you compared a failing test run against a failing build.
+	//
+	// The `in <path>:line <n>` shape is what identifies it, not the `at ` prefix: continuation lines
+	// in an aggregate exception carry the same form without it. Framework frames
+	// (`at System.Reflection.MethodBaseInvoker...`) name no file at all and so never match.
+	//
+	// The path is non-greedy up to the extension because a real one contains spaces
+	// (`/workspace/My Project/Handler.cs`) and Windows drive letters (`C:\src\...`), neither of
+	// which a character class can accept without also swallowing the `:line` delimiter.
+	reDotNetFrame = regexp.MustCompile(`(?i)\bin\s+(.+?\.(?:cs|razor|cshtml|vb|fs)):line\s+(\d+)\b`)
 )
 
 // ParseLocations extracts (file, line) pairs from build/test output. Order is scan order; callers dedupe.
@@ -71,6 +86,14 @@ func ParseLocations(log string) []Location {
 		if len(sub) >= 3 {
 			line, _ := strconv.Atoi(sub[2])
 			add(sub[1], line)
+		}
+	}
+	// Before the generic patterns: a .NET frame's path may contain spaces, which the character
+	// classes below would truncate at the first one.
+	for _, sub := range reDotNetFrame.FindAllStringSubmatch(log, -1) {
+		if len(sub) >= 3 {
+			line, _ := strconv.Atoi(sub[2])
+			add(strings.TrimSpace(sub[1]), line)
 		}
 	}
 	for _, sub := range reFileParenLineCol.FindAllStringSubmatch(log, -1) {

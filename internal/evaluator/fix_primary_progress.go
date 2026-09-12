@@ -265,6 +265,11 @@ var resolutionFailureRE = regexp.MustCompile(`(?i)` + strings.Join([]string{
 	`could not be found`,
 	`call is ambiguous`,
 	`no accessible extension method`,
+	// CS1061 and CS0117 both read "'T' does not contain a definition for 'M'". CS1061's full text
+	// goes on to ask "are you missing a using directive or an assembly reference?", which is the
+	// repair: the extension method exists and its namespace is not imported. Without this phrase a
+	// round that added exactly the right using read as "no progress" and was reverted.
+	`does not contain a definition for`,
 	// TypeScript: TS2304, TS2305.
 	`cannot find name`,
 	`has no exported member`,
