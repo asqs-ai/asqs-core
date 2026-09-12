@@ -18,9 +18,6 @@ var (
 	reDeclaredMember = regexp.MustCompile(
 		`(?m)^\s*(?:public|internal|protected internal)\s+(?:static\s+|virtual\s+|override\s+|sealed\s+|async\s+|readonly\s+|required\s+|partial\s+|extern\s+|new\s+)*(?:[\w.<>\[\],?]+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:[({=;]|=>)`)
 
-	// reEnumBody captures an enum's members, which are bare identifiers with no modifier to key on.
-	reEnumBody = regexp.MustCompile(`(?s)\benum\s+[A-Za-z_][A-Za-z0-9_]*[^{]*\{(.*?)\}`)
-
 	// reTypeKeyword is the set of words the member pattern can capture from a declaration LINE
 	// rather than from a member: `public class Foo` matches it with "class".
 	typeKeywords = map[string]bool{
@@ -43,9 +40,9 @@ var (
 func DeclaredMemberNames(typeName, src string) []string {
 	src = StripCSharpCommentsAndStrings(src)
 
-	if m := reEnumBody.FindStringSubmatch(src); len(m) > 1 && strings.Contains(src, "enum "+typeName) {
+	if body, isEnum := enumBodyFor(typeName, src); isEnum {
 		var out []string
-		for _, part := range strings.Split(m[1], ",") {
+		for _, part := range strings.Split(body, ",") {
 			name := strings.TrimSpace(part)
 			if i := strings.Index(name, "="); i >= 0 {
 				name = strings.TrimSpace(name[:i])
@@ -80,6 +77,28 @@ func DeclaredMemberNames(typeName, src string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// enumBodyFor returns the body of the enum with exactly this name.
+//
+// Both halves of that sentence were wrong before. The type was matched with
+// `strings.Contains(src, "enum "+typeName)`, which is a PREFIX test — "enum BasketState" contains
+// "enum Basket" — and the body then came from a pattern that found the first enum in the file
+// whatever it was called. A class declared beside an enum whose name merely starts with the class's
+// was therefore read as that enum and given its members.
+//
+// A validation run is the case, and it is the worst shape this can fail in: the generator told the
+// model that Basket.Add() does not exist and offered it the members of BasketState. Add is a public
+// method of Basket. A correct test was rejected, its one retry spent, and the model was handed a
+// false statement about the very type it was testing.
+func enumBodyFor(typeName, strippedSrc string) (string, bool) {
+	re := regexp.MustCompile(`\benum\s+` + regexp.QuoteMeta(typeName) +
+		`\s*(?::\s*[\w.]+\s*)?\{([^}]*)\}`)
+	m := re.FindStringSubmatch(strippedSrc)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
 }
 
 // recordPositionalParameters returns the property names a record declares in its parameter list.
