@@ -175,6 +175,7 @@ const csharpAPIE2EHints = "- **This application has no browser-drivable pages** 
 const csharpUIE2EHints = "- **This application serves browser-drivable pages** (detected E2E surface: `ui`/`mixed`).\n" +
 	"- **Canonical imports:** `using Microsoft.Playwright;` — obtain **`IPlaywright`**, **`IBrowser`**, **`IPage`** through the async Playwright .NET API, one `IPage` per test; match the repo's test adapter (**xUnit**, **NUnit** or **MSTest**).\n" +
 	"- **Base URL:** read **`ASQS_BASE_URL`** from the environment and navigate to paths relative to it (`await page.GotoAsync($\"{baseUrl}/orders\")`). Never navigate to a `data:` URL and never hard-code `http://localhost:5000`: the port is assigned per run.\n" +
+	"- **When `ASQS_BASE_URL` is unset, fail the test with that as the message** rather than navigating to an empty URL. The runner sets it only when it starts the application for the E2E step; a test that navigates anyway fails with a browser timeout, which reads as a broken test and sends the repair loop rewriting something that is not wrong.\n" +
 	"- **Selectors:** address elements by the `data-testid` attributes the page already carries (`page.GetByTestId(\"orders-search\")`), not by CSS structure or visible text.\n" +
 	"- **Typical runner:** `dotnet test -c Release --filter \"FullyQualifiedName~E2E\"`.\n" +
 	"- **Reference:** Playwright for .NET — [https://playwright.dev/dotnet/docs/intro](https://playwright.dev/dotnet/docs/intro)"

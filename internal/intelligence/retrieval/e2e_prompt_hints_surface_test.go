@@ -91,3 +91,19 @@ func TestE2EPromptCanonicalHints_apiSurfaceKeepsANonBrowserFramework(t *testing.
 		t.Errorf("a detected selenium stack lost to the ui surface:\n%s", got)
 	}
 }
+
+// The ui hints name ASQS_BASE_URL, which nothing sets until CS24 lands. Until then a generated
+// browser test must fail with that fact rather than navigate to an empty URL and time out — a
+// timeout reads as a broken test, and the fixer spends rounds rewriting a test whose only problem
+// is a missing precondition.
+func TestE2EPromptCanonicalHints_uiSurfaceStatesTheBaseURLPrecondition(t *testing.T) {
+	got := E2EPromptCanonicalHintsForSurface("csharp", "", "ui")
+	if !strings.Contains(got, "ASQS_BASE_URL") {
+		t.Fatalf("ui hints no longer name the base URL variable:\n%s", got)
+	}
+	for _, want := range []string{"unset", "fail"} {
+		if !strings.Contains(strings.ToLower(got), want) {
+			t.Errorf("ui hints do not tell the test what to do when the variable is unset (%q):\n%s", want, got)
+		}
+	}
+}
