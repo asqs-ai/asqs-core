@@ -3,6 +3,8 @@ package layout
 import (
 	"path/filepath"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 // csharpSourceDirLooksLikeTestTree is true when the path is already under a conventional tests folder
@@ -48,7 +50,7 @@ func SuggestedCSharpUnitTestPath(sourceFileRel, repoAbs string) string {
 	// Prefer routing into an existing unit-test project's directory (wherever it lives in the tree),
 	// so generated tests compile in that project instead of being scattered into production projects.
 	if projDir := DetectCSharpUnitTestProjectDir(repoAbs); projDir != "" {
-		mir := MirrorDirForTests(dir)
+		mir := csharpMirrorDirForTests(sourceFileRel, dir, repoAbs)
 		if mir == "" {
 			return filepath.Join(projDir, testName)
 		}
@@ -62,11 +64,49 @@ func SuggestedCSharpUnitTestPath(sourceFileRel, repoAbs string) string {
 	if root == "" {
 		root = "tests"
 	}
-	mir := MirrorDirForTests(dir)
+	mir := csharpMirrorDirForTests(sourceFileRel, dir, repoAbs)
 	if mir == "" {
 		return filepath.Join(root, testName)
 	}
 	return filepath.Join(root, filepath.FromSlash(mir), testName)
+}
+
+// csharpMirrorDirForTests returns the sub-path a test should sit at INSIDE the test project.
+//
+// The shared mirror strips `src/` and keeps everything after it, which leaves the source project's
+// own directory name in the path: src/Shop/Pages/Orders became <test project>/Shop/Pages/Orders.
+//
+// In C# a folder is a namespace. A test project whose root namespace is Shop.Tests therefore reads
+// that directory as Shop.Tests.Shop, and the segment `Shop` SHADOWS the top-level Shop namespace for
+// every file in the project — so `using Shop.Core.Services;` resolves against Shop.Tests.Shop.Core
+// and fails. A validation run is the case: one generated Razor test landed and the repository's
+// own pre-existing PricingServiceTests.cs stopped compiling. Nothing could repair it
+// from inside that file, because the shadow is created by a different file's namespace.
+//
+// Mirroring below the SOURCE PROJECT is both the fix and what the convention meant all along: a
+// test for src/Shop/Pages/Orders/Index.cshtml.cs belongs at <test project>/Pages/Orders. When no
+// project can be found the shared behaviour stands — there is no project directory to mirror
+// against, and inventing one would be worse than a flat layout.
+func csharpMirrorDirForTests(sourceFileRel, dir, repoAbs string) string {
+	if repoAbs == "" {
+		return MirrorDirForTests(dir)
+	}
+	csprojRel, ok := dotnetproj.NearestCsprojRel(repoAbs, sourceFileRel)
+	if !ok {
+		return MirrorDirForTests(dir)
+	}
+	projDir := filepath.ToSlash(filepath.Dir(csprojRel))
+	if projDir == "." || projDir == "" {
+		return MirrorDirForTests(dir)
+	}
+	d := filepath.ToSlash(dir)
+	if d == projDir {
+		return "" // the file sits at the project root: no subdirectory to mirror
+	}
+	if rest := strings.TrimPrefix(d, projDir+"/"); rest != d {
+		return strings.Trim(rest, "/")
+	}
+	return MirrorDirForTests(dir)
 }
 
 func sourceNameFromCSharpTestBase(fileName string) (sourceName string, ok bool) {
