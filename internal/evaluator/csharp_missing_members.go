@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/dotnetproj"
@@ -53,14 +54,14 @@ func csharpMissingMemberFacts(errorOutput string, files map[string]string, artif
 		if !ok {
 			continue // third-party: the classpath surface answers for it
 		}
-		if artifacts[normalizePathForFix(src.path)] {
+		if generated := firstGeneratedArtifactPath(src.paths, artifacts); generated != "" {
 			emit(typeName+"#"+member, fmt.Sprintf(
 				"%s (%s) is a file THIS run generated and it has no member %q — the call was written before the member. "+
 					"Define it in that file, or call something the type under test actually declares.",
-				typeName, src.path, member))
+				typeName, generated, member))
 			continue
 		}
-		emit(typeName+"#"+member, csharpOwnedTypeMissFact(typeName, src.path, member, src.body))
+		emit(typeName+"#"+member, csharpOwnedTypeMissFact(typeName, src.pathLabel(), member, src.bodies))
 	}
 
 	// CS1729 / CS7036: the type exists, the constructor call matches no declared signature.
@@ -70,7 +71,7 @@ func csharpMissingMemberFacts(errorOutput string, files map[string]string, artif
 		if !ok {
 			continue
 		}
-		emit(typeName+"#.ctor", csharpConstructorFact(typeName, src.path, src.body))
+		emit(typeName+"#.ctor", csharpConstructorFact(typeName, src.pathLabel(), src.bodies))
 	}
 	return facts
 }
@@ -91,33 +92,78 @@ var (
 	reCSharpCtorParams = `(?m)^\s*(?:public|internal|protected internal|protected)\s+%s\s*\(([^)]*)\)`
 )
 
+// csharpTypeSource is every file in this prompt that declares one type. A type has more than one
+// when it is partial.
 type csharpTypeSource struct {
-	path string
-	body string
+	paths  []string
+	bodies []string
 }
 
-// csharpTypeSourcesByName maps a simple type name to the file that declares it. Comments and string
+func (s csharpTypeSource) primaryPath() string {
+	if len(s.paths) == 0 {
+		return ""
+	}
+	return s.paths[0]
+}
+
+// pathLabel names every file the members come from, because the fact that follows it says "shown in
+// this prompt" — and for a partial type a single path would attribute half the members to a file
+// that does not contain them.
+func (s csharpTypeSource) pathLabel() string {
+	return strings.Join(s.paths, ", ")
+}
+
+// csharpTypeSourcesByName maps a simple type name to the files that declare it. Comments and string
 // literals are stripped first: a type named only inside a template string is not declared.
+//
+// Every declaring file is kept, not the first. A partial class is one type spread over several
+// files, and keeping one of them made the fixer offer half a type's members while the generator's
+// invented-member gate, which accumulates across files, saw all of them — the divergence the header
+// of dotnetproj/csharpdecl.go says must not exist. Which half survived depended on map iteration
+// order, so the prompt was not even stable between runs.
 func csharpTypeSourcesByName(files map[string]string) map[string]csharpTypeSource {
 	out := map[string]csharpTypeSource{}
-	for path, body := range files {
+	paths := make([]string, 0, len(files))
+	for path := range files {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		body := files[path]
 		if !strings.HasSuffix(strings.ToLower(strings.TrimSpace(path)), ".cs") {
 			continue
 		}
 		src := dotnetproj.StripCSharpCommentsAndStrings(body)
+		declaredInThisFile := map[string]bool{}
 		for _, m := range reCSharpDeclaredType.FindAllStringSubmatch(src, -1) {
-			if name := strings.TrimSpace(m[1]); name != "" {
-				if _, dup := out[name]; !dup {
-					out[name] = csharpTypeSource{path: path, body: body}
-				}
+			name := strings.TrimSpace(m[1])
+			if name == "" || declaredInThisFile[name] {
+				continue
 			}
+			declaredInThisFile[name] = true
+			decl := out[name]
+			decl.paths = append(decl.paths, path)
+			decl.bodies = append(decl.bodies, body)
+			out[name] = decl
 		}
 	}
 	return out
 }
 
-func csharpOwnedTypeMissFact(typeName, path, member, body string) string {
-	declared := csharpDeclaredMemberNames(typeName, body)
+// firstGeneratedArtifactPath returns the declaring file this run generated, if any. A partial type
+// can be spread over a generated artifact and repo-owned source at once, and the artifact is the
+// file the fixer can write to.
+func firstGeneratedArtifactPath(paths []string, artifacts map[string]bool) string {
+	for _, p := range paths {
+		if artifacts[normalizePathForFix(p)] {
+			return p
+		}
+	}
+	return ""
+}
+
+func csharpOwnedTypeMissFact(typeName, path, member string, bodies []string) string {
+	declared := csharpDeclaredMemberNames(typeName, bodies...)
 	partial := false
 	if len(declared) > maxDeclaredMethodsListed {
 		declared = declared[:maxDeclaredMethodsListed]
@@ -137,17 +183,21 @@ func csharpOwnedTypeMissFact(typeName, path, member, body string) string {
 	return b.String()
 }
 
-func csharpConstructorFact(typeName, path, body string) string {
-	src := dotnetproj.StripCSharpCommentsAndStrings(body)
+func csharpConstructorFact(typeName, path string, bodies []string) string {
 	re := regexp.MustCompile(fmt.Sprintf(reCSharpCtorParams, regexp.QuoteMeta(typeName)))
 	var sigs []string
-	for _, m := range re.FindAllStringSubmatch(src, -1) {
-		params := strings.TrimSpace(m[1])
-		if params == "" {
-			sigs = append(sigs, typeName+"()")
-			continue
+	seen := map[string]bool{}
+	for _, body := range bodies {
+		src := dotnetproj.StripCSharpCommentsAndStrings(body)
+		for _, m := range re.FindAllStringSubmatch(src, -1) {
+			params := strings.TrimSpace(m[1])
+			sig := typeName + "(" + params + ")"
+			if seen[sig] {
+				continue
+			}
+			seen[sig] = true
+			sigs = append(sigs, sig)
 		}
-		sigs = append(sigs, typeName+"("+params+")")
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "%s (%s, shown in this prompt) has no constructor matching that call.", typeName, path)
@@ -168,8 +218,23 @@ func csharpConstructorFact(typeName, path, body string) string {
 // It delegates to dotnetproj so the fixer and the generator's invented-member gate read the same
 // declarations. They used to be two scans of the same source: a member the generator allowed and
 // the fixer then called absent would have put the loop into an argument with itself.
-func csharpDeclaredMemberNames(typeName, body string) []string {
-	return dotnetproj.DeclaredMemberNames(typeName, body)
+//
+// Variadic over bodies for the same reason the gate accumulates them: one partial type's members
+// are spread over several files.
+func csharpDeclaredMemberNames(typeName string, bodies ...string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, body := range bodies {
+		for _, name := range dotnetproj.DeclaredMemberNames(typeName, body) {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // auditMissingMemberFacts records the C# facts on the same event the Java path uses, so a

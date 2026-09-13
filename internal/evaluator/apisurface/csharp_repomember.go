@@ -27,13 +27,18 @@ import (
 //   - a partial class, whose members are spread over files that do not share its name; and
 //   - a type the repository does not declare at all, which is the package surface's business.
 //
+// The extension-method bound was a fixed list of BCL and library names, which is not a bound at
+// all: adding behaviour to a type through an extension method of one's own is ordinary C#, and a
+// repository that does it had its own correct calls refused with the receiver's member list offered
+// as the alternative. The repository's own `this Foo` declarations are read alongside its types.
+//
 // A false rejection costs a correct test its regeneration budget, so the bar for speaking is that
 // the whole member set is in view.
 func RepoInventedMemberReasonCS(repoRoot, testContent string) string {
 	if strings.TrimSpace(repoRoot) == "" || strings.TrimSpace(testContent) == "" {
 		return ""
 	}
-	index, ok := csharpRepoTypeIndex(repoRoot)
+	index, repoExtensions, ok := csharpRepoTypeIndex(repoRoot)
 	if !ok || len(index) == 0 {
 		return ""
 	}
@@ -74,7 +79,8 @@ func RepoInventedMemberReasonCS(repoRoot, testContent string) string {
 		callRE := regexp.MustCompile(`(^|[^\w.])` + regexp.QuoteMeta(ident) + `\s*\.\s*(\w+)\s*\(`)
 		for _, m := range callRE.FindAllStringSubmatch(stripped, -1) {
 			name := m[2]
-			if members[name] || csharpObjectMemberNames[name] || csharpExtensionMethodNames[name] {
+			if members[name] || csharpObjectMemberNames[name] ||
+				csharpExtensionMethodNames[name] || repoExtensions[name] {
 				continue
 			}
 			key := typ + "#" + name
@@ -175,18 +181,33 @@ func (d csharpTypeDecl) primaryPath() string {
 	return d.paths[0]
 }
 
-// csharpRepoTypeIndex maps every simple type name the repository declares to the files declaring it.
+// reCSharpExtensionMethod matches an extension method DECLARATION: a static method whose first
+// parameter is marked `this`. Only the method name is captured.
+//
+// The receiver type is deliberately not keyed on. An extension declared on an interface answers for
+// every implementation of it, one declared on a generic parameter answers for everything, and
+// getting either wrong reintroduces the false refusal this replaces. A name the repository declares
+// as an extension is a name this gate declines to judge — the same allowance, and for the same
+// reason, as csharpExtensionMethodNames.
+var reCSharpExtensionMethod = regexp.MustCompile(
+	`(?:public|internal)\s+(?:static\s+|unsafe\s+|partial\s+|extern\s+)*static\s+` +
+		`(?:\([^()\n]*\)|[\w.<>\[\],?]+)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>()\n]*>\s*)?` +
+		`\(\s*(?:\[[^\]\n]*\]\s*)*this\s`)
+
+// csharpRepoTypeIndex maps every simple type name the repository declares to the files declaring it,
+// and collects the names of every extension method the repository declares.
 //
 // It reports false rather than a partial index for an unreadable subtree, for the same reason
 // csharpDeclaredSimpleNames does: a name the walk failed to see would read as proof of absence, and
 // the caller's whole output is an absence claim.
-func csharpRepoTypeIndex(repoRoot string) (map[string]csharpTypeDecl, bool) {
+func csharpRepoTypeIndex(repoRoot string) (map[string]csharpTypeDecl, map[string]bool, bool) {
 	root := filepath.Clean(strings.TrimSpace(repoRoot))
 	st, err := os.Stat(root)
 	if err != nil || !st.IsDir() {
-		return nil, false
+		return nil, nil, false
 	}
 	out := map[string]csharpTypeDecl{}
+	extensions := map[string]bool{}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -213,6 +234,11 @@ func csharpRepoTypeIndex(repoRoot string) (map[string]csharpTypeDecl, bool) {
 			rel = path
 		}
 		rel = filepath.ToSlash(rel)
+		for _, m := range reCSharpExtensionMethod.FindAllStringSubmatch(src, -1) {
+			if name := strings.TrimSpace(m[1]); name != "" {
+				extensions[name] = true
+			}
+		}
 		for _, m := range reCSharpTypeDeclaration.FindAllStringSubmatch(src, -1) {
 			name := strings.TrimSpace(m[1])
 			if name == "" {
@@ -226,9 +252,9 @@ func csharpRepoTypeIndex(repoRoot string) (map[string]csharpTypeDecl, bool) {
 		return nil
 	})
 	if walkErr != nil {
-		return nil, false
+		return nil, nil, false
 	}
-	return out, true
+	return out, extensions, true
 }
 
 // csharpVisibleMembers collects the members a caller may reach on a type: its own declarations

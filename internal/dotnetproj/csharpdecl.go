@@ -12,14 +12,73 @@ import (
 // invented would put the loop into an argument with itself — so the extraction lives here, below
 // both, rather than being written twice.
 
+// The pieces a member declaration is made of. They are spelled once and composed, because the same
+// shapes have to be recognised twice: with an access modifier in a class body, and without one in an
+// interface body, where C# does not permit modifiers at all.
+const (
+	// memberAttributes are the attribute groups a member may carry on its own line.
+	// `[JsonPropertyName("id")] public string Id { get; set; }` is one line, and anchoring the
+	// modifier at the start of it hid every property written that way.
+	//
+	// The content runs to the last `]` on the line rather than the first, because an attribute
+	// argument may itself contain brackets — `[Values(new[] { 1, 2 })]`. Stopping at the first one
+	// put the scan in the middle of the attribute, where no access modifier follows.
+	memberAttributes = `(?:\[[^\n]*\][ \t]*)*`
+
+	// memberModifiers are the non-access modifiers that may sit between the access modifier and the
+	// return type. `const` belongs here: a public constant is a member a test may read, and leaving
+	// it out made `Order.MaxItems` read as invented.
+	memberModifiers = `(?:(?:static|virtual|override|sealed|abstract|async|readonly|required|partial|` +
+		`extern|new|const|unsafe|volatile|event|ref)\s+)*`
+
+	// genericArguments matches a `<…>` list three levels deep. Three, rather than a character class,
+	// because a type argument list is written WITH SPACES by everyone — `Dictionary<string, int>`,
+	// `Func<int, string>`, `Task<Dictionary<string, List<int>>>` — and a character run ends at the
+	// first space. That hid the member exactly as the generic-METHOD hole did, and at the same two
+	// claim sites. A regular expression cannot balance brackets to arbitrary depth; three covers
+	// every signature anyone writes, and a fourth simply falls back to not matching, which offers
+	// one member fewer rather than a wrong one.
+	genericArgumentsL1 = `<[^<>\n]*>`
+	genericArgumentsL2 = `<(?:[^<>\n]|` + genericArgumentsL1 + `)*>`
+	genericArguments   = `<(?:[^<>\n]|` + genericArgumentsL2 + `)*>`
+
+	// memberType is the return or field type: a tuple, or a name with optional type arguments and
+	// any number of array and nullable suffixes. The tuple alternative is why it is not one
+	// character class: `public (int, string) Summary()` is an ordinary C# signature, and a pattern
+	// built only from identifier characters cannot see past the parentheses.
+	memberType = `(\([^()\n]*\)|[\w.?\[\],]+(?:` + genericArguments + `)?(?:\[\]|\?)*)`
+
+	// memberNameAndOpener is the member's own name, its type parameters when it is generic, and the
+	// token that ends the declaration. The type-parameter list is the reason generic methods were
+	// invisible: in `public T Get<T>(int id)` the name is followed by `<`, never by `(`.
+	memberNameAndOpener = `([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^<>()\n]*>\s*)?`
+)
+
 var (
 	// reDeclaredMember matches members worth offering as call targets: public and internal, never
 	// private. Offering a private member would trade one compile error for another.
+	//
+	// Both orders of the two-word access modifier are accepted. C# allows `protected internal` and
+	// `internal protected` interchangeably, and only the first was listed.
 	reDeclaredMember = regexp.MustCompile(
-		`(?m)^\s*(?:public|internal|protected internal)\s+(?:static\s+|virtual\s+|override\s+|sealed\s+|async\s+|readonly\s+|required\s+|partial\s+|extern\s+|new\s+)*(?:[\w.<>\[\],?]+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:[({=;]|=>)`)
+		`(?m)^[ \t]*` + memberAttributes +
+			`(?:public|internal|protected\s+internal|internal\s+protected)\s+` +
+			memberModifiers + `(?:` + memberType + `\s+)?` + memberNameAndOpener + `(?:[({=;]|=>)`)
 
-	// reTypeKeyword is the set of words the member pattern can capture from a declaration LINE
-	// rather than from a member: `public class Foo` matches it with "class".
+	// reInterfaceMember matches a member of an INTERFACE, which carries no access modifier — so the
+	// pattern above, which requires one, returned an empty set for every interface in the
+	// repository while still reporting the type as fully known. A test holding
+	// `IOrderService svc = new OrderService();` then had every call on svc called invented.
+	//
+	// It is only ever run against a brace-matched interface body, where every declaration is a
+	// member. Run over a whole file it would capture statements.
+	reInterfaceMember = regexp.MustCompile(
+		`(?m)^[ \t]*` + memberAttributes +
+			`(?:(?:public|internal|protected|static|abstract|virtual|sealed|new|async|ref|readonly|event)\s+)*` +
+			memberType + `\s+` + memberNameAndOpener + `(?:[({;]|=>)`)
+
+	// typeKeywords is the set of words the member pattern can capture from a declaration LINE rather
+	// than from a member: `public class Foo` matches it with "class".
 	typeKeywords = map[string]bool{
 		"class": true, "struct": true, "interface": true, "enum": true, "record": true,
 		"delegate": true, "event": true, "const": true, "using": true, "namespace": true,
@@ -72,11 +131,62 @@ func DeclaredMemberNames(typeName, src string) []string {
 	for _, p := range recordPositionalParameters(typeName, src) {
 		add(p)
 	}
+	if body, isInterface := interfaceBodyFor(typeName, src); isInterface {
+		for _, m := range reInterfaceMember.FindAllStringSubmatch(body, -1) {
+			addMemberMatch(add, m[1], m[2])
+		}
+		sort.Strings(out)
+		return out
+	}
 	for _, m := range reDeclaredMember.FindAllStringSubmatch(src, -1) {
-		add(m[1])
+		addMemberMatch(add, m[1], m[2])
 	}
 	sort.Strings(out)
 	return out
+}
+
+// addMemberMatch records one pattern match, unless what it captured is a TYPE's name rather than a
+// member's.
+//
+// `public class OrderDto {` matches the member pattern: the type slot takes "class" and the name
+// slot takes "OrderDto". Offering that to the model as a member of the type beside it is the same
+// class of wrong statement this file exists to avoid — the model is invited to call something that
+// is not there.
+func addMemberMatch(add func(string), typeToken, name string) {
+	if typeKeywords[strings.TrimSpace(typeToken)] {
+		return
+	}
+	add(name)
+}
+
+// interfaceBodyFor returns the brace-matched body of the interface with exactly this name.
+//
+// Everything between the name and the opening brace is skipped wholesale — type parameters, the
+// base-interface list and a `where` clause can all appear there, in that order or not at all, and
+// enumerating them is how the pattern would come to miss one. The `;` in the character class stops
+// the scan from running past the declaration if the brace never comes.
+func interfaceBodyFor(typeName, strippedSrc string) (string, bool) {
+	re := regexp.MustCompile(`\binterface\s+` + regexp.QuoteMeta(typeName) + `\b[^{;]*\{`)
+	loc := re.FindStringIndex(strippedSrc)
+	if loc == nil {
+		return "", false
+	}
+	open := loc[1] - 1 // the '{' the pattern ends on
+	depth := 0
+	for i := open; i < len(strippedSrc); i++ {
+		switch strippedSrc[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return strippedSrc[open+1 : i], true
+			}
+		}
+	}
+	// Unbalanced: the rest of the file is the best available answer, and a superset is the safe
+	// direction here — it makes an absence claim rarer, never wider.
+	return strippedSrc[open+1:], true
 }
 
 // enumBodyFor returns the body of the enum with exactly this name.
