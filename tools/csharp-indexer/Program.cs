@@ -619,6 +619,7 @@ internal static class Program
             });
         }
 
+        CollectTestSelectors(root, relPath, isTest || ContainsTestAttribute(text), symbols, edges);
         CollectHttpClientRequests(root, model, symbols, edges);
         CollectServiceRegistrationEdges(root, model, moduleNs, AddEdge);
 
@@ -1323,6 +1324,106 @@ internal static class Program
 
     private static readonly System.Text.RegularExpressions.Regex HttpClientDeclarationRE =
         new(@"\bHttpClient\b", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    // SelectorMethodNames are the Playwright .NET calls that address an element by a literal.
+    //
+    // What a test SELECTS is as much a fact about the UI as what the markup declares, and it is the
+    // better one: it is the selector somebody already proved works. Without this the selector
+    // inventory a generated test reads is built from markup alone, so a convention established in
+    // the existing tests — a page-object helper, a chosen data-testid scheme — is invisible.
+    private static readonly HashSet<string> SelectorMethodNames = new(StringComparer.Ordinal)
+    {
+        "GetByTestId", "Locator", "QuerySelectorAsync", "QuerySelectorAllAsync",
+        "GetByRole", "GetByLabel", "GetByPlaceholder", "GetByText", "GetByTitle", "GetByAltText",
+    };
+
+    // CollectTestSelectors emits TEST_SELECTOR symbols for the selectors a test file uses, linked to
+    // the file's E2E_SPEC so retrieval can reach them from the spec.
+    private static void CollectTestSelectors(SyntaxNode root, string relPath, bool isTest,
+        List<SymbolDto> symbols, List<EdgeDto> edges)
+    {
+        if (!isTest) return;
+        var specFq = "E2E_SPEC:" + relPath;
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var inv in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+        {
+            var name = inv.Expression switch
+            {
+                MemberAccessExpressionSyntax ma => ma.Name.Identifier.Text,
+                IdentifierNameSyntax id => id.Identifier.Text,
+                _ => null,
+            };
+            if (name == null || !SelectorMethodNames.Contains(name)) continue;
+            if (inv.ArgumentList.Arguments.Count == 0) continue;
+            // Only a literal counts. A selector built from a variable is a string this scope cannot
+            // read, and recording the expression text would put source code where a selector goes.
+            if (inv.ArgumentList.Arguments[0].Expression is not LiteralExpressionSyntax lit) continue;
+            if (lit.Token.Value is not string value || value.Length == 0) continue;
+
+            var fq = $"TEST_SELECTOR:{relPath}#{name}={value}";
+            if (!seen.Add(fq)) continue;
+            var (sl, el, sc, ec) = LineSpan(inv);
+            symbols.Add(new SymbolDto
+            {
+                Kind = "TEST_SELECTOR",
+                FqName = fq,
+                StartLine = sl,
+                EndLine = el,
+                StartColumn = sc,
+                EndColumn = ec,
+                Signature = JsonSerializer.SerializeToElement(new Dictionary<string, string>
+                {
+                    ["method"] = name,
+                    ["selector"] = value,
+                }),
+            });
+            edges.Add(new EdgeDto { CallerFqName = specFq, CalleeFqName = fq, EdgeType = "USES_SELECTOR" });
+        }
+
+        // Selenium page objects declare their selectors as attributes rather than calls.
+        foreach (var field in root.DescendantNodes().OfType<FieldDeclarationSyntax>())
+        {
+            foreach (var entry in SyntaxAttributes(field))
+            {
+                if (entry.Name != "FindsByAttribute") continue;
+                var using_ = GetNamedAttributeArgument(entry.Syntax, "Using");
+                if (string.IsNullOrEmpty(using_)) continue;
+                var how = GetNamedAttributeArgument(entry.Syntax, "How") ?? "How.Id";
+                var fq = $"TEST_SELECTOR:{relPath}#{how}={using_}";
+                if (!seen.Add(fq)) continue;
+                var (sl, el, sc, ec) = LineSpan(field);
+                symbols.Add(new SymbolDto
+                {
+                    Kind = "TEST_SELECTOR",
+                    FqName = fq,
+                    StartLine = sl,
+                    EndLine = el,
+                    StartColumn = sc,
+                    EndColumn = ec,
+                    Signature = JsonSerializer.SerializeToElement(new Dictionary<string, string>
+                    {
+                        ["method"] = how!,
+                        ["selector"] = using_!,
+                    }),
+                });
+                edges.Add(new EdgeDto { CallerFqName = specFq, CalleeFqName = fq, EdgeType = "USES_SELECTOR" });
+            }
+        }
+    }
+
+    // GetNamedAttributeArgument reads `Name = value` out of an attribute's argument list. A literal
+    // yields its text; anything else yields the expression as written, which is what `How.Id` is.
+    private static string? GetNamedAttributeArgument(AttributeSyntax attr, string name)
+    {
+        if (attr.ArgumentList == null) return null;
+        foreach (var arg in attr.ArgumentList.Arguments)
+        {
+            if (arg.NameEquals?.Name.Identifier.Text != name) continue;
+            if (arg.Expression is LiteralExpressionSyntax lit && lit.Token.Value is string s) return s;
+            return arg.Expression.ToString();
+        }
+        return null;
+    }
 
     private static void CollectHttpClientRequests(SyntaxNode root, SemanticModel model, List<SymbolDto> symbols, List<EdgeDto> edges)
     {
