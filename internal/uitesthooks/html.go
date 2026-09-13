@@ -13,7 +13,13 @@ var (
 	// htmlOpenTagRE matches an opening tag of a hookable element and captures name and attribute
 	// text. Self-closing (`/>`) forms are included. Angular control-flow blocks and interpolations
 	// never start with `<name`, so they are not matched.
-	htmlOpenTagRE = regexp.MustCompile(`(?is)<(button|a|input|select|textarea|form|nav|main|section|header|footer|aside|h[1-6]|ul|ol|li|table|tr|img)(\s[^<>]*?)?(/?)>`)
+	//
+	// The attribute text reads quoted values whole rather than stopping at the first `>`, because an
+	// attribute VALUE may contain one: `@onclick="() => Go()"` in Blazor, `(click)="a > b"` in
+	// Angular. Truncating there hid whatever followed — including an existing data-testid, so the
+	// element was given a second one and the file stopped compiling on a duplicate attribute
+	// (RZ10007). An unbalanced quote makes the tag match nothing, which leaves it alone.
+	htmlOpenTagRE = regexp.MustCompile(`(?is)<(button|a|input|select|textarea|form|nav|main|section|header|footer|aside|h[1-6]|ul|ol|li|table|tr|img)((?:\s(?:"[^"]*"|'[^']*'|[^<>"'])*)?)(/?)>`)
 	// htmlCommentRE marks ranges the inserter must not edit.
 	htmlCommentRE = regexp.MustCompile(`(?s)<!--.*?-->`)
 	// htmlHookAttrRE detects an existing hook, including Angular's binding spellings.
