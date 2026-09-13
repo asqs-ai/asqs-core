@@ -610,9 +610,14 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 				// has no webServer block to start one. Without this a generated
 				// page.GotoAsync(baseUrl) has no URL: the test fails on an empty variable, which
 				// says nothing about the application and which no fix round can repair.
-				restoreEnv := applyCSharpE2EAppServerEnv(ctx, opts, audit)
-				testE2E := RunTestE2E(ctx, runner, opts, e2eCmd)
-				restoreEnv()
+				// Deferred inside its own scope: the restore puts back an environment variable, ends
+				// the application's process group and releases the lock that serialises all three.
+				// A panic in the step with the call sited after it leaked every one of them.
+				testE2E := func() StepResult {
+					restoreEnv := applyCSharpE2EAppServerEnv(ctx, opts, audit)
+					defer restoreEnv()
+					return RunTestE2E(ctx, runner, opts, e2eCmd)
+				}()
 				testE2E.Step = StepTestE2E
 				if testE2E.Summary != "" && !strings.HasPrefix(strings.ToLower(testE2E.Summary), "e2e") {
 					testE2E.Summary = "e2e: " + testE2E.Summary

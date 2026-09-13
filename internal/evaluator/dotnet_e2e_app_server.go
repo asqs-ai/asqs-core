@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/asqs/asqs-core/internal/appserver"
 	"github.com/asqs/asqs-core/internal/langid"
@@ -111,11 +112,24 @@ func auditE2EServer(ctx context.Context, audit Auditor, event string, payload ma
 //
 // The variable is restored rather than merely unset: an operator who exported ASQS_BASE_URL to
 // point at a deployed environment meant it, and a run must not silently delete their setting.
+//
+// The process environment is shared by everything in the process, so the lock holds from the moment
+// the variable is set until it is put back. Two browser-driven C# runs in one process would
+// otherwise interleave: the second would overwrite the first's URL, and the first's restore would
+// hand the second whichever value predated it — mid-step, so the test navigates somewhere else or
+// nowhere. This mirror runs one pipeline per process today, which makes the lock a guard against a
+// future caller rather than a live fix; the private distribution runs jobs concurrently in one
+// process and needs it now. It buys nothing against a process outside this one; the Docker bound
+// above is the other half of the same problem.
+var csharpE2EAppServerEnvMu sync.Mutex
+
 func applyCSharpE2EAppServerEnv(ctx context.Context, opts EvalOptions, audit Auditor) func() {
 	env, stop := startCSharpE2EAppServer(ctx, opts, audit)
 	if len(env) == 0 {
 		return stop
 	}
+	csharpE2EAppServerEnvMu.Lock()
+	unlock := &sync.Once{}
 	var restores []func()
 	for _, kv := range env {
 		name, value, ok := strings.Cut(kv, "=")
@@ -138,6 +152,7 @@ func applyCSharpE2EAppServerEnv(ctx context.Context, opts EvalOptions, audit Aud
 		for _, r := range restores {
 			r()
 		}
+		unlock.Do(csharpE2EAppServerEnvMu.Unlock)
 		stop()
 	}
 }

@@ -36,6 +36,16 @@ type DotnetE2EServer struct {
 	logFile *os.File
 	logPath string
 	once    sync.Once
+	// pgid is the process group recorded at start, when the process is certainly alive. Asking the
+	// kernel for it later would mean asking about a pid that may already have been reaped.
+	pgid int
+	// exited receives the result of cmd.Wait() exactly once, for the readiness poll to select on.
+	exited chan error
+	// mu guards the exit state, which Stop() reads to decide whether signalling is still its
+	// business. It is a field rather than a second read of the channel: taking the value out and
+	// putting it back made the answer depend on who asked first.
+	mu        sync.Mutex
+	hasExited bool
 }
 
 // DotnetE2EServerOptions configures the application ASQS starts for an E2E step.
@@ -48,6 +58,9 @@ type DotnetE2EServerOptions struct {
 	ReadyTimeout time.Duration
 	// Env is appended to the process environment.
 	Env []string
+	// Configuration is the MSBuild configuration the application was BUILT in. Empty means Release,
+	// which is what the eval toolchain compiles with.
+	Configuration string
 }
 
 const (
@@ -61,6 +74,9 @@ const (
 	// becomes ready. The reason is almost always in the last few lines — a port already in use, a
 	// database that is not there, a missing connection string.
 	dotnetE2EServerLogTail = 4000
+	// defaultDotnetE2EConfiguration must match what the eval toolchain builds with
+	// (runner/profile.ToolchainProfile.Compile for CSharpDotnet: `dotnet build -c Release`).
+	defaultDotnetE2EConfiguration = "Release"
 )
 
 // StartDotnetE2EServer starts the application and waits for it to answer.
@@ -89,9 +105,7 @@ func StartDotnetE2EServer(ctx context.Context, opts DotnetE2EServerOptions) (*Do
 		return nil, fmt.Errorf("dotnet e2e server: create log: %w", err)
 	}
 
-	// --no-build because the compile step already built this project: rebuilding here would both
-	// waste the time and risk a different result from the artifact under test.
-	argv := []string{"dotnet", "run", "--no-build", "--project", filepath.FromSlash(proj), "--urls", baseURL}
+	argv := dotnetRunArgv(proj, baseURL, opts.Configuration)
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = repo
 	cmd.Stdout = logFile
@@ -111,13 +125,30 @@ func StartDotnetE2EServer(ctx context.Context, opts DotnetE2EServerOptions) (*Do
 		os.Remove(logFile.Name())
 		return nil, fmt.Errorf("dotnet e2e server: start %s: %w", proj, err)
 	}
-	srv := &DotnetE2EServer{BaseURL: baseURL, cmd: cmd, logFile: logFile, logPath: logFile.Name()}
+	srv := &DotnetE2EServer{
+		BaseURL: baseURL, cmd: cmd, logFile: logFile, logPath: logFile.Name(),
+		exited: make(chan error, 1),
+	}
+	// The group is this process's own, recorded now: Setpgid made the child a group leader, so the
+	// group id is its pid, and reading it here rather than in Stop means never asking the kernel
+	// about a pid that has since been reaped.
+	if pgid, gerr := syscall.Getpgid(cmd.Process.Pid); gerr == nil {
+		srv.pgid = pgid
+	}
+	// One Wait() for the life of the server, owned here rather than by the readiness poll. The poll
+	// started its own and left it running on the success path, so the process could be reaped after
+	// the server was handed back — and Stop() would then signal a pid that was no longer its own.
+	go func() {
+		err := cmd.Wait()
+		srv.markExited()
+		srv.exited <- err
+	}()
 
 	timeout := opts.ReadyTimeout
 	if timeout <= 0 {
 		timeout = defaultDotnetE2EReadyTimeout
 	}
-	if err := waitForDotnetE2EReady(ctx, baseURL, timeout, cmd); err != nil {
+	if err := waitForDotnetE2EReady(ctx, baseURL, timeout, srv.exited); err != nil {
 		tail := srv.LogTail()
 		_ = srv.Stop()
 		return nil, fmt.Errorf("%w\n--- application output ---\n%s", err, tail)
@@ -126,11 +157,13 @@ func StartDotnetE2EServer(ctx context.Context, opts DotnetE2EServerOptions) (*Do
 }
 
 // waitForDotnetE2EReady polls until the application answers, the process exits, or time runs out.
-func waitForDotnetE2EReady(ctx context.Context, baseURL string, timeout time.Duration, cmd *exec.Cmd) error {
+//
+// The exit channel is the server's own, not one this opens: a second Wait() on the same process
+// would race the first for the exit status, and the loser gets an error about a child that is not
+// there rather than the reason the application stopped.
+func waitForDotnetE2EReady(ctx context.Context, baseURL string, timeout time.Duration, exited <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 3 * time.Second}
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
 
 	for {
 		select {
@@ -167,15 +200,17 @@ func (s *DotnetE2EServer) Stop() error {
 	}
 	var err error
 	s.once.Do(func() {
-		if s.cmd != nil && s.cmd.Process != nil {
+		if s.cmd != nil && s.cmd.Process != nil && !s.alreadyExited() {
 			// The whole group: `dotnet run` is a launcher, and its child is what holds the port.
-			if pgid, gerr := syscall.Getpgid(s.cmd.Process.Pid); gerr == nil {
-				_ = syscall.Kill(-pgid, syscall.SIGTERM)
+			if s.pgid > 0 {
+				_ = syscall.Kill(-s.pgid, syscall.SIGTERM)
 				// A short grace period, then insist. An application blocked on a shutdown hook
 				// would otherwise hold the port for the next step.
 				time.Sleep(500 * time.Millisecond)
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+				_ = syscall.Kill(-s.pgid, syscall.SIGKILL)
 			} else {
+				// No group to signal: os.Process.Kill refuses on a reaped process, so this is the
+				// safe fallback rather than a second-best one.
 				_ = s.cmd.Process.Kill()
 			}
 		}
@@ -190,6 +225,53 @@ func (s *DotnetE2EServer) Stop() error {
 		}
 	})
 	return err
+}
+
+// markExited records that the process has been reaped. Called once, by the goroutine that reaped it.
+func (s *DotnetE2EServer) markExited() {
+	s.mu.Lock()
+	s.hasExited = true
+	s.mu.Unlock()
+}
+
+// alreadyExited reports whether the process has been reaped, in which case its pid is no longer
+// its own.
+//
+// This is the difference between signalling a process group and signalling whatever the kernel
+// handed that number to next. os.Process.Kill would have refused on a reaped process — it keeps a
+// done flag — but the group kill goes through syscall with the raw pid and has no such guard, and
+// SIGKILL to a recycled group would take out an unrelated process tree.
+//
+// What remains after this check is the interval between it and the signal, during which this
+// process's own reaper may run. It is not closed here because it cannot be closed portably: a pid
+// is reserved only while the child is unreaped, and the call that would observe an exit WITHOUT
+// reaping — waitpid with WNOWAIT — is valid on Darwin and returns EINVAL on Linux, which is where
+// evaluation runs. Narrowing it to a few instructions, against sequential pid allocation over a
+// 32-bit space, is what is available.
+func (s *DotnetE2EServer) alreadyExited() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.hasExited
+}
+
+// dotnetRunArgv is the command that starts the application.
+//
+// `--no-build` because the compile step already built this project: rebuilding here would both
+// waste the time and risk a different result from the artifact under test. The configuration has to
+// be named for the same reason — `dotnet run --no-build` defaults to Debug and looks for
+// bin/Debug/<tfm>/<app>, while the eval toolchain compiles with `dotnet build -c Release`. Without
+// it the launcher exits immediately with "An error occurred trying to start process … No such file
+// or directory", every browser-driven C# E2E pass takes the e2e_server_failed path, and the
+// generated test fails on an unset ASQS_BASE_URL — the exact failure this server exists to remove.
+func dotnetRunArgv(projectRel, baseURL, configuration string) []string {
+	cfg := strings.TrimSpace(configuration)
+	if cfg == "" {
+		cfg = defaultDotnetE2EConfiguration
+	}
+	return []string{
+		"dotnet", "run", "--no-build", "-c", cfg,
+		"--project", filepath.FromSlash(projectRel), "--urls", baseURL,
+	}
 }
 
 // LogTail returns the end of the application's own output, which is where the reason for a failed

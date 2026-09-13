@@ -36,8 +36,9 @@ func TestWaitForDotnetE2EReady_anyStatusCounts(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer cmd.Process.Kill()
+			exited := waitChan(cmd)
 
-			if err := waitForDotnetE2EReady(context.Background(), base, 5*time.Second, cmd); err != nil {
+			if err := waitForDotnetE2EReady(context.Background(), base, 5*time.Second, exited); err != nil {
 				t.Fatalf("status %d should count as ready: %v", status, err)
 			}
 		})
@@ -52,7 +53,7 @@ func TestWaitForDotnetE2EReady_processExitIsImmediate(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	err := waitForDotnetE2EReady(context.Background(), "http://127.0.0.1:1", 30*time.Second, cmd)
+	err := waitForDotnetE2EReady(context.Background(), "http://127.0.0.1:1", 30*time.Second, waitChan(cmd))
 	if err == nil {
 		t.Fatal("a process that exited should not be reported as ready")
 	}
@@ -145,4 +146,61 @@ func TestFreeLocalPort(t *testing.T) {
 		t.Fatalf("the reported port is not free: %v", err)
 	}
 	ln.Close()
+}
+
+// waitChan is what StartDotnetE2EServer gives the readiness poll: one Wait() for the life of the
+// process, owned by the caller so that Stop can ask whether the process has already been reaped.
+func waitChan(cmd *exec.Cmd) <-chan error {
+	ch := make(chan error, 1)
+	go func() { ch <- cmd.Wait() }()
+	return ch
+}
+
+// `dotnet run --no-build` defaults to Debug and looks for bin/Debug/<tfm>/<app>. The eval toolchain
+// compiles with `dotnet build -c Release`, so without naming the configuration the launcher exits
+// with "An error occurred trying to start process … No such file or directory" — every
+// browser-driven C# E2E pass takes the e2e_server_failed path and the generated test then fails on
+// an unset ASQS_BASE_URL, which is the failure this server exists to remove.
+func TestDotnetRunArgv_namesTheConfigurationTheCompileStepBuilt(t *testing.T) {
+	argv := dotnetRunArgv("src/Shop/Shop.csproj", "http://127.0.0.1:5199", "")
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "-c Release") {
+		t.Fatalf("argv does not build against the Release output: %s", joined)
+	}
+	if !strings.Contains(joined, "--no-build") {
+		t.Fatalf("argv should not rebuild what the compile step already built: %s", joined)
+	}
+	if got := dotnetRunArgv("p.csproj", "http://x", "Debug"); !strings.Contains(strings.Join(got, " "), "-c Debug") {
+		t.Fatalf("an explicit configuration is not honoured: %v", got)
+	}
+}
+
+// Stop signals a process GROUP through syscall, which has none of os.Process.Kill's done guard. If
+// the application exited during the step the pid has been reaped and may have been reused, so the
+// signal would land on an unrelated process tree.
+func TestDotnetE2EServer_stopDoesNotSignalAReapedProcess(t *testing.T) {
+	cmd := exec.Command("true")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	srv := &DotnetE2EServer{cmd: cmd, exited: make(chan error, 1)}
+	go func() {
+		err := cmd.Wait()
+		srv.markExited()
+		srv.exited <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !srv.alreadyExited() {
+		if time.Now().After(deadline) {
+			t.Fatal("the process never exited")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := srv.Stop(); err != nil {
+		t.Fatalf("Stop on an exited process: %v", err)
+	}
+	// The answer is a field, not a value taken out of the channel: asking twice gives the same one.
+	if !srv.alreadyExited() {
+		t.Error("the exit state did not survive being read")
+	}
 }
