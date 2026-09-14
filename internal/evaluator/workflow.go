@@ -2930,11 +2930,18 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			skippedPaths[relClean] = "returned empty content, which would erase the file"
 			continue
 		}
-		// Absolute gate: never accept a test file that has no test methods — even if the previous on-disk body
-		// was also empty (so introducedLowValueFixReason would silently pass it through). An empty shell like
-		// `package x; class FooIT {}` compiles but runs zero assertions, and accepting it effectively ends the
-		// fix loop on a success that adds no coverage.
-		if reason := EmptyTestFileReason(relClean, content); reason != "" {
+		// Never accept a TEST file that has no test methods — even if the previous on-disk body was
+		// also empty (so introducedLowValueFixReason would silently pass it through). An empty shell
+		// like `package x; class FooIT {}` compiles but runs zero assertions, and accepting it
+		// effectively ends the fix loop on a success that adds no coverage.
+		//
+		// A test PROJECT, though, holds more than tests: a WebApplicationFactory subclass, a
+		// fixture, a builder, a GlobalUsings.cs. None of them carry [Fact], all of them are
+		// ordinary files a repair may have to touch, and the extension cannot tell them apart from
+		// a test the fixer just emptied. What can is the file's own history — see
+		// fixEmptyTestGateApplies.
+		if reason := EmptyTestFileReason(relClean, content); reason != "" &&
+			fixEmptyTestGateApplies(relClean, opts, files) {
 			if audit != nil {
 				audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
 					"message": fmt.Sprintf("LLM fix rejected for %s: %s.", relClean, reason),

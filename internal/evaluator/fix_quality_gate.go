@@ -357,10 +357,26 @@ func unicodeEscapeLen(s string) int {
 	return i + 4
 }
 
+// utf8BOM is the byte-order mark, which C# permits at the start of a compilation unit and nowhere
+// else.
+const utf8BOM = "\ufeff"
+
 func csharpSyntacticShellReason(s string) string {
 	if strings.Contains(s, "```") {
 		return "contains markdown code fence (```), LLM emitted fenced output instead of raw C# source"
 	}
+	// Dropped once, here, so every C# check below reads the same text. A UTF-8 BOM opens a large
+	// share of the .cs files in the world — Visual Studio writes one by default — so an extend-mode
+	// payload merged into an existing repository file inherits that file's own mark. A validation
+	// run lost FIVE of its fifteen gaps to it: every E2E payload was such a merge, and each was
+	// refused as an illegal character with the claim that the compiler rejects it. It does not.
+	// Measured both ways: `dotnet build` on a .cs whose first three bytes are the BOM reports 0
+	// errors, while javac on the same shape reports `error: illegal character: '\ufeff'` — which is
+	// why this is the C# arm's business alone and javaSyntacticShellReason is untouched.
+	//
+	// Only the leading one. A BOM anywhere else is a stray character in code position and Roslyn
+	// does reject it, so the scan below must still see those.
+	s = strings.TrimPrefix(s, utf8BOM)
 	stripped := stripStringsAndComments(s, ".cs")
 	if op, cl := strings.Count(stripped, "{"), strings.Count(stripped, "}"); op != cl {
 		return fmt.Sprintf("unbalanced braces ({=%d, }=%d), C# source is truncated or mis-nested", op, cl)
@@ -1043,4 +1059,32 @@ func illegalEscapeReason(s, ext string) string {
 		i++
 	}
 	return ""
+}
+
+// fixEmptyTestGateApplies reports whether the empty-test gate should judge a write to this path.
+//
+// The gate's subject is "a test that came back with no tests", and three cases are exactly that:
+// a file this run generated (an artifact with no test bought nothing, whatever is on disk now), a
+// path with no prior content (the fixer inventing an empty test file), and a file that DID declare
+// tests before this round (the write is removing them).
+//
+// The case it must not judge is the fourth: a file that lives in a test project, has never declared
+// a test, and never will — test SUPPORT. A validation run lost its whole fix loop to it. Three of
+// four failing tests came from a broken SQLite fallback in CustomWebApplicationFactory.cs; the model
+// located that file and returned an edit for it on three consecutive rounds; each was refused here
+// as an "empty C# test file", each round was recorded as producing nothing usable, and the third
+// refusal stopped the run with fixer_response_unusable — with the repair sitting in the response
+// every time.
+func fixEmptyTestGateApplies(rel string, opts EvalOptions, before map[string]string) bool {
+	for _, a := range opts.ArtifactPaths {
+		if normalizePathForFix(a) == rel {
+			return true
+		}
+	}
+	prior, ok := before[rel]
+	if !ok || strings.TrimSpace(prior) == "" {
+		return true
+	}
+	// It declared tests before, so this write is taking them away.
+	return EmptyTestFileReason(rel, prior) == ""
 }
