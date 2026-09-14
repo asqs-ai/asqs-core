@@ -109,6 +109,18 @@ type Contract struct {
 	// resolved, when the language has no such list, or when a name resolved ambiguously.
 	CanonicalImports map[string]string `json:"canonical_imports,omitempty"`
 
+	// TestProject is the repo-relative project file bootstrap ensured the stack ON: the .csproj for
+	// .NET, and empty for languages with no such notion.
+	//
+	// Generation needs it because it was deriving its own answer and getting a different one. A
+	// validation run had four test projects under tests/; bootstrap patched the FunctionalTests one
+	// (chosen from the root solution, which is what the evaluator builds) and added Moq,
+	// FluentAssertions and EF InMemory to it, while generation's own filesystem walk scored every
+	// candidate identically and took the alphabetically first — an Aspire integration-test project.
+	// All ten generated tests landed in a project the solution does not list, so none was compiled,
+	// none ran, and the run still reported compile=ok.
+	TestProject string `json:"test_project,omitempty"`
+
 	// Verified reports whether a smoke test actually compiled AND ran against this stack during this
 	// run. False when bootstrap skipped because the stack was already complete — the packages are
 	// still real, they were simply not exercised.

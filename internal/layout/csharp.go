@@ -2,6 +2,7 @@ package layout
 
 import (
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -50,7 +51,7 @@ func SuggestedCSharpUnitTestPath(sourceFileRel, repoAbs string) string {
 
 	// Prefer routing into an existing unit-test project's directory (wherever it lives in the tree),
 	// so generated tests compile in that project instead of being scattered into production projects.
-	if projDir := DetectCSharpUnitTestProjectDir(repoAbs); projDir != "" {
+	if projDir := csharpTestProjectDirForSource(repoAbs, sourceFileRel); projDir != "" {
 		mir := csharpMirrorDirForTests(sourceFileRel, dir, repoAbs)
 		if mir == "" {
 			return filepath.Join(projDir, testName)
@@ -319,4 +320,75 @@ func DetectCSharpWebProjectRel(repoAbs string) string {
 		return ""
 	}
 	return found[0]
+}
+
+// csharpTestProjectDirForSource picks the test project a test for THIS source file belongs in.
+//
+// One test project for the whole repository is right for a single-solution repo and wrong for a
+// mono-repo, which holds several independent .NET trees. A test can only name types its own project
+// references, so a test for tree B placed in tree A cannot compile — and it fails in the worst way,
+// because the namespace it needs exists in the repository, just not from there.
+//
+// A validation run is the case. Seven unit tests for one tree's sources were written
+// into another tree's test project. The fixer spent eight rounds on them: the model
+// alternated between the real NimblePros namespace, which that project cannot reference, and an
+// invented Clean.Architecture one, which does not exist — and ASQS refused the second as an
+// unresolved dependency every round, correctly and uselessly.
+//
+// The answer already exists elsewhere in the system: TestProjectReachableDirs computes what each
+// test project can reference, and the planner uses it to decide which gaps are worth planning. This
+// asks the same question in the other direction — not "may this gap be planned" but "from which
+// project can it be written". A closure it cannot read in full comes back nil, which keeps the
+// candidate out and leaves the repository-wide answer in place.
+func csharpTestProjectDirForSource(repoAbs, sourceFileRel string) string {
+	repoAbs = filepath.Clean(strings.TrimSpace(repoAbs))
+	sourceFileRel = filepath.ToSlash(strings.TrimSpace(sourceFileRel))
+	if repoAbs == "" || sourceFileRel == "" {
+		return DetectCSharpUnitTestProjectDir(repoAbs)
+	}
+
+	inSolution := solutionProjectDirs(repoAbs)
+	contractDir := bootstrapTestProjectDir(repoAbs)
+	best, bestScore := "", -1
+	for _, projRel := range dotnetproj.FindTestProjects(repoAbs) {
+		dirs := dotnetproj.TestProjectReachableDirs(repoAbs, projRel)
+		if len(dirs) == 0 || !dotnetproj.PathIsReachableFrom(sourceFileRel, dirs) {
+			continue
+		}
+		dir := filepath.ToSlash(filepath.Dir(projRel))
+		if dir == "." {
+			dir = ""
+		}
+		if csharpTestProjectIsE2E(repoAbs, projRel, dir) {
+			continue // unit tests do not belong in a Playwright project
+		}
+		score := testProjectDirScore(dir, false, inSolution)
+		if dir == contractDir {
+			// The bootstrap verified this one and installed the packages a generated test needs
+			// into it, so among projects that can all reach the source it is the settled answer.
+			score += 10000
+		}
+		if score > bestScore {
+			best, bestScore = dir, score
+		}
+	}
+	if best != "" {
+		return best
+	}
+	// Nothing could be proven to reach this file: keep the repository-wide answer rather than
+	// inventing a location from a closure that could not be read.
+	return DetectCSharpUnitTestProjectDir(repoAbs)
+}
+
+// csharpTestProjectIsE2E mirrors detectCSharpTestProjectDir's own exclusion, so the source-scoped
+// pick and the repository-wide one agree about what a unit-test project is.
+func csharpTestProjectIsE2E(repoAbs, projRel, dirRel string) bool {
+	if firstSegmentMatches(dirRel, E2ERootDirCandidates) {
+		return true
+	}
+	b, err := os.ReadFile(filepath.Join(repoAbs, filepath.FromSlash(projRel)))
+	if err != nil {
+		return false
+	}
+	return csprojReferencesPlaywrightContent(string(b))
 }

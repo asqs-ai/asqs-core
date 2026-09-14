@@ -161,6 +161,10 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 	filesChanged = removeRelPath(filesChanged, relPathForBootstrap(repo, unitSmoke.Abs))
 
 	contract := csharpContract(prof)
+	// The project this bootstrap actually ensured the stack on. It was already in the audit and
+	// nowhere a consumer could read it, so generation re-derived its own answer and picked a
+	// different project — see teststack.Contract.TestProject.
+	contract.TestProject = relPathForBootstrap(repo, testProj)
 	contract.Verified = true
 	contract.Smoke = smokeFromRun(string(prof.FrameworkSmoke), prof.FrameworkSmoke != csharpSmokeNone, frameworkSmokeOK, frameworkSmokeNote)
 	if frameworkSmokeNote != "" && !frameworkSmokeOK {
