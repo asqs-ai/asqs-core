@@ -133,7 +133,7 @@ func TestBaselineProgress(t *testing.T) {
 	}{
 		{"repaired some", BaselineProgress{Known: true, BaselineCount: 5, StillFailing: 2}, true, "2 of 5"},
 		{"repaired none", BaselineProgress{Known: true, BaselineCount: 5, StillFailing: 5}, false, "5 of 5"},
-		{"clean and stayed clean", BaselineProgress{Known: true}, false, "compiled before the run and still does"},
+		{"clean and stayed clean", BaselineProgress{Known: true}, false, "was green before the run and still is"},
 		{"clean then broke it", BaselineProgress{Known: true, Introduced: 3}, false, "introduced 3"},
 		{"unknown", BaselineProgress{}, false, "no baseline was captured"},
 	}
