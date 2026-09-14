@@ -26,6 +26,13 @@ func failedStepSummary(stepEval evaluator.SandboxStep, out string, headLines int
 			return firstLines(excerpt, failedStepSummaryLines)
 		}
 	}
+	// A compile log's head is not its diagnostic. MSBuild opens with the projects that built, so
+	// the first lines of a FAILED build are success lines — see ExtractCompileDiagnostics.
+	if stepEval == evaluator.StepCompile {
+		if excerpt := errout.ExtractCompileDiagnostics(out); excerpt != "" {
+			return firstLines(excerpt, failedStepSummaryLines)
+		}
+	}
 	s := firstLines(out, headLines)
 	if s == "" {
 		return "failed"

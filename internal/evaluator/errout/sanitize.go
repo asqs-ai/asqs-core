@@ -403,3 +403,38 @@ func tryResolveUnderRepo(repoRoot, raw string) (string, bool) {
 	}
 	return "", false
 }
+
+// ExtractCompileDiagnostics returns the lines of a build log that carry a compiler diagnostic, in
+// order, or "" when none does.
+//
+// The compile branch of a failing step used to be summarised from the head of the log, which works
+// for javac — Maven prints `[ERROR] COMPILATION ERROR` first — and not at all for MSBuild, which
+// opens with the projects that BUILT. A validation run recorded eight
+// identical audit rows reading "compile step failed: Clean.Architecture.Core -> …Core.dll", a
+// success line, while the CS0246 that actually stopped the build sat forty lines further down. The
+// audit is the only artifact a post-mortem has, and for eight rounds of a failing compile it
+// carried no diagnostic at all.
+//
+// It returns the log FROM the first diagnostic line onwards rather than the matching lines alone:
+// a compiler diagnostic is rarely one line. Maven prints `[ERROR] COMPILATION ERROR :` and then the
+// per-file errors under it, javac follows each error with `symbol:` and `location:`, and Roslyn
+// puts the project that failed in brackets after the message. Keeping only the lines that match
+// would throw that context away, and a caller taking the head of the result would show the reader
+// less than the head of the raw log did.
+//
+// Same patterns IsCompileShaped keys on, so "this log is compile-shaped" and "where its diagnostics
+// start" cannot disagree.
+func ExtractCompileDiagnostics(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		for _, re := range compileSignalPatterns {
+			if re.MatchString(line) {
+				return strings.Join(lines[i:], "\n")
+			}
+		}
+	}
+	return ""
+}
