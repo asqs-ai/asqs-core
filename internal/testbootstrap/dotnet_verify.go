@@ -30,7 +30,7 @@ func runDotnetTestWithFilter(ctx context.Context, ed *EphemeralDocker, repoDir, 
 		argv = append(argv, "--filter", f)
 	}
 	argv = runner.AppendDotnetMultiTargetFrameworkArgv(argv, csprojAbs, dotnetFallbackTFM)
-	argv = appendDotnetCLIArgsTFMFallback(argv, csprojAbs, dotnetFallbackTFM)
+	argv = appendDotnetCLIArgsTFMFallback(repoDir, argv, csprojAbs, dotnetFallbackTFM)
 	argv = runner.ApplyDotnetTestFrameworkBootstrapMSBuildProps(argv)
 	if ed == nil {
 		c := exec.CommandContext(ctx, argv[0], argv[1:]...)

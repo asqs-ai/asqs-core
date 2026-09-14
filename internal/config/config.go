@@ -587,7 +587,7 @@ type RunnerConfig struct {
 	ImagePlaywrightDotnet string `yaml:"image_playwright_dotnet"`
 	// ImageDotNet is the Docker image for .NET runs. Empty = mcr.microsoft.com/dotnet/sdk:10.0, or sdk:{major}.0 inferred from net{major}.* in repo-root csproj files.
 	ImageDotNet string `yaml:"image_dotnet"`
-	// DotNetFallbackTargetFramework when set (e.g. net8.0): for dotnet restore/build/test/format argv, append /p:TargetFramework=<value> when the entry .csproj does not declare a non-empty concrete TargetFramework/TargetFrameworks (no file edits). Empty = disabled.
+	// DotNetFallbackTargetFramework when set (e.g. net8.0): for dotnet restore/build/test/format argv, append /p:TargetFramework=<value> when the entry project EVALUATES to no concrete TargetFramework/TargetFrameworks — its own file or any Directory.Build.props it inherits (no file edits). Empty = disabled.
 	DotNetFallbackTargetFramework string `yaml:"dotnet_fallback_target_framework"`
 
 	// EvalProfile selects the docker eval toolchain: java-maven, java-maven-11, java-maven-21, java-gradle, java-gradle-11, java-gradle-21, typescript-*, nodejs-lts, csharp-dotnet, or empty/auto.

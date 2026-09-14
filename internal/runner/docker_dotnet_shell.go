@@ -483,7 +483,7 @@ func applyDotnetShellScriptTargetFrameworkFallback(script, cwdAbs, fallback stri
 	if !ok {
 		return script, nil
 	}
-	conc, err := CsprojDeclaresConcreteTargetFramework(projAbs)
+	conc, err := ProjectResolvesConcreteTargetFramework(cwdAbs, projAbs)
 	if err == nil && conc {
 		return script, nil
 	}
