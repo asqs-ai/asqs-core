@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	auditctx "github.com/asqs/asqs-core/internal/audit"
 	"os"
 	"path/filepath"
 	"sort"
@@ -95,6 +96,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var sum Summary
 	audit, closeAudit := buildRunAuditor(opts.AuditLogPath, opts.AuditDumpPrompts)
 	defer closeAudit()
+	// The LLM clients are built from a config and never receive an Auditor, so what only they know
+	// — that a request was retried, that a stream stalled — had nowhere to go. See
+	// auditctx.WithAuditor.
+	ctx = auditctx.WithAuditor(ctx, audit)
 	repoAbs, err := filepath.Abs(opts.RepoPath)
 	if err != nil {
 		return sum, fmt.Errorf("resolve repo path: %w", err)

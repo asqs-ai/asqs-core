@@ -46,7 +46,13 @@ func responseHeaderTimeout(llm *config.LLMConfig, forOllama bool) time.Duration 
 	return DefaultHTTPResponseHeaderTimeout
 }
 
-func newHTTPClient(llm *config.LLMConfig, bearerToken string, forOllama bool) *http.Client {
+// ClientTimeout is the configured general.llm.http.timeout, or the default when unset.
+//
+// Exported because a STREAMING client cannot use it as http.Client.Timeout: that deadline bounds the
+// whole exchange including the body, so it would kill a long but perfectly healthy generation. The
+// streaming caller takes this value and applies it as a stall budget instead — the time allowed to
+// pass with no byte arriving. See ollama.Client.Complete.
+func ClientTimeout(llm *config.LLMConfig) time.Duration {
 	timeout := DefaultHTTPClientTimeout
 	if llm != nil {
 		if s := strings.TrimSpace(llm.HTTPTimeout); s != "" {
@@ -55,6 +61,11 @@ func newHTTPClient(llm *config.LLMConfig, bearerToken string, forOllama bool) *h
 			}
 		}
 	}
+	return timeout
+}
+
+func newHTTPClient(llm *config.LLMConfig, bearerToken string, forOllama bool) *http.Client {
+	timeout := ClientTimeout(llm)
 	headerTO := responseHeaderTimeout(llm, forOllama)
 
 	tr := http.DefaultTransport
@@ -100,4 +111,16 @@ func HTTPClientWithBearer(llm *config.LLMConfig, bearerToken string) *http.Clien
 // deadline when llm.HTTPResponseHeaderTimeout is unset (see responseHeaderTimeout).
 func HTTPClientWithBearerForOllama(llm *config.LLMConfig, bearerToken string) *http.Client {
 	return newHTTPClient(llm, bearerToken, true)
+}
+
+// StreamingHTTPClientForOllama is HTTPClientWithBearerForOllama with no overall deadline.
+//
+// http.Client.Timeout bounds the entire exchange, body included, so on a streaming response it caps
+// TOTAL generation time — the opposite of what a streaming client wants. The caller enforces
+// ClientTimeout as a stall budget instead: a stream that is still delivering tokens is healthy
+// however long it runs, and one that has gone quiet is not, however recently it started.
+func StreamingHTTPClientForOllama(llm *config.LLMConfig, bearerToken string) *http.Client {
+	c := newHTTPClient(llm, bearerToken, true)
+	c.Timeout = 0
+	return c
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 )
 
-func TestComplete_nonStreaming(t *testing.T) {
+func TestComplete_streams(t *testing.T) {
 	t.Parallel()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/api/chat") {
@@ -27,8 +27,10 @@ func TestComplete_nonStreaming(t *testing.T) {
 		if err := json.Unmarshal(body, &req); err != nil {
 			t.Fatal(err)
 		}
-		if req.Stream {
-			t.Fatal("expected stream false")
+		// Streamed, so the client can tell a slow generation from a stopped one: the configured
+		// timeout bounds silence rather than total completion time. See stream.go.
+		if !req.Stream {
+			t.Fatal("expected stream true")
 		}
 		if req.Model != "mistral" {
 			t.Fatalf("model: %#v", req)

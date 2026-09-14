@@ -163,7 +163,8 @@ func BuildStepCompleters(cfg *config.Config) (base, doc, gen, fixer model.ChatCo
 	if cfg == nil || strings.TrimSpace(cfg.LLM.Provider) == "" {
 		return nil, nil, nil, nil, nil, nil
 	}
-	lim = model.NewLLMLimiter(cfg.LLM.MaxConcurrent)
+	// Process-wide, not per run: see sharedLimiterFor.
+	lim = sharedLimiterFor(&cfg.LLM)
 	base, err = NewChatCompleter(cfg)
 	doc, _ = NewChatCompleterForStep(cfg, StepDoc)
 	if doc == nil {
