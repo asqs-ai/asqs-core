@@ -790,6 +790,10 @@ func uncoveredAPIRouteE2EGapsForLang(
 		return nil, false, err
 	}
 	routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
+	// A route no evaluated test project can reach yields an e2e test that is never compiled or run.
+	// Filtering to nothing here is not "no gaps": it falls through to the E2E_SPEC anchors below,
+	// the same as a repository with no routes at all.
+	routes = csharpReachableFilter(opts).keep(routes)
 	if len(routes) == 0 {
 		return nil, false, nil
 	}
@@ -928,6 +932,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 			}
 		}
 		apiRoutes = filterSymbolsByMonoGapPrefix(apiRoutes, opts.MonoRepoGapPrefix)
+		apiRoutes = csharpReachableFilter(opts).keep(apiRoutes)
 		if len(apiRoutes) > 0 {
 			list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, apiRoutes)
 			if err != nil {
@@ -944,12 +949,17 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	queries := e2eSymbolQueriesForWorkflowLangWithSupplement(opts)
 	var allSymbols []*metadata.Symbol
 	seenID := make(map[string]bool)
+	// The same reachability question the unit branch asks, asked of the spec's own project: a spec
+	// in a test project the evaluated solution does not list is never built and never run, so
+	// extending it buys the run nothing. Run api-bdf7539b296a0df65a7cf1bf2bf2739b wrote five such
+	// tests, a third of its output, and its own test step never saw one of them.
+	reachable := csharpReachableFilter(opts)
 	for _, q := range queries {
 		symbols, err := meta.ListSymbolsInTestFiles(ctx, opts.RepoID, q.lang, q.kind)
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range symbols {
+		for _, s := range reachable.keep(symbols) {
 			if s != nil && !seenID[s.ID] {
 				seenID[s.ID] = true
 				allSymbols = append(allSymbols, s)

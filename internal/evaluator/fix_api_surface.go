@@ -133,8 +133,14 @@ func absentTargetNames(targets []apisurface.Target, surfaces []apisurface.TypeSu
 }
 
 // NOTE: this wrapper currently has no caller in this repository — the fix loop here does not run an
-// unresolved-dependency rejection. apisurface.CSharpIntroducedUnresolvedUsingReason is available for
-// when it does; wiring it is a behaviour change, not a port, and belongs to its own ticket.
+// unresolved-dependency rejection. Both language arms are available in apisurface for when it does:
+// CSharpIntroducedUnresolvedUsingReason (repository namespaces and referenced package ids) and
+// TSIntroducedUnresolvedImportReason (package.json manifests). Wiring either is a behaviour change,
+// not a port, and belongs to its own ticket — and the change would not be free: in asqs-go this
+// stage refused three correct repairs in a row and ended run api-bdf7539b296a0df65a7cf1bf2bf2739b
+// at iteration 4 of 20. Both arms now take their evidence from the repository rather than the fix
+// prompt, which is what made those refusals possible; a caller here should still expect the stage
+// to be able to stop a run.
 //
 // introducedUnresolvedDependencyReason is the fixer-side wrapper over
 // apisurface.IntroducedUnresolvedDependencyReason: it applies the same provability bounds the

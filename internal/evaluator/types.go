@@ -24,6 +24,16 @@ type TestWithCommandRunner interface {
 	TestWithCommand(ctx context.Context, repoPath, lang, testCommand string) StepResult
 }
 
+// RestoreMemoInvalidator is optional: forget which dependency-restore fingerprints have already run,
+// so the next step restores before it builds.
+//
+// Needed because the restore memo is content-addressed over the dependency manifests and therefore
+// cannot distinguish "the derived state matches these manifests" from "the derived state was built
+// from manifests that have since been reverted". Only the caller that reverted them knows.
+type RestoreMemoInvalidator interface {
+	InvalidateRestoreMemo()
+}
+
 // CompileWithCommandRunner is optional: run the compile step with an explicit shell command. Used by the
 // evaluator's scoped-compile fallback: when a full-solution build fails because an unrelated project in the
 // same .sln can't restore its (e.g. private/authenticated) NuGet feed, the evaluator can retry with a

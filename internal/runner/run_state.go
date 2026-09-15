@@ -55,6 +55,34 @@ func (r *sandboxRunState) restoreOnce(key string, fn func()) {
 	fn()
 }
 
+// invalidateRestoreMemo forgets which restore fingerprints have run, so the next restore executes
+// whatever its key says.
+//
+// The memo is content-addressed over the dependency manifests, which makes it blind to one
+// sequence: edit a manifest, restore against it, revert the edit. The fingerprint returns to the
+// value it already had while the derived state on disk — project.assets.json, node_modules, the
+// local Maven view — still reflects the manifests that were reverted. Nothing in the key can see
+// that, so the caller that reverted has to say so.
+//
+// Deliberately a full reset rather than a per-key delete. The manifests a revert touched are known
+// to the caller, but the restore keys derived from them are not: a key covers every manifest in the
+// tree at once, and one file's revert changes it. Dropping the map is the only statement that is
+// true for every toolchain.
+func (r *sandboxRunState) invalidateRestoreMemo() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.restoredKeys = nil
+}
+
+// InvalidateRestoreMemo tells the Sandbox that the tree's derived dependency state no longer
+// corresponds to its manifests, so the next step must restore before it builds.
+//
+// The caller is whatever reverts a manifest after a build has already restored against it. This
+// repository has no pre-generate seam pass, so the method has no caller here yet; it exists because
+// the memo it corrects lives here and the correction is not something a caller can perform from
+// outside. Reaching every clone is the point — see TestRestoreMemo_invalidationReachesClones.
+func (s *Sandbox) InvalidateRestoreMemo() { s.runState().invalidateRestoreMemo() }
+
 // runState returns the shared per-run state, allocating it if the Sandbox was built as a struct
 // literal rather than through NewSandboxFromConfig (which allocates eagerly).
 //

@@ -2,6 +2,9 @@ package apisurface
 
 import (
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -38,7 +41,18 @@ var reCSharpUsingDirective = regexp.MustCompile(
 // declaredNamespaces are the namespaces the repository's own sources declare. knownNamespaces are
 // those the referenced packages provide. Either may be nil.
 func csharpIntroducedUnresolvedUsingReason(before, after string, declaredNamespaces, knownNamespaces map[string]bool) string {
-	if len(declaredNamespaces) == 0 && len(knownNamespaces) == 0 {
+	return csharpIntroducedUnresolvedUsingReasonWithPackages(before, after, declaredNamespaces, knownNamespaces, nil)
+}
+
+// csharpIntroducedUnresolvedUsingReasonWithPackages is csharpIntroducedUnresolvedUsingReason with the
+// referenced-package ids as a third evidence set, matched case-insensitively.
+//
+// Package ids are kept apart from the two namespace sets rather than merged into them because they
+// are evidence of a different kind: a namespace a source file imports is observed, a namespace a
+// package id implies is inferred from convention. Keeping them separate is what lets the case rule
+// apply to the inferred set alone.
+func csharpIntroducedUnresolvedUsingReasonWithPackages(before, after string, declaredNamespaces, knownNamespaces, packageIDs map[string]bool) string {
+	if len(declaredNamespaces) == 0 && len(knownNamespaces) == 0 && len(packageIDs) == 0 {
 		return ""
 	}
 	had := csharpUsingNamespaces(before)
@@ -48,6 +62,9 @@ func csharpIntroducedUnresolvedUsingReason(before, after string, declaredNamespa
 			continue // inherited, not introduced
 		}
 		if csharpNamespaceKnown(ns, declaredNamespaces) || csharpNamespaceKnown(ns, knownNamespaces) {
+			continue
+		}
+		if csharpNamespaceCoveredByPackage(ns, packageIDs) {
 			continue
 		}
 		unresolved = append(unresolved, ns)
@@ -98,6 +115,36 @@ func csharpNamespaceKnown(ns string, set map[string]bool) bool {
 	return false
 }
 
+// csharpNamespaceCoveredByPackage reports whether a referenced package id accounts for ns.
+//
+// Both directions count, and for different reasons. A package is an ANCESTOR of the namespace when
+// it ships more than one: `xunit` provides Xunit.Abstractions. A package is a DESCENDANT when the
+// repository references a satellite of a larger namespace: Microsoft.EntityFrameworkCore.InMemory
+// establishes that Microsoft.EntityFrameworkCore resolves. Requiring exact equality would refuse
+// both, which is the false-refusal failure this evidence set exists to end.
+//
+// Case-insensitive throughout: NuGet ids follow the namespace by convention but not in case, and
+// the set is stored lowercased by csharpRepoNamespaceEvidence.
+func csharpNamespaceCoveredByPackage(ns string, packageIDs map[string]bool) bool {
+	if len(packageIDs) == 0 {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimSpace(ns))
+	if lower == "" {
+		return false
+	}
+	if packageIDs[lower] {
+		return true
+	}
+	prefix := lower + "."
+	for id := range packageIDs {
+		if strings.HasPrefix(id, prefix) || strings.HasPrefix(lower, id+".") {
+			return true
+		}
+	}
+	return false
+}
+
 func quoteAll(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
@@ -108,14 +155,109 @@ func quoteAll(in []string) []string {
 
 // CSharpIntroducedUnresolvedUsingReason is the exported entry point for the fixer.
 //
-// The evidence comes from the repository itself — the namespaces its sources declare and the
-// namespaces the types in its own files reference — rather than from a package closure this package
-// cannot resolve without a restore. That is a weaker set than Java's classpath, which is why the
-// ancestor rule is generous and why an empty set means silence.
-func CSharpIntroducedUnresolvedUsingReason(before, after string, repoFiles map[string]string) string {
-	declared, known := csharpNamespaceEvidence(repoFiles)
-	return csharpIntroducedUnresolvedUsingReason(before, after, declared, known)
+// The evidence is the REPOSITORY — every namespace its sources declare, every namespace those
+// sources already import, and every NuGet package its projects reference — not the handful of files
+// the fix prompt happened to carry.
+//
+// That distinction is the whole point of this function. The prompt is clamped to a rune budget, and
+// the clamp bites hardest on the late, difficult rounds where the fixer most needs a repair to land.
+// Reading evidence from it made the gate's confidence inversely proportional to its information:
+// the more context was dropped, the more namespaces looked invented. Run
+// api-bdf7539b296a0df65a7cf1bf2bf2739b is the cost. The fixer proposed `using Ardalis.Result;` for a
+// handler returning Result<int>; seven files in that repository import that namespace and the
+// clamped prompt carried none of them, so the gate called it invented and refused the repair on
+// three consecutive rounds. The third refusal tripped the consecutive-unusable breaker and ended the
+// run at iteration 4 of a 20-iteration budget. In the same run the gate correctly refused
+// `using Mediator;` — genuinely absent — so the rule was never wrong about the repository, only
+// about which repository it was looking at.
+//
+// repoFiles is still folded in, because a file the fixer has written this round may be newer than
+// the tree walk; it can only ever WIDEN the evidence. It is never a substitute for it: without a
+// readable repository the gate says nothing at all, since a negative claim with a partial view
+// behind it is exactly the failure above.
+func CSharpIntroducedUnresolvedUsingReason(before, after, repoRoot string, repoFiles map[string]string) string {
+	declared, known, packages, ok := csharpRepoNamespaceEvidence(repoRoot)
+	if !ok {
+		return ""
+	}
+	promptDeclared, promptKnown := csharpNamespaceEvidence(repoFiles)
+	for ns := range promptDeclared {
+		declared[ns] = true
+	}
+	for ns := range promptKnown {
+		known[ns] = true
+	}
+	return csharpIntroducedUnresolvedUsingReasonWithPackages(before, after, declared, known, packages)
 }
+
+// csharpRepoNamespaceEvidence walks the repository for what its own code proves is reachable:
+// the namespaces it declares, the namespaces it already imports, and the ids of the packages its
+// projects reference.
+//
+// ok is false when the tree cannot be read in full. An incomplete walk is worse than no walk,
+// because every namespace the walk failed to see reads as proof of absence — the same reasoning
+// csharpDeclaredSimpleNames applies one file over.
+func csharpRepoNamespaceEvidence(repoRoot string) (declared, known, packages map[string]bool, ok bool) {
+	root := filepath.Clean(strings.TrimSpace(repoRoot))
+	if root == "" || root == "." {
+		return nil, nil, nil, false
+	}
+	st, err := os.Stat(root)
+	if err != nil || !st.IsDir() {
+		return nil, nil, nil, false
+	}
+
+	declared, known, packages = map[string]bool{}, map[string]bool{}, map[string]bool{}
+	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			if dotnetproj.WalkSkipDir(d.Name()) || dotnetproj.WalkDepth(root, path) > maxCSharpNamespaceWalkDepth {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(d.Name()), ".cs") {
+			return nil
+		}
+		b, rerr := os.ReadFile(path)
+		if rerr != nil {
+			return rerr
+		}
+		body := string(b)
+		for _, m := range reCSharpNamespaceDeclaration.FindAllStringSubmatch(
+			dotnetproj.StripCSharpCommentsAndStrings(body), -1) {
+			if ns := strings.TrimSpace(m[1]); ns != "" {
+				declared[ns] = true
+			}
+		}
+		for ns := range csharpUsingNamespaces(body) {
+			known[ns] = true
+		}
+		return nil
+	})
+	if walkErr != nil {
+		return nil, nil, nil, false
+	}
+	// A package id is the namespace root its assemblies ship under, by NuGet convention strong
+	// enough to rely on for a claim that only ever WIDENS what is allowed. Matched case-insensitively
+	// because the convention stops short of case: the `xunit` package ships `Xunit`, and a
+	// case-sensitive miss would reinstate the false refusal for the commonest test package there is.
+	for _, id := range csharpRepoPackageIDs(root) {
+		if id = strings.TrimSpace(id); id != "" {
+			packages[strings.ToLower(id)] = true
+		}
+	}
+	return declared, known, packages, true
+}
+
+// maxCSharpNamespaceWalkDepth bounds the walk, matching maxCSharpDeclaredWalkDepth: a namespace
+// twelve directories deep is in a vendored tree, not in the code under test.
+const maxCSharpNamespaceWalkDepth = 12
 
 // csharpNamespaceEvidence derives what namespaces are reachable, from the files already loaded into
 // the fix prompt: those the repo DECLARES, and those its own files already `using`.

@@ -3,6 +3,7 @@ package retrieval
 import (
 	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/langid"
+	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
 // reachabilityFilter answers whether a source file's symbols can be reached from the repository's
@@ -17,6 +18,25 @@ func (f reachabilityFilter) allows(file string) bool {
 		return true
 	}
 	return dotnetproj.PathIsReachableFrom(file, f.dirs)
+}
+
+// keep drops the symbols this filter excludes, preserving order. A zero filter returns the input
+// untouched, which is what every language but C# gets.
+//
+// The slice form exists because the e2e branch collects symbols in three places — API routes for
+// Java and C#, API routes for JS/TS, and E2E_SPEC anchors in test files — and each of them had its
+// own loop. Filtering per loop is how the unit branch got the check and this one did not.
+func (f reachabilityFilter) keep(syms []*metadata.Symbol) []*metadata.Symbol {
+	if len(f.dirs) == 0 || len(syms) == 0 {
+		return syms
+	}
+	out := make([]*metadata.Symbol, 0, len(syms))
+	for _, s := range syms {
+		if s == nil || f.allows(s.File) {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // csharpReachableFilter builds the set of directories a C# test can reference.
