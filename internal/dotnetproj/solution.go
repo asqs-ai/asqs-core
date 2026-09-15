@@ -173,3 +173,37 @@ func CsprojPathsFromRootSolutions(repo string) ([]string, error) {
 	}
 	return out, nil
 }
+
+// ProjectsListedInRootSolutions narrows repo-relative .csproj paths to those a root solution lists.
+//
+// A repository with no root solution is returned unchanged: there is nothing to narrow against, and
+// inventing a restriction from an absent file would be worse than none.
+//
+// The caller that needs this is the planner. What the EVALUATOR compiles and tests is the solution,
+// so a test project outside it can cover nothing however well it can reference the source — and a
+// gap planned against such a project produces a test that is never built and never run. A validation run generated twelve of them.
+func ProjectsListedInRootSolutions(repoRoot string, rels []string) []string {
+	if len(rels) == 0 {
+		return rels
+	}
+	listed, err := CsprojPathsFromRootSolutions(repoRoot)
+	if err != nil || len(listed) == 0 {
+		return rels
+	}
+	root := filepath.Clean(strings.TrimSpace(repoRoot))
+	inSolution := make(map[string]bool, len(listed))
+	for _, abs := range listed {
+		rel, rerr := filepath.Rel(root, abs)
+		if rerr != nil {
+			continue
+		}
+		inSolution[filepath.ToSlash(rel)] = true
+	}
+	out := make([]string, 0, len(rels))
+	for _, rel := range rels {
+		if inSolution[filepath.ToSlash(strings.TrimSpace(rel))] {
+			out = append(out, rel)
+		}
+	}
+	return out
+}

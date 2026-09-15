@@ -57,6 +57,18 @@ func csharpReachableFilter(opts PlanOptions) reachabilityFilter {
 		return reachabilityFilter{}
 	}
 	testProjects := dotnetproj.FindTestProjects(opts.RepoPath)
+	// Only the ones the evaluator will actually build. Its compile and test steps name the root
+	// solution, so a test project outside it is never compiled and never run — and a gap planned
+	// against it yields a test that buys nothing. A validation run wrote twelve such tests into a second tree's project, correctly (it was the only one able to
+	// reference that tree's sources) and uselessly (the solution does not list it, so the test run
+	// covered three DLLs from the root tree and the sample project appeared nowhere).
+	//
+	// A repository with no root solution, or a solution that lists no test project yet, narrows to
+	// nothing here and falls through to the same answer as "no test project at all" below: the
+	// bootstrap case, where everything is reachable once one exists.
+	if inSolution := dotnetproj.ProjectsListedInRootSolutions(opts.RepoPath, testProjects); len(inSolution) > 0 {
+		testProjects = inSolution
+	}
 	if len(testProjects) == 0 {
 		return reachabilityFilter{}
 	}

@@ -64,3 +64,68 @@ func TestCSharpReachableFilter_oneUnreadableClosureDisablesTheFilter(t *testing.
 		t.Error("src/Web is referenced by nothing and should have been filtered out")
 	}
 }
+
+// A test project the EVALUATOR never builds cannot cover anything, however well it can reference
+// the source. The compile and test steps both name the root solution, so a project outside it is
+// never compiled and never run — and a gap planned for it produces a test that buys nothing.
+//
+// A validation run is the case. Twelve of its fourteen generated tests went
+// to sample/tests/NimblePros.SampleToDo.FunctionalTests, correctly — that is the only project able
+// to reference sample/src. The root solution does not list it, so the test run covered three DLLs
+// from the root tree and the sample project appeared nowhere. Fourteen gaps "succeeded" and twelve
+// of them ran nothing.
+func TestCSharpReachableFilter_ignoresTestProjectsOutsideTheRootSolution(t *testing.T) {
+	files := map[string]string{
+		// The root solution lists the root tree and nothing under sample/.
+		"App.slnx": `<Solution>` +
+			`<Project Path="src/Root.Core/Root.Core.csproj" />` +
+			`<Project Path="tests/Root.Tests/Root.Tests.csproj" /></Solution>`,
+		"src/Root.Core/Root.Core.csproj": `<Project Sdk="Microsoft.NET.Sdk"></Project>`,
+		"src/Root.Core/Calc.cs":          "public class Calc { }",
+		"tests/Root.Tests/Root.Tests.csproj": reachTestCsprojHead +
+			`<ProjectReference Include="..\..\src\Root.Core\Root.Core.csproj" /></ItemGroup></Project>`,
+		// A second, self-contained tree the evaluator never touches.
+		"sample/src/Sample.Core/Sample.Core.csproj": `<Project Sdk="Microsoft.NET.Sdk"></Project>`,
+		"sample/src/Sample.Core/Handler.cs":         "public class Handler { }",
+		"sample/tests/Sample.Tests/Sample.Tests.csproj": reachTestCsprojHead +
+			`<ProjectReference Include="..\..\src\Sample.Core\Sample.Core.csproj" /></ItemGroup></Project>`,
+	}
+	root := writeReachRepo(t, files)
+
+	f := csharpReachableFilter(PlanOptions{Lang: "csharp", RepoPath: root})
+	if !f.allows("src/Root.Core/Calc.cs") {
+		t.Error("root-tree source is reachable from a solution-listed test project and must be planned")
+	}
+	if f.allows("sample/src/Sample.Core/Handler.cs") {
+		t.Error("sample/ source is only reachable from a project the solution does not list; planning it produces a test that never runs")
+	}
+}
+
+// With no root solution there is nothing to restrict against, so the filter behaves exactly as it
+// did: a repository laid out without one is not one this can reason about.
+func TestCSharpReachableFilter_withoutARootSolutionRestrictsNothing(t *testing.T) {
+	root := writeReachRepo(t, map[string]string{
+		"sample/src/Sample.Core/Sample.Core.csproj": `<Project Sdk="Microsoft.NET.Sdk"></Project>`,
+		"sample/src/Sample.Core/Handler.cs":         "public class Handler { }",
+		"sample/tests/Sample.Tests/Sample.Tests.csproj": reachTestCsprojHead +
+			`<ProjectReference Include="..\..\src\Sample.Core\Sample.Core.csproj" /></ItemGroup></Project>`,
+	})
+	if f := csharpReachableFilter(PlanOptions{Lang: "csharp", RepoPath: root}); !f.allows("sample/src/Sample.Core/Handler.cs") {
+		t.Error("with no solution to consult, the previous behaviour must stand")
+	}
+}
+
+// A solution that lists no test project at all is the bootstrap case — one is about to be created
+// and added to it — and everything stays reachable, as it does when no test project exists.
+func TestCSharpReachableFilter_solutionWithNoTestProjectIsTheBootstrapCase(t *testing.T) {
+	root := writeReachRepo(t, map[string]string{
+		"App.slnx":                       `<Solution><Project Path="src/Root.Core/Root.Core.csproj" /></Solution>`,
+		"src/Root.Core/Root.Core.csproj": `<Project Sdk="Microsoft.NET.Sdk"></Project>`,
+		"src/Root.Core/Calc.cs":          "public class Calc { }",
+		"sample/tests/Sample.Tests/Sample.Tests.csproj": reachTestCsprojHead +
+			`<ProjectReference Include="..\..\src\Root.Core\Root.Core.csproj" /></ItemGroup></Project>`,
+	})
+	if f := csharpReachableFilter(PlanOptions{Lang: "csharp", RepoPath: root}); !f.allows("src/Root.Core/Calc.cs") {
+		t.Error("a solution with no test project yet must not filter everything out")
+	}
+}
