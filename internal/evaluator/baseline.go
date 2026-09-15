@@ -135,7 +135,7 @@ func CaptureBaselineFailures(ctx context.Context, runner SandboxRunner, in EvalO
 	out.TestsClean = res.OK
 	if !res.OK {
 		out.TestSignature = FailureSignature(opts.Lang, StepTest, res.Output)
-		out.TestSummary = firstLines(res.Output, 3)
+		out.TestSummary = baselineTestSummary(res.Output)
 		add(res.Output)
 	}
 	sort.Strings(out.Paths)
@@ -212,6 +212,45 @@ func EvaluateBaselineProgress(baseline BaselineFailures, finalErrorOutput, repoP
 		Introduced:    len(introduced),
 		Known:         true,
 	}
+}
+
+// baselineTestSummary renders the baseline's test failure for the audit.
+//
+// It used to be firstLines(output, 3). On a 1738-line xUnit log the first three lines are the
+// framework's "Test run for ..." banner, so run api-8d5367b3383017e25f09e53dacf6c275 recorded a
+// 348-character baseline summary naming no failure at all — beside a list of nine failing paths.
+// Whoever reads that row can see WHICH files were already red and never why, which is exactly the
+// question "did this run break it, or inherit it?" needs answered.
+//
+// errout.ExtractTestFailureBlocks is the same sanitiser the fix loop's prompt uses, so the baseline
+// row and the round that has to act on it describe the failure the same way. The head fallback is
+// for output it does not recognise: a baseline that failed and reports no reason is worse than a
+// truncated one.
+func baselineTestSummary(output string) string {
+	if strings.TrimSpace(output) == "" {
+		return ""
+	}
+	if blocks := strings.TrimSpace(errout.ExtractTestFailureBlocks(output)); blocks != "" {
+		return truncateRunes(blocks, maxBaselineTestSummaryRunes)
+	}
+	return truncateRunes(firstLines(output, baselineTestSummaryFallbackLines), maxBaselineTestSummaryRunes)
+}
+
+// maxBaselineTestSummaryRunes bounds the audit row. Long enough for the failure and a frame or two,
+// short enough that a suite failing in a hundred places does not put a log in the audit stream.
+const maxBaselineTestSummaryRunes = 4000
+
+// baselineTestSummaryFallbackLines is the head kept when nothing in the output is recognisable as a
+// test failure. More than the three that produced the banner, since an unrecognised format is
+// precisely the case where context is needed.
+const baselineTestSummaryFallbackLines = 20
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "\n… (truncated)"
 }
 
 func firstLines(s string, n int) string {

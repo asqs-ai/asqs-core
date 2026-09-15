@@ -954,12 +954,16 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	// extending it buys the run nothing. Run api-bdf7539b296a0df65a7cf1bf2bf2739b wrote five such
 	// tests, a third of its output, and its own test step never saw one of them.
 	reachable := csharpReachableFilter(opts)
+	// And the spec itself must actually be one: a file in a test project that declares no test is
+	// the shared harness or a fixtures module, and a gap anchored to it invites a rewrite of the
+	// code every other test depends on. See specMarkerFilter.
+	declaresTest := newSpecMarkerFilter(opts)
 	for _, q := range queries {
 		symbols, err := meta.ListSymbolsInTestFiles(ctx, opts.RepoID, q.lang, q.kind)
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range reachable.keep(symbols) {
+		for _, s := range declaresTest.keep(reachable.keep(symbols)) {
 			if s != nil && !seenID[s.ID] {
 				seenID[s.ID] = true
 				allSymbols = append(allSymbols, s)

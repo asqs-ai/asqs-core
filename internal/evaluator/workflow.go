@@ -181,6 +181,15 @@ type EvalOptions struct {
 	// writable set as a known input rather than being re-derived from each round's diagnostic by
 	// regex, which is what the derived-path fallback below has to do without them.
 	BaselineFailingPaths []string
+	// BaselineTestSignature is the position-insensitive signature of the test failure this run
+	// INHERITED, taken from the pre-generation test run over its full output.
+	//
+	// The baseline has computed it all along and nothing compared it: its only consumers were two
+	// audit payload fields. So a run ending test=fail could not say whether it broke something or
+	// merely failed to repair what was already red — which is the question that decides whether the
+	// run may ship. Empty when the baseline captured no test failure, and an empty signature never
+	// matches: the claim "this was already failing" is made on evidence or not at all.
+	BaselineTestSignature string
 	// AllowFixCoverageReduction (escape hatch, default false) lets a fixer write through even when
 	// it reduces the number of test methods in a file. Off by default because the observed failure
 	// mode was the fixer "repairing" a compile error by deleting the tests and the round being
@@ -240,6 +249,10 @@ type EvalWorkflowResult struct {
 	TestOKWithoutFix bool
 	CompileFixCount  int // LLM fix invocations for StepCompile
 	TestFixCount     int // LLM fix invocations for StepTest or StepTestE2E (shared budget in loop)
+	// TestFailureInherited is true when the last failing test step reproduced the baseline's own
+	// test failure. Reported only: Stable still requires every step to pass, and whether an
+	// inherited-only failure may ship is a decision for the caller, not for this loop.
+	TestFailureInherited bool
 
 	// EarlyExitDiscardPaths: set when the fix loop stopped early because the same generated tests failed repeatedly (RepeatedTestFailureThreshold). Orchestrator applies discards like max-iteration unstable handling.
 	EarlyExitDiscardPaths []string
@@ -551,10 +564,23 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 		if !testRes.OK {
 			e2eFailStreak, e2eFailFP = 0, ""
 			out.LastFixAction = FixAssumptions
+			inherited := baselineTestFailureRepeated(opts, testRes.Output)
+			out.TestFailureInherited = inherited
 			if audit != nil {
 				audit.LogError(ctx, "evaluator.test_failed", map[string]interface{}{
 					"message": fmt.Sprintf("Unit tests failed; suggested action: adjust assumptions. %s", testRes.Summary),
 					"action":  FixAssumptions, "output": testRes.Output, "pass": "unit",
+					// Reported, not acted on. Whether a run whose only failure is the one it
+					// inherited may ship is a policy decision; this is the evidence it needs.
+					"failure_inherited": inherited,
+				})
+			}
+			if inherited && audit != nil {
+				audit.Log(ctx, "evaluator.test_failure_inherited", map[string]interface{}{
+					"message": "This test failure is byte-for-byte the one the baseline recorded before generation: " +
+						"the run did not cause it and has not repaired it. Stability is unchanged — the verdict still " +
+						"requires every step to pass.",
+					"step": StepTest,
 				})
 			}
 			infraKind := errclass.Kind(opts.Lang, testRes.Output)
@@ -2055,6 +2081,24 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			src = strings.TrimPrefix(filepath.ToSlash(src), "/")
 			readOne(src, false)
 		}
+	}
+	// The `global using` declarations governing the files now in scope. In a C# project that
+	// declares its imports once for every file it compiles, neither the file under repair nor any
+	// file the diagnostic names carries a using line for those namespaces — so nothing in the
+	// prompt says where its types come from. Read BEFORE the error-cited tail so the declaration
+	// wins the budget over a stack frame; best-effort, since a project may have none.
+	// See csharpGlobalUsingsFilesFor.
+	globalUsingsAdded := csharpGlobalUsingsFilesFor(opts.RepoPath, opts.Lang, keysOfFileMap(files))
+	for _, rel := range globalUsingsAdded {
+		readOne(rel, false)
+	}
+	if len(globalUsingsAdded) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_global_usings_context", map[string]interface{}{
+			"message": fmt.Sprintf("Added %d global-using declaration file(s) to the %s prompt: the namespaces they declare are in scope for every file in their project and appear in none of them.",
+				len(globalUsingsAdded), step),
+			"paths": globalUsingsAdded,
+			"step":  step,
+		})
 	}
 	// Paths cited in the error log (stack traces, javac `location: ... of type <FQCN>` hints)
 	// may point to sources not yet loaded; pull in a bounded set for fixer context. Phase 2 hygiene

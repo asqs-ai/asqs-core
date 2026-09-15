@@ -19,13 +19,13 @@ func twoTreeSolutionRepo(t *testing.T) string {
 		"src/Root.Web/Api.cs":          "public class Api { }",
 		"tests/Root.Tests/Root.Tests.csproj": reachTestCsprojHead +
 			`<ProjectReference Include="..\..\src\Root.Web\Root.Web.csproj" /></ItemGroup></Project>`,
-		"tests/Root.Tests/ApiSpec.cs": "public class ApiSpec { }",
+		"tests/Root.Tests/ApiSpec.cs": "using Xunit;\npublic class ApiSpec { [Fact] public void A() { } }",
 
 		"sample/src/Sample.Web/Sample.Web.csproj": `<Project Sdk="Microsoft.NET.Sdk"></Project>`,
 		"sample/src/Sample.Web/Api.cs":            "public class Api { }",
 		"sample/tests/Sample.Tests/Sample.Tests.csproj": reachTestCsprojHead +
 			`<ProjectReference Include="..\..\src\Sample.Web\Sample.Web.csproj" /></ItemGroup></Project>`,
-		"sample/tests/Sample.Tests/ApiSpec.cs": "public class ApiSpec { }",
+		"sample/tests/Sample.Tests/ApiSpec.cs": "using Xunit;\npublic class ApiSpec { [Fact] public void A() { } }",
 	})
 }
 

@@ -842,6 +842,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// The fixer may now repair inherited breakage on evidence rather than on a regex guess over
 	// each round's diagnostic.
 	evalOpts.BaselineFailingPaths = append([]string(nil), baseline.Paths...)
+	// And the evaluation can tell a failure it inherited from one it caused. The baseline has
+	// computed this signature all along; until now its only reader was an audit payload.
+	evalOpts.BaselineTestSignature = baseline.TestSignature
 	evalOpts.APISurfaceProvider = apiSurface
 	evalOpts.FormatAfterFix = formatAfterFixHook
 	evalOpts.ErrorLogSummarizer = errorLogSummarizer(cfg, fixerChat)

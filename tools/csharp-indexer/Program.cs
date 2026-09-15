@@ -435,6 +435,24 @@ internal static class Program
         {
             moduleNs = TopLevelModuleName(root);
         }
+        // A file whose only content is `global using` declarations has neither a namespace nor a
+        // type, so TopLevelModuleName returns "" and the using loop below — which skips on an empty
+        // moduleNs — dropped every import it declares. The file ended with no symbol, no chunk and
+        // no edge, and it is the file that answers "which namespace provides this type" for every
+        // other file in its project.
+        //
+        // In the .NET fixture 14 of 16 GlobalUsings.cs indexed to nothing at all. Run
+        // api-8d5367b3383017e25f09e53dacf6c275 then spent eight of its ten fix iterations failing to
+        // resolve IRepository<>, which that project's global usings name, before the loop gave up on
+        // no progress. Keyed by path rather than by "Global" because every project has one and they
+        // must not merge into a single node.
+        var moduleEndLine = 1;
+        if (string.IsNullOrEmpty(moduleNs) && HasGlobalUsing(root))
+        {
+            moduleNs = GlobalUsingsModuleName(relPath);
+            var (_, guEnd, _, _) = LineSpan(root);
+            moduleEndLine = guEnd;
+        }
         if (!string.IsNullOrEmpty(moduleNs))
         {
             symbols.Add(new SymbolDto
@@ -442,7 +460,9 @@ internal static class Program
                 Kind = "MODULE",
                 FqName = moduleNs,
                 StartLine = 1,
-                EndLine = 1,
+                // The whole file for a global-usings anchor: a one-line span holds the first using
+                // and hides the rest, which defeats the point of indexing it.
+                EndLine = moduleEndLine,
             });
         }
 
@@ -602,13 +622,25 @@ internal static class Program
         // and a repository using either had no E2E anchors at all — so the plan proposed E2E gaps
         // with nothing to model them on.
         var e2eFramework = DetectE2EFramework(text);
-        if ((isTest || ContainsTestAttribute(text)) && e2eFramework != null)
+        // The first test method, not the whole file: a span covering every using directive and
+        // every helper is a chunk the retrieval side cannot use as an example.
+        var firstTest = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
+            .FirstOrDefault(m => ContainsTestAttribute(m.ToString()));
+        // A TEST METHOD, not a test PROJECT. `isTest` is true for every file under tests/, and
+        // DetectE2EFramework matches the bare substring "WebApplicationFactory" — so a project's
+        // shared harness and its GlobalUsings.cs both satisfied the old condition, and the `?? root`
+        // fallback then gave them the whole-file span this comment rejects two lines up.
+        //
+        // An E2E_SPEC says "here is an end-to-end test to extend". Anchoring a gap to a file with no
+        // test in it invites the generator to write one there, and the shared harness is the file
+        // every other test depends on. Run api-8d5367b3383017e25f09e53dacf6c275 did exactly that:
+        // two of its four E2E anchors were these files, it rewrote CustomWebApplicationFactory.cs,
+        // and the run ended with every functional test throwing "Cannot create an instance of
+        // CustomWebApplicationFactory`1[TProgram] because Type.ContainsGenericParameters is true."
+        var isE2ESpec = firstTest != null && e2eFramework != null;
+        if (isE2ESpec)
         {
-            // The first test method, not the whole file: a span covering every using directive and
-            // every helper is a chunk the retrieval side cannot use as an example.
-            var firstTest = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
-                .FirstOrDefault(m => ContainsTestAttribute(m.ToString()));
-            var (sl, el, _, _) = LineSpan((SyntaxNode?)firstTest ?? root);
+            var (sl, el, _, _) = LineSpan(firstTest!);
             symbols.Add(new SymbolDto
             {
                 Kind = "E2E_SPEC",
@@ -619,7 +651,10 @@ internal static class Program
             });
         }
 
-        CollectTestSelectors(root, relPath, isTest || ContainsTestAttribute(text), symbols, edges);
+        // Gated on the SAME condition: CollectTestSelectors links every TEST_SELECTOR it emits to
+        // "E2E_SPEC:" + relPath, so narrowing one without the other leaves selector symbols whose
+        // declaring spec does not exist.
+        CollectTestSelectors(root, relPath, isE2ESpec, symbols, edges);
         CollectHttpClientRequests(root, model, symbols, edges);
         CollectServiceRegistrationEdges(root, model, moduleNs, AddEdge);
 
@@ -1592,6 +1627,16 @@ internal static class Program
     // the fallback is the assembly-neutral "Global", which is what C# itself calls the namespace a
     // top-level declaration lands in. Anything is better than "": an empty module drops every
     // CONTAINS edge and leaves the file's symbols with no container to chunk by.
+    // HasGlobalUsing reports whether the file declares at least one `global using`. Only the global
+    // form counts: a file of ordinary usings and nothing else declares nothing for the project.
+    private static bool HasGlobalUsing(SyntaxNode root) =>
+        root.DescendantNodes().OfType<UsingDirectiveSyntax>()
+            .Any(u => u.GlobalKeyword.IsKind(SyntaxKind.GlobalKeyword));
+
+    // GlobalUsingsModuleName keys the anchor by path, following the E2E_SPEC:<path> form the other
+    // file-scoped symbols use.
+    private static string GlobalUsingsModuleName(string relPath) => "GLOBAL_USINGS:" + relPath;
+
     private static string TopLevelModuleName(SyntaxNode root)
     {
         var hasContent = root.DescendantNodes().OfType<GlobalStatementSyntax>().Any()
