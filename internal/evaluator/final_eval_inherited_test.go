@@ -55,7 +55,7 @@ func TestRunFinalEval_reportsAnInheritedTestFailure(t *testing.T) {
 Failed!  - Failed: 1, Passed: 4, Skipped: 0, Total: 5
 `
 	opts := EvalOptions{Lang: "csharp", RepoPath: t.TempDir(), TestCommand: "dotnet test"}
-	opts.BaselineTestSignature = FailureSignature(opts.Lang, StepTest, out)
+	opts.BaselineTestSignature = TestFailureSignature(opts.Lang, out)
 
 	audit := &recordingAuditor{}
 	res := RunRunFinalEval(context.Background(), &finalEvalRunner{testOut: out}, opts, audit)
@@ -82,7 +82,7 @@ Failed!  - Failed: 1, Passed: 4, Skipped: 0, Total: 5
 Failed!  - Failed: 1, Passed: 4, Skipped: 0, Total: 5
 `
 	opts := EvalOptions{Lang: "csharp", RepoPath: t.TempDir(), TestCommand: "dotnet test"}
-	opts.BaselineTestSignature = FailureSignature(opts.Lang, StepTest, baselineOut)
+	opts.BaselineTestSignature = TestFailureSignature(opts.Lang, baselineOut)
 
 	audit := &recordingAuditor{}
 	res := RunRunFinalEval(context.Background(), &finalEvalRunner{testOut: runOut}, opts, audit)

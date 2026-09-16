@@ -17,7 +17,7 @@ Failed!  - Failed: 3, Passed: 12, Skipped: 0, Total: 15
 // already red, and that is precisely the question deciding whether it may ship.
 func TestBaselineTestFailureRepeated_recognisesTheInheritedFailure(t *testing.T) {
 	opts := EvalOptions{Lang: "csharp"}
-	opts.BaselineTestSignature = FailureSignature(opts.Lang, StepTest, inheritedFailureLog)
+	opts.BaselineTestSignature = TestFailureSignature(opts.Lang, inheritedFailureLog)
 
 	if !baselineTestFailureRepeated(opts, inheritedFailureLog) {
 		t.Fatal("the same failure must be recognised as the one the run inherited")
@@ -39,7 +39,7 @@ func TestBaselineTestFailureRepeated_recognisesTheInheritedFailure(t *testing.T)
 // regression ship.
 func TestBaselineTestFailureRepeated_adifferentFailureIsNotInherited(t *testing.T) {
 	opts := EvalOptions{Lang: "csharp"}
-	opts.BaselineTestSignature = FailureSignature(opts.Lang, StepTest, inheritedFailureLog)
+	opts.BaselineTestSignature = TestFailureSignature(opts.Lang, inheritedFailureLog)
 
 	other := strings.Replace(inheritedFailureLog,
 		"System.ArgumentException : Cannot create an instance of",
@@ -52,7 +52,7 @@ func TestBaselineTestFailureRepeated_adifferentFailureIsNotInherited(t *testing.
 // Every branch with nothing to compare must answer "not inherited": a claim that a failure was
 // already there is what would let a regression through, so it is made only on evidence.
 func TestBaselineTestFailureRepeated_silentWithoutEvidence(t *testing.T) {
-	withSig := EvalOptions{Lang: "csharp", BaselineTestSignature: FailureSignature("csharp", StepTest, inheritedFailureLog)}
+	withSig := EvalOptions{Lang: "csharp", BaselineTestSignature: TestFailureSignature("csharp", inheritedFailureLog)}
 
 	if baselineTestFailureRepeated(EvalOptions{Lang: "csharp"}, inheritedFailureLog) {
 		t.Error("no baseline signature: nothing to inherit from")
@@ -65,16 +65,27 @@ func TestBaselineTestFailureRepeated_silentWithoutEvidence(t *testing.T) {
 	}
 }
 
-// The baseline is captured per language, so the comparison must be made on the same terms. A
-// signature carries its step and its language normalisation, which is what keeps this honest.
-func TestBaselineTestFailureRepeated_isLanguageAndStepScoped(t *testing.T) {
-	opts := EvalOptions{Lang: "csharp", BaselineTestSignature: FailureSignature("csharp", StepTest, inheritedFailureLog)}
-	if FailureSignature("java", StepTest, inheritedFailureLog) == opts.BaselineTestSignature {
-		t.Skip("this language pair normalises identically; the scoping claim needs a different pair")
+// The baseline is captured per language, and the comparison has to be made on the same terms.
+// CanonicalForFixLoop collapses runs of identical lines for C# and for no other language, so a log
+// that repeats a failure — which xUnit does, once per test sharing a fixture — normalises to
+// different text under the two and must not compare equal.
+func TestBaselineTestFailureRepeated_isLanguageScoped(t *testing.T) {
+	repeated := strings.Repeat(
+		"[xUnit.net 00:00:00.93]       System.ArgumentException : Cannot create an instance.\n", 6)
+	log := "[xUnit.net 00:00:00.93]     App.Tests.A.B [FAIL]\n" + repeated +
+		"Failed!  - Failed: 6, Passed: 1, Skipped: 0, Total: 7\n"
+
+	csharp := TestFailureSignature("csharp", log)
+	java := TestFailureSignature("java", log)
+	if csharp == "" || java == "" {
+		t.Fatal("no signature computed")
 	}
-	other := opts
-	other.Lang = "java"
-	if baselineTestFailureRepeated(other, inheritedFailureLog) {
-		t.Error("a signature taken under one language must not match under another")
+	if csharp == java {
+		t.Fatal("C# collapses repeated lines and Java does not; the signatures must differ")
+	}
+
+	opts := EvalOptions{Lang: "java", BaselineTestSignature: csharp}
+	if baselineTestFailureRepeated(opts, log) {
+		t.Error("a signature taken under one language matched under another")
 	}
 }

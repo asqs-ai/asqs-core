@@ -134,7 +134,10 @@ func CaptureBaselineFailures(ctx context.Context, runner SandboxRunner, in EvalO
 	out.TestsCaptured = true
 	out.TestsClean = res.OK
 	if !res.OK {
-		out.TestSignature = FailureSignature(opts.Lang, StepTest, res.Output)
+		// Taken over the FAILURES in the log rather than the log, or a run that adds passing tests —
+		// which is the whole job — changes the hash and its own inherited failures stop matching.
+		// TestFailureSignature is the same function the comparison uses; the two must not drift.
+		out.TestSignature = TestFailureSignature(opts.Lang, res.Output)
 		out.TestSummary = baselineTestSummary(res.Output)
 		add(res.Output)
 	}
