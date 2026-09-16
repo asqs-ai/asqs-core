@@ -52,6 +52,14 @@ type FinalEvalResult struct {
 	Stable        bool
 	StepResults   []StepResult
 	LastFixAction FixAction
+	// TestFailureInherited is true when the failing test step reproduced the failure the baseline
+	// recorded before generation. Reported only — Stable still requires every step to pass.
+	//
+	// It lives here as well as on the evaluation loop's result because THIS is the path that
+	// decides a run's verdict after a discard, and run api-aace45f1f78d36a4474c06ad7d7ffae3 failed
+	// every one of its nine iterations at compile: the loop's test branch never ran, and the one
+	// test failure of the whole run came through here with nothing to say about it.
+	TestFailureInherited bool
 	// FailingStep names the step whose failure caused Stable=false. Empty for Stable=true.
 	FailingStep SandboxStep
 	// FailingOutput is the (truncated) error output of the failing step, ready to feed into
@@ -198,8 +206,21 @@ func RunRunFinalEval(ctx context.Context, runner SandboxRunner, opts EvalOptions
 	}
 	tr := RunTest(ctx, runner, opts, testCmd)
 	out.StepResults = append(out.StepResults, tr)
-	auditFinalStep(ctx, audit, tr)
 	if !tr.OK {
+		out.TestFailureInherited = baselineTestFailureRepeated(opts, tr.Output)
+	}
+	// The flag rides on the step row itself so a reader of evaluator.test never has to correlate
+	// two events to learn whether the run caused this.
+	auditFinalStepExtra(ctx, audit, tr, map[string]any{"failure_inherited": out.TestFailureInherited})
+	if !tr.OK {
+		if out.TestFailureInherited && audit != nil {
+			audit.Log(ctx, "evaluator.test_failure_inherited", map[string]any{
+				"message": "This test failure is the one the baseline recorded before generation: the run did not " +
+					"cause it and has not repaired it. Stability is unchanged — the verdict still requires every " +
+					"step to pass.",
+				"step": string(StepTest),
+			})
+		}
 		out.Stable = false
 		out.LastFixAction = FixAssumptions
 		out.FailingStep = StepTest

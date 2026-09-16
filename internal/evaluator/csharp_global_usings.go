@@ -11,17 +11,6 @@ import (
 	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
 )
 
-// keysOfFileMap returns the map's keys in a deterministic order, so a prompt built from them is the
-// same on two runs over the same repository.
-func keysOfFileMap(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // reCSharpGlobalUsing matches a `global using` declaration, in its plain, static and aliased forms.
 var reCSharpGlobalUsing = regexp.MustCompile(`(?m)^\s*global\s+using\s`)
 
@@ -58,7 +47,21 @@ func csharpGlobalUsingsFilesFor(repoRoot, lang string, rels []string) []string {
 		return nil
 	}
 	already := make(map[string]bool, len(rels))
-	projects := map[string]bool{}
+	// FIRST-APPEARANCE order, not sorted. The caller passes paths in order of relevance — what the
+	// round is repairing, then what it is repairing against — and the cap below takes the front of
+	// this list, so the order IS the policy.
+	//
+	// Sorting here is what broke run api-aace45f1f78d36a4474c06ad7d7ffae3. The prompt of a monorepo
+	// round carries files from every application in it, this function was handed all of them, and
+	// four alphabetically-first slots went to "MinimalClean" and "sample" while "src" and "tests" —
+	// the application under repair — were never reached. The fixer was shown a sibling
+	// application's namespaces, wrote `using NimblePros.SharedKernel;` into a root-tree test, and
+	// spent nine rounds oscillating between that CS0234 and the CS0246 it started with.
+	//
+	// Determinism comes from the caller's order being deterministic, which it is: the artifacts
+	// under repair and their declared dependencies, in the order the evaluation holds them.
+	var dirs []string
+	seenDir := map[string]bool{}
 	for _, rel := range rels {
 		clean := filepath.ToSlash(strings.TrimSpace(rel))
 		if clean == "" {
@@ -69,17 +72,16 @@ func csharpGlobalUsingsFilesFor(repoRoot, lang string, rels []string) []string {
 		if !ok {
 			continue
 		}
-		projects[filepath.ToSlash(filepath.Dir(csproj))] = true
+		dir := filepath.ToSlash(filepath.Dir(csproj))
+		if seenDir[dir] {
+			continue
+		}
+		seenDir[dir] = true
+		dirs = append(dirs, dir)
 	}
 
 	var out []string
 	seen := map[string]bool{}
-	dirs := make([]string, 0, len(projects))
-	for d := range projects {
-		dirs = append(dirs, d)
-	}
-	// Deterministic: two rounds on the same repository must build the same prompt.
-	sort.Strings(dirs)
 	for _, dir := range dirs {
 		for _, rel := range globalUsingsInProjectRoot(root, dir) {
 			if already[rel] || seen[rel] {
