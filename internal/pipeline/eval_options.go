@@ -19,12 +19,24 @@ import (
 // Playwright image, which the runner would have swapped in for "playwright", was never selected.
 // asqs-go has always derived this from testbootstrap.DetectE2E after bootstrap; this is that.
 func detectRunE2EFramework(ctx context.Context, repoAbs, lang string, audit runAuditor) string {
+	fw, _ := detectRunE2EFrameworkAndSurface(ctx, repoAbs, lang, "", audit)
+	return fw
+}
+
+// detectRunE2EFrameworkAndSurface also reports what an E2E test can drive against the application
+// (none | api | ui | mixed; C# today), with the operator's
+// bootstrap.policy.e2e_framework.surface applied.
+//
+// The surface selects the E2E retrieval profile, the uncovered-anchor kinds and the generation
+// hints. Detecting it and then not threading it through leaves those consumers on the old
+// assumption — http_api and browser hints for every C# repository, including Web APIs with no pages.
+func detectRunE2EFrameworkAndSurface(ctx context.Context, repoAbs, lang, forcedSurface string, audit runAuditor) (string, string) {
 	switch strings.ToLower(strings.TrimSpace(lang)) {
 	case "javascript", "typescript", "js", "ts", "java", "csharp", "cs":
 	default:
-		return ""
+		return "", ""
 	}
-	rep, err := testbootstrap.DetectE2E(repoAbs, lang)
+	rep, err := testbootstrap.DetectE2EForSurface(repoAbs, lang, forcedSurface)
 	fw := ""
 	if err == nil && rep.HasE2E {
 		fw = strings.TrimSpace(rep.Framework)
@@ -45,7 +57,7 @@ func detectRunE2EFramework(ctx context.Context, repoAbs, lang string, audit runA
 		}
 		audit.Log(ctx, "pipeline.e2e_framework", payload)
 	}
-	return fw
+	return fw, rep.Surface
 }
 
 // evalOptionsFromConfig returns the EvalOptions fields that come from configuration and the run's

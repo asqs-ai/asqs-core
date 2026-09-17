@@ -31,7 +31,7 @@ func (r dotnetGoalRunner) buildArgv() ([]string, error) {
 	}
 	argv := []string{"dotnet", "build", rel, "--verbosity", "quiet", "-nologo"}
 	argv = runner.AppendDotnetMultiTargetFrameworkArgv(argv, r.csprojAbs, r.fallbackTFM)
-	argv = appendDotnetCLIArgsTFMFallback(argv, r.csprojAbs, r.fallbackTFM)
+	argv = appendDotnetCLIArgsTFMFallback(r.repo, argv, r.csprojAbs, r.fallbackTFM)
 	return runner.ApplyDotnetTestFrameworkBootstrapMSBuildProps(argv), nil
 }
 

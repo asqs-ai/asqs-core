@@ -2,6 +2,7 @@
 package errclass
 
 import (
+	"regexp"
 	"strings"
 )
 
@@ -95,7 +96,46 @@ func kindCSharp(out, lower string) string {
 		(strings.Contains(lower, "connection string") || strings.Contains(lower, "connectionstring")) {
 		return "connection_configuration"
 	}
+	// Everything above is sqlite/connection-string shaped, which is one way a C# test meets its
+	// environment and not the common one. A generated test that fails against EF Core, SQL Server,
+	// Npgsql or Testcontainers carried NO class at all, so the fixer was left to infer from a raw
+	// exception string whether it was looking at a broken assertion or an absent database.
+	for _, c := range csharpRuntimeClasses {
+		if c.re.MatchString(out) {
+			return c.class
+		}
+	}
 	return ""
+}
+
+var csharpRuntimeClasses = []struct {
+	class string
+	re    *regexp.Regexp
+}{
+	{
+		// Checked before the database classes: a Testcontainers failure surfaces as a Docker error
+		// wrapped around whatever database the container was for, and the container is what failed.
+		class: "container_unavailable",
+		re:    regexp.MustCompile(`(?i)\b(?:DotNet\.)?Testcontainers\b|ResourceReaperException|Could not connect to Docker`),
+	},
+	{
+		class: "database_connection",
+		re: regexp.MustCompile(`(?i)Npgsql\.\w*Exception|Microsoft\.Data\.SqlClient\.SqlException|` +
+			`\bLogin failed for user\b|\bA network-related or instance-specific error\b`),
+	},
+	{
+		// EF Core's own failures: a migration that never ran, a model that no longer matches the
+		// schema, a save that violated a constraint. Distinct from "no database at all".
+		class: "orm_failure",
+		re: regexp.MustCompile(`(?i)Microsoft\.EntityFrameworkCore\.\w*Exception|DbUpdateException|` +
+			`\bNo database provider has been configured\b`),
+	},
+	{
+		// Nothing was listening where the test expected the application — what a
+		// WebApplicationFactory or browser E2E test produces when the app did not start.
+		class: "app_unreachable",
+		re:    regexp.MustCompile(`(?i)System\.Net\.Http\.HttpRequestException|\bConnection refused\b|\bNo connection could be made\b`),
+	},
 }
 
 func kindJVM(lower string) string {

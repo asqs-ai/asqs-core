@@ -61,7 +61,7 @@ func (g *LLMGenerator) signatureAPISurfaceEntry(ctx context.Context, item *retri
 		return apiSurfaceEntry{}
 	}
 	sym := item.Gap.Symbol
-	signature := javaSignatureText(sym.SignatureJSON)
+	signature := declaredSignatureText(sym.SignatureJSON)
 	if signature == "" {
 		return apiSurfaceEntry{}
 	}
@@ -178,9 +178,13 @@ func (g *LLMGenerator) repairMemberCase(ctx context.Context, content string, ite
 	return repaired
 }
 
-// javaSignatureText pulls the raw declaration text out of a symbol's signature JSON. The shape is
-// the java-indexer's ({"signature": "...", "visibility": ...}); anything else yields "".
-func javaSignatureText(sigJSON []byte) string {
+// declaredSignatureText pulls the raw declaration text out of a symbol's signature JSON.
+//
+// The shape is the one the java-indexer established ({"signature": "…", "visibility": …}), and the
+// C# indexer now emits the same key — so this is language-neutral and no longer named for one of
+// them. Anything else yields "", which is what the C# path returned for every symbol until the
+// indexer started writing a signature at all.
+func declaredSignatureText(sigJSON []byte) string {
 	if len(sigJSON) == 0 {
 		return ""
 	}

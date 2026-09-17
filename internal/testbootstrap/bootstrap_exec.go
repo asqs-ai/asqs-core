@@ -102,8 +102,27 @@ func RunArgv(ctx context.Context, e *EphemeralDocker, repo string, argv []string
 		c.Env = append(os.Environ(), extraEnv...)
 		return c.CombinedOutput()
 	}
+	return e.sh(ctx, bootstrapDockerScript(argv, "", e.extraDockerEnv), extraEnv)
+}
+
+// bootstrapDockerScript renders the shell script one bootstrap container runs: an optional caller
+// prefix, the command itself, and — for any dotnet command in a container that carries a NuGet
+// credential envelope — the Artifacts credential provider install ahead of both.
+//
+// Both entry points build their script here because they used to disagree. The provider prepend
+// lived in RunArgvWithShellPrefix alone, and dotnetGoalRunner.build went through RunArgv; building
+// the generated test project triggers an implicit restore, so the first bootstrap command to talk
+// to a NuGet feed was the one command that had no credentials, and a private feed failed NU1301
+// there while every later goal would have succeeded.
+func bootstrapDockerScript(argv []string, shellPrefix string, dockerEnv []string) string {
 	line := joinShellArgs(argv)
-	return e.sh(ctx, line, extraEnv)
+	if s := strings.TrimSpace(shellPrefix); s != "" {
+		line = s + " && " + line
+	}
+	if bootstrapArgvIsDotnet(argv) && runner.DockerEvalEnvHasNuGetCredentialEnvelope(dockerEnv) {
+		line = runner.NuGetCredentialProviderDockerInstallShell() + " && " + line
+	}
+	return line
 }
 
 // RunArgvWithShellPrefix runs argv in Docker after optional shellPrefix in the same container (required when
@@ -121,14 +140,7 @@ func RunArgvWithShellPrefix(ctx context.Context, e *EphemeralDocker, repo string
 	if e == nil {
 		return RunArgv(ctx, nil, repo, argv, extraEnv)
 	}
-	line := joinShellArgs(argv)
-	if s := strings.TrimSpace(shellPrefix); s != "" {
-		line = s + " && " + line
-	}
-	if bootstrapArgvIsDotnet(argv) && runner.DockerEvalEnvHasNuGetCredentialEnvelope(e.extraDockerEnv) {
-		line = runner.NuGetCredentialProviderDockerInstallShell() + " && " + line
-	}
-	return e.sh(ctx, line, extraEnv)
+	return e.sh(ctx, bootstrapDockerScript(argv, shellPrefix, e.extraDockerEnv), extraEnv)
 }
 
 // bootstrapArgvIsDotnet is true when argv[0] names the dotnet CLI (driver on PATH).

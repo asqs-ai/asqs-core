@@ -21,10 +21,14 @@ func dotnetTFMFallbackFromRunner(r *config.RunnerConfig) string {
 }
 
 // appendDotnetCLIArgsTFMFallback inserts /p:TargetFramework=<fallback> immediately after the dotnet subcommand
-// (build|test|restore|…) when the .csproj does not declare a concrete in-file TFM. Trailing placement breaks some
-// dotnet CLI / MSBuild flows (e.g. args after --filter). If analysis of the project file fails, the fallback is
-// still applied when the user configured it.
-func appendDotnetCLIArgsTFMFallback(argv []string, csprojAbs, fallback string) []string {
+// (build|test|restore|…) when the project evaluates to no concrete TFM — in its own file or in anything it
+// inherits. Trailing placement breaks some dotnet CLI / MSBuild flows (e.g. args after --filter). If analysis of
+// the project fails, the fallback is still applied when the user configured it.
+//
+// repoRoot bounds the Directory.Build.props walk that answers the question. Passing it is what makes this the
+// question MSBuild answers: a solution declaring its framework once at the root read as declaring none, and the
+// pin then contradicted the framework the project restores for.
+func appendDotnetCLIArgsTFMFallback(repoRoot string, argv []string, csprojAbs, fallback string) []string {
 	fallback = strings.TrimSpace(fallback)
 	if fallback == "" || len(argv) < 2 || !strings.EqualFold(filepath.Base(strings.TrimSpace(argv[0])), "dotnet") {
 		return argv
@@ -35,7 +39,7 @@ func appendDotnetCLIArgsTFMFallback(argv []string, csprojAbs, fallback string) [
 			return argv
 		}
 	}
-	ok, err := runner.CsprojDeclaresConcreteTargetFramework(csprojAbs)
+	ok, err := runner.ProjectResolvesConcreteTargetFramework(repoRoot, csprojAbs)
 	if err == nil && ok {
 		return argv
 	}

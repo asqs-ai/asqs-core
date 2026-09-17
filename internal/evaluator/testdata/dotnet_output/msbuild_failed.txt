@@ -1,0 +1,13 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+/workspace/Broken.cs(7,11): error CS1061: 'OrderService' does not contain a definition for 'NoSuchMethod' and no accessible extension method 'NoSuchMethod' accepting a first argument of type 'OrderService' could be found (are you missing a using directive or an assembly reference?) [/workspace/T.csproj]
+/workspace/Broken.cs(8,17): error CS1503: Argument 1: cannot convert from 'string' to 'int' [/workspace/T.csproj]
+
+Build FAILED.
+
+/workspace/Broken.cs(7,11): error CS1061: 'OrderService' does not contain a definition for 'NoSuchMethod' and no accessible extension method 'NoSuchMethod' accepting a first argument of type 'OrderService' could be found (are you missing a using directive or an assembly reference?) [/workspace/T.csproj]
+/workspace/Broken.cs(8,17): error CS1503: Argument 1: cannot convert from 'string' to 'int' [/workspace/T.csproj]
+    0 Warning(s)
+    2 Error(s)
+
+Time Elapsed 00:00:00.47

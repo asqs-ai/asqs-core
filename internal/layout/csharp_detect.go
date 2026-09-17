@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
+	"github.com/asqs/asqs-core/internal/teststack"
 )
 
 // E2ERootDirCandidates are repo-root directory names that indicate a dedicated end-to-end test tree
@@ -15,13 +18,10 @@ var E2ERootDirCandidates = []string{
 
 const maxCsprojWalkDepth = 8
 
+// csprojWalkSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func csprojWalkSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case ".git", "bin", "obj", "node_modules", "packages", ".vs", ".vscode", "testresults",
-		"dist", "build", "out", "target", "__pycache__", ".next", ".idea":
-		return true
-	}
-	return false
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func relDirDepth(root, path string) int {
@@ -72,6 +72,7 @@ func detectCSharpTestProjectDir(repoAbs string, wantE2E bool) (relDir string, fo
 	if repoAbs == "" {
 		return "", false
 	}
+	inSolution := solutionProjectDirs(repoAbs)
 	best, bestScore := "", -1
 	_ = filepath.WalkDir(repoAbs, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -105,7 +106,7 @@ func detectCSharpTestProjectDir(repoAbs string, wantE2E bool) (relDir string, fo
 		if isE2E != wantE2E {
 			return nil
 		}
-		score := testProjectDirScore(dir, wantE2E)
+		score := testProjectDirScore(dir, wantE2E, inSolution)
 		if !found || score > bestScore {
 			best, bestScore, found = dir, score, true
 		}
@@ -114,12 +115,23 @@ func detectCSharpTestProjectDir(repoAbs string, wantE2E bool) (relDir string, fo
 	return best, found
 }
 
-func testProjectDirScore(relDir string, wantE2E bool) int {
+// testProjectDirScore ranks a candidate test project directory.
+//
+// Solution membership outranks everything else because it decides whether the tests run at all: the
+// evaluator's compile and test steps both name the solution, so a project outside it is never built
+// and never executed. Before this, every candidate under tests/ one level deep scored identically
+// and the winner was whichever the directory walk reached first — alphabetical order, which is how
+// run api-4198e8aa94b1aad506e17a3a6ff8f74b put ten unit tests into an Aspire integration-test
+// project that no test run touched.
+func testProjectDirScore(relDir string, wantE2E bool, inSolution map[string]bool) int {
 	roots := DedicatedRootDirCandidates
 	if wantE2E {
 		roots = E2ERootDirCandidates
 	}
 	score := 10
+	if len(inSolution) > 0 && inSolution[relDir] {
+		score += 1000
+	}
 	if firstSegmentMatches(relDir, roots) {
 		score += 100
 	}
@@ -129,11 +141,79 @@ func testProjectDirScore(relDir string, wantE2E bool) int {
 	return score
 }
 
+// solutionProjectDirs is the set of repo-relative directories holding a project a root solution
+// lists. Empty when the repository has no root solution, which leaves the scoring unchanged.
+func solutionProjectDirs(repoAbs string) map[string]bool {
+	paths, err := dotnetproj.CsprojPathsFromRootSolutions(repoAbs)
+	if err != nil || len(paths) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(paths))
+	for _, abs := range paths {
+		rel, rerr := filepath.Rel(repoAbs, filepath.Dir(abs))
+		if rerr != nil {
+			continue
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." {
+			rel = ""
+		}
+		out[rel] = true
+	}
+	return out
+}
+
 // DetectCSharpUnitTestProjectDir returns the repo-relative directory of an existing C# unit-test
 // project (excluding Playwright/E2E projects), or "" if none. Lets generated unit tests be routed into
 // an existing test project regardless of where it lives in the tree.
+//
+// WHERE a generated test lands decides whether it ever runs, because the evaluator builds and tests
+// the SOLUTION: a project the solution does not list is a project whose tests are never compiled and
+// never executed, and the run still reports compile=ok because the solution it compiled never saw
+// them. A validation run wrote all ten of its unit tests into an Aspire
+// integration-test project and not one of them ran.
+//
+// Two sources answer better than the scoring, and both are consulted first:
+//
+//   - the bootstrap's own contract. It already chose a project, verified the stack on it, and added
+//     the packages a generated test needs TO THAT PROJECT. Re-deriving the answer here is what let
+//     the two disagree;
+//   - the root solution's project list. The bootstrap picks from it (testbootstrap.primaryCsprojAbs)
+//     and the evaluator builds it, so a candidate outside it is a candidate whose tests do not run.
 func DetectCSharpUnitTestProjectDir(repoAbs string) string {
+	if dir := bootstrapTestProjectDir(repoAbs); dir != "" {
+		return dir
+	}
 	dir, _ := detectCSharpTestProjectDir(repoAbs, false)
+	return dir
+}
+
+// bootstrapTestProjectDir returns the directory of the project named by the bootstrap → generation
+// contract, when there is one and it is a C# project that still exists.
+//
+// Absence is normal and is the contract's own rule: bootstrap is off by default, a repository with a
+// complete stack is skipped, and a checkout may predate the file. Every one of those returns "" and
+// the detection below carries on exactly as it did.
+func bootstrapTestProjectDir(repoAbs string) string {
+	repoAbs = filepath.Clean(strings.TrimSpace(repoAbs))
+	if repoAbs == "" {
+		return ""
+	}
+	c, ok := teststack.Read(repoAbs)
+	if !ok {
+		return ""
+	}
+	rel := strings.TrimSpace(filepath.ToSlash(c.TestProject))
+	if rel == "" || !strings.EqualFold(filepath.Ext(rel), ".csproj") {
+		return ""
+	}
+	if st, err := os.Stat(filepath.Join(repoAbs, filepath.FromSlash(rel))); err != nil || st.IsDir() {
+		return ""
+	}
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." {
+		return ""
+	}
 	return dir
 }
 

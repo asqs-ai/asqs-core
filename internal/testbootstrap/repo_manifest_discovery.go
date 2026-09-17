@@ -8,23 +8,17 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 const maxBootstrapWalkDepth = 12
 
 // bootstrapSkipDir reports whether a directory entry should be skipped during repo walks.
+// bootstrapSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func bootstrapSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case "node_modules", ".git", "dist", "build", "bin", "obj", "target", "packages",
-		".vs", "venv", "__pycache__", "vendor", "coverage", "playwright-report",
-		"test-results", ".gradle", ".idea":
-		return true
-	default:
-		if len(name) > 0 && name[0] == '.' && name != "." && name != ".." {
-			return true
-		}
-		return false
-	}
+	return dotnetproj.WalkSkipDir(name)
 }
 
 // jsBootstrapSkipDir is bootstrapSkipDir minus "packages".

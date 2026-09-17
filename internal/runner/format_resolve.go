@@ -88,7 +88,7 @@ func resolveFormatOnlyAdded(repoPath, lang string, target Target) FormatResolveR
 			PerFile: true,
 		}
 	case "csharp", "cs":
-		if !dotnetOnPATH() {
+		if !formatBinaryAvailable("dotnet", target) {
 			return FormatResolveResult{
 				Source:     "none",
 				SkipReason: "formatter_not_available:dotnet",
@@ -148,7 +148,7 @@ func resolveFormatRepoWide(repoPath, lang, buildTool string, target Target) Form
 			PerFile: false,
 		}
 	case "csharp", "cs":
-		if !dotnetOnPATH() {
+		if !formatBinaryAvailable("dotnet", target) {
 			return FormatResolveResult{
 				Source:     "none",
 				SkipReason: "formatter_not_available:dotnet",
@@ -362,7 +362,7 @@ func formatAvailabilitySkipReason(repoPath string, r FormatResolveResult, target
 	}
 	bin := parts[0]
 	if strings.EqualFold(bin, "dotnet") {
-		if !dotnetOnPATH() {
+		if !formatBinaryAvailable("dotnet", target) {
 			return "formatter_not_available:dotnet"
 		}
 		return ""
@@ -425,7 +425,7 @@ func shellFormatAvailabilitySkipReason(repoPath, cmd string, target Target) stri
 	case strings.Contains(low, "prettier"):
 		return prettierAvailabilitySkipReason(dir, cmd, target)
 	case strings.Contains(low, "dotnet"):
-		if !dotnetOnPATH() {
+		if !formatBinaryAvailable("dotnet", target) {
 			return "formatter_not_available:dotnet"
 		}
 	}

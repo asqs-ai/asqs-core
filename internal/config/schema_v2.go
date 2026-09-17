@@ -219,7 +219,7 @@ type BuildV2 struct {
 	E2ETestCommand string `yaml:"e2e_test_command"`
 	// FormatCommand runs after generation and after each fix, before evaluation.
 	FormatCommand string `yaml:"format_command"`
-	// DotNetFallbackTargetFramework is used when a .csproj names no target framework.
+	// DotNetFallbackTargetFramework is used when a project resolves to no target framework, inherited Directory.Build.props included.
 	DotNetFallbackTargetFramework string `yaml:"dotnet_fallback_target_framework"`
 	// Workspace narrows a mono-repo to one project.
 	Workspace WorkspaceV2 `yaml:"workspace"`

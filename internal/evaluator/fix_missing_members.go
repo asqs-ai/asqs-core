@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator/apisurface"
+	"github.com/asqs/asqs-core/internal/langid"
 )
 
 // Missing-member facts: deterministic statements for "cannot find symbol: method M" diagnostics
@@ -137,7 +138,15 @@ func repoFQCNToPath(files map[string]string) map[string]string {
 // repo-owned type. Returns nil when the language is not Java, nothing matches, or every match
 // names a non-owned type (those are the classpath surface's job).
 func missingMemberFacts(ctx context.Context, opts EvalOptions, errorOutput string, files map[string]string, artifactPaths []string, audit Auditor) []string {
-	if !strings.EqualFold(strings.TrimSpace(opts.Lang), "java") || strings.TrimSpace(errorOutput) == "" || len(files) == 0 {
+	if strings.TrimSpace(errorOutput) == "" || len(files) == 0 {
+		return nil
+	}
+	if langid.IsCSharp(opts.Lang) {
+		facts := csharpMissingMemberFacts(errorOutput, files, artifactPaths)
+		auditMissingMemberFacts(ctx, audit, opts, facts)
+		return facts
+	}
+	if !langid.IsJava(opts.Lang) {
 		return nil
 	}
 	fqcnToPath := repoFQCNToPath(files)

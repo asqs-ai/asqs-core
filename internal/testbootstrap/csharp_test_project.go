@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/layout"
 )
 
@@ -48,36 +49,24 @@ var reCsprojTargetFramework = regexp.MustCompile(`(?i)<TargetFrameworks?>\s*([^<
 // netMajorFromTFM returns the major version of a netX.Y TFM (net8.0 -> 8, net8.0-windows -> 8), or 0
 // for non-net / netstandard / netcoreapp monikers.
 func netMajorFromTFM(tfm string) int {
-	low := strings.ToLower(strings.TrimSpace(tfm))
-	if !strings.HasPrefix(low, "net") {
-		return 0
-	}
-	rest := strings.TrimPrefix(low, "net")
-	if i := strings.IndexByte(rest, '.'); i > 0 {
-		if n, err := strconv.Atoi(rest[:i]); err == nil {
-			return n
-		}
-	}
-	return 0
+	return dotnetproj.NetMajorFromTFM(tfm)
 }
 
+// Resolution goes through dotnetproj.ResolveFacts rather than reading each .csproj alone, because a
+// repository that factors TargetFramework into Directory.Build.props — the recommended layout —
+// declares none in the project files, and the scan then silently produced the net8.0 fallback.
+//
 // inferCSharpTestTFM picks a target framework for the generated test project: the highest netX.0 among
 // the production projects (a higher TFM can reference lower ones). Falls back to fallbackTFM, then net8.0.
-func inferCSharpTestTFM(prodCsprojs []string, fallback string) string {
+func inferCSharpTestTFM(repoRoot string, prodCsprojs []string, fallback string) string {
 	maxMajor := 0
 	for _, p := range prodCsprojs {
-		b, err := os.ReadFile(p)
+		facts, err := dotnetproj.ResolveFacts(repoRoot, p)
 		if err != nil {
 			continue
 		}
-		m := reCsprojTargetFramework.FindStringSubmatch(string(b))
-		if m == nil {
-			continue
-		}
-		for _, tfm := range strings.Split(m[1], ";") {
-			if maj := netMajorFromTFM(tfm); maj > maxMajor {
-				maxMajor = maj
-			}
+		if maj := facts.MaxNetMajor(); maj > maxMajor {
+			maxMajor = maj
 		}
 	}
 	if maxMajor > 0 {
@@ -195,7 +184,7 @@ func writeDedicatedCSharpTestProject(repo, gitRoot string, prodCsprojs []string,
 		return testProjAbs, nil, nil // already present
 	}
 
-	tfm := inferCSharpTestTFM(prodCsprojs, fallbackTFM)
+	tfm := inferCSharpTestTFM(repo, prodCsprojs, fallbackTFM)
 
 	// Central Package Management: when a Directory.Packages.props governs versions, the project must
 	// not pin Version on PackageReference; merge PackageVersion entries into the props instead.

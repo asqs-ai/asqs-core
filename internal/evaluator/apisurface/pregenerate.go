@@ -29,7 +29,7 @@ import (
 // Returns nil for every combination not listed, which is the no-op path: the caller renders no
 // block and generation is byte-for-byte what it was before.
 func PregenerateTargets(lang, e2eFramework string, isE2E bool) []Target {
-	out := append([]Target(nil), frameworkAnnotationTargets(lang)...)
+	out := append([]Target(nil), frameworkTestTypeTargets(lang)...)
 	out = append(out, e2eAssertionTargets(lang, e2eFramework, isE2E)...)
 	out = append(out, e2eRequestTargets(lang, e2eFramework, isE2E)...)
 	out = append(out, e2eRoutingTargets(lang, e2eFramework, isE2E)...)
@@ -39,7 +39,7 @@ func PregenerateTargets(lang, e2eFramework string, isE2E bool) []Target {
 	return out
 }
 
-// frameworkAnnotationTargets returns the test-framework types whose PACKAGE the model gets wrong,
+// frameworkTestTypeTargets returns the test-framework types whose PACKAGE the model gets wrong,
 // as opposed to whose members it invents. They apply to unit and E2E gaps alike.
 //
 // This is a different failure mode from the assertion APIs, and it cost the two runs on record
@@ -57,16 +57,47 @@ func PregenerateTargets(lang, e2eFramework string, isE2E bool) []Target {
 //
 // Resolution is by simple name (KindSymbol), because the whole point is that the model does not
 // know the package. A name that is genuinely absent from the classpath simply resolves to nothing.
-func frameworkAnnotationTargets(lang string) []Target {
-	if NormalizeLang(lang) != LangJava {
+func frameworkTestTypeTargets(lang string) []Target {
+	switch NormalizeLang(lang) {
+	case LangJava:
+		return []Target{
+			{Kind: KindSymbol, Name: "WebMvcTest"},
+			{Kind: KindSymbol, Name: "SpringBootTest"},
+			{Kind: KindSymbol, Name: "LocalServerPort"},
+			{Kind: KindSymbol, Name: "AutoConfigureMockMvc"},
+			{Kind: KindSymbol, Name: "MockitoBean"},
+		}
+	case LangCSharp:
+		// The .NET equivalents of the same failure, in the same order of how often the model gets
+		// the namespace wrong rather than the member:
+		//
+		//   - The three test attributes, because a repository picks ONE runner and the other two
+		//     namespaces resolve to nothing here. Which one survives is itself the fact worth
+		//     stating: a project on NUnit is told `Test` exists and is never told about `Fact`.
+		//   - ITestOutputHelper, which xUnit moved out of Xunit.Abstractions in v3 — the same
+		//     class of relocation the Java list exists to catch, and the reason this resolves
+		//     against the project's own packages rather than a version table.
+		//   - The fixture types a test actually constructs. These are not attributes, so their
+		//     member dumps carry weight too: WebApplicationFactory<T> is the type whose members a
+		//     model most reliably invents, and its namespace is nowhere near its package name.
+		//
+		// Well-known BCL types are deliberately absent. HttpClient would resolve from whichever
+		// assembly documents it, dump a very long member list, and teach the model nothing it does
+		// not already know — spending on it is what crowds out the types above.
+		return []Target{
+			{Kind: KindSymbol, Name: "Fact"},
+			{Kind: KindSymbol, Name: "Theory"},
+			{Kind: KindSymbol, Name: "Test"},
+			{Kind: KindSymbol, Name: "TestMethod"},
+			{Kind: KindSymbol, Name: "ITestOutputHelper"},
+			{Kind: KindSymbol, Name: "Mock"},
+			{Kind: KindSymbol, Name: "WebApplicationFactory"},
+			{Kind: KindSymbol, Name: "TestServer"},
+			{Kind: KindSymbol, Name: "IServiceCollection"},
+			{Kind: KindSymbol, Name: "DbContextOptionsBuilder"},
+		}
+	default:
 		return nil
-	}
-	return []Target{
-		{Kind: KindSymbol, Name: "WebMvcTest"},
-		{Kind: KindSymbol, Name: "SpringBootTest"},
-		{Kind: KindSymbol, Name: "LocalServerPort"},
-		{Kind: KindSymbol, Name: "AutoConfigureMockMvc"},
-		{Kind: KindSymbol, Name: "MockitoBean"},
 	}
 }
 
@@ -84,7 +115,7 @@ func frameworkAnnotationTargets(lang string) []Target {
 // contract would be stating something it does not know, and the contract's whole value is that the
 // prompt may call it authoritative.
 func ResolveCanonicalImports(ctx context.Context, provider Provider, repoPath, lang string) map[string]string {
-	targets := frameworkAnnotationTargets(lang)
+	targets := frameworkTestTypeTargets(lang)
 	if provider == nil || len(targets) == 0 || strings.TrimSpace(repoPath) == "" {
 		return nil
 	}
@@ -92,18 +123,21 @@ func ResolveCanonicalImports(ctx context.Context, provider Provider, repoPath, l
 	if err != nil || len(surfaces) == 0 {
 		return nil
 	}
-	bySimple := map[string][]string{}
-	for _, s := range surfaces {
-		fq := strings.TrimSpace(s.FQCN)
-		if fq == "" {
-			continue
-		}
-		simple := fq[strings.LastIndex(fq, ".")+1:]
-		bySimple[simple] = append(bySimple[simple], fq)
-	}
+	// Matched per target rather than by a simple-name key, because the name a target is written
+	// under is not always the name the resolved type carries: a C# attribute is written without
+	// its Attribute suffix and a generic type is documented with its arity.
 	out := map[string]string{}
 	for _, t := range targets {
-		got := bySimple[t.Name]
+		var got []string
+		for _, s := range surfaces {
+			fq := strings.TrimSpace(s.FQCN)
+			if fq == "" {
+				continue
+			}
+			if bareNameMatches(lang, fq, t.Name) {
+				got = append(got, fq)
+			}
+		}
 		if len(got) != 1 {
 			continue // absent, or ambiguous: say nothing rather than pick.
 		}
@@ -219,6 +253,19 @@ func TypesPresent(ctx context.Context, provider Provider, repoPath, lang string,
 		out[t.Name] = found[t.Name]
 	}
 	return out
+}
+
+// bareNameMatches reports whether a resolved type is the one a simple-name target asked for.
+//
+// Java compares literally: a class's simple name is exactly what an import line ends with. C# has
+// two spelling conventions between the two, handled in csharpBareNameMatches, and they are kept
+// out of the Java path on purpose — "Foo matches FooAttribute" is a false statement about Java, and
+// this map is presented to the model as authoritative.
+func bareNameMatches(lang, fq, want string) bool {
+	if NormalizeLang(lang) == LangCSharp {
+		return csharpBareNameMatches(fq, want)
+	}
+	return fq[strings.LastIndex(fq, ".")+1:] == want
 }
 
 func e2eAssertionTargets(lang, e2eFramework string, isE2E bool) []Target {
@@ -411,7 +458,11 @@ func RenderSurfaces(surfaces []TypeSurface) string {
 			// an annotation arrives — @WebMvcTest and @LocalServerPort have no members worth
 			// showing, and the fully-qualified name is the entire fact the model is missing.
 			b.WriteString(fmt.Sprintf("--- %s ---\n", s.FQCN))
-			b.WriteString(fmt.Sprintf("  (import %s — this is the correct package for this type in THIS project)\n\n", s.FQCN))
+			hint := strings.TrimSpace(s.ImportHint)
+			if hint == "" {
+				hint = "import " + s.FQCN
+			}
+			b.WriteString(fmt.Sprintf("  (%s — this is the correct package for this type in THIS project)\n\n", hint))
 			continue
 		}
 		origin := ""
@@ -419,6 +470,11 @@ func RenderSurfaces(surfaces []TypeSurface) string {
 			origin = " [" + s.Origin + "]"
 		}
 		b.WriteString(fmt.Sprintf("--- %s%s ---\n", s.FQCN, origin))
+		// A resolved SIMPLE name carries its import line even when members are shown: the model
+		// asked about `Assert`, and knowing which `Assert` is half the answer.
+		if hint := strings.TrimSpace(s.ImportHint); hint != "" {
+			b.WriteString("  " + hint + "\n")
+		}
 		for _, m := range s.Members {
 			b.WriteString("  " + m + "\n")
 		}
@@ -479,6 +535,9 @@ var javaImportRE = regexp.MustCompile(`(?m)^\s*import\s+([\w.$]+\.[A-Z][\w$]*)\s
 // Returns nil for every non-Java language and for any input it cannot parse, which is the no-op
 // path: the caller renders no block and generation is exactly what it was before.
 func SignatureTargets(lang, signature, source string) []Target {
+	if NormalizeLang(lang) == LangCSharp {
+		return csharpSignatureTargets(signature, source)
+	}
 	if NormalizeLang(lang) != LangJava {
 		return nil
 	}

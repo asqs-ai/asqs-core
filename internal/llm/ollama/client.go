@@ -6,11 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
@@ -33,6 +33,9 @@ type Client struct {
 	// toolCalling is the cached result of ProbeToolSupport. False until probed: an unprobed client
 	// falls back to prompted tools rather than sending definitions a template will ignore.
 	toolCalling bool
+	// stallBudget is general.llm.http.timeout applied to SILENCE on the streamed response rather
+	// than to the whole exchange. See stream.go.
+	stallBudget time.Duration
 }
 
 type chatRequest struct {
@@ -151,12 +154,15 @@ func NewClientWithKeyAndModel(cfg *config.Config, keyOverride, chatModel string)
 	ep := chatEndpoint(cfg)
 	maybeLogResolvedOllama("chat", ep, modelID)
 	return &Client{
-		httpClient:  httpcfg.HTTPClientWithBearerForOllama(&cfg.LLM, key),
+		// No overall deadline: on a streamed response http.Client.Timeout would cap total
+		// generation time. stallBudget carries the configured value to where it belongs.
+		httpClient:  httpcfg.StreamingHTTPClientForOllama(&cfg.LLM, key),
 		endpoint:    ep,
 		model:       modelID,
 		chatOptions: opts,
 		keepAlive:   keepAlive,
 		think:       think,
+		stallBudget: httpcfg.ClientTimeout(&cfg.LLM),
 	}, nil
 }
 
@@ -215,9 +221,11 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 		opt = nil
 	}
 	payload := chatRequest{
-		Model:     c.model,
-		Messages:  msgs,
-		Stream:    false,
+		Model:    c.model,
+		Messages: msgs,
+		// Streamed so the client can tell a slow generation from a stopped one: the budget below
+		// bounds silence, not total time. See stream.go.
+		Stream:    true,
 		Format:    structuredFormat(opts.Structured),
 		Options:   opt,
 		KeepAlive: c.keepAlive,
@@ -280,39 +288,21 @@ func (c *Client) Complete(ctx context.Context, messages []model.Message, opts mo
 			return nil, err
 		}
 		if attempt > 0 {
+			// Every retry is recorded. They used to be silent, so a wedged server produced one
+			// "context deadline exceeded" per gap and no sign that five attempts had gone into it.
+			// The wait comes after the row so the row is not the thing delayed.
+			c.auditRetry(ctx, attempt, lastErr)
 			if err := llembed.SleepBeforeRetry(ctx, attempt); err != nil {
 				return nil, err
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(rawPayload))
-		if err != nil {
-			return nil, fmt.Errorf("ollama chat: %w", err)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := c.httpClient.Do(req)
+		out, err := c.doChat(ctx, rawPayload)
 		if err != nil {
 			lastErr = err
-			if !llembed.IsRetriableChatTransport(err) {
-				return nil, fmt.Errorf("ollama chat: %w", err)
+			if !isRetriableOllamaChatError(err) {
+				return nil, err
 			}
 			continue
-		}
-		respBody, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			lastErr = fmt.Errorf("ollama chat: status %d: %s", resp.StatusCode, truncate(string(respBody), 512))
-			if !llembed.IsRetriableHTTPStatus(resp.StatusCode) {
-				return nil, lastErr
-			}
-			continue
-		}
-		var out chatResponse
-		if err := json.Unmarshal(respBody, &out); err != nil {
-			return nil, fmt.Errorf("ollama chat: decode response: %w", err)
 		}
 		stopReason := strings.ToLower(strings.TrimSpace(out.DoneReason))
 		if model.IsLengthStopReason(stopReason) {

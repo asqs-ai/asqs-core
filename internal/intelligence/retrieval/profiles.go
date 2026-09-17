@@ -227,7 +227,10 @@ func isEnclosingContainerKind(kind string) bool {
 	}
 	kl := strings.ToLower(k)
 	switch kl {
-	case "class", "interface", "struct", "record":
+	case "class", "interface", "struct", "record", "enum":
+		// An enum encloses its members exactly as a class encloses its methods, and the C# indexer
+		// emits both. Leaving it out meant an enum member's container never joined the context, so
+		// the model saw the member and not the set it belongs to.
 		return true
 	}
 	switch k {

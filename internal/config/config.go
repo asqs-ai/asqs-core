@@ -587,7 +587,7 @@ type RunnerConfig struct {
 	ImagePlaywrightDotnet string `yaml:"image_playwright_dotnet"`
 	// ImageDotNet is the Docker image for .NET runs. Empty = mcr.microsoft.com/dotnet/sdk:10.0, or sdk:{major}.0 inferred from net{major}.* in repo-root csproj files.
 	ImageDotNet string `yaml:"image_dotnet"`
-	// DotNetFallbackTargetFramework when set (e.g. net8.0): for dotnet restore/build/test/format argv, append /p:TargetFramework=<value> when the entry .csproj does not declare a non-empty concrete TargetFramework/TargetFrameworks (no file edits). Empty = disabled.
+	// DotNetFallbackTargetFramework when set (e.g. net8.0): for dotnet restore/build/test/format argv, append /p:TargetFramework=<value> when the entry project EVALUATES to no concrete TargetFramework/TargetFrameworks — its own file or any Directory.Build.props it inherits (no file edits). Empty = disabled.
 	DotNetFallbackTargetFramework string `yaml:"dotnet_fallback_target_framework"`
 
 	// EvalProfile selects the docker eval toolchain: java-maven, java-maven-11, java-maven-21, java-gradle, java-gradle-11, java-gradle-21, typescript-*, nodejs-lts, csharp-dotnet, or empty/auto.
@@ -823,6 +823,14 @@ type E2EFrameworkBootstrapConfig struct {
 	AllowLockfileChange bool `yaml:"allow_lockfile_change"`
 	// Execution: auto | docker | local. auto uses ephemeral Docker when runner.type is docker (same for C# as JS/Java).
 	Execution string `yaml:"execution"`
+	// Surface: auto | none | api | ui | mixed. What an E2E test can drive against this application.
+	// auto (default) detects it from the project's own files at bootstrap: pages a browser can drive
+	// (Razor Pages, MVC views, Blazor, a hosted SPA) make it ui, HTTP endpoints alone make it api,
+	// both make it mixed, and a library or worker makes it none. The surface decides the E2E
+	// retrieval profile, the generation hints, and whether uncovered page routes are listed as gaps.
+	// Set it explicitly when the scan guesses wrong; an unrecognised value is ignored rather than
+	// treated as a surface. C# only today.
+	Surface string `yaml:"surface"`
 }
 
 // TestFrameworkBootstrapConfig controls auto-setup of test tooling before indexing/generation.

@@ -418,7 +418,7 @@ func (s *Sandbox) runLocalPlannedStep(ctx context.Context, gitRootAbs, cwd, lang
 		}
 		// A JS runner that exited non-zero because it found no test files has not failed anything;
 		// the evaluator decides whether an empty tree is fine (see evaluator.NoTestFilesSuffix).
-		if step == evaluator.StepTest && isJSLang(lang) && jsTestOutputReportsNoTestFiles(out) {
+		if step == evaluator.StepTest && testOutputReportsNoTestFiles(lang, out) {
 			summary := stepSuccessSummary(step, plan, cwd) + evaluator.NoTestFilesSuffix
 			fmt.Fprintf(os.Stderr, "  %s: %s\n", label, summary)
 			return evaluator.StepResult{Step: step, OK: true, Summary: summary, Output: out}

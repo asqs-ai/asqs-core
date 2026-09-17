@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	auditctx "github.com/asqs/asqs-core/internal/audit"
 	"os"
 	"path/filepath"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"github.com/asqs/asqs-core/internal/intelligence/model"
 	"github.com/asqs/asqs-core/internal/intelligence/projectintel"
 	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
+	"github.com/asqs/asqs-core/internal/langid"
 	"github.com/asqs/asqs-core/internal/llm"
 	"github.com/asqs/asqs-core/internal/llm/tokens"
 	"github.com/asqs/asqs-core/internal/overview"
@@ -94,6 +96,10 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	var sum Summary
 	audit, closeAudit := buildRunAuditor(opts.AuditLogPath, opts.AuditDumpPrompts)
 	defer closeAudit()
+	// The LLM clients are built from a config and never receive an Auditor, so what only they know
+	// — that a request was retried, that a stream stalled — had nowhere to go. See
+	// auditctx.WithAuditor.
+	ctx = auditctx.WithAuditor(ctx, audit)
 	repoAbs, err := filepath.Abs(opts.RepoPath)
 	if err != nil {
 		return sum, fmt.Errorf("resolve repo path: %w", err)
@@ -238,7 +244,8 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	runID := fmt.Sprintf("core_%d", time.Now().UnixNano())
 	// The E2E stack the evaluator must be told about — after bootstrap, so a stack the bootstrap
 	// just installed counts. See detectRunE2EFramework.
-	runE2EFramework := detectRunE2EFramework(ctx, repoAbs, lang, audit)
+	runE2EFramework, runE2ESurface := detectRunE2EFrameworkAndSurface(ctx, repoAbs, lang,
+		cfg.Runner.E2EFrameworkBootstrap.Surface, audit)
 
 	// Join this run to the exact configuration that produced it (the A/B report groups on it).
 	// Best-effort: a run without a recorded revision still runs, it is just invisible to ab-report.
@@ -278,7 +285,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// exists yet, so a duplicate found here is genuinely pre-existing.
 	reconcileDuplicateArtifacts(ctx, cfg, audit, repoAbs, lang, files)
 
-	planOpts := buildPlanOptions(cfg, lang, opts.RepoID)
+	planOpts := buildPlanOptions(cfg, lang, opts.RepoID, runE2ESurface)
 	planOpts.MaxGaps = orDefault(opts.MaxGaps, 10)
 	planOpts.MaxGapsE2E = opts.MaxGapsE2E
 	planOpts.Audit = audit
@@ -372,6 +379,11 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 
 	// --- Generate every gap's test, then evaluate the WHOLE project ONCE ----------------
 	formatOpts := retrieval.DefaultFormatOptions()
+	// The E2E surface decides whether the prompt's E2E guidance describes a browser test or an
+	// in-process HTTP one; without it every C# repository gets the browser shape, including Web
+	// APIs with no pages to open.
+	formatOpts.E2EFramework = runE2EFramework
+	formatOpts.E2ESurface = runE2ESurface
 	applyRetrievalContextCompactToFormat(&cfg.Retrieval, &formatOpts)
 	formatOpts = resolvePromptBudget(cfg, formatOpts)
 	// Compact once per plan, before the generation loop, so every prompt (tests and docs) sees the
@@ -440,6 +452,7 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// The same detected stack the evaluator gets, so the suggested spec paths and the E2E prompt
 	// hints agree with the runner that will execute them.
 	gen.E2EFramework = runE2EFramework
+	gen.E2ESurface = runE2ESurface
 	// Give the model read-only access to the index during generation.
 	//
 	// Retrieval otherwise assembles a context once and the model gets a single turn; measured
@@ -829,6 +842,9 @@ func Run(ctx context.Context, cfg *config.Config, opts Options) (Summary, error)
 	// The fixer may now repair inherited breakage on evidence rather than on a regex guess over
 	// each round's diagnostic.
 	evalOpts.BaselineFailingPaths = append([]string(nil), baseline.Paths...)
+	// And the evaluation can tell a failure it inherited from one it caused. The baseline has
+	// computed this signature all along; until now its only reader was an audit payload.
+	evalOpts.BaselineTestSignature = baseline.TestSignature
 	evalOpts.APISurfaceProvider = apiSurface
 	evalOpts.FormatAfterFix = formatAfterFixHook
 	evalOpts.ErrorLogSummarizer = errorLogSummarizer(cfg, fixerChat)
@@ -1009,9 +1025,35 @@ func findInsertLineAboveAnnotations(lines []string, declarationLine1Based int) i
 	return insertLine
 }
 
+// isAnnotationLine reports whether a line decorates the declaration below it rather than being part
+// of it — a Java annotation or a C# attribute.
+//
+// Documentation belongs ABOVE the decorations. C# attributes were not recognised, so an XML doc
+// comment landed between `[Fact]` and the method it documents: legal, but it reads as documenting
+// nothing, and a second pass would not find it where it looks for existing docs.
+//
+// `[assembly: …]` is excluded because it decorates the ASSEMBLY, not whatever follows it — treating
+// it as a declaration's decoration would push a doc comment above a file-level attribute and attach
+// it to the wrong thing. A continuation line of a wrapped attribute list counts too: an attribute
+// argument list spans lines routinely.
 func isAnnotationLine(s string) bool {
 	s = strings.TrimSpace(s)
-	return len(s) > 0 && s[0] == '@'
+	if s == "" {
+		return false
+	}
+	if s[0] == '@' {
+		return true
+	}
+	if s[0] != '[' {
+		return false
+	}
+	lower := strings.ToLower(s)
+	for _, target := range []string{"[assembly:", "[module:"} {
+		if strings.HasPrefix(lower, target) {
+			return false
+		}
+	}
+	return true
 }
 
 // hasExistingDocAbove reports whether the symbol at insertLine1Based already has a doc comment
@@ -1149,7 +1191,19 @@ func buildLangIndexer(ctx context.Context, cfg *config.Config, repoAbs, lang str
 		}
 		parsed = indexer.FilterParsedMapBySkipPrefixes(parsed, cfg.Indexer.SkipPathPrefixes)
 		indexer.AddJavaParsedMapPathAliases(parsed)
-		return javaAdvancedLangIndexer(parsed), indexer.IndexablePathsFromParsedMap(parsed), nil
+		// An OpenAPI or Swagger document declares routes no C# source states — a spec-first
+		// project's controllers are generated, and the spec is the only place the contract lives.
+		indexer.MergeOpenAPISpecFilesIntoMap(repoAbs, parsed)
+		// Razor pages, MVC views and Blazor components: the route a page answers at, the controls
+		// a test can address, and the text it can assert on. None of it is in a .cs file, so a
+		// generated UI test had no selector to use and no URL to navigate to, and invented both.
+		indexer.MergeCSharpMarkupIntoMap(repoAbs, parsed)
+		// Markup reaches indexing too. A Razor page or Blazor component is where a UI surface's
+		// routes, its rendered text and its test hooks live, and IndexablePaths built from the
+		// PARSED map alone could never contain one: the Roslyn indexer reads .cs and nothing else,
+		// so those files were filtered out before the index phase ever saw them.
+		return javaAdvancedLangIndexer(parsed),
+			appendCSharpMarkupPaths(indexer.IndexablePathsFromParsedMap(parsed), repoAbs), nil
 	case "java":
 		if strings.EqualFold(strings.TrimSpace(cfg.Indexer.Type), "advanced") && strings.TrimSpace(cfg.Indexer.AdvancedJarPath) != "" {
 			parsed, err := javaindexer.RunJAR(ctx, repoAbs, cfg.Indexer.AdvancedJarPath, javaindexerRunJARConfig(cfg, 0))
@@ -1269,7 +1323,7 @@ func pruneEmbeddingCache(store *embeddings.Store, retentionDays int) {
 // are deliberately LEFT AT ZERO here: retrieval substitutes its Default* constants for a zero,
 // which is exactly what every shipped config resolved to, and upstream's config restructure froze
 // those keys pending an A/B. Wiring them now would promote unmeasured defaults (rule 10).
-func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval.PlanOptions {
+func buildPlanOptions(cfg *config.Config, workflowLang, repoID, e2eSurface string) retrieval.PlanOptions {
 	lang := strings.TrimSpace(workflowLang)
 	if lang == "" {
 		lang = "java"
@@ -1284,7 +1338,8 @@ func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval
 		MaxGapsPerFile:            cfg.Indexer.MaxGapsPerFile,
 		MaxGapsE2E:                cfg.Indexer.MaxGapsE2E,
 		MaxGapsPerFileE2E:         cfg.Indexer.MaxGapsPerFileE2E,
-		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang),
+		RetrievalProfileE2E:       defaultRetrievalProfileE2E(cfg, lang, e2eSurface),
+		E2ESurface:                strings.TrimSpace(e2eSurface),
 		CriticalModulePrefixes:    cfg.Indexer.CriticalModulePrefixes,
 		SkipPathPrefixes:          cfg.Indexer.SkipPathPrefixes,
 		DependencyMaxDepth:        cfg.Retrieval.DependencyMaxDepth,
@@ -1303,7 +1358,10 @@ func buildPlanOptions(cfg *config.Config, workflowLang, repoID string) retrieval
 
 // defaultRetrievalProfileE2E resolves the E2E retrieval profile: explicit profile_e2e, else the
 // unit profile, else a language default (http_api for backends, e2e_playwright otherwise).
-func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string {
+// e2eSurface is what an E2E test can drive against the application, detected at bootstrap. A C#
+// ui/mixed surface retrieves the full stack: http_api for every C# repo is right for a Web API and
+// wrong for a Razor Pages one, whose testable surface is pages. Empty = not detected.
+func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang, e2eSurface string) string {
 	if cfg == nil {
 		return string(retrieval.ProfileE2EPlaywright)
 	}
@@ -1313,12 +1371,17 @@ func defaultRetrievalProfileE2E(cfg *config.Config, workflowLang string) string 
 	if s := strings.TrimSpace(cfg.Retrieval.Profile); s != "" {
 		return s
 	}
-	switch strings.ToLower(strings.TrimSpace(workflowLang)) {
-	case "java", "csharp", "cs":
+	if langid.IsCSharp(workflowLang) {
+		switch strings.ToLower(strings.TrimSpace(e2eSurface)) {
+		case "ui", "mixed":
+			return string(retrieval.ProfileFullStack)
+		}
 		return string(retrieval.ProfileHTTPAPI)
-	default:
-		return string(retrieval.ProfileE2EPlaywright)
 	}
+	if langid.IsJava(workflowLang) {
+		return string(retrieval.ProfileHTTPAPI)
+	}
+	return string(retrieval.ProfileE2EPlaywright)
 }
 
 // applyRetrievalAbstentionDefaults sets PlanOptions sufficiency fields from config.

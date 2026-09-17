@@ -77,6 +77,15 @@ type Contract struct {
 	// "Cannot find module", although the bootstrap had detected the module type and said nothing.
 	ModuleType string `json:"module_type,omitempty"`
 
+	// E2ESurface is what an E2E test can drive against this application: none, api, ui or mixed.
+	// Detected at bootstrap from the project's own files, or forced by
+	// bootstrap.policy.e2e_framework.surface. Empty in a contract written before this field existed,
+	// which readers must treat as "unknown" rather than "none" — C# only today.
+	E2ESurface string `json:"e2e_surface,omitempty"`
+	// UIFramework names how the UI is built when E2ESurface is ui or mixed (razor-pages, mvc-views,
+	// blazor-server, blazor-wasm, spa-static), which decides how a browser test reaches a page.
+	UIFramework string `json:"ui_framework,omitempty"`
+
 	// AvailablePackages are the coordinates on the test classpath, in the ecosystem's own notation.
 	AvailablePackages []string `json:"available_packages,omitempty"`
 	// AvailableImports are the import roots a generated test may reference. This is the field that
@@ -99,6 +108,18 @@ type Contract struct {
 	// they are version truth by construction and need no table. Empty when no classpath could be
 	// resolved, when the language has no such list, or when a name resolved ambiguously.
 	CanonicalImports map[string]string `json:"canonical_imports,omitempty"`
+
+	// TestProject is the repo-relative project file bootstrap ensured the stack ON: the .csproj for
+	// .NET, and empty for languages with no such notion.
+	//
+	// Generation needs it because it was deriving its own answer and getting a different one. A
+	// validation run had four test projects under tests/; bootstrap patched the FunctionalTests one
+	// (chosen from the root solution, which is what the evaluator builds) and added Moq,
+	// FluentAssertions and EF InMemory to it, while generation's own filesystem walk scored every
+	// candidate identically and took the alphabetically first — an Aspire integration-test project.
+	// All ten generated tests landed in a project the solution does not list, so none was compiled,
+	// none ran, and the run still reported compile=ok.
+	TestProject string `json:"test_project,omitempty"`
 
 	// Verified reports whether a smoke test actually compiled AND ran against this stack during this
 	// run. False when bootstrap skipped because the stack was already complete — the packages are

@@ -30,7 +30,13 @@ import (
 // A walk error also yields supported=false. An incomplete set is worse than none: every name the
 // walk failed to see would read as proof of absence.
 func RepoDeclaredSimpleNames(lang Lang, repoRoot string) (map[string]bool, bool) {
-	if lang != LangJava || strings.TrimSpace(repoRoot) == "" {
+	if strings.TrimSpace(repoRoot) == "" {
+		return nil, false
+	}
+	if lang == LangCSharp {
+		return csharpDeclaredSimpleNames(repoRoot)
+	}
+	if lang != LangJava {
 		return nil, false
 	}
 	out := map[string]bool{}

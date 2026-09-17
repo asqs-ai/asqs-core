@@ -441,7 +441,7 @@ func collectTSClassMembers(repoRoot, rel, name string, depth int) (*tsClassMembe
 		}
 		var parent *tsClassMembers
 		ok := false
-		if regexp.MustCompile(`\bclass\s+`+base+`\b`).MatchString(src) {
+		if regexp.MustCompile(`\bclass\s+` + base + `\b`).MatchString(src) {
 			parent, ok = collectTSClassMembers(repoRoot, rel, base, depth+1)
 		} else {
 			bind, has := tsImportBindings(stripJSComments(string(body)))[base]

@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 	"github.com/asqs/asqs-core/internal/runner/profile"
 )
 
@@ -21,18 +22,10 @@ var (
 
 const maxDotnetWalkDepth = 12
 
+// dotnetEvalSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func dotnetEvalSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case "node_modules", ".git", "dist", "build", "bin", "obj", "target", "packages",
-		".vs", "venv", "__pycache__", "vendor", "coverage", "playwright-report",
-		"test-results", ".gradle", ".idea":
-		return true
-	default:
-		if len(name) > 0 && name[0] == '.' && name != "." && name != ".." {
-			return true
-		}
-		return false
-	}
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func dotnetRepoRelDepth(repo, absPath string) int {
@@ -43,11 +36,6 @@ func dotnetRepoRelDepth(repo, absPath string) int {
 		return 0
 	}
 	return strings.Count(rel, string(filepath.Separator))
-}
-
-func isSdkStyleCsprojContent(content string) bool {
-	s := strings.ToLower(content)
-	return strings.Contains(s, `sdk="microsoft.net.sdk"`) || strings.Contains(s, `sdk='microsoft.net.sdk'`)
 }
 
 func rootSlnRel(repo string) (rel string, ok bool, err error) {
@@ -131,7 +119,7 @@ func discoverSDKStyleCsprojPathsForDotnet(repo string) ([]string, error) {
 		if err != nil {
 			continue
 		}
-		if isSdkStyleCsprojContent(string(b)) {
+		if dotnetproj.IsSDKStyle(string(b)) {
 			out = append(out, p)
 		}
 	}
@@ -233,26 +221,26 @@ func argvAlreadyHasTargetFrameworkMSBuildProp(argv []string) bool {
 	return false
 }
 
-// CsprojDeclaresConcreteTargetFramework is true when the file has a non-empty TargetFramework / TargetFrameworks value that is not an MSBuild property reference like $(Foo).
-func CsprojDeclaresConcreteTargetFramework(path string) (bool, error) {
-	b, err := os.ReadFile(path)
+// ProjectResolvesConcreteTargetFramework is true when a project evaluates to a non-empty
+// TargetFramework / TargetFrameworks that is not an MSBuild property reference like $(Foo).
+//
+// EVALUATES, not declares in its own file. The fallback its callers apply exists for a project
+// MSBuild cannot resolve a framework for, and reading the .csproj alone answers a different
+// question: a repository that declares its framework once, in Directory.Build.props — the layout
+// every solution with central properties uses, including the Clean Architecture template — read as
+// declaring none. The run then pinned the configured fallback over the framework the project
+// actually restores for, and `dotnet build` stopped at NETSDK1005, "Assets file … doesn't have a
+// target for 'net8.0'", before a single test was generated. Same shape as the coverlet gate reading
+// PackageReference from the project alone, and fixed the same way: through ResolveFacts, which
+// evaluates the Directory.Build.props / .targets chain.
+//
+// repoRoot bounds that walk. A props file above the checkout belongs to somebody else.
+func ProjectResolvesConcreteTargetFramework(repoRoot, csprojAbs string) (bool, error) {
+	facts, err := dotnetproj.ResolveFacts(repoRoot, csprojAbs)
 	if err != nil {
 		return false, err
 	}
-	s := reCsprojXMLComments.ReplaceAllString(string(b), "")
-	for _, m := range reCsprojTargetFramework.FindAllStringSubmatch(s, -1) {
-		v := strings.TrimSpace(m[1])
-		if v != "" && !strings.HasPrefix(v, "$(") {
-			return true, nil
-		}
-	}
-	for _, m := range reCsprojTargetFrameworks.FindAllStringSubmatch(s, -1) {
-		v := strings.TrimSpace(m[1])
-		if v != "" && !strings.HasPrefix(v, "$(") {
-			return true, nil
-		}
-	}
-	return false, nil
+	return len(facts.TFMs) > 0, nil
 }
 
 // insertDotnetTargetFrameworkMSBuildProp adds /p:TargetFramework=… immediately after the dotnet CLI verb for most commands.
@@ -282,8 +270,8 @@ func insertDotnetTargetFrameworkMSBuildProp(argv []string, fallback string) []st
 	}
 }
 
-// applyDotnetTargetFrameworkFallbackArgv inserts /p:TargetFramework=<fallback> when fallback is set and the entry .csproj
-// does not declare a concrete TFM in the project file itself (no repo edits). cwdAbs is the dotnet working directory.
+// applyDotnetTargetFrameworkFallbackArgv inserts /p:TargetFramework=<fallback> when fallback is set and the entry project
+// does not EVALUATE to a concrete TFM — its own file or anything it inherits (no repo edits). cwdAbs is the dotnet working directory.
 func applyDotnetTargetFrameworkFallbackArgv(argv []string, cwdAbs, fallback string) ([]string, error) {
 	fallback = strings.TrimSpace(fallback)
 	if fallback == "" || len(argv) < 2 || !dotnetFirstArgIsCLI(argv) {
@@ -320,7 +308,7 @@ func applyDotnetTargetFrameworkFallbackArgv(argv []string, cwdAbs, fallback stri
 	if err != nil || st.IsDir() {
 		return argv, nil
 	}
-	ok, err := CsprojDeclaresConcreteTargetFramework(absProj)
+	ok, err := ProjectResolvesConcreteTargetFramework(cwdAbs, absProj)
 	if err == nil && ok {
 		return argv, nil
 	}
@@ -395,7 +383,7 @@ func ensureDotnetProjectArgPreferred(p profile.ToolchainProfile, argv []string, 
 }
 
 // dotnetShellLineWithProject appends a quoted repo-relative project/solution path for `sh -c` local runs (cwd = repo).
-// When fallbackTFM is set and the entry is a .csproj without a concrete in-file TFM, inserts /p:TargetFramework=… before the project path.
+// When fallbackTFM is set and the entry is a .csproj that evaluates to no concrete TFM, inserts /p:TargetFramework=… before the project path.
 func dotnetShellLineWithProject(repo, commandPrefix string, fallbackTFM string) (string, error) {
 	repo = filepath.Clean(repo)
 	rel, err := resolveDotnetEntryRel(repo)
@@ -409,7 +397,7 @@ func dotnetShellLineWithProject(repo, commandPrefix string, fallbackTFM string) 
 	fallbackTFM = strings.TrimSpace(fallbackTFM)
 	if fallbackTFM != "" && strings.HasSuffix(strings.ToLower(rel), ".csproj") {
 		abs := filepath.Join(repo, filepath.FromSlash(rel))
-		ok, err := CsprojDeclaresConcreteTargetFramework(abs)
+		ok, err := ProjectResolvesConcreteTargetFramework(repo, abs)
 		if err != nil || !ok {
 			line += " /p:TargetFramework=" + fallbackTFM
 		}

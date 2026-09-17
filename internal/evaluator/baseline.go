@@ -38,10 +38,30 @@ type BaselineFailures struct {
 	// Signature is the position-insensitive failure signature of the baseline output, so a later
 	// identical failure is recognisable across line-number drift.
 	Signature string
-	// Paths are the repo-relative files the baseline diagnostic blamed, sorted.
+	// Paths are the repo-relative files the baseline diagnostics blamed, compile and test together,
+	// sorted. One set, because every consumer asks the same question of it — "was this file already
+	// failing?" — and the step that broke it does not change the answer.
 	Paths []string
 	// Summary is a short excerpt for audit.
 	Summary string
+
+	// TestsCaptured is false when the test baseline was not attempted — no test step to run, or a
+	// tree that did not compile, where a test result would mean nothing. Readers must treat it as
+	// "cannot classify test failures" rather than as "the tests passed".
+	//
+	// A compiling tree can still be red, and the baseline used to stop at the compiler. A validation
+	// run is the case and it cost the run its verdict: four tests were already failing for reasons
+	// the run had no part in — one asserts Docker is running, which it is not inside the eval
+	// container, and three more fall through to a SQLite path that only executes when Docker is
+	// absent. None of the ten generated tests failed. The run spent 34 minutes in the fix loop on
+	// inherited breakage and reported unstable.
+	TestsCaptured bool
+	// TestsClean is true when the baseline test step passed.
+	TestsClean bool
+	// TestSignature is the position-insensitive signature of the baseline test failure.
+	TestSignature string
+	// TestSummary is a short excerpt of the baseline test failure, for audit.
+	TestSummary string
 }
 
 // Inherited reports whether path was already failing before this run started.
@@ -83,29 +103,46 @@ func CaptureBaselineFailures(ctx context.Context, runner SandboxRunner, in EvalO
 	opts.ArtifactPaths = nil
 	opts.Fixer = nil
 
-	res := RunCompile(ctx, runner, opts)
-	if res.OK {
-		return BaselineFailures{Captured: true, Clean: true}
-	}
-	cited := errout.AllCitedRepoPaths(res.Output, filepath.Clean(repo))
-	paths := make([]string, 0, len(cited))
+	out := BaselineFailures{Captured: true, Clean: true}
 	seen := map[string]bool{}
-	for _, p := range cited {
-		n := normalizeRel(p)
-		if n == "" || seen[n] {
-			continue
+	add := func(output string) {
+		for _, p := range errout.AllCitedRepoPaths(output, filepath.Clean(repo)) {
+			n := normalizeRel(p)
+			if n == "" || seen[n] {
+				continue
+			}
+			seen[n] = true
+			out.Paths = append(out.Paths, n)
 		}
-		seen[n] = true
-		paths = append(paths, n)
 	}
-	sort.Strings(paths)
-	return BaselineFailures{
-		Captured:  true,
-		Clean:     false,
-		Signature: FailureSignature(opts.Lang, StepCompile, res.Output),
-		Paths:     paths,
-		Summary:   firstLines(res.Output, 3),
+
+	if res := RunCompile(ctx, runner, opts); !res.OK {
+		out.Clean = false
+		out.Signature = FailureSignature(opts.Lang, StepCompile, res.Output)
+		out.Summary = firstLines(res.Output, 3)
+		add(res.Output)
+		// A tree that does not compile cannot be tested, and a test result taken here would say
+		// nothing about what this run inherits. Leaving TestsCaptured false is the honest blank.
+		sort.Strings(out.Paths)
+		return out
 	}
+
+	// The compile baseline answers "what was already broken"; it does not answer "what was already
+	// FAILING", and those are different sets. Running the tests once more here is the price of
+	// telling a run that inherited a red suite apart from a run that turned a green one red.
+	res := RunTest(ctx, runner, opts, strings.TrimSpace(opts.TestCommand))
+	out.TestsCaptured = true
+	out.TestsClean = res.OK
+	if !res.OK {
+		// Taken over the FAILURES in the log rather than the log, or a run that adds passing tests —
+		// which is the whole job — changes the hash and its own inherited failures stop matching.
+		// TestFailureSignature is the same function the comparison uses; the two must not drift.
+		out.TestSignature = TestFailureSignature(opts.Lang, res.Output)
+		out.TestSummary = baselineTestSummary(res.Output)
+		add(res.Output)
+	}
+	sort.Strings(out.Paths)
+	return out
 }
 
 // ClassifyFailures splits the paths a later diagnostic blames into those the baseline already had
@@ -158,9 +195,9 @@ func (p BaselineProgress) Describe() string {
 	}
 	if p.BaselineCount == 0 {
 		if p.Introduced == 0 {
-			return "the tree compiled before the run and still does"
+			return "the tree was green before the run and still is"
 		}
-		return fmt.Sprintf("the tree compiled before the run; this run introduced %d failing file(s)", p.Introduced)
+		return fmt.Sprintf("the tree was green before the run; this run introduced %d failing file(s)", p.Introduced)
 	}
 	return fmt.Sprintf("%d of %d inherited failing file(s) remain; this run introduced %d",
 		p.StillFailing, p.BaselineCount, p.Introduced)
@@ -178,6 +215,45 @@ func EvaluateBaselineProgress(baseline BaselineFailures, finalErrorOutput, repoP
 		Introduced:    len(introduced),
 		Known:         true,
 	}
+}
+
+// baselineTestSummary renders the baseline's test failure for the audit.
+//
+// It used to be firstLines(output, 3). On a 1738-line xUnit log the first three lines are the
+// framework's "Test run for ..." banner, so run api-8d5367b3383017e25f09e53dacf6c275 recorded a
+// 348-character baseline summary naming no failure at all — beside a list of nine failing paths.
+// Whoever reads that row can see WHICH files were already red and never why, which is exactly the
+// question "did this run break it, or inherit it?" needs answered.
+//
+// errout.ExtractTestFailureBlocks is the same sanitiser the fix loop's prompt uses, so the baseline
+// row and the round that has to act on it describe the failure the same way. The head fallback is
+// for output it does not recognise: a baseline that failed and reports no reason is worse than a
+// truncated one.
+func baselineTestSummary(output string) string {
+	if strings.TrimSpace(output) == "" {
+		return ""
+	}
+	if blocks := strings.TrimSpace(errout.ExtractTestFailureBlocks(output)); blocks != "" {
+		return truncateRunes(blocks, maxBaselineTestSummaryRunes)
+	}
+	return truncateRunes(firstLines(output, baselineTestSummaryFallbackLines), maxBaselineTestSummaryRunes)
+}
+
+// maxBaselineTestSummaryRunes bounds the audit row. Long enough for the failure and a frame or two,
+// short enough that a suite failing in a hundred places does not put a log in the audit stream.
+const maxBaselineTestSummaryRunes = 4000
+
+// baselineTestSummaryFallbackLines is the head kept when nothing in the output is recognisable as a
+// test failure. More than the three that produced the banner, since an unrecognised format is
+// precisely the case where context is needed.
+const baselineTestSummaryFallbackLines = 20
+
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "\n… (truncated)"
 }
 
 func firstLines(s string, n int) string {

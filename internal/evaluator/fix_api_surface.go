@@ -26,7 +26,7 @@ func lookupAPISurface(ctx context.Context, opts EvalOptions, errorOutput string,
 	// javac's `location:` line names the ENCLOSING class for an unresolved-symbol error, which is
 	// the file under repair. Asking the classpath about the repo's own test class is a lookup that
 	// can only miss, and it burns one of the bounded target slots.
-	targets = apisurface.FilterOwnedTypes(targets, repoDeclaredTypeNames(files))
+	targets = apisurface.FilterOwnedTypes(targets, repoDeclaredTypeNamesForLang(opts.Lang, files))
 	// Drop JDK/BCL types: their member lists are budget the prompt cannot spare and knowledge the
 	// model already has. Unresolved simple names survive — resolving one to its import line is the
 	// whole point. The language is what decides whether an unqualified name counts as unresolvable
@@ -132,6 +132,16 @@ func absentTargetNames(targets []apisurface.Target, surfaces []apisurface.TypeSu
 	return out
 }
 
+// NOTE: this wrapper currently has no caller in this repository — the fix loop here does not run an
+// unresolved-dependency rejection. Both language arms are available in apisurface for when it does:
+// CSharpIntroducedUnresolvedUsingReason (repository namespaces and referenced package ids) and
+// TSIntroducedUnresolvedImportReason (package.json manifests). Wiring either is a behaviour change,
+// not a port, and belongs to its own ticket — and the change would not be free: in asqs-go this
+// stage refused three correct repairs in a row and ended run api-bdf7539b296a0df65a7cf1bf2bf2739b
+// at iteration 4 of 20. Both arms now take their evidence from the repository rather than the fix
+// prompt, which is what made those refusals possible; a caller here should still expect the stage
+// to be able to stop a run.
+//
 // introducedUnresolvedDependencyReason is the fixer-side wrapper over
 // apisurface.IntroducedUnresolvedDependencyReason: it applies the same provability bounds the
 // generator's call has, plus the two the fixer needs.

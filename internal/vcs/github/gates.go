@@ -3,6 +3,8 @@ package github
 import (
 	"context"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/vcs"
 )
 
 // GateResult is the result of running all gating rules.
@@ -115,14 +117,7 @@ func (g *Gates) RunGates(ctx context.Context, pr *PRContext) GateResult {
 		if len(g.Options.SupportedLanguages) > 0 {
 			lang, err := g.RepoInspector.DetectLanguage(ctx, pr.CloneURL, pr.HeadSHA)
 			if err == nil && lang != "" {
-				ok := false
-				for _, l := range g.Options.SupportedLanguages {
-					if l == lang {
-						ok = true
-						break
-					}
-				}
-				if !ok {
+				if !vcs.LanguageSupported(g.Options.SupportedLanguages, lang) {
 					failed = append(failed, "unsupported_language")
 					return GateResult{Pass: false, Reason: "language/framework not supported", Failed: failed}
 				}

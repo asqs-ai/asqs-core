@@ -83,15 +83,20 @@ func coverageRegressionReason(path, before, after string) string {
 // (fully-qualified usage, annotations processed by name, string-based reflection).
 func unusedImportResidueReason(path, before, after string) string {
 	base := strings.ToLower(filepath.Base(path))
-	if !strings.HasSuffix(base, ".java") {
+	simpleNames, stripLines := javaImportSimpleNames, stripJavaImportLines
+	switch {
+	case strings.HasSuffix(base, ".java"):
+	case strings.HasSuffix(base, ".cs"):
+		simpleNames, stripLines = csharpUsingSimpleNames, stripCSharpUsingLines
+	default:
 		return ""
 	}
 	beforeImports := map[string]bool{}
-	for _, m := range javaImportSimpleNames(before) {
+	for _, m := range simpleNames(before) {
 		beforeImports[m] = true
 	}
 	var unused []string
-	for _, name := range javaImportSimpleNames(after) {
+	for _, name := range simpleNames(after) {
 		if beforeImports[name] {
 			continue // pre-existing; not this write's doing
 		}
@@ -99,7 +104,7 @@ func unusedImportResidueReason(path, before, after string) string {
 			continue
 		}
 		// Strip the import lines themselves before looking for a use.
-		body := stripJavaImportLines(after)
+		body := stripLines(after)
 		if !strings.Contains(body, name) {
 			unused = append(unused, name)
 		}
@@ -108,6 +113,63 @@ func unusedImportResidueReason(path, before, after string) string {
 		return ""
 	}
 	return "added import(s) nothing references: " + strings.Join(unused, ", ")
+}
+
+// csharpUsingSimpleNames returns the identifier each using DIRECTIVE in src puts in scope — which,
+// in C#, only ONE form actually has.
+//
+// Java's rule is "take the last segment of the import and look for it in the body", and it works
+// because `import a.b.C;` imports the TYPE C. Neither C# form behaves that way:
+//
+//	using Moq;                   // imports a NAMESPACE; a test writing `new Mock<IRepo>()`
+//	                             // never contains the word "Moq"
+//	using static Xunit.Assert;   // imports Assert's MEMBERS; the body writes `True(...)`,
+//	                             // not `Assert`
+//
+// Applying Java's rule to either would report a correct file's imports as dead residue, and this
+// advisory goes straight into the fixer's prompt. Only the alias form names an identifier the body
+// is obliged to write:
+//
+//	using Sut = Shop.Core.Basket;   // the body must say `Sut`
+//
+// So that is the only form judged here. The rest is left to the compiler, which reports an
+// unnecessary directive as CS8019 and is the only thing that can actually know.
+func csharpUsingSimpleNames(src string) []string {
+	var out []string
+	for _, ln := range strings.Split(src, "\n") {
+		s := strings.TrimSpace(ln)
+		s = strings.TrimPrefix(s, "global ")
+		if !strings.HasPrefix(s, "using ") || !strings.HasSuffix(s, ";") || strings.Contains(s, "(") {
+			continue
+		}
+		s = strings.TrimSuffix(strings.TrimSpace(strings.TrimPrefix(s, "using ")), ";")
+		if strings.HasPrefix(s, "static ") {
+			continue
+		}
+		if i := strings.Index(s, "="); i > 0 {
+			if alias := strings.TrimSpace(s[:i]); alias != "" {
+				out = append(out, alias)
+			}
+		}
+	}
+	return out
+}
+
+// stripCSharpUsingLines blanks the using directives so a name is not found in its own import.
+func stripCSharpUsingLines(src string) string {
+	var b strings.Builder
+	for _, ln := range strings.Split(src, "\n") {
+		s := strings.TrimSpace(ln)
+		if strings.HasPrefix(s, "using ") || strings.HasPrefix(s, "global using ") {
+			if strings.HasSuffix(s, ";") && !strings.Contains(s, "(") {
+				b.WriteString("\n")
+				continue
+			}
+		}
+		b.WriteString(ln)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // javaImportSimpleNames returns the trailing identifier of every import in src.

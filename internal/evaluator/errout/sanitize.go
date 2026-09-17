@@ -37,8 +37,84 @@ func Sanitize(lang, raw string) string {
 	switch normLang {
 	case "java", "kotlin", "scala":
 		return sanitizeMavenLike(raw)
+	case "csharp", "cs":
+		return sanitizeMSBuildLike(raw)
 	default:
 		return raw
+	}
+}
+
+// sanitizeMSBuildLike trims the noise MSBuild adds around a compile failure.
+//
+// MSBuild prints every diagnostic TWICE: once inline as it compiles, and again in a recap after
+// `Build FAILED.`. It then adds a `N Warning(s) / M Error(s)` tally and a `Time Elapsed` line. For a
+// failure with a dozen errors that is half the fixer's prompt budget spent on a verbatim copy of
+// the output's own first half — and Sanitize returned the raw text for every language but Java, so
+// no C# failure was ever trimmed.
+//
+// The inline diagnostics are kept and the recap is cut, not the other way round: the inline copy
+// appears in build order, next to the project that produced it. Idempotent, like the Maven path.
+func sanitizeMSBuildLike(raw string) string {
+	lines := strings.Split(raw, "\n")
+
+	// Cut at the recap header, but only when the diagnostics it repeats are already above it.
+	// A build that fails before any diagnostic is emitted (a missing project, a bad SDK) has its
+	// only explanation below that line.
+	cut := -1
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if t != "Build FAILED." && t != "Build succeeded." {
+			continue
+		}
+		if t == "Build FAILED." && !hasMSBuildDiagnosticAbove(lines[:i]) {
+			break
+		}
+		cut = i
+		break
+	}
+	if cut >= 0 {
+		keep := lines[:cut+1]
+		lines = keep
+	}
+
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if isMSBuildEpilogueLine(line) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return collapseBlankRuns(strings.Join(out, "\n"))
+}
+
+// reMSBuildDiagnostic matches a compiler or NuGet diagnostic line: `<path>(12,5): error CS1061: …`
+// or `error NU1301: …`.
+var reMSBuildDiagnostic = regexp.MustCompile(`(?i):\s*(?:error|warning)\s+(?:CS|NU|MSB|NETSDK)\d+`)
+
+func hasMSBuildDiagnosticAbove(lines []string) bool {
+	for _, l := range lines {
+		if reMSBuildDiagnostic.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
+
+// reMSBuildTally matches the `    0 Warning(s)` / `    2 Error(s)` footer.
+var reMSBuildTally = regexp.MustCompile(`^\s*\d+\s+(?:Warning|Error)\(s\)\s*$`)
+
+// isMSBuildEpilogueLine reports whether a line is MSBuild bookkeeping rather than a diagnostic.
+// The tally is dropped because the errors themselves are still in the text and a count of them is
+// not a fact the fixer can act on; `Time Elapsed` is never actionable.
+func isMSBuildEpilogueLine(line string) bool {
+	t := strings.TrimSpace(line)
+	switch {
+	case reMSBuildTally.MatchString(line):
+		return true
+	case strings.HasPrefix(t, "Time Elapsed"):
+		return true
+	default:
+		return false
 	}
 }
 
@@ -326,4 +402,39 @@ func tryResolveUnderRepo(repoRoot, raw string) (string, bool) {
 		return filepath.ToSlash(rel), true
 	}
 	return "", false
+}
+
+// ExtractCompileDiagnostics returns the lines of a build log that carry a compiler diagnostic, in
+// order, or "" when none does.
+//
+// The compile branch of a failing step used to be summarised from the head of the log, which works
+// for javac — Maven prints `[ERROR] COMPILATION ERROR` first — and not at all for MSBuild, which
+// opens with the projects that BUILT. A validation run recorded eight
+// identical audit rows reading "compile step failed: Clean.Architecture.Core -> …Core.dll", a
+// success line, while the CS0246 that actually stopped the build sat forty lines further down. The
+// audit is the only artifact a post-mortem has, and for eight rounds of a failing compile it
+// carried no diagnostic at all.
+//
+// It returns the log FROM the first diagnostic line onwards rather than the matching lines alone:
+// a compiler diagnostic is rarely one line. Maven prints `[ERROR] COMPILATION ERROR :` and then the
+// per-file errors under it, javac follows each error with `symbol:` and `location:`, and Roslyn
+// puts the project that failed in brackets after the message. Keeping only the lines that match
+// would throw that context away, and a caller taking the head of the result would show the reader
+// less than the head of the raw log did.
+//
+// Same patterns IsCompileShaped keys on, so "this log is compile-shaped" and "where its diagnostics
+// start" cannot disagree.
+func ExtractCompileDiagnostics(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	lines := strings.Split(raw, "\n")
+	for i, line := range lines {
+		for _, re := range compileSignalPatterns {
+			if re.MatchString(line) {
+				return strings.Join(lines[i:], "\n")
+			}
+		}
+	}
+	return ""
 }

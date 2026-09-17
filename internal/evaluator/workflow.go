@@ -120,6 +120,17 @@ type EvalOptions struct {
 	E2ETestCommand string
 	// E2EFramework: JS/TS playwright|cypress; Java playwright-java|selenium|selenide; C# playwright-dotnet|selenium.
 	E2EFramework string
+	// E2ESurface is what an E2E test can drive: none, api, ui or mixed.
+	//
+	// It decides whether the C# E2E pass needs the application RUNNING. A browser test does, and
+	// Playwright .NET has no webServer block to start one — so ASQS starts it and exports
+	// ASQS_BASE_URL. An api surface does not: WebApplicationFactory hosts the application inside
+	// the test process, and starting a second copy would only contend for a port.
+	//
+	// Empty means "not detected", which is treated as possibly having a UI: the surface is a
+	// refinement, and refusing to start the application because nobody detected one would break
+	// exactly the case this exists for.
+	E2ESurface string
 	// RunE2ETestPass when true: after the unit test step succeeds, run a second test step (JS/TS, Java, C# when enabled).
 	RunE2ETestPass bool
 	// RepeatedTestFailureThreshold: after this many consecutive evaluation iterations with the same failing generated test fingerprint (unit or E2E), stop the fix loop early. 0 = default 5; negative = disabled. See EvalWorkflowResult.EarlyExitDiscardPaths.
@@ -170,6 +181,15 @@ type EvalOptions struct {
 	// writable set as a known input rather than being re-derived from each round's diagnostic by
 	// regex, which is what the derived-path fallback below has to do without them.
 	BaselineFailingPaths []string
+	// BaselineTestSignature is the position-insensitive signature of the test failure this run
+	// INHERITED, taken from the pre-generation test run over its full output.
+	//
+	// The baseline has computed it all along and nothing compared it: its only consumers were two
+	// audit payload fields. So a run ending test=fail could not say whether it broke something or
+	// merely failed to repair what was already red — which is the question that decides whether the
+	// run may ship. Empty when the baseline captured no test failure, and an empty signature never
+	// matches: the claim "this was already failing" is made on evidence or not at all.
+	BaselineTestSignature string
 	// AllowFixCoverageReduction (escape hatch, default false) lets a fixer write through even when
 	// it reduces the number of test methods in a file. Off by default because the observed failure
 	// mode was the fixer "repairing" a compile error by deleting the tests and the round being
@@ -229,6 +249,10 @@ type EvalWorkflowResult struct {
 	TestOKWithoutFix bool
 	CompileFixCount  int // LLM fix invocations for StepCompile
 	TestFixCount     int // LLM fix invocations for StepTest or StepTestE2E (shared budget in loop)
+	// TestFailureInherited is true when the last failing test step reproduced the baseline's own
+	// test failure. Reported only: Stable still requires every step to pass, and whether an
+	// inherited-only failure may ship is a decision for the caller, not for this loop.
+	TestFailureInherited bool
 
 	// EarlyExitDiscardPaths: set when the fix loop stopped early because the same generated tests failed repeatedly (RepeatedTestFailureThreshold). Orchestrator applies discards like max-iteration unstable handling.
 	EarlyExitDiscardPaths []string
@@ -540,10 +564,23 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 		if !testRes.OK {
 			e2eFailStreak, e2eFailFP = 0, ""
 			out.LastFixAction = FixAssumptions
+			inherited := baselineTestFailureRepeated(opts, testRes.Output)
+			out.TestFailureInherited = inherited
 			if audit != nil {
 				audit.LogError(ctx, "evaluator.test_failed", map[string]interface{}{
 					"message": fmt.Sprintf("Unit tests failed; suggested action: adjust assumptions. %s", testRes.Summary),
 					"action":  FixAssumptions, "output": testRes.Output, "pass": "unit",
+					// Reported, not acted on. Whether a run whose only failure is the one it
+					// inherited may ship is a policy decision; this is the evidence it needs.
+					"failure_inherited": inherited,
+				})
+			}
+			if inherited && audit != nil {
+				audit.Log(ctx, "evaluator.test_failure_inherited", map[string]interface{}{
+					"message": "This test failure is byte-for-byte the one the baseline recorded before generation: " +
+						"the run did not cause it and has not repaired it. Stability is unchanged — the verdict still " +
+						"requires every step to pass.",
+					"step": StepTest,
 				})
 			}
 			infraKind := errclass.Kind(opts.Lang, testRes.Output)
@@ -595,7 +632,18 @@ func RunEvaluation(ctx context.Context, runner SandboxRunner, opts EvalOptions, 
 		if opts.RunE2ETestPass && dualE2EPassSupportedLang(opts.Lang) {
 			e2eCmd := resolveE2ETestCommand(opts)
 			if strings.TrimSpace(e2eCmd) != "" {
-				testE2E := RunTestE2E(ctx, runner, opts, e2eCmd)
+				// A browser-driven C# E2E pass needs the application RUNNING, and Playwright .NET
+				// has no webServer block to start one. Without this a generated
+				// page.GotoAsync(baseUrl) has no URL: the test fails on an empty variable, which
+				// says nothing about the application and which no fix round can repair.
+				// Deferred inside its own scope: the restore puts back an environment variable, ends
+				// the application's process group and releases the lock that serialises all three.
+				// A panic in the step with the call sited after it leaked every one of them.
+				testE2E := func() StepResult {
+					restoreEnv := applyCSharpE2EAppServerEnv(ctx, opts, audit)
+					defer restoreEnv()
+					return RunTestE2E(ctx, runner, opts, e2eCmd)
+				}()
 				testE2E.Step = StepTestE2E
 				if testE2E.Summary != "" && !strings.HasPrefix(strings.ToLower(testE2E.Summary), "e2e") {
 					testE2E.Summary = "e2e: " + testE2E.Summary
@@ -1830,6 +1878,49 @@ func mergeFixRequestAuditErrorOutput(canonicalErr string, errorOutputRaw string,
 // The third return value is the FixSkip* reason when nothing was written, empty on success. It
 // distinguishes a bad model turn (retryable — a fresh turn may well succeed) from an exhausted
 // fixer (terminal). Collapsing the two ended a run on a single unparseable JSON response.
+// globalUsingsScope returns the paths whose projects may contribute import declarations to the fix
+// prompt, most relevant first: the files the round is repairing, then what each is repairing
+// against — its declared dependencies and the source it covers.
+//
+// The whole prompt map is NOT the scope, and passing it is what broke run
+// api-aace45f1f78d36a4474c06ad7d7ffae3. In a monorepo the prompt carries files from every
+// application in the tree, so every application contributed a project and the four-file cap went to
+// whichever sorted first. The round was repairing the root application and was shown a sibling's
+// namespaces.
+//
+// Language-neutral, though the only consumer is C#: TestPathToSourcePath resolves the source under
+// test for Java, C# and JS/TS alike, so a second ecosystem adopting import declarations inherits the
+// same ordering.
+func globalUsingsScope(opts EvalOptions, pathsToRead []string) []string {
+	out := make([]string, 0, len(pathsToRead)*3)
+	seen := make(map[string]bool, len(pathsToRead)*3)
+	add := func(rel string) {
+		rel = strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(rel)), "/")
+		if rel == "" || seen[rel] {
+			return
+		}
+		seen[rel] = true
+		out = append(out, rel)
+	}
+	// The artifacts first: their own project's declarations are in scope for the file being written.
+	for _, rel := range pathsToRead {
+		add(rel)
+	}
+	// Then what they are written against. The type a generated test cannot resolve is almost always
+	// declared in the SOURCE project's imports rather than the test project's — in the .NET fixture
+	// the test project's global usings name neither Ardalis.SharedKernel nor Mediator, and both
+	// source projects name both.
+	for _, rel := range pathsToRead {
+		for _, dep := range opts.ArtifactDependencies[rel] {
+			add(dep)
+		}
+		if src := retrieval.TestPathToSourcePath(rel, opts.Lang, opts.TestFramework, opts.RepoPath); src != "" {
+			add(src)
+		}
+	}
+	return out
+}
+
 func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorOutput string, audit Auditor, attemptCounter *int, maxAttempts int, loopState *FixLoopState, infrastructureFailureKind string) (bool, []string, string) {
 	// Sanitize + dedupe (csharp) into canonical error text for fix-loop signatures and fixer input.
 	errorOutputRaw := errorOutput
@@ -2033,6 +2124,25 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			src = strings.TrimPrefix(filepath.ToSlash(src), "/")
 			readOne(src, false)
 		}
+	}
+	// The `global using` declarations governing the files now in scope. In a C# project that
+	// declares its imports once for every file it compiles, neither the file under repair nor any
+	// file the diagnostic names carries a using line for those namespaces — so nothing in the
+	// prompt says where its types come from. Read BEFORE the error-cited tail so the declaration
+	// wins the budget over a stack frame; best-effort, since a project may have none.
+	// See csharpGlobalUsingsFilesFor.
+	globalUsingsAdded := csharpGlobalUsingsFilesFor(opts.RepoPath, opts.Lang,
+		globalUsingsScope(opts, pathsToRead))
+	for _, rel := range globalUsingsAdded {
+		readOne(rel, false)
+	}
+	if len(globalUsingsAdded) > 0 && audit != nil {
+		audit.Log(ctx, "evaluator.fix_global_usings_context", map[string]interface{}{
+			"message": fmt.Sprintf("Added %d global-using declaration file(s) to the %s prompt: the namespaces they declare are in scope for every file in their project and appear in none of them.",
+				len(globalUsingsAdded), step),
+			"paths": globalUsingsAdded,
+			"step":  step,
+		})
 	}
 	// Paths cited in the error log (stack traces, javac `location: ... of type <FQCN>` hints)
 	// may point to sources not yet loaded; pull in a bounded set for fixer context. Phase 2 hygiene
@@ -2908,11 +3018,18 @@ func applyLLMFix(ctx context.Context, opts EvalOptions, step SandboxStep, errorO
 			skippedPaths[relClean] = "returned empty content, which would erase the file"
 			continue
 		}
-		// Absolute gate: never accept a test file that has no test methods — even if the previous on-disk body
-		// was also empty (so introducedLowValueFixReason would silently pass it through). An empty shell like
-		// `package x; class FooIT {}` compiles but runs zero assertions, and accepting it effectively ends the
-		// fix loop on a success that adds no coverage.
-		if reason := EmptyTestFileReason(relClean, content); reason != "" {
+		// Never accept a TEST file that has no test methods — even if the previous on-disk body was
+		// also empty (so introducedLowValueFixReason would silently pass it through). An empty shell
+		// like `package x; class FooIT {}` compiles but runs zero assertions, and accepting it
+		// effectively ends the fix loop on a success that adds no coverage.
+		//
+		// A test PROJECT, though, holds more than tests: a WebApplicationFactory subclass, a
+		// fixture, a builder, a GlobalUsings.cs. None of them carry [Fact], all of them are
+		// ordinary files a repair may have to touch, and the extension cannot tell them apart from
+		// a test the fixer just emptied. What can is the file's own history — see
+		// fixEmptyTestGateApplies.
+		if reason := EmptyTestFileReason(relClean, content); reason != "" &&
+			fixEmptyTestGateApplies(relClean, opts, files) {
 			if audit != nil {
 				audit.Log(ctx, "evaluator.fix_rejected_low_value", map[string]interface{}{
 					"message": fmt.Sprintf("LLM fix rejected for %s: %s.", relClean, reason),
@@ -3372,17 +3489,45 @@ func relevantDependencyPaths(files map[string]string, protected map[string]bool,
 			artifacts = append(artifacts, c)
 		}
 	}
+	// How many candidates each base name could refer to. Two of the three signals below key on a
+	// NAME, and a name is only evidence when it names ONE file.
+	//
+	// A monorepo of several applications breaks that assumption completely: run
+	// api-aace45f1f78d36a4474c06ad7d7ffae3 ran against a tree whose three applications each declare
+	// MiddlewareConfig, SeedData, InfrastructureServiceExtensions and EventDispatchInterceptor, so
+	// every tree's copy matched the artifact's module name and all of them were protected from the
+	// context clamp. The round was repairing one application while reading two others, and the
+	// files that actually mattered were shed for budget.
+	//
+	// Language-neutral because the assumption is: services/a/Owner.java and services/b/Owner.java
+	// identify each other no better than three MiddlewareConfig.cs do.
+	nameCount := make(map[string]int, len(files))
 	for p := range files {
 		norm := normalizePathForFix(p)
 		if protected[norm] {
 			continue
 		}
+		if b := path.Base(norm); b != "" {
+			nameCount[b]++
+		}
+	}
+	for p := range files {
+		norm := normalizePathForFix(p)
+		if protected[norm] {
+			continue
+		}
+		// An exact path is the compiler saying which file it means. It stands whatever else shares
+		// the name.
 		if normErr != "" && strings.Contains(normErr, norm) {
 			out[norm] = true
 			continue
 		}
 		base := path.Base(norm)
-		if normErr != "" && base != "" && strings.Contains(normErr, base) {
+		// Both remaining signals are name-based, so both stop at ambiguity.
+		if base == "" || nameCount[base] > 1 {
+			continue
+		}
+		if normErr != "" && strings.Contains(normErr, base) {
 			out[norm] = true
 			continue
 		}

@@ -111,11 +111,11 @@ func (s *Sandbox) runDockerEvalWithImageOverride(ctx context.Context, repoPath, 
 	// zero failures (open handles), and no test files at all. The suffix names which one so the
 	// evaluator can tell them apart (see evaluator.NoTestFilesSuffix).
 	exitSuffix := ""
-	if !ok && stepEval == evaluator.StepTest && isJSLang(lang) {
+	if !ok && stepEval == evaluator.StepTest {
 		switch {
-		case jsTestOutputSummaryShowsZeroFailures(out):
+		case isJSLang(lang) && jsTestOutputSummaryShowsZeroFailures(out):
 			ok, exitSuffix = true, jsExitCodeIgnoredSuffix
-		case jsTestOutputReportsNoTestFiles(out):
+		case testOutputReportsNoTestFiles(lang, out):
 			ok, exitSuffix = true, evaluator.NoTestFilesSuffix
 		}
 	}

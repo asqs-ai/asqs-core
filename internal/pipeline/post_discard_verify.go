@@ -39,6 +39,7 @@ const PostDiscardRepairBudget = 3
 //     the run's own result with no bound on how much.
 //   - the discarded paths leave the writable set. They are gone from disk; leaving them in invites
 //     the fixer to "repair" a file that is not there.
+//
 // It also returns the survivors it discarded itself (see discardFailingSurvivors); those files are
 // off disk whether or not the tree then verified, and the caller records them as discarded.
 func verifyAfterDiscard(ctx context.Context, sandbox evaluator.SandboxRunner, opts evaluator.EvalOptions, discarded []string, audit evaluator.Auditor) (bool, []string) {

@@ -85,7 +85,7 @@ func (g *LLMGenerator) buildGeneratorSystem(item *retrieval.TestPlanItem, isE2E 
 				system += jsTSE2EGenerationContract(fw)
 			}
 			system += "\n\nThis item is **end-to-end** coverage. Stack: **" + fw + "**.\n" + e2ELLMHintForFramework(fw)
-			if h := strings.TrimSpace(retrieval.E2EPromptCanonicalHints(itemLang, fw)); h != "" {
+			if h := strings.TrimSpace(retrieval.E2EPromptCanonicalHintsForSurface(itemLang, fw, g.E2ESurface)); h != "" {
 				system += "\n\n" + h
 			}
 			system += e2eGenerationActiveTestsPolicy()

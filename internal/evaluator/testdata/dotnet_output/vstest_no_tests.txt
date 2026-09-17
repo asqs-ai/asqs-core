@@ -1,0 +1,8 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  E -> /workspace/bin/Release/net10.0/E.dll
+Test run for /workspace/bin/Release/net10.0/E.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+No test is available in /workspace/bin/Release/net10.0/E.dll. Make sure that test discoverer & executors are registered and platform & framework version settings are appropriate and try again.
+
+Additionally, path to test adapters can be specified using /TestAdapterPath command. Example  /TestAdapterPath:<pathToCustomAdapters>.

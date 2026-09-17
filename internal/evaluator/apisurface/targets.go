@@ -701,6 +701,11 @@ type TypeSurface struct {
 	Truncated bool
 	// Origin is the jar or directory the type came from, for the audit trail.
 	Origin string
+	// ImportHint is the line that makes this type resolve, in the LANGUAGE'S OWN spelling —
+	// `using Microsoft.Playwright;` for C#, not Java's `import`. Set by the provider, because the
+	// renderer does not know the language and a C# surface rendered with `import x.y.Z` states a
+	// line that cannot compile. Empty leaves the renderer's own default in place.
+	ImportHint string
 	// AllMemberNames is every member name the type declares, complete regardless of what
 	// Truncated says about Members.
 	//

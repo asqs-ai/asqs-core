@@ -16,6 +16,13 @@ type LangIndexerJSON struct {
 	IsTest  bool         `json:"is_test"`
 	Symbols []SymbolJSON `json:"symbols"`
 	Edges   []EdgeJSON   `json:"edges"`
+	// UnresolvedInvocations is how many calls in THIS file the indexer could not bind to a symbol.
+	//
+	// A pointer because absent and zero say different things: an indexer that does not report the
+	// count must not be read as reporting a clean file. The repository-wide total already reaches
+	// the audit trail; this is what lets it name the files, which is the only form of the number
+	// anyone can act on — a file whose calls do not resolve has incomplete project references.
+	UnresolvedInvocations *int `json:"unresolved_invocations,omitempty"`
 }
 
 type SymbolJSON struct {
@@ -42,11 +49,12 @@ func ParsedFileFromJSON(data []byte, source string) (*ParsedFile, error) {
 		return nil, err
 	}
 	p := &ParsedFile{
-		Path:   j.Path,
-		Lang:   j.Lang,
-		Module: j.Module,
-		IsTest: j.IsTest,
-		Source: source,
+		Path:                  j.Path,
+		Lang:                  j.Lang,
+		Module:                j.Module,
+		IsTest:                j.IsTest,
+		Source:                source,
+		UnresolvedInvocations: j.UnresolvedInvocations,
 	}
 	for _, s := range j.Symbols {
 		p.Symbols = append(p.Symbols, ParsedSymbol{

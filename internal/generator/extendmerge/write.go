@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/asqs/asqs-core/internal/evaluator"
+	"github.com/asqs/asqs-core/internal/layout"
 )
 
 var (
@@ -463,7 +464,9 @@ func looksLikeTestPath(path string) bool {
 		}
 		return false
 	}
-	if strings.HasSuffix(base, ".cs") && strings.Contains(base, "tests") {
+	// One predicate, shared with the fixer's writable-path rule. This copy rejected FooTest.cs —
+	// the MSTest and NUnit convention — and accepted Contest.cs.
+	if layout.IsCSharpTestPath(path) {
 		return true
 	}
 	// JS/TS: __tests__/foo.ts (Jest/Vitest) and E2E trees (e2e/foo.ts, cypress/)

@@ -86,13 +86,18 @@ func sourcePathCandidates(mirrorPath string, sourceFileName string) []string {
 
 func firstExistingSourcePath(candidates []string, repoAbs string) string {
 	repoAbs = filepath.Clean(strings.TrimSpace(repoAbs))
-	if repoAbs != "" {
+	if repoAbs != "" && repoAbs != "." {
 		for _, p := range candidates {
 			full := filepath.Join(repoAbs, p)
 			if st, err := os.Stat(full); err == nil && !st.IsDir() {
 				return filepath.ToSlash(p)
 			}
 		}
+		// With a repository to check against, a candidate that exists nowhere is not a mapping.
+		// Returning a best guess made the caller materialise a TESTS_SOURCE edge to a file that is
+		// not in the repository — a false statement about coverage, which is exactly what the
+		// planner reads to decide a symbol needs no test.
+		return ""
 	}
 	if len(candidates) == 0 {
 		return ""

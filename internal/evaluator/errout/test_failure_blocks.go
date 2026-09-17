@@ -69,15 +69,34 @@ func testFailureMarkerLine(line string) bool {
 	return false
 }
 
-// testFailureStackFrameLine matches "at pkg.Class.method(File.java:12)"-style frames (Java and JS).
+// testFailureStackFrameLine matches "at pkg.Class.method(File.java:12)"-style frames (Java and JS)
+// and .NET's "at Ns.Type.Method(Int32 a) in <path>:line <n>".
+//
+// The distinction matters because frames and continuation lines draw on different budgets: 8 frames
+// against 20 continuation lines. A C# stack counted as prose crowds out the assertion diff the
+// continuation budget exists to preserve. .NET framework frames (System.Reflection...) carry no file
+// at all and are matched by the trailing-parenthesis form so they are capped as frames too, rather
+// than each consuming a continuation slot.
 func testFailureStackFrameLine(s string) bool {
 	if !strings.HasPrefix(s, "at ") {
 		return false
 	}
-	return strings.Contains(s, ".java:") || strings.Contains(s, ".kt:") ||
+	if strings.Contains(s, ".java:") || strings.Contains(s, ".kt:") ||
 		strings.Contains(s, ".ts:") || strings.Contains(s, ".tsx:") ||
-		strings.Contains(s, ".js:") || strings.Contains(s, "Unknown Source")
+		strings.Contains(s, ".js:") || strings.Contains(s, "Unknown Source") {
+		return true
+	}
+	return reDotNetFrameTail.MatchString(s) || reDotNetFrameworkFrame.MatchString(s)
 }
+
+var (
+	// reDotNetFrameTail is the located form: `... in <path>.cs:line 12`.
+	reDotNetFrameTail = regexp.MustCompile(`(?i)\bin\s+.+?\.(?:cs|razor|cshtml|vb|fs):line\s+\d+\b`)
+	// reDotNetFrameworkFrame is an unlocated frame: a dotted method with a parameter list and
+	// nothing after it. Anchored so assertion prose ("Assert.Equal() Failure: Values differ") does
+	// not match — that has text after the parentheses.
+	reDotNetFrameworkFrame = regexp.MustCompile(`^at\s+[\w.<>` + "`" + `\[\]]+\([^)]*\)\s*$`)
+)
 
 func testFailureContinuationLine(line string) bool {
 	s := strings.TrimSpace(line)

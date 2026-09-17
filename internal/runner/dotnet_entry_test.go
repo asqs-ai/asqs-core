@@ -165,13 +165,13 @@ func TestApplyDotnetTargetFrameworkFallbackArgv_formatWithoutIncludeSkipsTFM(t *
 	}
 }
 
-func TestCsprojDeclaresConcreteTargetFramework(t *testing.T) {
+func TestProjectResolvesConcreteTargetFramework(t *testing.T) {
 	dir := t.TempDir()
 	empty := filepath.Join(dir, "e.csproj")
 	if err := os.WriteFile(empty, []byte(`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework></TargetFramework></PropertyGroup></Project>`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := CsprojDeclaresConcreteTargetFramework(empty)
+	ok, err := ProjectResolvesConcreteTargetFramework(dir, empty)
 	if err != nil || ok {
 		t.Fatalf("empty tag: ok=%v err=%v", ok, err)
 	}
@@ -179,7 +179,7 @@ func TestCsprojDeclaresConcreteTargetFramework(t *testing.T) {
 	if err := os.WriteFile(prop, []byte(`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>$(Foo)</TargetFramework></PropertyGroup></Project>`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, err = CsprojDeclaresConcreteTargetFramework(prop)
+	ok, err = ProjectResolvesConcreteTargetFramework(dir, prop)
 	if err != nil || ok {
 		t.Fatalf("property ref: ok=%v", ok)
 	}
@@ -187,13 +187,13 @@ func TestCsprojDeclaresConcreteTargetFramework(t *testing.T) {
 	if err := os.WriteFile(good, []byte(`<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, err = CsprojDeclaresConcreteTargetFramework(good)
+	ok, err = ProjectResolvesConcreteTargetFramework(dir, good)
 	if err != nil || !ok {
 		t.Fatalf("concrete: ok=%v err=%v", ok, err)
 	}
 }
 
-func TestCsprojDeclaresConcreteTargetFramework_ignoresCommentedTags(t *testing.T) {
+func TestProjectResolvesConcreteTargetFramework_ignoresCommentedTags(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "c.csproj")
 	if err := os.WriteFile(p, []byte(`<Project Sdk="Microsoft.NET.Sdk">
@@ -201,7 +201,7 @@ func TestCsprojDeclaresConcreteTargetFramework_ignoresCommentedTags(t *testing.T
 </Project>`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := CsprojDeclaresConcreteTargetFramework(p)
+	ok, err := ProjectResolvesConcreteTargetFramework(dir, p)
 	if err != nil || ok {
 		t.Fatalf("commented TFM must not count as concrete: ok=%v err=%v", ok, err)
 	}

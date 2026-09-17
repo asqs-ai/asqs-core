@@ -2,17 +2,11 @@ package profile
 
 import (
 	"io/fs"
-	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
-)
 
-var (
-	reTargetFramework  = regexp.MustCompile(`<TargetFramework>\s*([^<\s]+)\s*</TargetFramework>`)
-	reTargetFrameworks = regexp.MustCompile(`<TargetFrameworks>\s*([^<]+)\s*</TargetFrameworks>`)
-	reNetMajor         = regexp.MustCompile(`(?i)net(\d+)\.`)
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 // resolveDotNetDockerImage returns the Docker image for csharp-dotnet eval.
@@ -29,11 +23,15 @@ func resolveDotNetDockerImage(configured, repoPath string) string {
 	if repoPath == "" {
 		return DefaultDotNetImage
 	}
-	tag, ok := dotNetSDKTagFromRepo(repoPath)
-	if !ok {
+	// The image must satisfy BOTH constraints the repo states: the highest net{major} its projects
+	// target (including monikers inherited from Directory.Build.props) and the SDK its global.json
+	// pins. Only the first was consulted, so a net8.0 solution with global.json pinning SDK 10 was
+	// evaluated in sdk:8.0 and every step failed at "A compatible .NET SDK was not found".
+	major := MaxDotNetSdkMajorRequiredByRepo(repoPath)
+	if major <= 0 {
 		return DefaultDotNetImage
 	}
-	return "mcr.microsoft.com/dotnet/sdk:" + tag
+	return "mcr.microsoft.com/dotnet/sdk:" + strconv.Itoa(major) + ".0"
 }
 
 const maxDotNetCsprojWalkDepth = 12
@@ -53,15 +51,10 @@ func MaxNetTFMMajorFromRepo(repoRoot string) int {
 	return n
 }
 
+// dotnetWalkSkipDir delegates to dotnetproj.WalkSkipDir: there were five of these lists and they
+// disagreed, so two walks over the same tree descended into different build output.
 func dotnetWalkSkipDir(name string) bool {
-	switch strings.ToLower(name) {
-	case "node_modules", ".git", "bin", "obj", "packages", "dist", "target",
-		"build", "coverage", ".vs", "venv", "__pycache__", "vendor",
-		"playwright-report", "test-results", ".gradle", ".idea":
-		return true
-	default:
-		return len(name) > 0 && name[0] == '.'
-	}
+	return dotnetproj.WalkSkipDir(name)
 }
 
 func repoWalkDepth(root, abs string) int {
@@ -95,11 +88,12 @@ func dotNetSDKTagFromRepo(repoRoot string) (string, bool) {
 			return nil
 		}
 		if strings.EqualFold(filepath.Ext(d.Name()), ".csproj") {
-			b, err := os.ReadFile(path)
-			if err != nil {
+			// Through ResolveFacts, so a TargetFramework factored into Directory.Build.props counts.
+			facts, ferr := dotnetproj.ResolveFacts(dir, path)
+			if ferr != nil {
 				return nil
 			}
-			if m := maxNetMajorFromProjectXML(string(b)); m > maxMajor {
+			if m := facts.MaxNetMajor(); m > maxMajor {
 				maxMajor = m
 			}
 		}
@@ -109,39 +103,6 @@ func dotNetSDKTagFromRepo(repoRoot string) (string, bool) {
 		return "", false
 	}
 	return strconv.Itoa(maxMajor) + ".0", true
-}
-
-func maxNetMajorFromProjectXML(s string) int {
-	max := 0
-	for _, m := range reTargetFramework.FindAllStringSubmatch(s, -1) {
-		if len(m) > 1 {
-			max = maxInt(max, maxNetMajorFromTFM(strings.TrimSpace(m[1])))
-		}
-	}
-	for _, m := range reTargetFrameworks.FindAllStringSubmatch(s, -1) {
-		if len(m) <= 1 {
-			continue
-		}
-		for _, part := range strings.Split(m[1], ";") {
-			max = maxInt(max, maxNetMajorFromTFM(strings.TrimSpace(part)))
-		}
-	}
-	return max
-}
-
-func maxNetMajorFromTFM(tfm string) int {
-	if tfm == "" {
-		return 0
-	}
-	sub := reNetMajor.FindStringSubmatch(tfm)
-	if len(sub) < 2 {
-		return 0
-	}
-	n, err := strconv.Atoi(sub[1])
-	if err != nil || n <= 0 {
-		return 0
-	}
-	return n
 }
 
 func maxInt(a, b int) int {

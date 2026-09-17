@@ -86,6 +86,16 @@ func pathHasTestDirectorySegment(low string) bool {
 		case "test", "tests", "testing", "__tests__":
 			return true
 		}
+		// A .NET test PROJECT's directory is also its assembly name — MyApp.Tests, MyApp.UnitTests,
+		// MyApp.IntegrationTests, MyApp.Specs — and it is frequently the only signal a file inside
+		// it gives. A fixture builder or a helper there carries no naming convention at all, so it
+		// was classified as production code and its symbols became gap candidates: the run proposed
+		// writing tests for the test helpers.
+		for _, suffix := range []string{".tests", ".test", ".unittests", ".integrationtests", ".specs"} {
+			if strings.HasSuffix(seg, suffix) {
+				return true
+			}
+		}
 	}
 	return false
 }

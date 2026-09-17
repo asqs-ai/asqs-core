@@ -73,6 +73,14 @@ var EdgeTypes = map[string]EdgeTypeRegistry{
 	"MODULE_PROVIDERS": {EdgeConfidenceStructural, "module provides service"},
 	"MODULE_REGISTERS": {EdgeConfidenceStructural, "module registers component"},
 
+	// Structural, C#: what a signature mentions and what a body touches. Weaker than a call —
+	// naming a type in a parameter list is not using it — so they sit below the direct tier, which
+	// is exactly what an unregistered type could not express.
+	"ACCEPTS_PARAM_TYPE": {EdgeConfidenceStructural, "callable accepts this type as a parameter"},
+	"RETURNS_TYPE":       {EdgeConfidenceStructural, "callable returns this type"},
+	"READS_FIELD":        {EdgeConfidenceStructural, "member reads this field or property"},
+	"WRITES_FIELD":       {EdgeConfidenceStructural, "member assigns this field or property"},
+
 	// Ambient.
 	"IMPORTS":         {EdgeConfidenceAmbient, "source-level import"},
 	"DEPENDS_ON":      {EdgeConfidenceAmbient, "package dependency"},

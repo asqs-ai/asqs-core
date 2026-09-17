@@ -71,8 +71,11 @@ const jacocoPom = `<project><build><plugins><plugin>
 </plugin></plugins></build></project>`
 
 func planParityFixtures() []planParityFixture {
-	const csproj = `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>`
-	const multiTargetCsproj = `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup></Project>`
+	// coverlet is declared for the same reason jacocoPom declares JaCoCo: without it the coverage
+	// step is gated off on both targets and the parity harness stops comparing a coverage argv at all.
+	const coverletRef = `<ItemGroup><PackageReference Include="coverlet.collector" Version="6.0.2" /></ItemGroup>`
+	const csproj = `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>` + coverletRef + `</Project>`
+	const multiTargetCsproj = `<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFrameworks>net8.0;net9.0</TargetFrameworks></PropertyGroup>` + coverletRef + `</Project>`
 	const pkgJSON = `{"scripts":{"build":"tsc","test":"jest","coverage":"jest --coverage"}}`
 
 	// Upstream's matrix additionally carries two private-registry fixtures (a generated Maven

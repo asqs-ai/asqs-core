@@ -41,7 +41,7 @@ func TestDetectCSharpFramework_aspNetCore(t *testing.T) {
 	writeCsprojAt(t, repo, "src/App", "App.csproj", aspNetCoreWebCsproj)
 	writeCsprojAt(t, repo, "src/Core", "Core.csproj", plainLibCsproj)
 
-	det, err := detectCSharpFramework(repo, "")
+	det, err := detectCSharpFramework(repo, "", ptrTo(""))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestDetectCSharpFramework_efCoreMajorFromPackageReference(t *testing.T) {
   </ItemGroup>
 </Project>`)
 
-	det, err := detectCSharpFramework(repo, "")
+	det, err := detectCSharpFramework(repo, "", ptrTo(""))
 	if err != nil {
 		t.Fatal(err)
 	}

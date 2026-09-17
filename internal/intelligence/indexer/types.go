@@ -62,6 +62,9 @@ type ParsedFile struct {
 	Symbols []ParsedSymbol
 	Edges   []ParsedEdge
 	Source  string // full file content for chunking
+	// UnresolvedInvocations is how many calls in this file the language indexer could not bind.
+	// Nil when the indexer does not report it, which is not the same as zero.
+	UnresolvedInvocations *int
 }
 
 // ChunkPlan describes one chunk to be created (symbol-boundary, sanitized, within token budget).

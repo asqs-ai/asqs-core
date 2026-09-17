@@ -13,6 +13,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/config"
 	"github.com/asqs/asqs-core/internal/intelligence/indexer"
+	"github.com/asqs/asqs-core/internal/langid"
 	"github.com/asqs/asqs-core/internal/layout"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 	"github.com/asqs/asqs-core/internal/workspace"
@@ -111,11 +112,21 @@ type PlanOptions struct {
 	// a repo of getters still produces a plan rather than an empty run. Raise it to make the
 	// planner abstain on genuinely untestable candidates.
 	MinGapTestabilityScore int
+	// RepoPath is the repository's absolute path on disk. Optional: it is used only where a fact
+	// lives in the working tree rather than in the index — currently the C# test project's
+	// ProjectReference closure, which decides whether a symbol is reachable from a test at all.
+	// Empty means "do not apply rules that need the tree", never "nothing is reachable".
+	RepoPath string
 	// RetrievalProfileE2E selects retrieval profile for E2E items. Empty in PlanOptions is unusual (orchestrator sets DefaultRetrievalProfileE2E: http_api for Java/C#, e2e_playwright for JS/TS when config omits both profile fields).
 	RetrievalProfileE2E string
 	// E2EFramework is the detected stack for audit/context hints (playwright, cypress, playwright-java, playwright-dotnet, selenium, …).
 	E2EFramework string
-	Audit        Auditor
+	// E2ESurface is what an E2E test can drive against the application: none, api, ui or mixed,
+	// detected at bootstrap (C# today). It decides whether uncovered PAGE_ROUTE anchors are listed
+	// beside uncovered API_ROUTEs. Empty means "not detected", which keeps the API-route-only
+	// behaviour rather than guessing.
+	E2ESurface string
+	Audit      Auditor
 	// SourceFilesWithExistingTest: source file paths (e.g. "src/foo.ts") that already have a test file. Their symbols are deprioritized (not excluded) so we pick "no test file" first, then extend those files with tests for uncovered symbols.
 	SourceFilesWithExistingTest map[string]struct{}
 	// ExistingTestPathsBySource maps a source repo-relative path to the sorted list of existing test
@@ -178,18 +189,36 @@ const maxConcurrencyListGaps = 16
 // gapSymbolKindsForLang returns the symbol kinds that represent testable units for the given language.
 // Java: "method". JavaScript/TS: "FUNCTION" (declarations + const arrow/async), "METHOD" (class methods), "VARIABLE" (legacy: const arrow before indexer emitted FUNCTION).
 func gapSymbolKindsForLang(lang string) []string {
-	switch lang {
-	case "javascript", "typescript", "js", "ts":
+	if langid.IsJSTS(lang) {
 		return []string{"FUNCTION", "METHOD", "VARIABLE"}
-	default:
-		return []string{"method"}
 	}
+	return []string{"method"}
 }
 
-// isPrivateJavaMethod returns true if the symbol is a Java method with visibility "private" (from signature_json).
-// We do not generate tests for private members; only public (and protected) API.
-func isPrivateJavaMethod(sym *metadata.Symbol) bool {
-	if sym == nil || sym.Lang != "java" || sym.Kind != "method" || len(sym.SignatureJSON) == 0 {
+// symbolQueryLangs returns the language values to query the symbol store with.
+//
+// The store holds what the indexer wrote, not what the caller asked for: the JS/TS indexer splits
+// .ts and .js across "typescript" and "javascript" (and legacy rows are all "javascript"), so both
+// have to be asked. C# has the opposite problem — one stored spelling, "csharp", but PlanOptions,
+// CLI flags and gap symbols variously carry "cs". Canonicalising covers both: a query for "cs"
+// used to match no row at all, which is a plan with zero gaps and no error anywhere.
+func symbolQueryLangs(lang string) []string {
+	if langid.IsJSTS(lang) {
+		return []string{"javascript", "typescript"}
+	}
+	return []string{langid.Canonical(lang)}
+}
+
+// isPrivateMethod reports whether a symbol is a private member, from the `visibility` its indexer
+// stored. A test cannot call one, so proposing it as a gap spends the budget on something that
+// cannot be closed.
+//
+// The gate read `sym.Lang != "java"` and answered false for every other language. C# stores the
+// same key and always has, so a private C# method was proposed and the generated test could not
+// reach it — the loop then spent its rounds discovering that, which is not a thing any round can
+// fix. A language that stores no visibility answers false, which is the old behaviour for it.
+func isPrivateMethod(sym *metadata.Symbol) bool {
+	if sym == nil || sym.Kind != "method" || len(sym.SignatureJSON) == 0 {
 		return false
 	}
 	var parsed struct {
@@ -199,6 +228,25 @@ func isPrivateJavaMethod(sym *metadata.Symbol) bool {
 		return false
 	}
 	return strings.TrimSpace(strings.ToLower(parsed.Visibility)) == "private"
+}
+
+// symbolParamCount returns how many parameters a callable declares, or -1 when the indexer did not
+// record them. Absent and zero are different claims: "takes nothing" is a fact about the method,
+// "not recorded" is a fact about the index.
+func symbolParamCount(sym *metadata.Symbol) int {
+	if sym == nil || len(sym.SignatureJSON) == 0 {
+		return -1
+	}
+	var parsed struct {
+		Params *[]struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(sym.SignatureJSON, &parsed); err != nil || parsed.Params == nil {
+		return -1
+	}
+	return len(*parsed.Params)
 }
 
 // ListGaps returns a small set of test-gap candidates: public methods (or functions for JS/TS) with no tests, optionally
@@ -258,10 +306,11 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	kinds := gapSymbolKindsForLang(opts.Lang)
 	var allSymbols []*metadata.Symbol
 	// For JS/TS, query both "javascript" and "typescript" so we get all symbols (indexer may store .ts as "typescript", .js as "javascript"; legacy data may be "javascript" only).
-	langsToQuery := []string{opts.Lang}
-	if opts.Lang == "typescript" || opts.Lang == "javascript" || opts.Lang == "ts" || opts.Lang == "js" {
-		langsToQuery = []string{"javascript", "typescript"}
-	}
+	langsToQuery := symbolQueryLangs(opts.Lang)
+	reachable := csharpReachableFilter(opts)
+	// A member `internal` to a project the test assembly has no grant into cannot be called by any
+	// test this run writes. See internalAccessFilter.
+	reachableInternals := newInternalAccessFilter(opts)
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {
@@ -271,6 +320,9 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 			}
 			for _, s := range symbols {
 				if s == nil || seenID[s.ID] {
+					continue
+				}
+				if !reachable.allows(s.File) {
 					continue
 				}
 				if indexer.IsTypeScriptDeclarationPath(s.File) {
@@ -294,7 +346,7 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	for _, sym := range allSymbols {
 		sym := sym
 		g.Go(func() error {
-			if isPrivateJavaMethod(sym) {
+			if isPrivateMethod(sym) {
 				return nil
 			}
 			if !gapSymbolUnderMonoScope(sym.File, opts.MonoRepoGapPrefix) {
@@ -341,6 +393,15 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 				mu.Lock()
 				filtered = append(filtered, gap)
 				filteredByReason[reason]++
+				mu.Unlock()
+				return nil
+			}
+			// Separate from gapEligibility because this one reads the working tree — the project
+			// files and their InternalsVisibleTo grants — rather than the symbol row alone.
+			if !reachableInternals.allows(sym) {
+				mu.Lock()
+				filtered = append(filtered, gap)
+				filteredByReason[IneligibleUnreachableInternal]++
 				mu.Unlock()
 				return nil
 			}
@@ -460,6 +521,45 @@ func e2eSymbolQueriesForWorkflowLang(workflowLang string) []e2eSymbolQuery {
 	return out
 }
 
+// e2eSymbolQueriesForWorkflowLangSurface is e2eSymbolQueriesForWorkflowLang plus the E2E surface
+// bootstrap detected.
+//
+// C# only listed E2E_SPEC, which is the right anchor set for a Web API and too narrow for an
+// application with pages: a Razor Pages or Blazor repo has page objects and user flows in exactly
+// the way Java does, and its E2E plan could only ever anchor on API routes. A `ui` or `mixed`
+// surface therefore gets the same kinds Java gets; an `api` or undetected surface keeps today's
+// behaviour rather than querying kinds a Web API has none of.
+func e2eSymbolQueriesForWorkflowLangSurface(workflowLang, e2eSurface string) []e2eSymbolQuery {
+	base := e2eSymbolQueriesForWorkflowLang(workflowLang)
+	if !langid.IsCSharp(workflowLang) || !e2eSurfaceHasUI(e2eSurface) {
+		return base
+	}
+	for _, k := range []string{"PAGE_OBJECT", "USER_FLOW"} {
+		base = append(base, e2eSymbolQuery{lang: "csharp", kind: k})
+	}
+	return base
+}
+
+// e2eSurfaceHasUI reports whether the detected surface includes pages a browser can drive.
+func e2eSurfaceHasUI(e2eSurface string) bool {
+	switch strings.ToLower(strings.TrimSpace(e2eSurface)) {
+	case "ui", "mixed":
+		return true
+	default:
+		return false
+	}
+}
+
+// pageRouteE2EGapLangsForSurface returns the languages whose PAGE_ROUTE symbols should be listed as
+// uncovered E2E anchors because of the C# surface. JS/TS page routes are governed by
+// pageRouteE2EGapsEnabledJS and are unaffected by this.
+func pageRouteE2EGapLangsForSurface(opts PlanOptions) []string {
+	if !langid.IsCSharp(opts.Lang) || !e2eSurfaceHasUI(opts.E2ESurface) {
+		return nil
+	}
+	return []string{"csharp"}
+}
+
 func e2eGapBaseReasonForSymbolKind(kind string) string {
 	switch strings.ToUpper(strings.TrimSpace(kind)) {
 	case "API_ROUTE":
@@ -533,7 +633,7 @@ func e2eSymbolQueriesForWorkflowLangWithSupplement(opts PlanOptions) []e2eSymbol
 		}
 	}
 	wl := strings.ToLower(strings.TrimSpace(opts.Lang))
-	add(e2eSymbolQueriesForWorkflowLang(opts.Lang))
+	add(e2eSymbolQueriesForWorkflowLangSurface(opts.Lang, opts.E2ESurface))
 	if (wl == "java" || wl == "csharp" || wl == "cs") && e2eProfileWantsJSTSSupplement(opts) {
 		add(e2eSymbolQueriesForWorkflowLang("typescript"))
 	}
@@ -702,6 +802,10 @@ func uncoveredAPIRouteE2EGapsForLang(
 		return nil, false, err
 	}
 	routes = filterSymbolsByMonoGapPrefix(routes, opts.MonoRepoGapPrefix)
+	// A route no evaluated test project can reach yields an e2e test that is never compiled or run.
+	// Filtering to nothing here is not "no gaps": it falls through to the E2E_SPEC anchors below,
+	// the same as a repository with no routes at all.
+	routes = csharpReachableFilter(opts).keep(routes)
 	if len(routes) == 0 {
 		return nil, false, nil
 	}
@@ -734,8 +838,10 @@ func uncoveredAPIRouteE2EGapsForLang(
 // that no spec targets, whereas the main pass walks symbols already living in test files.
 func appendPageRouteE2EGaps(ctx context.Context, meta GapMetaReader, opts PlanOptions, list []*TestGap) ([]*TestGap, error) {
 	// UI routes (React Router, Angular, …): gap anchors for JS/TS unless profile_e2e is explicitly java_unit-shaped.
-	if pageRouteE2EGapsEnabledJS(opts) {
-		if langs := effectiveJSTSLangsForE2EQuery(opts); len(langs) > 0 {
+	// Razor Pages / Blazor routes join the JS/TS ones when bootstrap detected a C# ui or mixed
+	// surface: a page nothing drives is an uncovered E2E anchor whichever language rendered it.
+	if langs := pageRouteE2EGapLangs(opts); len(langs) > 0 {
+		{
 			seenID := make(map[string]bool)
 			for _, g := range list {
 				if g != nil && g.Symbol != nil && g.Symbol.ID != "" {
@@ -838,6 +944,7 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 			}
 		}
 		apiRoutes = filterSymbolsByMonoGapPrefix(apiRoutes, opts.MonoRepoGapPrefix)
+		apiRoutes = csharpReachableFilter(opts).keep(apiRoutes)
 		if len(apiRoutes) > 0 {
 			list, err := listUncoveredAPIRouteE2EGaps(ctx, meta, opts, apiRoutes)
 			if err != nil {
@@ -854,12 +961,21 @@ func ListGapsE2E(ctx context.Context, meta GapMetaReader, opts PlanOptions) ([]*
 	queries := e2eSymbolQueriesForWorkflowLangWithSupplement(opts)
 	var allSymbols []*metadata.Symbol
 	seenID := make(map[string]bool)
+	// The same reachability question the unit branch asks, asked of the spec's own project: a spec
+	// in a test project the evaluated solution does not list is never built and never run, so
+	// extending it buys the run nothing. Run api-bdf7539b296a0df65a7cf1bf2bf2739b wrote five such
+	// tests, a third of its output, and its own test step never saw one of them.
+	reachable := csharpReachableFilter(opts)
+	// And the spec itself must actually be one: a file in a test project that declares no test is
+	// the shared harness or a fixtures module, and a gap anchored to it invites a rewrite of the
+	// code every other test depends on. See specMarkerFilter.
+	declaresTest := newSpecMarkerFilter(opts)
 	for _, q := range queries {
 		symbols, err := meta.ListSymbolsInTestFiles(ctx, opts.RepoID, q.lang, q.kind)
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range symbols {
+		for _, s := range declaresTest.keep(reachable.keep(symbols)) {
 			if s != nil && !seenID[s.ID] {
 				seenID[s.ID] = true
 				allSymbols = append(allSymbols, s)
@@ -1388,4 +1504,14 @@ func TestPathToSourcePath(testFilePath string, lang string, testFramework string
 		sourceName := name[:len(name)-4] + ext
 		return filepath.Join(dir, sourceName)
 	}
+}
+
+// pageRouteE2EGapLangs is the union of the JS/TS page-route rule and the C# surface one.
+func pageRouteE2EGapLangs(opts PlanOptions) []string {
+	var out []string
+	if pageRouteE2EGapsEnabledJS(opts) {
+		out = append(out, effectiveJSTSLangsForE2EQuery(opts)...)
+	}
+	out = append(out, pageRouteE2EGapLangsForSurface(opts)...)
+	return out
 }

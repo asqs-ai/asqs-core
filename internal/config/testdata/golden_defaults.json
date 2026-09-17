@@ -174,7 +174,8 @@
       "Mode": "",
       "PinVersions": false,
       "AllowLockfileChange": false,
-      "Execution": ""
+      "Execution": "",
+      "Surface": ""
     }
   },
   "Indexer": {

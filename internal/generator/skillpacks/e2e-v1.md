@@ -16,7 +16,12 @@ Quality checklist:
 Stack contracts:
 - Playwright: use @playwright/test APIs and placement conventions from repo config.
 - Cypress: use cy.* APIs and cypress/e2e spec conventions.
-- Java/.NET E2E: use the configured browser/runner stack in project conventions (Playwright/Selenium/etc.).
+- Java E2E: use the configured browser/runner stack in project conventions (Playwright for Java, Selenium, etc.),
+  driven by the repository's JUnit version.
+- .NET E2E: the runner decides how the page is obtained. Microsoft.Playwright.NUnit and
+  Microsoft.Playwright.MSTest supply `PageTest`/`ContextTest` base classes with a `Page` property;
+  xUnit has no such base class, so create the browser yourself (`Playwright.CreateAsync()`) and dispose it
+  through `IAsyncLifetime`. Inheriting `PageTest` in an xUnit project does not compile.
 
 Anti-patterns (forbidden):
 - Mixing unit-test mocking styles (jest.mock/vi.mock) into browser E2E specs unless repo already combines them intentionally.

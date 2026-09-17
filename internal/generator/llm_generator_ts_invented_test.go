@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/intelligence/model"
+	"github.com/asqs/asqs-core/internal/intelligence/retrieval"
 	"github.com/asqs/asqs-core/internal/storage/metadata"
 )
 
@@ -35,7 +35,7 @@ func nestRepoForGenerator(t *testing.T) string {
 	t.Helper()
 	repo := t.TempDir()
 	for rel, body := range map[string]string{
-		"src/orders/orders.service.ts": "export class OrdersService {\n  listOrders() { return []; }\n  createOrder(dto: any) { return dto; }\n}\n",
+		"src/orders/orders.service.ts":    "export class OrdersService {\n  listOrders() { return []; }\n  createOrder(dto: any) { return dto; }\n}\n",
 		"src/orders/orders.controller.ts": "import { OrdersService } from './orders.service';\nexport class OrdersController {\n  constructor(private readonly ordersService: OrdersService) {}\n  createOrder(dto: any) { return this.ordersService.createOrder(dto); }\n}\n",
 	} {
 		full := filepath.Join(repo, filepath.FromSlash(rel))

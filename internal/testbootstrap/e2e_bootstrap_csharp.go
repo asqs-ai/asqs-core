@@ -148,7 +148,7 @@ func applyPlaywrightDotNetBootstrap(ctx context.Context, p E2EParams, audit Audi
 	})
 	buildArgv := []string{"dotnet", "build", csprojRel, "-c", "Release", "--verbosity", "quiet", "-nologo"}
 	buildArgv = runner.AppendDotnetMultiTargetFrameworkArgv(buildArgv, csproj, fallbackTFM)
-	buildArgv = appendDotnetCLIArgsTFMFallback(buildArgv, csproj, fallbackTFM)
+	buildArgv = appendDotnetCLIArgsTFMFallback(repo, buildArgv, csproj, fallbackTFM)
 	buildArgv = runner.ApplyDotnetTestFrameworkBootstrapMSBuildProps(buildArgv)
 	out, err := RunArgvWithShellPrefix(vCtx, ed, repo, buildArgv, nil, dotNetInstallShell)
 	if err != nil {

@@ -89,13 +89,15 @@ func testStackLLMBlock(repoPath string) string {
 	}
 
 	if len(c.CanonicalImports) > 0 {
-		b.WriteString("- **Exact imports for framework test types, read from THIS project's compile classpath:**\n")
-		for _, simple := range sortedImportKeys(c.CanonicalImports) {
-			fmt.Fprintf(&b, "  - `import %s;` — the only %s on this classpath\n", c.CanonicalImports[simple], simple)
+		source, lines := canonicalImportLines(c.Language, c.CanonicalImports)
+		fmt.Fprintf(&b, "- **Exact imports for framework test types, read from THIS project's %s:**\n", source)
+		for _, line := range lines {
+			fmt.Fprintf(&b, "  - %s\n", line)
 		}
-		b.WriteString("  These were resolved against the jars this project actually compiles against, so they are correct for " +
-			"its framework version. Where one of them contradicts an import you would otherwise write — including anything " +
-			"suggested by the package roots above or by your own recollection of this framework — **this list wins**.\n")
+		fmt.Fprintf(&b, "  These were resolved against the %s this project actually compiles against, so they are correct for "+
+			"its framework version. Where one of them contradicts an import you would otherwise write — including anything "+
+			"suggested by the package roots above or by your own recollection of this framework — **this list wins**.\n",
+			canonicalImportArtefactNoun(c.Language))
 	}
 
 	switch c.Smoke.Status {
@@ -209,6 +211,64 @@ func isDOMTestEnvironment(env string) bool {
 	default:
 		return true
 	}
+}
+
+// canonicalImportLines renders the resolved framework types as import lines in the language's own
+// spelling, and returns the noun for where they were read from.
+//
+// The distinction is not cosmetic. Java imports a TYPE, so the resolved fully-qualified name is the
+// import line. C# imports a NAMESPACE: "using Xunit;" is what brings FactAttribute into scope, and
+// "using Xunit.FactAttribute;" does not compile. Rendering the Java spelling for a C# run would put
+// a line that cannot compile into the one block the prompt calls authoritative — and a documented
+// generic type carries an arity suffix that is not legal in source at all.
+func canonicalImportLines(lang string, imports map[string]string) (source string, lines []string) {
+	if apisurface.NormalizeLang(lang) != apisurface.LangCSharp {
+		for _, simple := range sortedImportKeys(imports) {
+			lines = append(lines, fmt.Sprintf("`import %s;` — the only %s on this classpath", imports[simple], simple))
+		}
+		return "compile classpath", lines
+	}
+	// Several types commonly share one namespace, and the instruction IS the namespace: state it
+	// once and name what it covers, rather than repeating the same using line per type.
+	typesByNamespace := map[string][]string{}
+	for _, simple := range sortedImportKeys(imports) {
+		ns := csharpNamespaceOfDocType(imports[simple])
+		if ns == "" {
+			continue
+		}
+		typesByNamespace[ns] = append(typesByNamespace[ns], simple)
+	}
+	namespaces := make([]string, 0, len(typesByNamespace))
+	for ns := range typesByNamespace {
+		namespaces = append(namespaces, ns)
+	}
+	sort.Strings(namespaces)
+	for _, ns := range namespaces {
+		lines = append(lines, fmt.Sprintf("`using %s;` — where this project's %s lives",
+			ns, strings.Join(typesByNamespace[ns], " and ")))
+	}
+	return "package closure", lines
+}
+
+func canonicalImportArtefactNoun(lang string) string {
+	if apisurface.NormalizeLang(lang) == apisurface.LangCSharp {
+		return "packages"
+	}
+	return "jars"
+}
+
+// csharpNamespaceOfDocType takes the namespace off a documented type name, dropping the generic
+// arity a documentation ID carries: Moq.Mock with a backtick-1 suffix yields Moq.
+func csharpNamespaceOfDocType(fq string) string {
+	fq = strings.TrimSpace(fq)
+	if i := strings.IndexByte(fq, '`'); i >= 0 {
+		fq = fq[:i]
+	}
+	i := strings.LastIndex(fq, ".")
+	if i <= 0 {
+		return ""
+	}
+	return fq[:i]
 }
 
 func sortedImportKeys(m map[string]string) []string {

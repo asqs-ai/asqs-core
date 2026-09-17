@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/asqs/asqs-core/internal/dotnetproj"
 )
 
 const (
@@ -46,9 +48,6 @@ func rootCsprojFiles(dir string) ([]string, error) {
 	return out, nil
 }
 
-// reCsprojSdkAttr captures the Sdk attribute value on the <Project> element.
-var reCsprojSdkAttr = regexp.MustCompile(`(?i)<Project[^>]*\bSdk\s*=\s*["']([^"']+)["']`)
-
 // isSdkStyleCsproj reports whether a project uses the modern SDK format.
 //
 // It matches the whole Microsoft.NET.Sdk FAMILY, not just the bare value. The previous exact match on
@@ -57,12 +56,11 @@ var reCsprojSdkAttr = regexp.MustCompile(`(?i)<Project[^>]*\bSdk\s*=\s*["']([^"'
 // a Web+library solution the generated test project referenced only the library, so no controller was
 // reachable from a test. Legacy non-SDK projects (ToolsVersion + Microsoft.CSharp.targets import)
 // still do not match, which is the distinction that matters.
+// The implementation moved to dotnetproj.IsSDKStyle so the runner's eval-entry discovery stops
+// answering the same question differently — it matched the exact Sdk="Microsoft.NET.Sdk" and
+// therefore found no project at all in an ASP.NET Core repository.
 func isSdkStyleCsproj(content string) bool {
-	m := reCsprojSdkAttr.FindStringSubmatch(content)
-	if m == nil {
-		return false
-	}
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(m[1])), "microsoft.net.sdk")
+	return dotnetproj.IsSDKStyle(content)
 }
 
 // reDotnetOptionalWorkloadTFM matches TFMs that need optional SDK workloads (MAUI / mobile / Windows desktop packs).

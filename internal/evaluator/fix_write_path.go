@@ -7,6 +7,7 @@ import (
 
 	"github.com/asqs/asqs-core/internal/evaluator/errloc"
 	"github.com/asqs/asqs-core/internal/evaluator/errout"
+	"github.com/asqs/asqs-core/internal/layout"
 )
 
 // writableFixPathsForFailure lists the repo-relative paths the fixer may write for this failure:
@@ -125,33 +126,9 @@ func pathLooksLikeTestArtifact(rel string, lang string) bool {
 		}
 		return strings.Contains(pl, "src/test/") || strings.Contains(pl, "src/it/")
 	case "csharp", "cs":
-		if !strings.EqualFold(filepath.Ext(base), ".cs") {
-			return false
-		}
-		lb := strings.ToLower(base)
-		pl := strings.ToLower(rel)
-		// *Tests.cs / *Test.cs (xUnit/MSTest/NUnit); reject bare "Test.cs".
-		if strings.HasSuffix(lb, "tests.cs") {
-			return true
-		}
-		if strings.HasSuffix(lb, "test.cs") && lb != "test.cs" {
-			return true
-		}
-		// Convention: files under a Tests folder or .Tests project segment.
-		if strings.Contains(pl, "/tests/") || strings.Contains(pl, "\\tests\\") ||
-			strings.HasPrefix(pl, "tests/") || strings.Contains(pl, ".tests/") {
-			return true
-		}
-		// Playwright / .NET E2E: names like AsqsPlaywrightSmokeE2E.cs under .../E2E/ often omit *Test*.cs.
-		if strings.Contains(pl, "/e2e/") || strings.HasPrefix(pl, "e2e/") ||
-			strings.Contains(pl, "\\e2e\\") {
-			return true
-		}
-		stem := strings.TrimSuffix(lb, ".cs")
-		if strings.Contains(stem, "e2e") {
-			return true
-		}
-		return false
+		// One predicate, shared with the write gate and the extend-merge path. They used to be
+		// three, and they disagreed: two rejected FooTest.cs and accepted Contest.cs.
+		return layout.IsCSharpTestPath(rel)
 	case "javascript", "typescript", "js", "ts":
 		if strings.HasSuffix(base, ".ts") || strings.HasSuffix(base, ".tsx") || strings.HasSuffix(base, ".js") ||
 			strings.HasSuffix(base, ".jsx") || strings.HasSuffix(base, ".mjs") || strings.HasSuffix(base, ".cjs") {

@@ -12,8 +12,13 @@ import (
 )
 
 // resolveCSharpTestProfile reads the solution's projects and derives the required test stack.
-func resolveCSharpTestProfile(repo, fallbackTFM string) (csharpTestProfile, error) {
-	det, err := detectCSharpFramework(repo, fallbackTFM)
+// forcedSurface is bootstrap.policy.e2e_framework.surface; empty or "auto" means detect it.
+// forcedSurface is bootstrap.policy.e2e_framework.surface ("" or "auto" meaning detect it), or NIL
+// for a caller that cannot see the configuration. Nil is not the same as "auto": those callers skip
+// surface detection entirely and the contract they write records no surface, rather than a detected
+// one that could contradict what the run resolved with the operator's override applied.
+func resolveCSharpTestProfile(repo, fallbackTFM string, forcedSurface *string) (csharpTestProfile, error) {
+	det, err := detectCSharpFramework(repo, fallbackTFM, forcedSurface)
 	if err != nil {
 		return csharpTestProfile{}, err
 	}
@@ -33,7 +38,7 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 	_ = cfg // pin_versions / lockfile N/A for .NET bootstrap
 
 	fallbackTFM := dotnetTFMFallbackFromRunner(runnerCfg)
-	prof, err := resolveCSharpTestProfile(repo, fallbackTFM)
+	prof, err := resolveCSharpTestProfile(repo, fallbackTFM, ptrTo(csharpForcedE2ESurface(runnerCfg)))
 	if err != nil {
 		return fmt.Errorf("test_framework_bootstrap: resolve C# profile: %w", err)
 	}
@@ -48,6 +53,11 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 		"evidence":          prof.Evidence,
 		"stack":             prof.Stack,
 		"required_packages": describeCSharpPackages(prof.Packages),
+		// What an E2E test can drive here, with the file-level reasoning behind it, so an operator
+		// can check the call rather than take it on faith.
+		"e2e_surface":          string(prof.UISurface),
+		"ui_framework":         string(prof.UIFramework),
+		"e2e_surface_evidence": prof.UISurfaceEvidence,
 	})
 
 	if prof.Declined {
@@ -151,6 +161,10 @@ func setupCSharpTestProject(ctx context.Context, repo, gitRoot string, cfg *conf
 	filesChanged = removeRelPath(filesChanged, relPathForBootstrap(repo, unitSmoke.Abs))
 
 	contract := csharpContract(prof)
+	// The project this bootstrap actually ensured the stack on. It was already in the audit and
+	// nowhere a consumer could read it, so generation re-derived its own answer and picked a
+	// different project — see teststack.Contract.TestProject.
+	contract.TestProject = relPathForBootstrap(repo, testProj)
 	contract.Verified = true
 	contract.Smoke = smokeFromRun(string(prof.FrameworkSmoke), prof.FrameworkSmoke != csharpSmokeNone, frameworkSmokeOK, frameworkSmokeNote)
 	if frameworkSmokeNote != "" && !frameworkSmokeOK {
