@@ -164,12 +164,35 @@ func firstGeneratedArtifactPath(paths []string, artifacts map[string]bool) strin
 
 func csharpOwnedTypeMissFact(typeName, path, member string, bodies []string) string {
 	declared := csharpDeclaredMemberNames(typeName, bodies...)
+	// Never offer the member the compiler just rejected as the alternative to itself.
+	//
+	// DeclaredMemberNames lists public AND internal members, by design — they are call targets from
+	// inside the same assembly. So a rejected internal member appeared in its own suggestion list,
+	// and the fact read "has NO member X … Members declared on T include: X". Run
+	// api-2555a79ee2660a8a5cd95c8c860090f5 handed the fixer exactly that contradiction; across
+	// three rounds its only move was to delete tests (9 → 6, then 9 → 7), the coverage gate refused
+	// both, and the loop ended on no_accepted_writes having spent fifty minutes.
+	declared = withoutMember(declared, member)
 	partial := false
 	if len(declared) > maxDeclaredMethodsListed {
 		declared = declared[:maxDeclaredMethodsListed]
 		partial = true
 	}
 	var b strings.Builder
+	// "Does not contain a definition for" is what the compiler says whether the member is absent or
+	// merely out of reach from this assembly, and the two have different remedies. Ask the source
+	// which one it is rather than asserting the stronger claim.
+	if access, ok := csharpMemberAccess(typeName, member, bodies); ok && access != "public" {
+		b.WriteString(dotnetproj.DescribeAccessRemedy(typeName, member, access))
+		if len(declared) > 0 {
+			suffix := ""
+			if partial {
+				suffix = " (list shortened)"
+			}
+			fmt.Fprintf(&b, " Members of %s this test CAN call include%s: %s.", typeName, suffix, strings.Join(declared, ", "))
+		}
+		return b.String()
+	}
 	fmt.Fprintf(&b, "%s (%s, shown in this prompt) has NO member %q — the compiler rejected it; do not use it again.",
 		typeName, path, member)
 	if len(declared) > 0 {
@@ -181,6 +204,30 @@ func csharpOwnedTypeMissFact(typeName, path, member string, bodies []string) str
 		b.WriteString(" Use one of these, or build the state you need through the constructors the source shows.")
 	}
 	return b.String()
+}
+
+// csharpMemberAccess asks every body that declares the type how it declares this member. The first
+// answer wins: a partial class splits one type across files, and only one of them declares it.
+// csharpMemberAccess asks every body that declares the type how it declares this member. The first
+// answer wins: a partial class splits one type across files, and only one of them declares it.
+func csharpMemberAccess(typeName, member string, bodies []string) (string, bool) {
+	for _, body := range bodies {
+		if access, ok := dotnetproj.DeclaredMemberAccess(typeName, member, body); ok {
+			return access, true
+		}
+	}
+	return "", false
+}
+
+// withoutMember returns names with one removed, preserving order.
+func withoutMember(names []string, member string) []string {
+	out := names[:0:0]
+	for _, n := range names {
+		if n != member {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func csharpConstructorFact(typeName, path string, bodies []string) string {

@@ -144,6 +144,9 @@ const (
 	// IneligibleUnexported is a TypeScript module-level function nothing can import. See
 	// isUnexportedTypeScriptFunction.
 	IneligibleUnexported = "unexported"
+	// IneligibleUnreachableInternal is a C# member declared `internal` in a project that does not
+	// grant InternalsVisibleTo to the test assembly. See internalAccessFilter.
+	IneligibleUnreachableInternal = "unreachable_internal"
 )
 
 // fqNameIsBindingPattern reports whether a candidate's FQName is a destructuring pattern rather

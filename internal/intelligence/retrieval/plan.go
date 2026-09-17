@@ -308,6 +308,9 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 	// For JS/TS, query both "javascript" and "typescript" so we get all symbols (indexer may store .ts as "typescript", .js as "javascript"; legacy data may be "javascript" only).
 	langsToQuery := symbolQueryLangs(opts.Lang)
 	reachable := csharpReachableFilter(opts)
+	// A member `internal` to a project the test assembly has no grant into cannot be called by any
+	// test this run writes. See internalAccessFilter.
+	reachableInternals := newInternalAccessFilter(opts)
 	seenID := make(map[string]bool)
 	for _, kind := range kinds {
 		for _, lang := range langsToQuery {
@@ -390,6 +393,15 @@ func ListGapsWithChunks(ctx context.Context, meta GapMetaReader, chunks ChunkRea
 				mu.Lock()
 				filtered = append(filtered, gap)
 				filteredByReason[reason]++
+				mu.Unlock()
+				return nil
+			}
+			// Separate from gapEligibility because this one reads the working tree — the project
+			// files and their InternalsVisibleTo grants — rather than the symbol row alone.
+			if !reachableInternals.allows(sym) {
+				mu.Lock()
+				filtered = append(filtered, gap)
+				filteredByReason[IneligibleUnreachableInternal]++
 				mu.Unlock()
 				return nil
 			}
